@@ -1,0 +1,62 @@
+name: build-win-x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "发布版本号（同时用作 tag 名）"
+        required: false
+        default: "2026.08.14.0001"
+  push:
+    branches: [main]
+
+env:
+  VERSION: ${{ inputs.version || '2026.08.14.0001' }}
+
+jobs:
+  build:
+    name: 构建 Windows x64
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链 (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建 Release
+        run: cargo build --release
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-project-manager-win-x64-${{ env.VERSION }}
+          path: target/release/tui-project-manager.exe
+          if-no-files-found: error
+
+      - name: 发布 pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          body: |
+            Windows x64 自动构建（pre-release）
+
+            - 版本: `${{ env.VERSION }}`
+            - 运行: 直接运行 `tui-project-manager.exe`
+            - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
+            - 会话页签: `Ctrl+B` 前缀  `h` 首页  `n` 下一个  `p` 上一个  `x` 关闭  `b` 发送 Ctrl+B  `Esc` 取消
+            - 终端输入: 键盘事件直接透传给内嵌终端（支持 Ctrl+C / Ctrl+V 粘贴等）
+            - 配置: 自动保存到 exe 同级的 `config/config.json`
+          files: target/release/tui-project-manager.exe
+          draft: false
+          prerelease: true
+          update_release: true
