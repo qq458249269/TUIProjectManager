@@ -46,8 +46,19 @@ impl EventListener for SessionListener {
     }
 }
 
+/// 去掉路径/命令里可能混入的不可见 Unicode 控制符（如复制粘贴带进来的
+/// U+202A 双向嵌入符）以及 NUL 字节，避免 CreateProcessW 因非法字符失败。
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !matches!(*c, '\0' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect()
+}
+
 /// 把一条命令字符串拆成程序与参数（支持双引号）。
 fn split_command(cmd: &str) -> Vec<String> {
+    let cmd = sanitize(cmd);
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
@@ -96,8 +107,9 @@ pub fn spawn(
     for arg in &parts[1..] {
         cmd.arg(arg.clone());
     }
+    let dir = sanitize(dir);
     if !dir.is_empty() {
-        cmd.cwd(Path::new(dir));
+        cmd.cwd(Path::new(&dir));
     }
 
     let child = pair
@@ -166,6 +178,14 @@ mod tests {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
     use std::time::Duration;
+
+    #[test]
+    fn sanitize_strips_bidi_and_nul() {
+        let s = "\u{202a}D:\\tools\\app.exe\u{0} --flag";
+        assert_eq!(sanitize(s), "D:\\tools\\app.exe --flag");
+        assert_eq!(split_command(s), vec!["D:\\tools\\app.exe", "--flag"]);
+        assert_eq!(sanitize("D:\\projects\\PG数据库性能测试\u{202e}"), "D:\\projects\\PG数据库性能测试");
+    }
 
     #[test]
     fn spawn_run_and_render() {

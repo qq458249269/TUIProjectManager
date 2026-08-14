@@ -531,6 +531,18 @@ impl ClientApp {
             if launch.clicked() {
                 self.launch_selected();
             }
+            let open_dir = ui.add_enabled(
+                exists,
+                egui::Button::new(RichText::new("📂 打开目录")),
+            );
+            if open_dir.clicked() {
+                if let Err(e) = std::process::Command::new("explorer")
+                    .arg(&p.path)
+                    .spawn()
+                {
+                    self.status = Some(format!("打开目录失败: {e}"));
+                }
+            }
             if ui.button("重命名").clicked() {
                 self.open_rename();
             }
@@ -555,9 +567,10 @@ impl ClientApp {
         ui.add_space(8.0);
         ui.heading("设置");
         ui.separator();
-        ui.label("TUI 启动命令（点击选择启动时要用的命令，可添加多个）:");
+        ui.label("TUI 启动命令（点击选择启动时要用的命令，可添加多个，改动自动保存）:");
         ui.add_space(4.0);
 
+        let mut dirty = false;
         let mut remove_idx: Option<usize> = None;
         for (i, cmd) in self.settings_commands.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -568,6 +581,7 @@ impl ClientApp {
                 );
                 if resp.clicked() {
                     self.settings_command = cmd.clone();
+                    dirty = true;
                 }
                 if ui
                     .small_button("删除")
@@ -588,6 +602,7 @@ impl ClientApp {
                         .cloned()
                         .unwrap_or_default();
                 }
+                dirty = true;
             }
         }
         ui.add_space(6.0);
@@ -597,6 +612,15 @@ impl ClientApp {
                     .desired_width(280.0)
                     .hint_text("新命令，如 lazygit / htop"),
             );
+            if ui.button("浏览…").on_hover_text("选择可执行文件").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("选择 TUI 可执行文件")
+                    .add_filter("可执行文件", &["exe", "bat", "cmd", "com"])
+                    .pick_file()
+                {
+                    self.settings_new_command = path.to_string_lossy().to_string();
+                }
+            }
             let clicked = ui.button("添加").clicked();
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if clicked || enter {
@@ -604,6 +628,7 @@ impl ClientApp {
                 if !cmd.is_empty() && !self.settings_commands.contains(&cmd) {
                     self.settings_commands.push(cmd.clone());
                     self.settings_new_command.clear();
+                    dirty = true;
                 }
             }
         });
@@ -612,17 +637,11 @@ impl ClientApp {
                 .weak()
                 .small(),
         );
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("保存").clicked() {
-                self.config.settings.tui_command = self.settings_command.trim().to_string();
-                self.config.settings.tui_commands = self.settings_commands.clone();
-                self.save_config("已保存设置".to_string());
-            }
-            if ui.button("放弃修改").clicked() {
-                self.open_settings();
-            }
-        });
+        if dirty {
+            self.config.settings.tui_command = self.settings_command.trim().to_string();
+            self.config.settings.tui_commands = self.settings_commands.clone();
+            self.save_config("设置已自动保存".to_string());
+        }
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
