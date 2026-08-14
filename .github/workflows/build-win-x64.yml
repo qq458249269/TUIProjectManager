@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "发布版本号（留空则自动基于最新 tag 自增末尾段，如 …0001 → …0002）"
+        description: "发布版本号（留空则自动：版本日期取今天，当天已发布过才自增末尾段）"
         required: false
   push:
     branches: [main]
@@ -36,17 +36,22 @@ jobs:
         shell: pwsh
         run: |
           $specified = "${{ env.VERSION }}"
+          $today = Get-Date -Format 'yyyy.MM.dd'
           if ($specified -ne "") {
             $ver = $specified
           } else {
             $tags = (git tag --sort=-v:refname) 2>$null
             $last = ($tags | Select-Object -First 1)
+            $ver = "$today.0001"
+            # 版本日期跟随“今天”，不沿用最近 tag 的日期：跨天后从 .0001
+            # 重新开始（修复 15 号构建还叫 …14.xxxx 的问题），当天已发布
+            # 过才自增末尾段（…0001 → …0002）。
             if ($last -match '^(\d{4})\.(\d{2})\.(\d{2})\.(\d{4})$') {
-              $n = [int]$Matches[4] + 1
-              $ver = "$($Matches[1]).$($Matches[2]).$($Matches[3]).$($n.ToString('0000'))"
-            } else {
-              $today = Get-Date -Format 'yyyy.MM.dd'
-              $ver = "$today.0001"
+              $lastDate = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+              if ($lastDate -eq $today) {
+                $n = [int]$Matches[4] + 1
+                $ver = "$today.$($n.ToString('0000'))"
+              }
             }
           }
           Write-Host "发布版本号: $ver"
@@ -118,8 +123,8 @@ jobs:
             - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
             - 会话页签: 可多开，关闭按钮立即销毁会话；退出时记录打开中的页签目录，下次启动自动恢复
             - 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲；左键拖拽选择文本
-            - 界面: 顶栏可切换深/浅色主题、`🔄 检查更新` 从 GitHub Release 检查新版本
-            - 刷新: 消息驱动，空闲时零重绘
+            - 界面: 顶栏可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗
+            - 刷新: 默认 30fps 基线刷新，设置中可调（15/30/60/120 FPS）
             - 配置: 自动保存到 exe 同级的 `config/config.json`
           files: target/release/tui-project-manager.exe
           draft: false

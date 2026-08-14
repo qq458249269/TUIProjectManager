@@ -560,7 +560,6 @@ pub fn show_terminal(
             let col = p.column.0 as usize;
             if col < cols {
                 let cursor_cell = &term.grid()[cursor.point];
-                let fg = resolve_color(cursor_cell.fg, colors, true, dark);
                 let x = rect.left() + col as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
                 let cursor_cell_rect =
@@ -569,31 +568,36 @@ pub fn show_terminal(
                 let blinking = term.cursor_style().blinking;
                 let phase_on = (ui.input(|t| t.time).rem_euclid(1.1)) < 0.55;
                 if !blinking || phase_on {
-                    let border = color_for(dark, Color32::from_gray(200), Color32::from_gray(70));
+                    // 光标填充色与画布底色强对比：深色画布→白色光标、浅色画布→
+                    // 黑色光标，深浅主题下都清晰可见（不能沿用单元格前景色：浅色
+                    // 主题下暗色配色 TUI 的前景色接近白，白块落在白底上就是光标消失）。
+                    let (fill, ink) = if dark {
+                        (Color32::WHITE, Color32::BLACK)
+                    } else {
+                        (Color32::BLACK, Color32::WHITE)
+                    };
+                    let border = fill;
                     if *term_focused {
-                        // 光标一律用高对比绘制，避免暗色字符时看不见。
                         match cursor.shape {
                             CursorShape::Block => {
-                                painter.rect_filled(cursor_cell_rect, 0.0, fg);
+                                painter.rect_filled(cursor_cell_rect, 0.0, fill);
                                 painter.rect_stroke(
                                     cursor_cell_rect,
                                     0.0,
-                                    Stroke::new(1.0, border),
+                                    Stroke::new(1.0, fill),
                                     egui::StrokeKind::Inside,
                                 );
-                                // 块内反色重绘格内字符（宽字符按整字宽画出），保证光标内内容可见。
+                                // 反色重绘格内字符（宽字符按整字宽画出），保证光标内内容可读。
                                 let ch = cursor_cell.c;
                                 if ch != '\0'
                                     && !cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                                 {
-                                    let cell_bg =
-                                        resolve_color(cursor_cell.bg, colors, false, dark);
                                     painter.text(
                                         Pos2::new(x, y + cell_h / 2.0),
                                         egui::Align2::LEFT_CENTER,
                                         ch.to_string(),
                                         font_id.clone(),
-                                        cell_bg,
+                                        ink,
                                     );
                                 }
                             }
@@ -613,7 +617,7 @@ pub fn show_terminal(
                                         Vec2::new(cell_w, h),
                                     ),
                                     0.0,
-                                    color_for(dark, Color32::WHITE, Color32::BLACK),
+                                    fill,
                                 );
                             }
                             CursorShape::Beam => {
@@ -621,7 +625,7 @@ pub fn show_terminal(
                                 painter.rect_filled(
                                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, cell_h)),
                                     0.0,
-                                    color_for(dark, Color32::WHITE, Color32::BLACK),
+                                    fill,
                                 );
                             }
                             CursorShape::Hidden => {}

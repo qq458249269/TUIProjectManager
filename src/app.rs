@@ -264,6 +264,8 @@ impl ClientApp {
             app.term_focused = app.current != 0;
             app.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
         }
+        // 每次启动自动检查一次更新。
+        app.check_updates(true);
         app
     }
 
@@ -290,9 +292,12 @@ impl ClientApp {
         }
     }
 
-    /// 异步检查 GitHub Release 最新版本，结果回到状态栏。
-    fn check_updates(&mut self) {
-        self.status = Some("正在检查更新…".to_string());
+    /// 异步检查 GitHub Release 最新版本，结果回到状态栏（不弹窗，只显示在窗口底部）。
+    /// silent=true（启动/新开页签自动检查）时不覆盖当前状态栏消息。
+    fn check_updates(&mut self, silent: bool) {
+        if !silent {
+            self.status = Some("正在检查更新…".to_string());
+        }
         let tx = self.check_tx.clone();
         let redraw_tx = self.redraw_tx.clone();
         std::thread::spawn(move || {
@@ -338,6 +343,8 @@ impl ClientApp {
                 self.term_focused = true;
                 self.screen = Screen::Main;
                 self.status = Some(format!("已启动: {}", project.name));
+                // 每次新开页签自动检查一次更新。
+                self.check_updates(true);
             }
             Err(e) => self.status = Some(format!("启动失败: {e}")),
         }
@@ -517,10 +524,10 @@ impl ClientApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("🔄 检查更新")
-                    .on_hover_text("从 GitHub Release 检查最新版本")
+                    .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
                     .clicked()
                 {
-                    self.check_updates();
+                    self.check_updates(false);
                 }
                 let dark = self.config.settings.dark_mode;
                 let theme_btn = if dark {
@@ -800,6 +807,23 @@ impl ClientApp {
             self.save_config("设置已自动保存".to_string());
         }
         ui.add_space(12.0);
+        ui.label("界面刷新率（默认 30 FPS；越高越流畅、CPU 占用越高）:");
+        ui.horizontal(|ui| {
+            for (label, ms) in [
+                ("15 FPS（省电）", 66u64),
+                ("30 FPS（默认）", 33),
+                ("60 FPS（流畅）", 16),
+                ("120 FPS（极限）", 8),
+            ] {
+                let selected = self.config.settings.refresh_ms == ms;
+                if ui.selectable_label(selected, label).clicked() && !selected {
+                    self.config.settings.refresh_ms = ms;
+                    self.save_config("已更新刷新率".to_string());
+                    ui.ctx().request_repaint();
+                }
+            }
+        });
+        ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
         if ui.button("← 返回项目列表").clicked() {
@@ -982,13 +1006,13 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 消息驱动，不设基线定时器：重绘全部由事件触发——终端输出经 redraw
-        // 通道推送、用户输入/窗口事件由 egui 自带、状态栏/更新检查/粘贴等
-        // 都显式 request_repaint，空闲时零重绘。唯一例外：当前页签是终端且
-        // 光标可见闪烁时，按闪烁半周期定时重绘（否则光标不闪）。
-        // redraw 通道容量为 1（见 new），try_iter 把当前积压信号一次抽干：
-        // 无论多少会话同时输出，每帧至多触发一次重绘，burst 结束后不会
-        // 留下逐帧消化的“信号尾巴”，也不会在输出不停时无限堆积。
+        // 固定帧率基线刷新（默认 30fps=33ms，设置中可调）：纯消息驱动时
+        // 鼠标不动/无事件的空闲期，状态栏、光标闪烁等界面元素不会刷新，
+        // 体验异常。request_repaint_after 每帧续上一帧，形成恒定基线。
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            self.config.settings.refresh_ms.max(1),
+        ));
+
         let cursor_blinks = match self.tabs.get(self.current) {
             Some(Tab::Session(s)) => s
                 .term
