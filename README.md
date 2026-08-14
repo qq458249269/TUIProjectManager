@@ -12,8 +12,12 @@
 - **添加项目**：支持名称 + 路径（原生文件夹选择窗口「浏览…」），名称留空时自动用路径最后一段。
 - **项目管理**：重命名 / 改路径 / 删除，配置自动保存到 exe 同级的 `config/config.json`。
 - **多 TUI 命令**：在「设置」中可配置多个命令（nvim / lazygit / cmd …），点选其中一个作为启动命令。
-- **内嵌终端**：键盘事件直接透传（支持 Ctrl+C / Ctrl+V 粘贴等），每个项目一个会话页签。
-- **Ctrl+B 页签管理**：在终端页签内按 `Ctrl+B` 进入前缀模式管理页签。
+- **内嵌终端**：多页签并排，退出时记录打开中的页签目录，下次启动自动恢复。
+- **深浅主题**：顶栏一键切换，暗色 TUI 输出自动映射为浅色主题可读配色。
+- **复制粘贴**：右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；多行粘贴支持括号粘贴（应用按字面插入）或转 `\r`（shell 逐行执行）。
+- **滚动查看历史**：滚轮回看滚动缓冲，左键拖拽选择文本。
+- **检查更新**：顶栏「🔄 检查更新」对比 GitHub Release 版本，有新版本时状态栏给出下载链接。
+- **消息驱动刷新**：空闲时零重绘，仅终端输出 / 光标闪烁 / 用户操作触发重绘。
 
 ## 使用
 
@@ -28,17 +32,16 @@
 | `重命名` / `改路径` / `删除` | 管理选中项目 |
 | `⚙ 设置` | 配置 TUI 启动命令（可添加多个、选择一个） |
 
-### 会话页签
+### 终端页签
 
-在终端页签内按 `Ctrl+B` 进入前缀模式：
-
-| 按键 | 功能 |
+| 操作 | 功能 |
 | --- | --- |
-| `h` | 回到首页 |
-| `n` / `p` | 下一个 / 上一个会话 |
-| `x` | 关闭当前会话 |
-| `b` | 发送 Ctrl+B 给终端程序 |
-| `Esc` | 取消 |
+| `滚轮` | 翻看滚动缓冲（历史输出） |
+| `左键拖拽` + `右键` | 选中 → 右键复制 |
+| `右键`（无选区） | 粘贴剪贴板内容 |
+| `Ctrl+C` | 有选区时复制；无选区时发 SIGINT 给终端程序 |
+| `Ctrl+V` / `Ctrl+Shift+V` | 粘贴（多行自动处理换行） |
+| `×`（页签右侧） | 关闭会话 |
 
 ## 配置
 
@@ -58,12 +61,41 @@
 
 ## 从源码构建
 
+需要 Rust（stable，1.97+）与 C 链接器。Windows 下两种工具链任选：
+
+- **MSVC**（推荐）：安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)（含链接器与 `rc.exe`）
+- **GNU**（w64devkit）：下载 [w64devkit](https://github.com/skeeto/w64devkit/releases) 解压后把 `bin` 加入 PATH
+
 ```bash
-# 需 Rust 1.97+；Windows 上建议 MSVC 工具链
+# 本地开发构建（快、带调试信息）
+cargo build
+
+# 发布构建（体积优先：opt-level=z + LTO + panic=abort + strip）
 cargo build --release
 ```
 
-产物：`target/release/tui-project-manager.exe`
+产物：`target/debug/tui-project-manager.exe` 或 `target/release/tui-project-manager.exe`
+
+> 无 `rc.exe` 时 `build.rs` 的资源编译（图标/版本信息）会警告并跳过，不影响功能。
+
+### 版本号注入
+
+exe 标题栏与「检查更新」用的版本号来源：`version.txt`（仓库根目录）→ `build.rs` 读取注入 `APP_VERSION` 与 Windows 资源 `FileVersion`；文件不存在则回退 `Cargo.toml` 版本。
+
+```bash
+# 例：发布前写入版本号再构建（version.txt 已 gitignore，不会被误提交）
+echo "2026.01.15.0042" > version.txt
+cargo build --release
+rm version.txt
+```
+
+## 发布（GitHub Actions）
+
+`.github/workflows/build-win-x64.yml` 自动完成：计算版本号 → **写入 `version.txt`** → 构建 → （可选）代码签名 → 上传产物 → 发布 pre-release tag。
+
+- **触发**：push 到 `main`（自动取最新 tag 末段自增，如 `2026.06.30.0001 → …0002`）；或 Actions 页面手动触发并指定版本号
+- **互斥**：同一时间只允许一个构建运行，新触发自动取消在跑的旧构建
+- **产物**：`tui-project-manager-win-x64-<版本号>` artifact + 同名 Release
 
 ## 技术栈
 
@@ -71,10 +103,3 @@ cargo build --release
 - 终端: [alacritty_terminal](https://github.com/alacritty/alacritty)（解析终端输出）
 - 伪终端: [portable-pty](https://github.com/wez/wezterm)（winpty/conpty）
 - 原生对话框: [rfd](https://github.com/Polpua/rfd)
-
-## 发布
-
-GitHub Actions 在每次 push 到 `main` 时自动构建 Windows x64 版本并发布 pre-release：
-https://github.com/qq458249269/TUIProjectManager/releases
-
-可在 Actions 页面手动触发（workflow_dispatch）并指定版本号。
