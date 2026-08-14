@@ -33,6 +33,28 @@ impl Default for Settings {
 pub struct Config {
     pub projects: Vec<Project>,
     pub settings: Settings,
+    /// 窗口位置/大小，下次启动时恢复。
+    #[serde(default)]
+    pub window: WindowState,
+}
+
+/// 上次的窗口状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WindowState {
+    pub pos: Option<[f32; 2]>,
+    pub size: Option<[f32; 2]>,
+    pub maximized: bool,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            pos: None,
+            size: None,
+            maximized: false,
+        }
+    }
 }
 
 impl Default for Config {
@@ -40,6 +62,7 @@ impl Default for Config {
         Self {
             projects: Vec::new(),
             settings: Settings::default(),
+            window: WindowState::default(),
         }
     }
 }

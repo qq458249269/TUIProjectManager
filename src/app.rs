@@ -804,7 +804,15 @@ impl Drop for ClientApp {
 }
 
 impl eframe::App for ClientApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 窗口状态已在每帧 logic 中记录，退出时落盘。
+        let _ = config::save(&self.config);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 固定 0.3s 基线刷新，避免只有鼠标移动才重绘；终端重绘事件仍会立即触发。
+        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+
         let redraw = self.redraw_rx.try_recv().is_ok();
         let exited = self.update_exited();
         if exited {
@@ -812,6 +820,18 @@ impl eframe::App for ClientApp {
         }
         if redraw || exited {
             ctx.request_repaint();
+        }
+
+        // 记录窗口状态，退出时保存。
+        let vp = ctx.input(|i| i.viewport().clone());
+        self.config.window.maximized = vp.maximized.unwrap_or(false);
+        if !self.config.window.maximized {
+            if let Some(r) = vp.outer_rect {
+                self.config.window.pos = Some([r.min.x, r.min.y]);
+            }
+            if let Some(r) = vp.inner_rect {
+                self.config.window.size = Some([r.width(), r.height()]);
+            }
         }
     }
 
