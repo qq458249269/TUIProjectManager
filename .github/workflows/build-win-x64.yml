@@ -40,19 +40,20 @@ jobs:
           if ($specified -ne "") {
             $ver = $specified
           } else {
-            $tags = (git tag --sort=-v:refname) 2>$null
-            $last = ($tags | Select-Object -First 1)
-            $ver = "$today.0001"
-            # 版本日期跟随“今天”，不沿用最近 tag 的日期：跨天后从 .0001
-            # 重新开始（修复 15 号构建还叫 …14.xxxx 的问题），当天已发布
-            # 过才自增末尾段（…0001 → …0002）。
-            if ($last -match '^(\d{4})\.(\d{2})\.(\d{2})\.(\d{4})$') {
-              $lastDate = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
-              if ($lastDate -eq $today) {
-                $n = [int]$Matches[4] + 1
-                $ver = "$today.$($n.ToString('0000'))"
+            # 前三位严格取“今天”的日期：遍历全部 tag，只统计今天日期开头的
+            # 版本号，取最大末尾段 +1；没有今天的 tag 则从 0001 开始。
+            # 不依赖 git 版本排序取“最新 tag”：排序会因 4 段数字解析或最新 tag
+            # 不是日期格式（如 v0.1.0）而误判，可能把今天已有的 0002..0008
+            # 重置回 0001 产生重复版本号。
+            $tags = (git tag) 2>$null
+            $max = 0
+            foreach ($t in $tags) {
+              if ($t -match ("^" + [regex]::Escape($today) + "\.(\d+)$")) {
+                $n = [int]$Matches[1]
+                if ($n -gt $max) { $max = $n }
               }
             }
+            $ver = "$today.$((($max + 1)).ToString('0000'))"
           }
           Write-Host "发布版本号: $ver"
           "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -122,8 +123,8 @@ jobs:
             - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
             - 会话页签: 可多开，关闭按钮立即销毁会话；退出时记录打开中的页签目录，下次启动自动恢复
             - 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲；左键拖拽选择文本
-            - 界面: 顶栏可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗
-            - 刷新: 默认 30fps 基线刷新，设置中可调（15/30/60/120 FPS）
+            - 界面: 右下角可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗
+            - 刷新: 默认 10fps 基线刷新，设置中可调（10-60 FPS）
             - 配置: 自动保存到 exe 同级的 `config/config.json`
           files: target/release/tui-project-manager.exe
           draft: false

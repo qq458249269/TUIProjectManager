@@ -9,11 +9,11 @@ pub struct Project {
     pub path: String,
 }
 
-/// 界面基线刷新间隔的默认值（毫秒），对应默认 30 帧/秒。
-const DEFAULT_REFRESH_MS: u64 = 33;
+/// 界面基线刷新帧率的默认值（帧/秒），对应默认 10 帧/秒。
+pub(crate) const DEFAULT_REFRESH_FPS: u64 = 10;
 
-fn default_refresh_ms() -> u64 {
-    DEFAULT_REFRESH_MS
+fn default_refresh_fps() -> u64 {
+    DEFAULT_REFRESH_FPS
 }
 
 fn default_dark_mode() -> bool {
@@ -28,9 +28,9 @@ pub struct Settings {
     pub tui_commands: Vec<String>,
     /// 当前选中的 TUI 命令（启动项目时使用）。
     pub tui_command: String,
-    /// 界面基线刷新间隔（毫秒），越小越流畅、CPU 占用越高（默认 30 帧/秒）。
-    #[serde(default = "default_refresh_ms")]
-    pub refresh_ms: u64,
+    /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 10。
+    #[serde(default = "default_refresh_fps")]
+    pub refresh_fps: u64,
     /// 深浅主题：true=深色（默认），false=浅色。
     #[serde(default = "default_dark_mode")]
     pub dark_mode: bool,
@@ -41,7 +41,7 @@ impl Default for Settings {
         Self {
             tui_commands: vec!["nvim".to_string()],
             tui_command: "nvim".to_string(),
-            refresh_ms: DEFAULT_REFRESH_MS,
+            refresh_fps: DEFAULT_REFRESH_FPS,
             dark_mode: true,
         }
     }

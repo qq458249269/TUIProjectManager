@@ -5,7 +5,7 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
@@ -550,35 +550,73 @@ pub fn show_terminal(
     let galley = painter.layout_job(job);
     painter.galley(rect.left_top(), galley, Color32::WHITE);
 
-    // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框；
-    // 闪烁光标（DECSET 12）按约 1.1s 周期半显半隐。
+    // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
+    // 定位策略分两种：
+    // 1) SHOW_CURSOR 开启的常规应用（cmd/nvim 等）：按 grid 光标位置精确绘制，
+    //    方向键移动光标时 grid 光标跟着走，位置永远正确。
+    // 2) pi 等 TUI 常驻 DECSET 25 隐藏光标（shape=Hidden、show_cursor=false），
+    //    并把终端光标停靠在输入框末尾的固定列——直接照画会停在错误位置，且不随
+    //    方向键移动（实测 pi 停靠 (11,79)，输入在 (11,5)）。这类 TUI 会用
+    //    “空白格 + 非默认前后景色”的单元格自绘真实输入光标（实测随方向键移动），
+    //    所以先在该行找这种自绘光标格、画在那里；找不到才退回停靠位置。
     let mut cursor_rect: Option<Rect> = None;
-    if term.mode().contains(TermMode::SHOW_CURSOR) && cursor.shape != CursorShape::Hidden {
-        let p = cursor.point;
+    {
+        // 光标位置：
+        // - SHOW_CURSOR 开启（cmd/nvim 等）：按 grid 光标位置，精确跟随方向键。
+        // - pi 等 TUI 常驻 DECSET 25 隐藏光标，并把终端光标停靠在最后写入行的
+        //   末尾（实测列固定不动，不随方向键走），改用自绘光标：pi 用
+        //   (Black,White) 反色格画输入光标，格内是字符或空格，随方向键移动。
+        //   自底向上整屏找反色格：输入行在 UI 最下方，必然优先命中；停靠行
+        //   是灰色状态行时（启动瞬间）也不会误判。找不到才退回停靠位置。
+        let show = term.mode().contains(TermMode::SHOW_CURSOR);
+        let mut cpoint = cursor.point;
+        if !show {
+            let is_caret = |cell: &Cell| {
+                matches!(
+                    (cell.fg, cell.bg),
+                    (Color::Named(NamedColor::Black), Color::Named(NamedColor::White))
+                        | (Color::Named(NamedColor::White), Color::Named(NamedColor::Black))
+                )
+            };
+            'outer: for r in (0..rows).rev() {
+                let line = Line(r as i32 - offset as i32);
+                for col in 0..cols {
+                    let cell = &term.grid()[Point::new(line, Column(col))];
+                    if is_caret(cell) {
+                        cpoint = Point::new(line, Column(col));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let p = cpoint;
         let vline = p.line.0 + offset as i32;
         if vline >= 0 && vline < rows as i32 {
             let col = p.column.0 as usize;
             if col < cols {
-                let cursor_cell = &term.grid()[cursor.point];
+                let cursor_cell = &term.grid()[cpoint];
                 let x = rect.left() + col as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
                 let cursor_cell_rect =
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
 
-                let blinking = term.cursor_style().blinking;
-                let phase_on = (ui.input(|t| t.time).rem_euclid(1.1)) < 0.55;
-                if !blinking || phase_on {
-                    // 光标填充色与画布底色强对比：深色画布→白色光标、浅色画布→
-                    // 黑色光标，深浅主题下都清晰可见（不能沿用单元格前景色：浅色
-                    // 主题下暗色配色 TUI 的前景色接近白，白块落在白底上就是光标消失）。
-                    let (fill, ink) = if dark {
-                        (Color32::WHITE, Color32::BLACK)
-                    } else {
-                        (Color32::BLACK, Color32::WHITE)
-                    };
-                    let border = fill;
-                    if *term_focused {
-                        match cursor.shape {
+                // 光标填充色与画布底色强对比：深色画布→白色光标、浅色画布→
+                // 黑色光标，深浅主题下都清晰可见（不能沿用单元格前景色：浅色
+                // 主题下暗色配色 TUI 的前景色接近白，白块落在白底上就是光标消失）。
+                let (fill, ink) = if dark {
+                    (Color32::WHITE, Color32::BLACK)
+                } else {
+                    (Color32::BLACK, Color32::WHITE)
+                };
+                let border = fill;
+                // Hidden 形状兜底成 Block：隐藏 = 不画，那就强制画个方块。
+                let shape = if cursor.shape == CursorShape::Hidden {
+                    CursorShape::Block
+                } else {
+                    cursor.shape
+                };
+                if *term_focused {
+                        match shape {
                             CursorShape::Block => {
                                 painter.rect_filled(cursor_cell_rect, 0.0, fill);
                                 painter.rect_stroke(
@@ -630,17 +668,16 @@ pub fn show_terminal(
                             }
                             CursorShape::Hidden => {}
                         }
-                    } else {
-                        // 未聚焦：空心边框指示光标位置，不遮挡文本。
-                        painter.rect_stroke(
-                            cursor_cell_rect,
-                            0.0,
-                            Stroke::new(1.5, border),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    cursor_rect = Some(cursor_cell_rect);
-                }
+    } else {
+        // 未聚焦：空心边框指示光标位置，不遮挡文本。
+        painter.rect_stroke(
+            cursor_cell_rect,
+            0.0,
+            Stroke::new(1.5, border),
+            egui::StrokeKind::Inside,
+        );
+    }
+    cursor_rect = Some(cursor_cell_rect);
             }
         }
     }

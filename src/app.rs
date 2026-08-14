@@ -155,6 +155,24 @@ fn fetch_latest_release() -> (String, Option<String>) {
     }
 }
 
+/// 用系统默认浏览器打开 URL。
+/// egui 的 Hyperlink 依赖 eframe 的 links 特性（webbrowser crate），本项目为减
+/// 体积禁用了该特性，OpenUrl 命令是空操作——所以自己调 cmd start 交给浏览器。
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW，避免闪黑窗
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// 点分数字版本比较（如 2025.06.30.0001），a > b 返回 true。
 fn version_newer(a: &str, b: &str) -> bool {
     let pa: Vec<u64> = a.split('.').map(|s| s.parse().unwrap_or(0)).collect();
@@ -178,6 +196,7 @@ pub struct ClientApp {
     pub settings_command: String,
     pub settings_commands: Vec<String>,
     pub settings_new_command: String,
+    pub settings_refresh_fps: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
     pub term_focused: bool,
@@ -213,6 +232,7 @@ impl ClientApp {
             settings_command,
             settings_commands,
             settings_new_command: String::new(),
+            settings_refresh_fps: config::DEFAULT_REFRESH_FPS.to_string(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
             term_focused: false,
@@ -281,6 +301,7 @@ impl ClientApp {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
+        self.settings_refresh_fps = self.config.settings.refresh_fps.to_string();
         self.screen = Screen::Settings;
         self.term_focused = false;
     }
@@ -520,27 +541,8 @@ impl ClientApp {
                 }
             }
 
-            // 右侧：深浅主题切换 + 快速打开用户目录。
+            // 右侧：打开当前页签目录 + 用户目录（检查更新/深浅切换已移到右下角状态栏）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("🔄 检查更新")
-                    .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
-                    .clicked()
-                {
-                    self.check_updates(false);
-                }
-                let dark = self.config.settings.dark_mode;
-                let theme_btn = if dark {
-                    ui.button("☀ 浅色").on_hover_text("切换到浅色主题，字体与颜色同步切换")
-                } else {
-                    ui.button("🌙 深色").on_hover_text("切换到深色主题，字体与颜色同步切换")
-                };
-                if theme_btn.clicked() {
-                    self.config.settings.dark_mode = !dark;
-                    apply_theme(ui.ctx(), self.config.settings.dark_mode);
-                    self.save_config("已切换主题".to_string());
-                    ui.ctx().request_repaint();
-                }
                 if ui
                     .button("📂 用户目录")
                     .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
@@ -554,6 +556,36 @@ impl ClientApp {
                             self.status = Some(format!("已打开用户目录: {dir}"));
                         }
                         Err(e) => self.status = Some(format!("打开用户目录失败: {e}")),
+                    }
+                }
+                // 当前激活页签指向的目录：会话页签用其工作目录，首页用当前选中项目路径。
+                let open_dir = match self.tabs.get(self.current) {
+                    Some(Tab::Session(s)) => Path::new(&s.dir).is_dir().then(|| s.dir.clone()),
+                    _ => self
+                        .config
+                        .projects
+                        .get(self.selected_project)
+                        .filter(|p| Path::new(&p.path).is_dir())
+                        .map(|p| p.path.clone()),
+                };
+                if ui
+                    .add_enabled(open_dir.is_some(), egui::Button::new("📁 打开目录"))
+                    .on_hover_text(
+                        if open_dir.is_some() {
+                            "在资源管理器中打开当前页签指向的目录"
+                        } else {
+                            "当前页签没有可用的目录"
+                        },
+                    )
+                    .clicked()
+                {
+                    if let Some(dir) = open_dir {
+                        match std::process::Command::new("explorer").arg(&dir).spawn() {
+                            Ok(_) => {
+                                self.status = Some(format!("已打开目录: {dir}"));
+                            }
+                            Err(e) => self.status = Some(format!("打开目录失败: {e}")),
+                        }
                     }
                 }
             });
@@ -593,11 +625,39 @@ impl ClientApp {
             ui.label(RichText::new(text).color(color));
             if let Some(tag) = &self.update_latest {
                 ui.separator();
-                ui.hyperlink_to(
-                    format!("⬇ 下载 {tag} (GitHub Release)"),
-                    format!("https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"),
+                let url = format!(
+                    "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
                 );
+                if ui
+                    .button(format!("⬇ 下载 {tag} (GitHub Release)"))
+                    .on_hover_text("用系统默认浏览器打开 GitHub Release 下载页")
+                    .clicked()
+                {
+                    open_url(&url);
+                }
             }
+            // 右下角：检查更新 + 深浅色切换（右侧第一个 = 最右）。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("🔄 检查更新")
+                    .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
+                    .clicked()
+                {
+                    self.check_updates(false);
+                }
+                let dark = self.config.settings.dark_mode;
+                let theme_btn = if dark {
+                    ui.button("☀ 浅色").on_hover_text("切换到浅色主题，字体与颜色同步切换")
+                } else {
+                    ui.button("🌙 深色").on_hover_text("切换到深色主题，字体与颜色同步切换")
+                };
+                if theme_btn.clicked() {
+                    self.config.settings.dark_mode = !dark;
+                    apply_theme(ui.ctx(), self.config.settings.dark_mode);
+                    self.save_config("已切换主题".to_string());
+                    ui.ctx().request_repaint();
+                }
+            });
         });
     }
 
@@ -807,21 +867,29 @@ impl ClientApp {
             self.save_config("设置已自动保存".to_string());
         }
         ui.add_space(12.0);
-        ui.label("界面刷新率（默认 30 FPS；越高越流畅、CPU 占用越高）:");
+        ui.label("界面刷新帧率（输入 10-60 帧/秒，默认 10）:");
         ui.horizontal(|ui| {
-            for (label, ms) in [
-                ("15 FPS（省电）", 66u64),
-                ("30 FPS（默认）", 33),
-                ("60 FPS（流畅）", 16),
-                ("120 FPS（极限）", 8),
-            ] {
-                let selected = self.config.settings.refresh_ms == ms;
-                if ui.selectable_label(selected, label).clicked() && !selected {
-                    self.config.settings.refresh_ms = ms;
-                    self.save_config("已更新刷新率".to_string());
-                    ui.ctx().request_repaint();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.settings_refresh_fps)
+                    .desired_width(60.0),
+            );
+            ui.label("FPS");
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if resp.lost_focus() || enter {
+                if let Ok(v) = self.settings_refresh_fps.trim().parse::<u64>() {
+                    let v = v.clamp(10, 60);
+                    if v != self.config.settings.refresh_fps {
+                        self.config.settings.refresh_fps = v;
+                        self.settings_refresh_fps = v.to_string();
+                        self.save_config("已更新刷新率".to_string());
+                    }
                 }
             }
+            ui.label(RichText::new(format!(
+                "当前: {} FPS，换算刷新间隔约 {}ms/帧",
+                self.config.settings.refresh_fps,
+                1000 / self.config.settings.refresh_fps.max(1).min(60),
+            )).weak());
         });
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
@@ -1006,29 +1074,12 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 固定帧率基线刷新（默认 30fps=33ms，设置中可调）：纯消息驱动时
-        // 鼠标不动/无事件的空闲期，状态栏、光标闪烁等界面元素不会刷新，
-        // 体验异常。request_repaint_after 每帧续上一帧，形成恒定基线。
-        ctx.request_repaint_after(std::time::Duration::from_millis(
-            self.config.settings.refresh_ms.max(1),
-        ));
-
-        let cursor_blinks = match self.tabs.get(self.current) {
-            Some(Tab::Session(s)) => s
-                .term
-                .lock()
-                .ok()
-                .map(|t| {
-                    t.mode()
-                        .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
-                        && t.cursor_style().blinking
-                })
-                .unwrap_or(false),
-            _ => false,
-        };
-        if cursor_blinks {
-            ctx.request_repaint_after(std::time::Duration::from_millis(400));
-        }
+        // 固定帧率基线刷新（默认 10fps=100ms，设置中可调 10-60）：纯消息驱动时
+        // 鼠标不动/无事件的空闲期，状态栏等界面元素不会刷新，体验异常。
+        // request_repaint_after 每帧续上一帧，形成恒定基线。
+        // （光标常显不闪烁，见 show_terminal，无需为此高频率重绘。）
+        let fps = self.config.settings.refresh_fps.clamp(10, 60);
+        ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
