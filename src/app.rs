@@ -232,9 +232,7 @@ impl ClientApp {
         let Some(Tab::Session(s)) = self.tabs.get_mut(self.current) else {
             return;
         };
-        if let Ok(mut w) = s.writer.lock() {
-            let _ = w.write_all(&bytes);
-        }
+        let _ = s.writer.try_send(bytes);
     }
 
     fn apply_term_commands(&mut self, cmds: Vec<TermCommand>) {
@@ -713,7 +711,9 @@ impl ClientApp {
                                     .desired_width(340.0)
                                     .hint_text(hint),
                             );
-                            resp.request_focus();
+                            if !resp.has_focus() {
+                                resp.request_focus();
+                            }
                             if is_edit_path {
                                 if ui.button("浏览…").clicked() {
                                     if let Some(dir) = rfd::FileDialog::new()
