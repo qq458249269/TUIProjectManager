@@ -6,7 +6,7 @@ use egui::{Color32, RichText};
 
 use crate::config;
 use crate::session::{self, Session};
-use crate::terminal::{self, TermCommand};
+use crate::terminal;
 
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +79,88 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 }
 
+/// 应用深浅主题（egui 全部控件/字体颜色随之切换）。
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    ctx.set_theme(if dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
+}
+
+/// 深浅主题下可读的提示色。
+fn ui_warn(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(220, 170, 60)
+    } else {
+        Color32::from_rgb(160, 125, 15)
+    }
+}
+
+fn ui_ok(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(90, 200, 90)
+    } else {
+        Color32::from_rgb(35, 150, 45)
+    }
+}
+
+fn ui_gray(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::GRAY
+    } else {
+        Color32::from_gray(90)
+    }
+}
+
+/// 从 GitHub Release 拉取最新版本号，返回（状态栏消息, 有新版本时的 tag）。
+fn fetch_latest_release() -> (String, Option<String>) {
+    const URL: &str =
+        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--connect-timeout",
+            "8",
+            "-H",
+            "User-Agent: TUIProjectManager",
+            URL,
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            match serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
+                Ok(v) => {
+                    let tag = v["tag_name"].as_str().unwrap_or("?").to_string();
+                    let latest = tag.trim_start_matches('v');
+                    if version_newer(latest, env!("CARGO_PKG_VERSION")) {
+                        (format!("发现新版本 {tag}，可在下方点击下载"), Some(tag))
+                    } else {
+                        (format!("已是最新版本 ({tag})"), None)
+                    }
+                }
+                Err(_) => ("检查更新失败：无法解析 GitHub 响应".to_string(), None),
+            }
+        }
+        Ok(_) => ("检查更新失败：网络错误".to_string(), None),
+        Err(e) => (format!("检查更新失败：{e}"), None),
+    }
+}
+
+/// 点分数字版本比较（如 2025.06.30.0001），a > b 返回 true。
+fn version_newer(a: &str, b: &str) -> bool {
+    let pa: Vec<u64> = a.split('.').map(|s| s.parse().unwrap_or(0)).collect();
+    let pb: Vec<u64> = b.split('.').map(|s| s.parse().unwrap_or(0)).collect();
+    for i in 0..pa.len().max(pb.len()) {
+        let x = pa.get(i).copied().unwrap_or(0);
+        let y = pb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
 pub struct ClientApp {
     pub config: config::Config,
     pub tabs: Vec<Tab>,
@@ -90,8 +172,10 @@ pub struct ClientApp {
     pub settings_new_command: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
-    pub prefix_active: bool,
     pub term_focused: bool,
+    update_latest: Option<String>,
+    check_tx: Sender<(String, Option<String>)>,
+    update_rx: Receiver<(String, Option<String>)>,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: Sender<()>,
@@ -101,13 +185,16 @@ pub struct ClientApp {
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let config = config::load();
+        apply_theme(&cc.egui_ctx, config.settings.dark_mode);
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
         let (redraw_tx, redraw_rx) = std::sync::mpsc::channel();
-        Self {
+        let (check_tx, update_rx) = std::sync::mpsc::channel();
+        let saved_tabs = config.tabs.clone();
+        let saved_active = config.tabs.active;
+        let mut app = Self {
             config,
             tabs: vec![Tab::Home],
             current: 0,
@@ -116,15 +203,58 @@ impl ClientApp {
             settings_command,
             settings_commands,
             settings_new_command: String::new(),
-            status: Some("在左侧选择项目并点击「启动」，或在终端页签中按 Ctrl+B 管理页签。".to_string()),
+            status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
-            prefix_active: false,
             term_focused: false,
+            update_latest: None,
             input: None,
             confirm: None,
+            check_tx,
+            update_rx,
             redraw_tx,
             redraw_rx,
+        };
+
+        // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
+        let mut restored = 0usize;
+        for d in &saved_tabs.dirs {
+            if !Path::new(d).is_dir() {
+                continue;
+            }
+            let name = app
+                .config
+                .projects
+                .iter()
+                .find(|p| p.path == *d)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| {
+                    Path::new(d)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| d.clone())
+                });
+            match session::spawn(
+                &name,
+                d,
+                &app.config.settings.tui_command,
+                80,
+                24,
+                app.redraw_tx.clone(),
+            ) {
+                Ok(sess) => {
+                    app.tabs.push(Tab::Session(sess));
+                    restored += 1;
+                }
+                Err(_) => {}
+            }
         }
+        if restored > 0 {
+            app.current = saved_active.min(app.tabs.len() - 1);
+            app.term_focused = app.current != 0;
+            app.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+        }
+        app
     }
 
     fn save_config(&mut self, msg: String) {
@@ -134,17 +264,12 @@ impl ClientApp {
         }
     }
 
+
     fn open_settings(&mut self) {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
         self.screen = Screen::Settings;
-        self.term_focused = false;
-    }
-
-    fn go_home(&mut self) {
-        self.current = 0;
-        self.screen = Screen::Main;
         self.term_focused = false;
     }
 
@@ -155,18 +280,15 @@ impl ClientApp {
         }
     }
 
-    fn next_tab(&mut self) {
-        if self.tabs.len() > 1 {
-            self.current = (self.current + 1) % self.tabs.len();
-        }
-        self.refresh_focus();
-    }
-
-    fn prev_tab(&mut self) {
-        if self.tabs.len() > 1 {
-            self.current = (self.current + self.tabs.len() - 1) % self.tabs.len();
-        }
-        self.refresh_focus();
+    /// 异步检查 GitHub Release 最新版本，结果回到状态栏。
+    fn check_updates(&mut self) {
+        self.status = Some("正在检查更新…".to_string());
+        let tx = self.check_tx.clone();
+        let redraw_tx = self.redraw_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_latest_release());
+            let _ = redraw_tx.send(());
+        });
     }
 
     fn launch_selected(&mut self) {
@@ -204,7 +326,7 @@ impl ClientApp {
                 self.current = self.tabs.len() - 1;
                 self.term_focused = true;
                 self.screen = Screen::Main;
-                self.status = Some(format!("已启动: {}  (Ctrl+B 管理页签)", project.name));
+                self.status = Some(format!("已启动: {}", project.name));
             }
             Err(e) => self.status = Some(format!("启动失败: {e}")),
         }
@@ -226,25 +348,6 @@ impl ClientApp {
         }
         self.refresh_focus();
         self.status = Some("已关闭会话".to_string());
-    }
-
-    fn send_raw(&mut self, bytes: Vec<u8>) {
-        let Some(Tab::Session(s)) = self.tabs.get_mut(self.current) else {
-            return;
-        };
-        let _ = s.writer.try_send(bytes);
-    }
-
-    fn apply_term_commands(&mut self, cmds: Vec<TermCommand>) {
-        for c in cmds {
-            match c {
-                TermCommand::GoHome => self.go_home(),
-                TermCommand::NextTab => self.next_tab(),
-                TermCommand::PrevTab => self.prev_tab(),
-                TermCommand::CloseTab => self.close_session(self.current),
-                TermCommand::SendCtrlB => self.send_raw(vec![0x02]),
-            }
-        }
     }
 
     fn update_exited(&mut self) -> bool {
@@ -375,20 +478,67 @@ impl ClientApp {
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
-                    let title = if s.exited {
-                        format!("{} (已退出)", s.title)
-                    } else {
-                        s.title.clone()
-                    };
-                    let selected = self.current == i;
-                    if ui.selectable_label(selected, title).clicked() && !selected {
-                        actions.push(TabAction::Activate(i));
-                    }
-                    if ui.small_button("×").on_hover_text("关闭会话").clicked() {
-                        actions.push(TabAction::Close(i));
-                    }
+                    // 标题 + 关闭按钮一组，收紧间距让 ✕ 紧贴页签。
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let title = if s.exited {
+                            format!("{} (已退出)", s.title)
+                        } else {
+                            s.title.clone()
+                        };
+                        let selected = self.current == i;
+                        if ui.selectable_label(selected, title).clicked() && !selected {
+                            actions.push(TabAction::Activate(i));
+                        }
+                        // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
+                        // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
+                        if ui.add(egui::Button::new("×").small().frame(false))
+                            .on_hover_text("关闭会话")
+                            .clicked()
+                        {
+                            actions.push(TabAction::Close(i));
+                        }
+                    });
                 }
             }
+
+            // 右侧：深浅主题切换 + 快速打开用户目录。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("🔄 检查更新")
+                    .on_hover_text("从 GitHub Release 检查最新版本")
+                    .clicked()
+                {
+                    self.check_updates();
+                }
+                let dark = self.config.settings.dark_mode;
+                let theme_btn = if dark {
+                    ui.button("☀ 浅色").on_hover_text("切换到浅色主题，字体与颜色同步切换")
+                } else {
+                    ui.button("🌙 深色").on_hover_text("切换到深色主题，字体与颜色同步切换")
+                };
+                if theme_btn.clicked() {
+                    self.config.settings.dark_mode = !dark;
+                    apply_theme(ui.ctx(), self.config.settings.dark_mode);
+                    self.save_config("已切换主题".to_string());
+                    ui.ctx().request_repaint();
+                }
+                if ui
+                    .button("📂 用户目录")
+                    .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
+                    .clicked()
+                {
+                    let dir = std::env::var("USERPROFILE")
+                        .or_else(|_| std::env::var("HOME"))
+                        .unwrap_or_else(|_| ".".to_string());
+                    match std::process::Command::new("explorer").arg(&dir).spawn() {
+                        Ok(_) => {
+                            self.status = Some(format!("已打开用户目录: {dir}"));
+                        }
+                        Err(e) => self.status = Some(format!("打开用户目录失败: {e}")),
+                    }
+                }
+            });
         });
         for action in actions {
             match action {
@@ -404,25 +554,32 @@ impl ClientApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (text, color) = match &self.status {
-                Some(s) => (s.clone(), Color32::from_rgb(200, 180, 60)),
+                Some(s) => (s.clone(), ui_warn(ui)),
                 None => match self.tabs.get(self.current) {
                     Some(Tab::Session(s)) => (
                         format!(
-                            "会话 {} / {}  项目: {}   |  Ctrl+B 页签菜单 (h 首页 n 下一个 p 上一个 x 关闭)",
+                            "会话 {} / {}  项目: {}",
                             self.current,
                             self.tabs.len() - 1,
                             s.title
                         ),
-                        Color32::GRAY,
+                        ui_gray(ui),
                     ),
                     _ => (
                         "选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除 / 设置"
                             .to_string(),
-                        Color32::GRAY,
+                        ui_gray(ui),
                     ),
                 },
             };
             ui.label(RichText::new(text).color(color));
+            if let Some(tag) = &self.update_latest {
+                ui.separator();
+                ui.hyperlink_to(
+                    format!("⬇ 下载 {tag} (GitHub Release)"),
+                    format!("https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"),
+                );
+            }
         });
     }
 
@@ -464,7 +621,7 @@ impl ClientApp {
                             let color = if exists {
                                 ui.visuals().text_color()
                             } else {
-                                Color32::from_rgb(220, 170, 60)
+                                ui_warn(ui)
                             };
                             if ui
                                 .selectable_label(sel == i, RichText::new(label).color(color))
@@ -495,11 +652,6 @@ impl ClientApp {
             ui.heading("欢迎使用 TUI 项目管理器");
             ui.add_space(6.0);
             ui.label("在左侧选择或添加一个项目，然后点击「启动」，将在一个内嵌终端页签中于该项目目录运行配置的 TUI 程序。");
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("终端页签内按 Ctrl+B 进入页签管理：h 首页  n 下一个  p 上一个  x 关闭  b 发送 Ctrl+B")
-                    .weak(),
-            );
             return;
         };
         let exists = Path::new(&p.path).is_dir();
@@ -514,11 +666,7 @@ impl ClientApp {
             } else {
                 "✗ 目录不存在"
             })
-            .color(if exists {
-                Color32::from_rgb(90, 200, 90)
-            } else {
-                Color32::from_rgb(200, 160, 60)
-            }),
+            .color(if exists { ui_ok(ui) } else { ui_warn(ui) }),
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -805,13 +953,51 @@ impl Drop for ClientApp {
 
 impl eframe::App for ClientApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 记录打开中的终端页签（退出后下次启动自动重新拉起）。
+        self.config.tabs = config::TabsState {
+            dirs: self
+                .tabs
+                .iter()
+                .skip(1)
+                .filter_map(|t| match t {
+                    Tab::Session(s) if !s.exited => Some(s.dir.clone()),
+                    _ => None,
+                })
+                .collect(),
+            active: self.current,
+        };
         // 窗口状态已在每帧 logic 中记录，退出时落盘。
         let _ = config::save(&self.config);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 固定 0.3s 基线刷新，避免只有鼠标移动才重绘；终端重绘事件仍会立即触发。
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        // 消息驱动，不设基线定时器：重绘全部由事件触发——终端输出经 redraw
+        // 通道推送、用户输入/窗口事件由 egui 自带、状态栏/更新检查/粘贴等
+        // 都显式 request_repaint，空闲时零重绘。唯一例外：当前页签是终端且
+        // 光标可见闪烁时，按闪烁半周期定时重绘（否则光标不闪）。
+        let cursor_blinks = match self.tabs.get(self.current) {
+            Some(Tab::Session(s)) => s
+                .term
+                .lock()
+                .ok()
+                .map(|t| {
+                    t.mode()
+                        .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
+                        && t.cursor_style().blinking
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if cursor_blinks {
+            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        }
+
+        // 更新检查结果回到状态栏。
+        if let Ok((msg, latest)) = self.update_rx.try_recv() {
+            self.status = Some(msg);
+            self.update_latest = latest;
+            ctx.request_repaint();
+        }
 
         let redraw = self.redraw_rx.try_recv().is_ok();
         let exited = self.update_exited();
@@ -841,14 +1027,13 @@ impl eframe::App for ClientApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(Tab::Session(s)) = self.tabs.get_mut(self.current) {
-                let cmds = terminal::show_terminal(
+                terminal::show_terminal(
                     ui,
                     s,
-                    &mut self.prefix_active,
+                    self.config.settings.dark_mode,
                     &mut self.status,
                     &mut self.term_focused,
                 );
-                self.apply_term_commands(cmds);
             } else {
                 self.home_ui(ui);
             }

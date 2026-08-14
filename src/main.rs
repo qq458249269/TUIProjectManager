@@ -29,7 +29,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "TUI 项目管理器",
+        &format!("TUI 项目管理器 v{}", env!("CARGO_PKG_VERSION")),
         options,
         Box::new(|cc| Ok(Box::new(app::ClientApp::new(cc)))),
     )

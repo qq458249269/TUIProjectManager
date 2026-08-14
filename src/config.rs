@@ -9,6 +9,17 @@ pub struct Project {
     pub path: String,
 }
 
+/// 界面基线刷新间隔的默认值（毫秒），对应默认 30 帧/秒。
+const DEFAULT_REFRESH_MS: u64 = 33;
+
+fn default_refresh_ms() -> u64 {
+    DEFAULT_REFRESH_MS
+}
+
+fn default_dark_mode() -> bool {
+    true
+}
+
 /// 程序设置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
@@ -17,6 +28,12 @@ pub struct Settings {
     pub tui_commands: Vec<String>,
     /// 当前选中的 TUI 命令（启动项目时使用）。
     pub tui_command: String,
+    /// 界面基线刷新间隔（毫秒），越小越流畅、CPU 占用越高（默认 30 帧/秒）。
+    #[serde(default = "default_refresh_ms")]
+    pub refresh_ms: u64,
+    /// 深浅主题：true=深色（默认），false=浅色。
+    #[serde(default = "default_dark_mode")]
+    pub dark_mode: bool,
 }
 
 impl Default for Settings {
@@ -24,6 +41,8 @@ impl Default for Settings {
         Self {
             tui_commands: vec!["nvim".to_string()],
             tui_command: "nvim".to_string(),
+            refresh_ms: DEFAULT_REFRESH_MS,
+            dark_mode: true,
         }
     }
 }
@@ -36,6 +55,9 @@ pub struct Config {
     /// 窗口位置/大小，下次启动时恢复。
     #[serde(default)]
     pub window: WindowState,
+    /// 上次打开中的页签，下次启动时重新拉起。
+    #[serde(default)]
+    pub tabs: TabsState,
 }
 
 /// 上次的窗口状态。
@@ -57,12 +79,32 @@ impl Default for WindowState {
     }
 }
 
+/// 上次退出时打开中的终端页签（启动时重新拉起）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TabsState {
+    /// 打开的会话目录，按页签顺序。
+    pub dirs: Vec<String>,
+    /// 上次激活的页签索引（0 = 首页）。
+    pub active: usize,
+}
+
+impl Default for TabsState {
+    fn default() -> Self {
+        Self {
+            dirs: Vec::new(),
+            active: 0,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             projects: Vec::new(),
             settings: Settings::default(),
             window: WindowState::default(),
+            tabs: TabsState::default(),
         }
     }
 }

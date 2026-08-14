@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 alacritty_terminal = "0.26"
-eframe = { version = "0.36.1", features = ["glow"] }
+# 关掉默认特性：去掉 wgpu/wayland/x11/accesskit/links，只用 glow 渲染器，
+# 体积和链接依赖都大幅缩减（links 会拉入 webbrowser，后者在 gnu 工具链下缺 shlwapi）。
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
 portable-pty = "0.9"
 rfd = "0.15"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -13,3 +15,23 @@ serde_json = "1.0.151"
 
 [build-dependencies]
 winres = "0.1"
+
+# 开发迭代：自己代码轻优化，依赖全优化 → 编译快、运行不卡。
+[profile.dev]
+opt-level = 1
+# 只留行号级别的调试信息：体积缩小约 5 倍，backtrace 仍可用
+# （真实调完再开 debug = 2 用 gdb/lldb 看变量）。
+debug = "line-tables-only"
+[profile.dev.package."*"]
+opt-level = 3
+
+# 精简产物：体积优先 + 全量链接 + 去符号 + panic abort。
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
+
+[patch.crates-io]
+getrandom = { path = "vendor/getrandom-0.4.3" }

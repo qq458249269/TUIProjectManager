@@ -1,30 +1,31 @@
 use alacritty_terminal::grid::Scroll;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, SelectionType};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::vte::ansi::{Color, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, Rgb};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
-use crate::session::Session;
+use crate::session::{Session, SessionListener};
 
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
 
-/// 在终端中按 Ctrl+B 前缀后产生的应用级命令。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TermCommand {
-    GoHome,
-    NextTab,
-    PrevTab,
-    CloseTab,
-    SendCtrlB,
+/// 深浅主题下的终端画布底色。
+const TERM_BG_DARK: Color32 = Color32::from_rgb(22, 22, 26);
+const TERM_BG_LIGHT: Color32 = Color32::WHITE;
+
+fn color_for(dark: bool, dark_c: Color32, light_c: Color32) -> Color32 {
+    if dark { dark_c } else { light_c }
 }
 
-/// 把 alacritty 颜色解析为 egui 颜色。缺省色时用前景黑/背景白兜底（白色终端页面）。
-fn resolve_color(color: Color, colors: &Colors, is_fg: bool) -> Color32 {
+/// 把 alacritty 颜色解析为 egui 颜色。缺省色时按主题兜底：
+/// 深色=白字深底，浅色=黑字白底（与深浅切换同步）。
+fn resolve_color(color: Color, colors: &Colors, is_fg: bool, dark: bool) -> Color32 {
     let rgb = match color {
         Color::Spec(rgb) => Some(rgb),
         Color::Indexed(i) => colors[i as usize],
@@ -32,8 +33,55 @@ fn resolve_color(color: Color, colors: &Colors, is_fg: bool) -> Color32 {
     };
     match rgb {
         Some(Rgb { r, g, b }) => Color32::from_rgb(r, g, b),
-        None if is_fg => Color32::BLACK,
-        None => Color32::WHITE,
+        None if is_fg => color_for(dark, Color32::WHITE, Color32::BLACK),
+        None => color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT),
+    }
+}
+
+/// 浅色主题下把暗色主题 TUI 的配色映射为可读组合：
+/// 深背景 → 白，亮灰/白前景 → 黑（仅近似无色相的亮色，避免误杀黄色等亮色语法高亮）。
+fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
+    let lum = |c: Color32| {
+        0.2126 * c.r() as f32 / 255.0
+            + 0.7152 * c.g() as f32 / 255.0
+            + 0.0722 * c.b() as f32 / 255.0
+    };
+    let neutral = |c: Color32| {
+        let max = c.r().max(c.g()).max(c.b()) as f32;
+        let min = c.r().min(c.g()).min(c.b()) as f32;
+        max - min < 32.0
+    };
+    let mut f = fg;
+    let mut b = bg;
+    if lum(b) < 0.30 {
+        b = TERM_BG_LIGHT;
+    }
+    if lum(f) > 0.72 && neutral(f) {
+        f = Color32::BLACK;
+    }
+    (f, b)
+}
+
+/// 有选中文本时复制到系统剪贴板（并清除选区），返回是否复制了内容。
+fn copy_selection(
+    term: &alacritty_terminal::term::Term<SessionListener>,
+    ctx: &egui::Context,
+    status: &mut Option<String>,
+) -> bool {
+    // 复制前先取字符串再释放锁（selection_to_string 内部也会拿锁）。
+    let text = term.selection_to_string();
+    match text {
+        Some(text) if !text.trim().is_empty() => {
+            let text = text
+                .lines()
+                .map(|l| l.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n");
+            ctx.copy_text(text);
+            *status = Some("已复制选中的文本".to_string());
+            true
+        }
+        _ => false,
     }
 }
 
@@ -201,22 +249,26 @@ fn encode_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool, _repeat: bool)
     }
 }
 
+/// 判断单元格是否在选区内（宽字符前导格在选区右边界落在其空格上时也算选中）。
+fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
+    range.contains(point)
+        || (cell.flags.contains(Flags::WIDE_CHAR)
+            && range.contains(Point::new(point.line, point.column + 1)))
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
-/// 返回需要由应用层执行的前缀命令（Ctrl+B 之后按下的 h/n/p/x/b 等）。
 pub fn show_terminal(
     ui: &mut egui::Ui,
     sess: &mut Session,
-    prefix_active: &mut bool,
+    dark: bool,
     status: &mut Option<String>,
     term_focused: &mut bool,
-) -> Vec<TermCommand> {
-    let mut cmds = Vec::new();
-
+) {
     let font_id = FontId::monospace(TERM_FONT_SIZE);
     let cell_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let cell_h = ui.ctx().fonts_mut(|f| f.row_height(&font_id));
     if cell_w <= 0.0 || cell_h <= 0.0 {
-        return cmds;
+        return;
     }
 
     let avail = ui.available_size();
@@ -236,7 +288,7 @@ pub fn show_terminal(
         sess.grid_size = (cols as u16, rows as u16);
     }
 
-    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
     let term_id = resp.id;
     if resp.clicked() {
         *term_focused = true;
@@ -249,7 +301,7 @@ pub fn show_terminal(
         && ui.memory(|m| m.focused().map_or(true, |id| id == term_id));
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::WHITE);
+    painter.rect_filled(rect, 0.0, color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT));
 
     // 鼠标滚轮查看滚动缓冲：只需悬停在终端区域，不需要终端获得焦点。
     // 直接复用 egui 的平滑滚动量（与 ScrollArea 方向一致：正值=向上滚=更早内容），
@@ -270,6 +322,48 @@ pub fn show_terminal(
         }
     }
 
+    // 文本选择：左键拖拽选中（选区由 alacritty 核心维护，随内容滚动/换行自动
+    // 跟随），左键单击清除选择，右键复制选中文本。
+    if let Ok(mut t) = sess.term.lock() {
+        let offset = t.grid().display_offset();
+        let point_at = |pos: Pos2| -> Option<Point> {
+            let col = ((pos.x - rect.left()) / cell_w).floor() as i64;
+            let row = ((pos.y - rect.top()) / cell_h).floor() as i64;
+            if row < 0 || col < 0 {
+                return None;
+            }
+            Some(Point::new(
+                Line(row as i32 - offset as i32),
+                Column((col as usize).min(cols.saturating_sub(1))),
+            ))
+        };
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                t.selection =
+                    Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
+            }
+        } else if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                if let Some(sel) = t.selection.as_mut() {
+                    sel.update(pos, Side::Left);
+                }
+            }
+        }
+        if resp.clicked() {
+            t.selection = None;
+        }
+        if resp.secondary_clicked() {
+            // 有选区 → 右键复制；无选区 → 右键粘贴（下一帧 egui 投递 Event::Paste）。
+            let copied = copy_selection(&t, ui.ctx(), status);
+            if !copied {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                // 右键粘贴也算与终端交互：聚焦终端，下一帧的粘贴事件才能写入。
+                *term_focused = true;
+            }
+            t.selection = None;
+        }
+    }
+
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
     let mut preedit = String::new();
 
@@ -279,14 +373,14 @@ pub fn show_terminal(
         for ev in &events {
             match ev {
                 egui::Event::Text(text) => {
-                    if *prefix_active || alt_down || text.is_empty() {
+                    if alt_down || text.is_empty() {
                         continue;
                     }
                     bytes_out.push(text.as_bytes().to_vec());
                 }
                 egui::Event::Ime(ime) if owns_ime => match ime {
                     egui::ImeEvent::Commit(text) => {
-                        if !*prefix_active && !alt_down && !text.is_empty() {
+                        if !alt_down && !text.is_empty() {
                             bytes_out.push(text.as_bytes().to_vec());
                         }
                     }
@@ -305,47 +399,11 @@ pub fn show_terminal(
                     let alt = modifiers.alt;
                     let shift = modifiers.shift;
 
-                    if *prefix_active {
-                        match key {
-                            egui::Key::Escape => {
-                                *prefix_active = false;
-                                *status = Some("已退出前缀模式".to_string());
-                            }
-                            egui::Key::H | egui::Key::Num0 => {
-                                cmds.push(TermCommand::GoHome);
-                                *prefix_active = false;
-                            }
-                            egui::Key::N => {
-                                cmds.push(TermCommand::NextTab);
-                                *prefix_active = false;
-                            }
-                            egui::Key::P => {
-                                cmds.push(TermCommand::PrevTab);
-                                *prefix_active = false;
-                            }
-                            egui::Key::X => {
-                                cmds.push(TermCommand::CloseTab);
-                                *prefix_active = false;
-                            }
-                            egui::Key::B => {
-                                cmds.push(TermCommand::SendCtrlB);
-                                *prefix_active = false;
-                            }
-                            _ => {
-                                *prefix_active = false;
-                                *status = Some("已退出前缀模式".to_string());
-                            }
+                    // Esc 清除文本选择（按键仍转发给终端，兼容 vim 等应用）。
+                    if *key == egui::Key::Escape {
+                        if let Ok(mut t) = sess.term.lock() {
+                            t.selection = None;
                         }
-                        continue;
-                    }
-
-                    if ctrl && !alt && *key == egui::Key::B {
-                        *prefix_active = true;
-                        *status = Some(
-                            "Ctrl+B 前缀: h 首页  n 下一个  p 上一个  x 关闭  b 发送Ctrl+B  Esc 取消"
-                                .to_string(),
-                        );
-                        continue;
                     }
 
                     if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
@@ -353,18 +411,38 @@ pub fn show_terminal(
                     }
                 }
                 egui::Event::Copy => {
-                    if !*prefix_active {
-                        bytes_out.push(vec![0x03]); // Ctrl+C
+                    // 有选区时 Ctrl+C 复制选区；无选区才发 SIGINT（0x03）。
+                    let mut copied = false;
+                    if let Ok(mut t) = sess.term.lock() {
+                        copied = copy_selection(&t, ui.ctx(), status);
+                        if copied {
+                            t.selection = None;
+                        }
+                    }
+                    if !copied {
+                        bytes_out.push(vec![0x03]);
                     }
                 }
                 egui::Event::Cut => {
-                    if !*prefix_active {
-                        bytes_out.push(vec![0x18]); // Ctrl+X
-                    }
+                    bytes_out.push(vec![0x18]); // Ctrl+X
                 }
                 egui::Event::Paste(text) => {
-                    if !*prefix_active && !text.is_empty() {
-                        bytes_out.push(text.as_bytes().to_vec());
+                    if !text.is_empty() {
+                        // 多行粘贴：支持括号粘贴的应用（nvim 等）按字面插入，
+                        // 否则把换行转成 \r，让 shell 逐行执行。
+                        let bracketed = sess
+                            .term
+                            .lock()
+                            .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
+                            .unwrap_or(false);
+                        if bracketed {
+                            let mut v = b"\x1b[200~".to_vec();
+                            v.extend_from_slice(text.as_bytes());
+                            v.extend_from_slice(b"\x1b[201~");
+                            bytes_out.push(v);
+                        } else {
+                            bytes_out.push(text.replace('\n', "\r").into_bytes());
+                        }
                     }
                 }
                 _ => {}
@@ -390,16 +468,19 @@ pub fn show_terminal(
     // ---- 渲染网格 ----
     let term = match sess.term.lock() {
         Ok(t) => t,
-        Err(_) => return cmds,
+        Err(_) => return,
     };
     let content = term.renderable_content();
     let offset = content.display_offset;
     let colors = &content.colors;
     let cursor = content.cursor;
+    // 当前选区范围（供高亮与复制共用；alacritty 核心随内容滚动自动维护）。
+    let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
 
     let mut job = egui::text::LayoutJob::default();
     job.break_on_newline = true;
-    job.wrap.max_width = cols as f32 * cell_w;
+    // max_width 留 0.5px 余量：行宽恰好等于 cols*cell_w 时避免 egui 因舍入多换一行。
+    job.wrap.max_width = cols as f32 * cell_w + 0.5;
     job.wrap.max_rows = rows;
 
     let mut last_vline: Option<i32> = None;
@@ -413,7 +494,14 @@ pub fn show_terminal(
         }
         if let Some(prev) = last_vline {
             if prev != vline {
-                job.append("\n", 0.0, egui::TextFormat::default());
+                job.append(
+                    "\n",
+                    0.0,
+                    egui::TextFormat {
+                        line_height: Some(cell_h),
+                        ..Default::default()
+                    },
+                );
             }
         }
         last_vline = Some(vline);
@@ -424,10 +512,21 @@ pub fn show_terminal(
         }
         let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
-        let fg = resolve_color(cell.fg, colors, true);
-        let bg = resolve_color(cell.bg, colors, false);
+        let fg = resolve_color(cell.fg, colors, true, dark);
+        let bg = resolve_color(cell.bg, colors, false, dark);
         let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
             (bg, fg)
+        } else {
+            (fg, bg)
+        };
+        // 浅色主题：把暗色主题 TUI 的深背景/浅前景适配成浅色界面可读组合。
+        let (fg, bg) = if dark { (fg, bg) } else { adapt_to_light(fg, bg) };
+        // 选中格用蓝底白字高亮。
+        let (fg, bg) = if sel_range
+            .as_ref()
+            .is_some_and(|r| cell_selected(r, indexed.point, cell))
+        {
+            (Color32::WHITE, Color32::from_rgb(0, 110, 210))
         } else {
             (fg, bg)
         };
@@ -437,6 +536,9 @@ pub fn show_terminal(
             color: fg,
             background: bg,
             underline: Stroke::NONE,
+            // 强制统一行高：CJK fallback 字体（msyh 等）行高与默认等宽字体不同，
+            // 不指定会让含中文的行变高，导致整块内容逐行漂移、与光标/选区错位。
+            line_height: Some(cell_h),
             ..Default::default()
         };
         if cell.flags.contains(Flags::UNDERLINE) {
@@ -448,27 +550,93 @@ pub fn show_terminal(
     let galley = painter.layout_job(job);
     painter.galley(rect.left_top(), galley, Color32::WHITE);
 
-    // 光标（方块）
+    // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框；
+    // 闪烁光标（DECSET 12）按约 1.1s 周期半显半隐。
     let mut cursor_rect: Option<Rect> = None;
-    if term.mode().contains(TermMode::SHOW_CURSOR)
-        && !matches!(
-            cursor.shape,
-            alacritty_terminal::vte::ansi::CursorShape::Hidden
-        )
-    {
+    if term.mode().contains(TermMode::SHOW_CURSOR) && cursor.shape != CursorShape::Hidden {
         let p = cursor.point;
         let vline = p.line.0 + offset as i32;
         if vline >= 0 && vline < rows as i32 {
             let col = p.column.0 as usize;
             if col < cols {
                 let cursor_cell = &term.grid()[cursor.point];
-                let fg = resolve_color(cursor_cell.fg, colors, true);
+                let fg = resolve_color(cursor_cell.fg, colors, true, dark);
                 let x = rect.left() + col as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
                 let cursor_cell_rect =
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
-                painter.rect_filled(cursor_cell_rect, 0.0, fg);
-                cursor_rect = Some(cursor_cell_rect);
+
+                let blinking = term.cursor_style().blinking;
+                let phase_on = (ui.input(|t| t.time).rem_euclid(1.1)) < 0.55;
+                if !blinking || phase_on {
+                    let border = color_for(dark, Color32::from_gray(200), Color32::from_gray(70));
+                    if *term_focused {
+                        // 光标一律用高对比绘制，避免暗色字符时看不见。
+                        match cursor.shape {
+                            CursorShape::Block => {
+                                painter.rect_filled(cursor_cell_rect, 0.0, fg);
+                                painter.rect_stroke(
+                                    cursor_cell_rect,
+                                    0.0,
+                                    Stroke::new(1.0, border),
+                                    egui::StrokeKind::Inside,
+                                );
+                                // 块内反色重绘格内字符（宽字符按整字宽画出），保证光标内内容可见。
+                                let ch = cursor_cell.c;
+                                if ch != '\0'
+                                    && !cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                                {
+                                    let cell_bg =
+                                        resolve_color(cursor_cell.bg, colors, false, dark);
+                                    painter.text(
+                                        Pos2::new(x, y + cell_h / 2.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        ch.to_string(),
+                                        font_id.clone(),
+                                        cell_bg,
+                                    );
+                                }
+                            }
+                            CursorShape::HollowBlock => {
+                                painter.rect_stroke(
+                                    cursor_cell_rect,
+                                    0.0,
+                                    Stroke::new(2.0, border),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            CursorShape::Underline => {
+                                let h = (cell_h * 0.25).max(3.0);
+                                painter.rect_filled(
+                                    Rect::from_min_size(
+                                        Pos2::new(x, y + cell_h - h),
+                                        Vec2::new(cell_w, h),
+                                    ),
+                                    0.0,
+                                    color_for(dark, Color32::WHITE, Color32::BLACK),
+                                );
+                            }
+                            CursorShape::Beam => {
+                                let w = (cell_w * 0.2).max(2.5);
+                                painter.rect_filled(
+                                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, cell_h)),
+                                    0.0,
+                                    color_for(dark, Color32::WHITE, Color32::BLACK),
+                                );
+                            }
+                            CursorShape::Hidden => {}
+                        }
+                    } else {
+                        // 未聚焦：空心边框指示光标位置，不遮挡文本。
+                        painter.rect_stroke(
+                            cursor_cell_rect,
+                            0.0,
+                            Stroke::new(1.5, border),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    cursor_rect = Some(cursor_cell_rect);
+                }
             }
         }
     }
@@ -492,11 +660,13 @@ pub fn show_terminal(
 
         // 把输入法组合（拼音预编辑）画在光标处，带下划线，便于确认候选内容。
         if !preedit.is_empty() {
+            let preedit_color = color_for(dark, Color32::WHITE, Color32::BLACK);
+            let preedit_bg = color_for(dark, Color32::from_gray(64), Color32::from_gray(225));
             let fmt = egui::TextFormat {
                 font_id: font_id.clone(),
-                color: Color32::BLACK,
-                background: Color32::from_gray(225),
-                underline: Stroke::new(1.0, Color32::BLACK),
+                color: preedit_color,
+                background: preedit_bg,
+                underline: Stroke::new(1.0, preedit_color),
                 ..Default::default()
             };
             let mut preedit_job = egui::text::LayoutJob::default();
@@ -514,8 +684,6 @@ pub fn show_terminal(
 
     // 会话活跃时由 SessionListener 的后台解析线程通过 redraw 信号触发重绘；
     // 这里不需要无条件 request_repaint，避免空闲时满帧空转。
-
-    cmds
 }
 
 #[cfg(test)]
@@ -524,6 +692,29 @@ mod tests {
 
     fn key_bytes(k: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
         encode_key(k, ctrl, alt, shift, false)
+    }
+
+    #[test]
+    fn selection_highlight_predicate() {
+        let cell = Cell::default();
+        let range = SelectionRange::new(
+            Point::new(Line(-2), Column(1)),
+            Point::new(Line(-2), Column(3)),
+            false,
+        );
+        assert!(cell_selected(&range, Point::new(Line(-2), Column(2)), &cell));
+        assert!(!cell_selected(&range, Point::new(Line(-1), Column(2)), &cell));
+        assert!(!cell_selected(&range, Point::new(Line(-2), Column(4)), &cell));
+
+        // 宽字符前导格：选区右边界落在其空格（column+1）上时仍高亮。
+        let mut wide = Cell::default();
+        wide.flags.insert(Flags::WIDE_CHAR);
+        let edge = SelectionRange::new(
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(0), Column(5)),
+            false,
+        );
+        assert!(cell_selected(&edge, Point::new(Line(0), Column(4)), &wide));
     }
 
     #[test]
