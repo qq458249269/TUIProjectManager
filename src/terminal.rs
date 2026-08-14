@@ -236,15 +236,22 @@ pub fn show_terminal(
     }
 
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+    let term_id = resp.id;
     if resp.clicked() {
         *term_focused = true;
         resp.request_focus();
     }
 
+    // IME 归属：终端聚焦，且没有其他 egui 控件（如输入弹窗里的 TextEdit）
+    // 持有键盘焦点时，才把系统输入法交给终端。
+    let owns_ime = *term_focused
+        && ui.memory(|m| m.focused().map_or(true, |id| id == term_id));
+
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::WHITE);
 
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
+    let mut preedit = String::new();
 
     if *term_focused {
         let events = ui.input(|i| i.events.clone());
@@ -257,6 +264,17 @@ pub fn show_terminal(
                     }
                     bytes_out.push(text.as_bytes().to_vec());
                 }
+                egui::Event::Ime(ime) if owns_ime => match ime {
+                    egui::ImeEvent::Commit(text) => {
+                        if !*prefix_active && !alt_down && !text.is_empty() {
+                            bytes_out.push(text.as_bytes().to_vec());
+                        }
+                    }
+                    egui::ImeEvent::Preedit { text, .. } => {
+                        preedit.clone_from(text);
+                    }
+                    _ => {}
+                },
                 egui::Event::Key {
                     key,
                     pressed: true,
@@ -403,6 +421,7 @@ pub fn show_terminal(
     painter.galley(rect.left_top(), galley, Color32::WHITE);
 
     // 光标（方块）
+    let mut cursor_rect: Option<Rect> = None;
     if term.mode().contains(TermMode::SHOW_CURSOR)
         && !matches!(
             cursor.shape,
@@ -418,12 +437,50 @@ pub fn show_terminal(
                 let fg = resolve_color(cursor_cell.fg, colors, true);
                 let x = rect.left() + col as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
-                painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h)),
-                    0.0,
-                    fg,
-                );
+                let cursor_cell_rect =
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
+                painter.rect_filled(cursor_cell_rect, 0.0, fg);
+                cursor_rect = Some(cursor_cell_rect);
             }
+        }
+    }
+
+    // 启用系统输入法：egui 只有在有控件写入 PlatformOutput::ime 时才会调用
+    // winit 的 set_ime_allowed（目前只有 TextEdit 走这条路径），否则 Windows
+    // 上根本不会创建 IME 上下文，输入法事件（含中文提交）永远到不了终端。
+    if owns_ime {
+        let cursor_rect = cursor_rect.unwrap_or(Rect::from_min_size(
+            rect.left_top(),
+            Vec2::new(cell_w, cell_h),
+        ));
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Terminal,
+                rect,
+                cursor_rect,
+                should_interrupt_composition: false,
+            });
+        });
+
+        // 把输入法组合（拼音预编辑）画在光标处，带下划线，便于确认候选内容。
+        if !preedit.is_empty() {
+            let fmt = egui::TextFormat {
+                font_id: font_id.clone(),
+                color: Color32::BLACK,
+                background: Color32::from_gray(225),
+                underline: Stroke::new(1.0, Color32::BLACK),
+                ..Default::default()
+            };
+            let mut preedit_job = egui::text::LayoutJob::default();
+            preedit_job.append(&preedit, 0.0, fmt);
+            let preedit_galley = painter.layout_job(preedit_job);
+            let row_rect = Rect::from_min_max(
+                rect.left_top(),
+                Pos2::new(rect.right(), cursor_rect.min.y + cell_h),
+            );
+            painter
+                .with_clip_rect(row_rect)
+                .galley(cursor_rect.min, preedit_galley, Color32::WHITE);
         }
     }
 
