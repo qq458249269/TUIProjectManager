@@ -28,12 +28,31 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+          cache: true
 
-      - name: 缓存 Cargo
+      - name: 缓存 Cargo 依赖与构建产物
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-win-x64
 
       - name: 构建 Release
         run: cargo build --release
+
+      - name: 代码签名 (signtool)
+        if: env.CODE_SIGNING_CERT != '' && env.CODE_SIGNING_PASSWORD != ''
+        shell: pwsh
+        env:
+          CODE_SIGNING_CERT: ${{ secrets.CODE_SIGNING_CERT }}
+          CODE_SIGNING_PASSWORD: ${{ secrets.CODE_SIGNING_PASSWORD }}
+        run: |
+          $cert = "$env:RUNNER_TEMP\code-signing.pfx"
+          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:CODE_SIGNING_CERT))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool 未找到" }
+          & $signtool.FullName sign /fd SHA256 /f $cert /p $env:CODE_SIGNING_PASSWORD `
+            /tr http://timestamp.digicert.com /td SHA256 target/release/tui-project-manager.exe
+          & $signtool.FullName verify /pa target/release/tui-project-manager.exe
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -52,6 +71,7 @@ jobs:
 
             - 版本: `${{ env.VERSION }}`
             - 运行: 直接运行 `tui-project-manager.exe`
+            - 签名: 已配置代码签名证书则用 signtool 签名（SHA256 + RFC3161 时间戳）；未配置时跳过签名
             - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
             - 会话页签: `Ctrl+B` 前缀  `h` 首页  `n` 下一个  `p` 上一个  `x` 关闭  `b` 发送 Ctrl+B  `Esc` 取消
             - 终端输入: 键盘事件直接透传给内嵌终端（支持 Ctrl+C / Ctrl+V 粘贴等）
