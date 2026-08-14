@@ -541,23 +541,8 @@ impl ClientApp {
                 }
             }
 
-            // 右侧：打开当前页签目录 + 用户目录（检查更新/深浅切换已移到右下角状态栏）。
+            // 右侧：打开当前页签目录（用户目录已在设置页；检查更新/深浅切换已移到右下角状态栏）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("📂 用户目录")
-                    .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
-                    .clicked()
-                {
-                    let dir = std::env::var("USERPROFILE")
-                        .or_else(|_| std::env::var("HOME"))
-                        .unwrap_or_else(|_| ".".to_string());
-                    match std::process::Command::new("explorer").arg(&dir).spawn() {
-                        Ok(_) => {
-                            self.status = Some(format!("已打开用户目录: {dir}"));
-                        }
-                        Err(e) => self.status = Some(format!("打开用户目录失败: {e}")),
-                    }
-                }
                 // 当前激活页签指向的目录：会话页签用其工作目录，首页用当前选中项目路径。
                 let open_dir = match self.tabs.get(self.current) {
                     Some(Tab::Session(s)) => Path::new(&s.dir).is_dir().then(|| s.dir.clone()),
@@ -892,7 +877,24 @@ impl ClientApp {
             )).weak());
         });
         ui.add_space(12.0);
-        ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+            if ui
+                .button("📂 打开用户目录")
+                .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
+                .clicked()
+            {
+                let dir = std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_else(|_| ".".to_string());
+                match std::process::Command::new("explorer").arg(&dir).spawn() {
+                    Ok(_) => {
+                        self.status = Some(format!("已打开用户目录: {dir}"));
+                    }
+                    Err(e) => self.status = Some(format!("打开用户目录失败: {e}")),
+                }
+            }
+        });
         ui.add_space(12.0);
         if ui.button("← 返回项目列表").clicked() {
             self.screen = Screen::Main;
