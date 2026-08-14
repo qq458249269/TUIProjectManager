@@ -117,16 +117,24 @@ fn ui_gray(ui: &egui::Ui) -> Color32 {
 fn fetch_latest_release() -> (String, Option<String>) {
     const URL: &str =
         "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
-    let out = std::process::Command::new("curl")
-        .args([
-            "-s",
-            "--connect-timeout",
-            "8",
-            "-H",
-            "User-Agent: TUIProjectManager",
-            URL,
-        ])
-        .output();
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-s",
+        "--connect-timeout",
+        "8",
+        "--ssl-no-revoke",
+        "-H",
+        "User-Agent: TUIProjectManager",
+        URL,
+    ]);
+    // GUI 程序 spawn 控制台程序（curl.exe）会闪一个黑窗口：
+    // CREATE_NO_WINDOW 让子进程不分配控制台，彻底消除。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => {
             match serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
@@ -178,7 +186,7 @@ pub struct ClientApp {
     update_rx: Receiver<(String, Option<String>)>,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
-    redraw_tx: Sender<()>,
+    redraw_tx: std::sync::mpsc::SyncSender<()>,
     redraw_rx: Receiver<()>,
 }
 
@@ -190,7 +198,9 @@ impl ClientApp {
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
-        let (redraw_tx, redraw_rx) = std::sync::mpsc::channel();
+        // 重绘信号用容量 1 的有界通道：任意多个终端会话/后台线程并发投递时，
+        // 通道满即丢弃新信号（try_send），刷新请求被合并——不会出现消息堆积。
+        let (redraw_tx, redraw_rx) = std::sync::mpsc::sync_channel(1);
         let (check_tx, update_rx) = std::sync::mpsc::channel();
         let saved_tabs = config.tabs.clone();
         let saved_active = config.tabs.active;
@@ -287,7 +297,8 @@ impl ClientApp {
         let redraw_tx = self.redraw_tx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(fetch_latest_release());
-            let _ = redraw_tx.send(());
+            // try_send：通道满说明已有待处理重绘，本次唤醒请求可安全丢弃。
+            let _ = redraw_tx.try_send(());
         });
     }
 
@@ -975,6 +986,9 @@ impl eframe::App for ClientApp {
         // 通道推送、用户输入/窗口事件由 egui 自带、状态栏/更新检查/粘贴等
         // 都显式 request_repaint，空闲时零重绘。唯一例外：当前页签是终端且
         // 光标可见闪烁时，按闪烁半周期定时重绘（否则光标不闪）。
+        // redraw 通道容量为 1（见 new），try_iter 把当前积压信号一次抽干：
+        // 无论多少会话同时输出，每帧至多触发一次重绘，burst 结束后不会
+        // 留下逐帧消化的“信号尾巴”，也不会在输出不停时无限堆积。
         let cursor_blinks = match self.tabs.get(self.current) {
             Some(Tab::Session(s)) => s
                 .term
@@ -999,7 +1013,7 @@ impl eframe::App for ClientApp {
             ctx.request_repaint();
         }
 
-        let redraw = self.redraw_rx.try_recv().is_ok();
+        let redraw = self.redraw_rx.try_iter().next().is_some();
         let exited = self.update_exited();
         if exited {
             self.status = Some("有会话已退出".to_string());

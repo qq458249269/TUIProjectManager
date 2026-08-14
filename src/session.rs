@@ -33,7 +33,7 @@ pub struct Session {
 #[derive(Clone)]
 pub struct SessionListener {
     writer: std::sync::mpsc::SyncSender<Vec<u8>>,
-    redraw: std::sync::mpsc::Sender<()>,
+    redraw: std::sync::mpsc::SyncSender<()>,
 }
 
 impl EventListener for SessionListener {
@@ -43,7 +43,10 @@ impl EventListener for SessionListener {
             //（解析线程持有 term 锁时会回调这里）。
             let _ = self.writer.try_send(text.as_bytes().to_vec());
         }
-        let _ = self.redraw.send(());
+        // try_send：通道容量 1，满则丢弃，刷新信号合并为一个。
+        // 必须非阻塞：解析线程持有 term 锁时回调这里，若 send 阻塞，
+        // 会与 UI 线程的 term.lock() 渲染互相等待而死锁。
+        let _ = self.redraw.try_send(());
     }
 }
 
@@ -87,7 +90,7 @@ pub fn spawn(
     tui_command: &str,
     cols: u16,
     rows: u16,
-    redraw: std::sync::mpsc::Sender<()>,
+    redraw: std::sync::mpsc::SyncSender<()>,
 ) -> Result<Session, String> {
     let pty_system = native_pty_system();
     let size = PtySize {
@@ -204,7 +207,7 @@ mod tests {
 
     #[test]
     fn spawn_run_and_render() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         let mut sess = spawn("test", ".", "cmd", 80, 24, tx).expect("spawn 失败");
         sess.writer.try_send(b"echo HELLO123\r".to_vec()).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
@@ -230,7 +233,7 @@ mod tests {
     fn scroll_display_offset_semantics() {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::grid::Scroll;
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         let mut sess = spawn("test", ".", "cmd", 80, 24, tx).expect("spawn 失败");
         // 输出 50 行，超出 24 行屏幕后产生历史缓冲。
         sess.writer
