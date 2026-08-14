@@ -12,6 +12,12 @@ on:
 env:
   VERSION: ${{ inputs.version || '' }}
 
+# 同一时间只允许一个该工作流运行：新触发时自动取消在跑的那个，
+# 避免并发构建互相覆盖产物 tag / 版本文件。
+concurrency:
+  group: build-win-x64
+  cancel-in-progress: true
+
 jobs:
   build:
     name: 构建 Windows x64
@@ -45,6 +51,12 @@ jobs:
           }
           Write-Host "发布版本号: $ver"
           "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 写入版本号文件（构建前注入 exe）
+        shell: pwsh
+        run: |
+          Set-Content -Path version.txt -Value "$env:VERSION" -NoNewline -Encoding ascii
+          Write-Host "已写入 version.txt: $env:VERSION"
 
       - name: 安装 Rust 工具链 (MSVC)
         uses: dtolnay/rust-toolchain@stable
@@ -104,8 +116,10 @@ jobs:
             - 运行: 直接运行 `tui-project-manager.exe`
             - 签名: 已配置代码签名证书则用 signtool 签名（SHA256 + RFC3161 时间戳）；未配置时跳过签名
             - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
-            - 会话页签: `Ctrl+B` 前缀  `h` 首页  `n` 下一个  `p` 上一个  `x` 关闭  `b` 发送 Ctrl+B  `Esc` 取消
-            - 终端输入: 键盘事件直接透传给内嵌终端（支持 Ctrl+C / Ctrl+V 粘贴等）
+            - 会话页签: 可多开，关闭按钮立即销毁会话；退出时记录打开中的页签目录，下次启动自动恢复
+            - 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲；左键拖拽选择文本
+            - 界面: 顶栏可切换深/浅色主题、`🔄 检查更新` 从 GitHub Release 检查新版本
+            - 刷新: 消息驱动，空闲时零重绘
             - 配置: 自动保存到 exe 同级的 `config/config.json`
           files: target/release/tui-project-manager.exe
           draft: false

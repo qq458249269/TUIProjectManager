@@ -7,6 +7,12 @@ mod terminal;
 
 use eframe::egui;
 
+/// 版本号：GitHub Actions 构建前把发布版本号写入 version.txt，由 build.rs 注入
+/// APP_VERSION；本地开发没有该文件时回退到 Cargo.toml 的版本。
+pub fn app_version() -> &'static str {
+    option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> eframe::Result {
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()
@@ -29,7 +35,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        &format!("TUI 项目管理器 v{}", env!("CARGO_PKG_VERSION")),
+        &format!("TUI 项目管理器 v{}", app_version()),
         options,
         Box::new(|cc| Ok(Box::new(app::ClientApp::new(cc)))),
     )

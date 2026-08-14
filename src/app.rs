@@ -133,7 +133,7 @@ fn fetch_latest_release() -> (String, Option<String>) {
                 Ok(v) => {
                     let tag = v["tag_name"].as_str().unwrap_or("?").to_string();
                     let latest = tag.trim_start_matches('v');
-                    if version_newer(latest, env!("CARGO_PKG_VERSION")) {
+                    if version_newer(latest, crate::app_version()) {
                         (format!("发现新版本 {tag}，可在下方点击下载"), Some(tag))
                     } else {
                         (format!("已是最新版本 ({tag})"), None)
