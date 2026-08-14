@@ -4,14 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "发布版本号（同时用作 tag 名）"
+        description: "发布版本号（留空则自动基于最新 tag 自增末尾段，如 …0001 → …0002）"
         required: false
-        default: "2026.08.14.0001"
   push:
     branches: [main]
 
 env:
-  VERSION: ${{ inputs.version || '2026.08.14.0001' }}
+  VERSION: ${{ inputs.version || '' }}
 
 jobs:
   build:
@@ -23,6 +22,29 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 计算发布版本号（自动自增）
+        id: version
+        shell: pwsh
+        run: |
+          $specified = "${{ env.VERSION }}"
+          if ($specified -ne "") {
+            $ver = $specified
+          } else {
+            $tags = (git tag --sort=-v:refname) 2>$null
+            $last = ($tags | Select-Object -First 1)
+            if ($last -match '^(\d{4})\.(\d{2})\.(\d{2})\.(\d{4})$') {
+              $n = [int]$Matches[4] + 1
+              $ver = "$($Matches[1]).$($Matches[2]).$($Matches[3]).$($n.ToString('0000'))"
+            } else {
+              $today = Get-Date -Format 'yyyy.MM.dd'
+              $ver = "$today.0001"
+            }
+          }
+          Write-Host "发布版本号: $ver"
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: 安装 Rust 工具链 (MSVC)
         uses: dtolnay/rust-toolchain@stable
