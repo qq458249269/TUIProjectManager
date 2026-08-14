@@ -225,4 +225,49 @@ mod tests {
 
         let _ = sess.child.kill();
     }
+
+    #[test]
+    fn scroll_display_offset_semantics() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::grid::Scroll;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut sess = spawn("test", ".", "cmd", 80, 24, tx).expect("spawn 失败");
+        // 输出 50 行，超出 24 行屏幕后产生历史缓冲。
+        sess.writer
+            .try_send(b"for /L %i in (1,1,50) do @echo line%i\r".to_vec())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2000));
+
+        let mut term = sess.term.lock().unwrap();
+        assert!(
+            term.history_size() > 0,
+            "输出后应有滚动缓冲, history_size={}",
+            term.history_size()
+        );
+        let top = term.history_size();
+
+        // 向上滚 5 行 -> offset=5。
+        term.scroll_display(Scroll::Delta(5));
+        assert_eq!(term.grid().display_offset(), 5);
+
+        // 向下滚 3 行 -> offset=2。
+        term.scroll_display(Scroll::Delta(-3));
+        assert_eq!(term.grid().display_offset(), 2);
+
+        // 滚到底部 -> 实时视图。
+        term.scroll_display(Scroll::Bottom);
+        assert_eq!(term.grid().display_offset(), 0);
+
+        // 滚到最顶 -> 全部历史。
+        term.scroll_display(Scroll::Top);
+        assert_eq!(term.grid().display_offset(), top);
+
+        // 超出边界被 clamp。
+        term.scroll_display(Scroll::Delta(1000));
+        assert_eq!(term.grid().display_offset(), top);
+        term.scroll_display(Scroll::Delta(-1000));
+        assert_eq!(term.grid().display_offset(), 0);
+
+        let _ = sess.child.kill();
+    }
 }

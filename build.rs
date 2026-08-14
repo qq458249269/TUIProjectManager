@@ -6,8 +6,9 @@ fn main() {
     res.set("FileDescription", "TUI Project Manager");
     res.set("ProductName", "TUI Project Manager");
     res.set("LegalCopyright", "Copyright (C) 2026");
+    // 资源编译失败只警告不阻断：无图标/版本信息不影响功能，
+    // 且允许在未安装 rc.exe 的开发机上正常构建。
     if let Err(e) = res.compile() {
-        eprintln!("winres compile failed: {e}");
-        std::process::exit(1);
+        eprintln!("winres compile failed (continuing without resources): {e}");
     }
 }

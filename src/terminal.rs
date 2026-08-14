@@ -1,3 +1,4 @@
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
@@ -250,6 +251,25 @@ pub fn show_terminal(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::WHITE);
 
+    // 鼠标滚轮查看滚动缓冲：只需悬停在终端区域，不需要终端获得焦点。
+    // 直接复用 egui 的平滑滚动量（与 ScrollArea 方向一致：正值=向上滚=更早内容），
+    // 并消费掉避免被后续控件重复使用；滚动后立即重绘，不等 0.3s 基线。
+    if resp.hovered() {
+        let delta = ui.input(|i| i.smooth_scroll_delta.y);
+        if delta != 0.0 {
+            ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+            // 平滑滚动量常 <1 行，按行高折算并保证至少 1 行，否则触摸板/精密滚轮无反应。
+            let mut lines = (delta / cell_h).round() as i32;
+            if lines == 0 {
+                lines = if delta > 0.0 { 1 } else { -1 };
+            }
+            if let Ok(mut t) = sess.term.lock() {
+                t.scroll_display(Scroll::Delta(lines));
+            }
+            ui.ctx().request_repaint();
+        }
+    }
+
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
     let mut preedit = String::new();
 
@@ -353,7 +373,13 @@ pub fn show_terminal(
     }
 
     // 投��用户输入到后台写入线程（非��塞）。
+    // 有输入时先回到实时视图底部：正在回看历史时输入，应回到最新内容。
     if !bytes_out.is_empty() {
+        if let Ok(mut t) = sess.term.lock() {
+            if t.grid().display_offset() != 0 {
+                t.scroll_display(Scroll::Bottom);
+            }
+        }
         let mut all = Vec::new();
         for b in &bytes_out {
             all.extend_from_slice(b);
@@ -379,7 +405,9 @@ pub fn show_terminal(
     let mut last_vline: Option<i32> = None;
     for indexed in content.display_iter {
         let point = indexed.point;
-        let vline = point.line.0 - offset as i32;
+        // display_iter 返回绝对行号（历史区为负行），视口顶对应 line=-offset，
+        // 所以屏幕行号是 line + offset（写成减法会把历史行全部过滤成空白）。
+        let vline = point.line.0 + offset as i32;
         if vline < 0 || vline >= rows as i32 {
             continue;
         }
@@ -429,7 +457,7 @@ pub fn show_terminal(
         )
     {
         let p = cursor.point;
-        let vline = p.line.0 - offset as i32;
+        let vline = p.line.0 + offset as i32;
         if vline >= 0 && vline < rows as i32 {
             let col = p.column.0 as usize;
             if col < cols {
