@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
@@ -336,12 +334,13 @@ pub fn show_terminal(
         }
     }
 
+    // 投��用户输入到后台写入线程（非��塞）。
     if !bytes_out.is_empty() {
-        if let Ok(mut w) = sess.writer.lock() {
-            for b in &bytes_out {
-                let _ = w.write_all(b);
-            }
+        let mut all = Vec::new();
+        for b in &bytes_out {
+            all.extend_from_slice(b);
         }
+        let _ = sess.writer.try_send(all);
     }
 
     // ---- 渲染网格 ----

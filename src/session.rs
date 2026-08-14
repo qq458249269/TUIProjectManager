@@ -16,8 +16,9 @@ pub struct Session {
     pub dir: String,
     /// 终端仿真状态。
     pub term: Arc<Mutex<Term<SessionListener>>>,
-    /// 向 PTY 写入输入的句柄。
-    pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// 向 PTY 写入输入的通道发送端（实际写由专用后台线程执行，
+    /// 避免子进程不读取输入时阻塞 UI/解析线程）。
+    pub writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     /// PTY 主句柄（用于 resize）。
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     /// 子进程。
@@ -31,16 +32,16 @@ pub struct Session {
 /// 终端事件监听器：把终端要求的写回 PTY，并通知界面重绘。
 #[derive(Clone)]
 pub struct SessionListener {
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     redraw: std::sync::mpsc::Sender<()>,
 }
 
 impl EventListener for SessionListener {
     fn send_event(&self, event: Event) {
         if let Event::PtyWrite(text) = &event {
-            if let Ok(mut w) = self.writer.lock() {
-                let _ = w.write_all(text.as_bytes());
-            }
+            // 只投递到后台写入线程，绝不在解析线程里阻塞写
+            //（解析线程持有 term 锁时会回调这里）。
+            let _ = self.writer.try_send(text.as_bytes().to_vec());
         }
         let _ = self.redraw.send(());
     }
@@ -122,10 +123,24 @@ pub fn spawn(
         .master
         .take_writer()
         .map_err(|e| format!("获取 PTY 写入句柄失败: {e}"))?;
-    let writer = Arc::new(Mutex::new(writer));
+
+    // 专用后台写入线程：UI/解析线程只把字节投递进通道，真正的 write_all
+    // 在这里执行。子进程不读取输入（管道缓冲满）时，write_all 只会阻塞
+    // 这个后台线程，不会拖死 UI 线程或持有 term 锁的解析线程。
+    // 通道有界，写满时 try_send 丢弃新输入（比阻塞整个程序好）。
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+    std::thread::spawn(move || {
+        let mut writer = writer;
+        while let Ok(bytes) = writer_rx.recv() {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
 
     let listener = SessionListener {
-        writer: writer.clone(),
+        writer: writer_tx.clone(),
         redraw,
     };
 
@@ -165,7 +180,7 @@ pub fn spawn(
         title: title.to_string(),
         dir: dir.to_string(),
         term,
-        writer,
+         writer: writer_tx,
         master: pair.master,
         child,
         grid_size: (cols, rows),
@@ -191,10 +206,7 @@ mod tests {
     fn spawn_run_and_render() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut sess = spawn("test", ".", "cmd", 80, 24, tx).expect("spawn 失败");
-        {
-            let mut w = sess.writer.lock().unwrap();
-            let _ = w.write_all(b"echo HELLO123\r");
-        }
+        sess.writer.try_send(b"echo HELLO123\r".to_vec()).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
 
         let term = sess.term.lock().unwrap();
