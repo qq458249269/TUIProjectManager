@@ -260,6 +260,19 @@ fn encode_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool, _repeat: bool)
     }
 }
 
+/// 宽字符视觉槽：返回（槽起始列, 槽宽格数）。宽字符前导格 2 格从自身列开始；
+/// 随空格连回前导格占满 2 格；其余窄格 1 格。背景/选中高亮按下槽绘制，保证选
+/// 区边界落在宽字符任何一列时整个汉字同色（不出现半字异色）。
+fn cjk_slot(col: usize, wide: bool, spacer: bool) -> (usize, usize) {
+    if wide {
+        (col, 2)
+    } else if spacer {
+        (col.saturating_sub(1), 2)
+    } else {
+        (col, 1)
+    }
+}
+
 /// 判断单元格是否在选区内（宽字符前导格在选区右边界落在其空格上时也算选中）。
 fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
     range.contains(point)
@@ -601,7 +614,14 @@ pub fn show_terminal(
         let x = rect.left() + col as f32 * cell_w;
         let y = rect.top() + vline as f32 * cell_h;
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
-        let slot_w = if wide { 2.0 * cell_w } else { cell_w };
+        // 视觉槽：宽字符前导格占 2 格；其随空格（SPACER）连回前导格占满 2 格；
+        // 窄格 1 格。背景/选区/光标下划线统一按槽绘制——选区边界落在宽字符的
+        // 任意一列（含随空格）时整个汉字同色，不会再出现左半正常色、右半被高亮
+        // 盖住的“半字”效果。字形仍左对齐画在前导格起点（spacer 无字形）。
+        let (slot_col, slot_cells) =
+            cjk_slot(col, wide, cell.flags.contains(Flags::WIDE_CHAR_SPACER));
+        let x_slot = rect.left() + slot_col as f32 * cell_w;
+        let slot_w = slot_cells as f32 * cell_w;
 
         let (mut fg, mut bg) = (
             resolve_color(cell.fg, colors, true, dark),
@@ -622,11 +642,12 @@ pub fn show_terminal(
             (fg, bg)
         };
 
-        // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景；宽字格位是
-        // 2 格宽，只靠字形的背景（仅 14pt 宽）会露出右半格。
+        // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景；宽字槽宽
+        // 占满 2 格（含随空格连回前导格），只靠字形的背景（仅 14pt 宽）会露出
+        // 右半格，选区边界落在随空格时也能盖满整个汉字。
         if bg != canvas_bg {
             painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, y), Vec2::new(slot_w, cell_h)),
+                Rect::from_min_size(Pos2::new(x_slot, y), Vec2::new(slot_w, cell_h)),
                 0.0,
                 bg,
             );
@@ -787,10 +808,12 @@ pub fn show_terminal(
                             }
                             CursorShape::Underline => {
                                 let h = (cell_h * 0.25).max(3.0);
+                                // 用 w（按 cursor_wide 已算 2 格）：下划线光标停在
+                                // 宽字符上时盖满 2 格槽，只画 1 格会只盖住半个汉字。
                                 painter.rect_filled(
                                     Rect::from_min_size(
                                         Pos2::new(x, y + cell_h - h),
-                                        Vec2::new(cell_w, h),
+                                        Vec2::new(w, h),
                                     ),
                                     0.0,
                                     fill,
@@ -920,6 +943,18 @@ mod tests {
         });
         let mut out = ctx.end_pass();
         out.textures_delta.clear(); // 不把纹理增量交给渲染器，避免 Drop 断言
+    }
+
+    #[test]
+    fn cjk_slot_geometry() {
+        // 窄格：1 格，起点自身。
+        assert_eq!(cjk_slot(3, false, false), (3, 1));
+        // 宽字符前导格：2 格，起点自身。
+        assert_eq!(cjk_slot(5, true, false), (5, 2));
+        // 随空格：连回前导格仍 2 格——选区/背景不会截半字。
+        assert_eq!(cjk_slot(6, false, true), (5, 2));
+        // 随空格排到第 0 列（理论上不会发生）也不越界 panic。
+        assert_eq!(cjk_slot(0, false, true), (0, 2));
     }
 
     #[test]
