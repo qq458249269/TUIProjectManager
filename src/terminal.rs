@@ -544,10 +544,11 @@ pub fn show_terminal(
         }
         let text = ch.to_string();
         if wide {
-            // 宽字水平居中画在 2 格位内（CJK 字形通常比 2×M 窄），下划线横贯整格位。
+            // 宽字左对齐画在 2 格位起点（与终端惯例一致：字身贴槽左沿，
+            // 槽宽仍按 2 格，选区/光标块/下划线盖满整槽；若居中则每个汉字
+            // 左右各内缩 1.43px，字与相邻 ASCII、行首字都显出偏移）。
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = slot_w;
-            job.halign = egui::Align::Center;
             job.append(&text, 0.0, format);
             painter.galley(Pos2::new(x, y), painter.layout_job(job), Color32::WHITE);
             if cell.flags.contains(Flags::UNDERLINE) {
@@ -647,15 +648,14 @@ pub fn show_terminal(
                                 if ch != '\0'
                                     && !cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                                 {
-                                    let (pos, anchor) = if cursor_wide {
-                                        (
-                                            Pos2::new(x + w / 2.0, y + cell_h / 2.0),
-                                            egui::Align2::CENTER_CENTER,
-                                        )
-                                    } else {
-                                        (Pos2::new(x, y + cell_h / 2.0), egui::Align2::LEFT_CENTER)
-                                    };
-                                    painter.text(pos, anchor, ch.to_string(), font_id.clone(), ink);
+                                    // 字身左对齐，与格内字形一致；宽字符光标块仍盖满 2 格槽。
+                                    painter.text(
+                                        Pos2::new(x, y + cell_h / 2.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        ch.to_string(),
+                                        font_id.clone(),
+                                        ink,
+                                    );
                                 }
                             }
                             CursorShape::HollowBlock => {
@@ -752,6 +752,55 @@ mod tests {
 
     fn key_bytes(k: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
         encode_key(k, ctrl, alt, shift, false)
+    }
+
+    /// 几何不变量：任一台机器加载的 CJK fallback 字体下，汉字字形必须占宽槽
+    /// （>1 格）且能并入 2 格槽（≤2 格）。只要成立，逐格渲染 + 左对齐就不会错位。
+    #[test]
+    fn cjk_glyph_fits_wide_slot() {
+        let ctx = egui::Context::default();
+        // 与 crate::app::setup_fonts 相同的候选字体加载逻辑。
+        let candidates = [
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\msyh.ttf",
+            r"C:\Windows\Fonts\msyhbd.ttc",
+            r"C:\Windows\Fonts\simhei.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",
+        ];
+        for path in candidates {
+            if let Ok(data) = std::fs::read(path) {
+                ctx.add_font(egui::epaint::text::FontInsert::new(
+                    "cjk",
+                    egui::epaint::text::FontData::from_owned(data),
+                    vec![egui::epaint::text::InsertFontFamily {
+                        family: egui::FontFamily::Monospace,
+                        priority: egui::epaint::text::FontPriority::Lowest,
+                    }],
+                ));
+                break;
+            }
+        }
+        let font_id = FontId::monospace(super::TERM_FONT_SIZE);
+        ctx.begin_pass(egui::RawInput::default());
+        ctx.fonts_mut(|f| {
+            let cell_w = f.glyph_width(&font_id, 'M');
+            let cjk = f.glyph_width(&font_id, '你');
+            assert!(
+                cjk > cell_w,
+                "汉字字形 {cjk:.3}px 必须宽于单格 {cell_w:.3}px，否则与 ASCII 同宽会错位"
+            );
+            assert!(
+                cjk <= 2.0 * cell_w + 0.01,
+                "汉字字形 {cjk:.3}px 必须能并入 2 格槽 {:.3}px",
+                2.0 * cell_w
+            );
+            // 整行 LayoutJob 排版按字形累加宽度：若汉字≠2 格宽，每个汉字都会让
+            // 后续内容向左漂移 (2*cell_w - cjk)，逐字累加——这就是逐格渲染的原因。
+            let drift = 2.0 * cell_w - cjk;
+            println!("cell_w={cell_w:.3} cjk={cjk:.3} drift/汉字={drift:.3}px");
+        });
+        let mut out = ctx.end_pass();
+        out.textures_delta.clear(); // 不把纹理增量交给渲染器，避免 Drop 断言
     }
 
     #[test]
