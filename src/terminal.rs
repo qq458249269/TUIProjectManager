@@ -39,7 +39,8 @@ fn resolve_color(color: Color, colors: &Colors, is_fg: bool, dark: bool) -> Colo
 }
 
 /// 浅色主题下把暗色主题 TUI 的配色映射为可读组合：
-/// 深背景 → 白，亮灰/白前景 → 黑（仅近似无色相的亮色，避免误杀黄色等亮色语法高亮）。
+/// 深背景 → 白；亮灰/白前景 → 黑；过亮的饱和前景（亮黄、亮青、亮绿、亮紫…）
+/// 在白底上对比不足，按通道等比压暗（保留色相）到半亮度保证可读。
 fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
     let lum = |c: Color32| {
         0.2126 * c.r() as f32 / 255.0
@@ -58,6 +59,14 @@ fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
     }
     if lum(f) > 0.72 && neutral(f) {
         f = Color32::BLACK;
+    } else if lum(f) > 0.55 {
+        // 亮饱和色（如 ANSI 亮黄 #FFFF00）白底上几乎看不见，压到半亮度：
+        // 色相不变，对比足够，且不会被误打成黑色。
+        f = Color32::from_rgb(
+            (f.r() as f32 * 0.5) as u8,
+            (f.g() as f32 * 0.5) as u8,
+            (f.b() as f32 * 0.5) as u8,
+        );
     }
     (f, b)
 }
@@ -886,6 +895,38 @@ pub fn show_terminal(
 
     // 会话活跃时由 SessionListener 的后台解析线程通过 redraw 信号触发重绘；
     // 这里不需要无条件 request_repaint，避免空闲时满帧空转。
+}
+
+/// 浅色主题颜色映射：亮黄等亮饱和色白底上必须被压暗到可读、色相保留；
+/// 中性亮色仍打黑；中低亮度颜色（本就够对比）不得被改动。
+#[cfg(test)]
+#[test]
+fn light_adapt_keeps_bright_colors_readable() {
+    let yellow = Color32::from_rgb(255, 255, 0);
+    let (f, _) = adapt_to_light(yellow, Color32::from_rgb(30, 30, 30));
+    let bright = (f.r() as u16) + (f.g() as u16) + (f.b() as u16);
+    assert!(
+        bright < 510,
+        "亮黄应从 #FFFF00 压暗（当前 {f:?}），白底上才看得见"
+    );
+    assert!(
+        f.r() == f.g(),
+        "压暗应保留黄色色相（红绿等高、蓝低），当前 {f:?}"
+    );
+    assert!(f.b() < f.r().min(f.g()), "黄色不应混入蓝色通道，当前 {f:?}");
+
+    // 白前景（中性亮色）按原规则直接打黑。
+    let (f2, _) = adapt_to_light(Color32::WHITE, Color32::from_rgb(30, 30, 30));
+    assert_eq!(f2, Color32::BLACK);
+
+    // 中亮度绿（如 0,128,0）白底对比已够，不得被改动。
+    let green = Color32::from_rgb(0, 128, 0);
+    let (f3, _) = adapt_to_light(green, Color32::from_rgb(30, 30, 30));
+    assert_eq!(f3, green);
+
+    // 深背景仍映射为白。
+    let (_, b) = adapt_to_light(yellow, Color32::BLACK);
+    assert_eq!(b, TERM_BG_LIGHT);
 }
 
 #[cfg(test)]

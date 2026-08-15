@@ -102,23 +102,43 @@ fn hwnd_of(cc: &eframe::CreationContext<'_>) -> isize {
 }
 
 /// 固定深色标题栏：egui 的 ThemePreference 只改面板颜色，标题栏由 DWM 绘制，
-/// 需要显式 DwmSetWindowAttribute。运行时切换深浅不可靠（DWM 节流重绘、部分
-/// 系统/主题下属性不生效），故固定为黑色标题栏，不随深浅主题切换。
+/// 需要显式 DwmSetWindowAttribute。固定为黑色标题栏，不随深浅主题切换。
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: isize,
+        attr: u32,
+        attr_value: *const std::ffi::c_void,
+        attr_size: u32,
+    ) -> i32;
+    fn DwmGetWindowAttribute(
+        hwnd: isize,
+        attr: u32,
+        attr_value: *mut std::ffi::c_void,
+        attr_size: u32,
+    ) -> i32;
+}
+
+/// 标题栏当前是否已是深色（DWM 属性 20 读回是否为 1）。
+fn is_titlebar_dark(hwnd: isize) -> bool {
+    let mut v: i32 = 0;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            20, // DWMWA_USE_IMMERSIVE_DARK_MODE（Win10 2004+；旧版本上 attr19 由 set 回退）
+            &mut v as *mut i32 as *mut std::ffi::c_void,
+            4,
+        )
+    };
+    hr >= 0 && v == 1
+}
+
 fn set_titlebar_theme(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
     // DWMWA_USE_IMMERSIVE_DARK_MODE：20H1+ 用 20，老版本回退 19；
     // 失败就试下一个，都失败说明系统不支持，忽略。
-    #[link(name = "dwmapi")]
-    unsafe extern "system" {
-        fn DwmSetWindowAttribute(
-            hwnd: isize,
-            attr: u32,
-            attr_value: *const std::ffi::c_void,
-            attr_size: u32,
-        ) -> i32;
-    }
     let value: i32 = 1; // 固定黑色标题栏
     unsafe {
         for attr in [20u32, 19u32] {
@@ -308,7 +328,12 @@ impl ClientApp {
         let config = config::load();
         apply_theme(&cc.egui_ctx, config.settings.dark_mode);
         let titlebar_hwnd = hwnd_of(cc);
+        // 手动设一次保证首帧即黑。再发一次 SetTheme(Dark)：winit 0.30 的 set_theme
+        // 不更新内部 preferred_theme（build 时为 None），WM_SETTINGCHANGE 时它会把
+        // 窗口重应用为系统默认浅色——真正的兜底在 logic() 每帧轮询补设（见下）。
         set_titlebar_theme(titlebar_hwnd);
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
@@ -1280,6 +1305,14 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 深色标题栏免疫层：winit 0.30 在 WM_SETTINGCHANGE（系统主题/显示设置变化）
+        // 时会把窗口重应用为系统默认（本项目机器上默认浅色），因为它只认 build 时
+        // 的 preferred_theme（None），运行时 set_theme(Dark) 存不进去。这里每帧轮询
+        // DWM 属性，被谁都重置成非深色就立刻补设——10fps × 一次 dwmapi 读取可忽略。
+        if !is_titlebar_dark(self.titlebar_hwnd) {
+            set_titlebar_theme(self.titlebar_hwnd);
+        }
+
         // 固定帧率基线刷新（默认 10fps=100ms，设置中可调 10-60）：纯消息驱动时
         // 鼠标不动/无事件的空闲期，状态栏等界面元素不会刷新，体验异常。
         // request_repaint_after 每帧续上一帧，形成恒定基线。
