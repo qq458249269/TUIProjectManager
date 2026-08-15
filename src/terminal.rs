@@ -62,6 +62,17 @@ fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
     (f, b)
 }
 
+/// 终端右键菜单动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TermAction {
+    /// 复制选中文本到剪贴板。
+    Copy,
+    /// 从剪贴板粘贴到终端。
+    Paste,
+    /// 清空当前输入行内容（等效按住退格键直到清空）。
+    ClearInput,
+}
+
 /// 有选中文本时复制到系统剪贴板（并清除选区），返回是否复制了内容。
 fn copy_selection(
     term: &alacritty_terminal::term::Term<SessionListener>,
@@ -352,16 +363,111 @@ pub fn show_terminal(
         if resp.clicked() {
             t.selection = None;
         }
-        if resp.secondary_clicked() {
-            // 有选区 → 右键复制；无选区 → 右键粘贴（下一帧 egui 投递 Event::Paste）。
-            let copied = copy_selection(&t, ui.ctx(), status);
-            if !copied {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-                // 右键粘贴也算与终端交互：聚焦终端，下一帧的粘贴事件才能写入。
-                *term_focused = true;
-            }
-            t.selection = None;
+    }
+
+    // 右键弹菜单：复制 / 粘贴 / 清空输入（不再右键直接粘贴，避免误触）。
+    // context_menu 闭包内再拿 term 锁；必须在上面 lock 块之外调用，否则同一
+    // 帧先锁后闭包再锁会死锁。
+    let mut menu_action: Option<TermAction> = None;
+    resp.context_menu(|ui| {
+        let has_selection = sess
+            .term
+            .lock()
+            .map(|t| t.selection.is_some())
+            .unwrap_or(false);
+        if ui
+            .add_enabled(has_selection, egui::Button::new("📋 复制"))
+            .on_hover_text("复制选中的文本到剪贴板")
+            .clicked()
+        {
+            menu_action = Some(TermAction::Copy);
+            ui.close();
         }
+        if ui
+            .button("📥 粘贴")
+            .on_hover_text("从剪贴板粘贴到终端")
+            .clicked()
+        {
+            menu_action = Some(TermAction::Paste);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .button("🧹 清空输入")
+            .on_hover_text("清除当前输入行内容（等效按住退格键直到清空）")
+            .clicked()
+        {
+            menu_action = Some(TermAction::ClearInput);
+            ui.close();
+        }
+    });
+    match menu_action {
+        Some(TermAction::Copy) => {
+            let copied = sess
+                .term
+                .lock()
+                .map(|mut t| {
+                    let copied = copy_selection(&t, ui.ctx(), status);
+                    if copied {
+                        t.selection = None;
+                    }
+                    copied
+                })
+                .unwrap_or(false);
+            if !copied {
+                *status = Some("没有可复制的选中文本".to_string());
+            }
+        }
+        Some(TermAction::Paste) => {
+            // 清掉选区再触发系统粘贴：下一帧 egui 投递 Event::Paste，聚焦终端后才能写入。
+            if let Ok(mut t) = sess.term.lock() {
+                t.selection = None;
+            }
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            *term_focused = true;
+        }
+        Some(TermAction::ClearInput) => {
+            // 等效按住退格键直到清空：从视口顶行到光标处整块统计字符数，再发送
+            // 等量退格（0x7f，与应用内 Backspace 键编码一致）。
+            // - 空格、换行/折行到上一行的输入都计入，全部清除；
+            // - 宽字符占位格跳过，CJK 按字符数而非显示格数计；
+            // - 空单元格(' ')多算无害：多余退格在空输入行上不被 shell 处理，
+            //   宁可多删（安全方向）也不可少删（漏空格/漏上一行正是此前的 bug）；
+            // - 光标各列不重叠：光标所在行数到光标列为止，其余行数整行。
+            let count = sess
+                .term
+                .lock()
+                .map(|t| {
+                    let cur = t.renderable_content().cursor.point;
+                    let offset = t.grid().display_offset();
+                    let mut n = 0usize;
+                    for r in 0..rows {
+                        let line = Line(r as i32 - offset as i32);
+                        let max_col = if line == cur.line {
+                            cur.column.0.min(cols)
+                        } else {
+                            cols
+                        };
+                        for col in 0..max_col {
+                            let cell = &t.grid()[Point::new(line, Column(col))];
+                            if cell.c != '\0'
+                                && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                            {
+                                n += 1;
+                            }
+                        }
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            if count > 0 {
+                let _ = sess.writer.try_send(vec![0x7f; count]);
+                *status = Some("已清空当前输入".to_string());
+            } else {
+                *status = Some("当前输入为空，无需清空".to_string());
+            }
+        }
+        None => {}
     }
 
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
