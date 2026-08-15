@@ -101,9 +101,10 @@ fn hwnd_of(cc: &eframe::CreationContext<'_>) -> isize {
     }
 }
 
-/// 切换原生标题栏明暗：egui 的 ThemePreference 只改面板颜色，标题栏由 DWM 绘制，
-/// 需要显式 DwmSetWindowAttribute。设置后标题栏底色/文字色才跟随深浅主题。
-fn set_titlebar_theme(hwnd: isize, dark: bool) {
+/// 固定深色标题栏：egui 的 ThemePreference 只改面板颜色，标题栏由 DWM 绘制，
+/// 需要显式 DwmSetWindowAttribute。运行时切换深浅不可靠（DWM 节流重绘、部分
+/// 系统/主题下属性不生效），故固定为黑色标题栏，不随深浅主题切换。
+fn set_titlebar_theme(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
@@ -118,7 +119,7 @@ fn set_titlebar_theme(hwnd: isize, dark: bool) {
             attr_size: u32,
         ) -> i32;
     }
-    let value: i32 = i32::from(dark);
+    let value: i32 = 1; // 固定黑色标题栏
     unsafe {
         for attr in [20u32, 19u32] {
             let ok = DwmSetWindowAttribute(
@@ -132,7 +133,7 @@ fn set_titlebar_theme(hwnd: isize, dark: bool) {
             }
         }
         // DWM 属性变更后标题栏不会自己重绘（要等 DWM 节流刷新），
-        // 强制重算非客户区让标题栏立即切换明暗。
+        // 强制重算非客户区让标题栏立即生效。
         refresh_titlebar(hwnd);
     }
 }
@@ -297,7 +298,7 @@ pub struct ClientApp {
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
     redraw_rx: Receiver<()>,
-    /// 原生窗口句柄：用于按主题切换标题栏明暗（egui 只改面板，改不了标题栏）。
+    /// 原生窗口句柄：启动时把 DWM 标题栏固定为黑色（运行中切换不可靠，直接固定）。
     titlebar_hwnd: isize,
 }
 
@@ -307,7 +308,7 @@ impl ClientApp {
         let config = config::load();
         apply_theme(&cc.egui_ctx, config.settings.dark_mode);
         let titlebar_hwnd = hwnd_of(cc);
-        set_titlebar_theme(titlebar_hwnd, config.settings.dark_mode);
+        set_titlebar_theme(titlebar_hwnd);
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
@@ -852,7 +853,6 @@ impl ClientApp {
                 if theme_btn.clicked() {
                     self.config.settings.dark_mode = !dark;
                     apply_theme(ui.ctx(), self.config.settings.dark_mode);
-                    set_titlebar_theme(self.titlebar_hwnd, self.config.settings.dark_mode);
                     self.save_config("已切换主题".to_string());
                     ui.ctx().request_repaint();
                 }
