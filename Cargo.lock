@@ -2827,6 +2827,7 @@ dependencies = [
  "alacritty_terminal",
  "eframe",
  "portable-pty",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",

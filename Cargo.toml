@@ -9,6 +9,7 @@ alacritty_terminal = "0.26"
 # 体积和链接依赖都大幅缩减（links 会拉入 webbrowser，后者在 gnu 工具链下缺 shlwapi）。
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
 portable-pty = "0.9"
+raw-window-handle = "0.6"
 rfd = "0.15"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

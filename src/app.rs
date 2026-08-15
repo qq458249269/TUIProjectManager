@@ -92,6 +92,48 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     });
 }
 
+/// 从 eframe 的创建上下文里取原生窗口句柄（Windows HWND）。
+fn hwnd_of(cc: &eframe::CreationContext<'_>) -> isize {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
+        _ => 0,
+    }
+}
+
+/// 切换原生标题栏明暗：egui 的 ThemePreference 只改面板颜色，标题栏由 DWM 绘制，
+/// 需要显式 DwmSetWindowAttribute。设置后标题栏底色/文字色才跟随深浅主题。
+fn set_titlebar_theme(hwnd: isize, dark: bool) {
+    if hwnd == 0 {
+        return;
+    }
+    // DWMWA_USE_IMMERSIVE_DARK_MODE：20H1+ 用 20，老版本回退 19；
+    // 失败就试下一个，都失败说明系统不支持，忽略。
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attr: u32,
+            attr_value: *const std::ffi::c_void,
+            attr_size: u32,
+        ) -> i32;
+    }
+    let value: i32 = i32::from(dark);
+    unsafe {
+        for attr in [20u32, 19u32] {
+            let ok = DwmSetWindowAttribute(
+                hwnd,
+                attr,
+                &value as *const i32 as *const std::ffi::c_void,
+                4,
+            );
+            if ok >= 0 {
+                break;
+            }
+        }
+    }
+}
+
 /// 深浅主题下可读的提示色。
 fn ui_warn(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
@@ -211,6 +253,8 @@ pub struct ClientApp {
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
     redraw_rx: Receiver<()>,
+    /// 原生窗口句柄：用于按主题切换标题栏明暗（egui 只改面板，改不了标题栏）。
+    titlebar_hwnd: isize,
 }
 
 impl ClientApp {
@@ -218,6 +262,8 @@ impl ClientApp {
         setup_fonts(&cc.egui_ctx);
         let config = config::load();
         apply_theme(&cc.egui_ctx, config.settings.dark_mode);
+        let titlebar_hwnd = hwnd_of(cc);
+        set_titlebar_theme(titlebar_hwnd, config.settings.dark_mode);
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
@@ -247,6 +293,7 @@ impl ClientApp {
             update_rx,
             redraw_tx,
             redraw_rx,
+            titlebar_hwnd,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -731,6 +778,7 @@ impl ClientApp {
                 if theme_btn.clicked() {
                     self.config.settings.dark_mode = !dark;
                     apply_theme(ui.ctx(), self.config.settings.dark_mode);
+                    set_titlebar_theme(self.titlebar_hwnd, self.config.settings.dark_mode);
                     self.save_config("已切换主题".to_string());
                     ui.ctx().request_repaint();
                 }
