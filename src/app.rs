@@ -43,10 +43,12 @@ pub enum ConfirmDialog {
     DeleteProject { index: usize, name: String },
 }
 
-/// 页签栏点击产生的动作。
+/// 页签栏点击/右键菜单产生的动作。
 enum TabAction {
     Activate(usize),
     Close(usize),
+    OpenDir(usize),
+    OpenVSCode(usize),
 }
 
 /// 加载中文字体作为 Proportional 与 Monospace 的 fallback。
@@ -371,6 +373,37 @@ impl ClientApp {
         }
     }
 
+    /// 用系统默认文件管理器打开目录（Windows 为 explorer）。
+    fn open_directory(&mut self, dir: &str) {
+        match std::process::Command::new("explorer").arg(dir).spawn() {
+            Ok(_) => self.status = Some(format!("已打开目录: {dir}")),
+            Err(e) => self.status = Some(format!("打开目录失败: {e}")),
+        }
+    }
+
+    /// 用 VS Code 打开目录。依赖 code CLI 已安装并加入 PATH。
+    fn open_in_vscode(&mut self, dir: &str) {
+        #[cfg(windows)]
+        let result = {
+            use std::os::windows::process::CommandExt;
+            // cmd /c 按 PATHEXT 解析 code → code.cmd；整条命令合成一个字符串并给目录加
+            // 引号，避免含空格路径被 cmd 二次解析拆开。output 捕获退出码以区分成功/未安装。
+            std::process::Command::new("cmd")
+                .args(["/c", &format!("code \"{dir}\"")])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW，避免闪黑窗
+                .output()
+        };
+        #[cfg(not(windows))]
+        let result = std::process::Command::new("code").arg(dir).output();
+        match result {
+            Ok(o) if o.status.success() => {
+                self.status = Some(format!("已在 VS Code 中打开: {dir}"));
+            }
+            Ok(_) => self.status = Some("打开 VS Code 失败：未找到 code 命令（请确认已安装 VS Code 并选择「添加到 PATH」）".to_string()),
+            Err(e) => self.status = Some(format!("打开 VS Code 失败: {e}")),
+        }
+    }
+
     fn close_session(&mut self, idx: usize) {
         if idx == 0 || idx >= self.tabs.len() {
             return;
@@ -526,9 +559,29 @@ impl ClientApp {
                             s.title.clone()
                         };
                         let selected = self.current == i;
-                        if ui.selectable_label(selected, title).clicked() && !selected {
+                        let tab_resp = ui.selectable_label(selected, title);
+                        if tab_resp.clicked() && !selected {
                             actions.push(TabAction::Activate(i));
                         }
+                        // 右键页签弹出菜单：打开目录 / 在 VSCode 打开。
+                        tab_resp.context_menu(|ui| {
+                            if ui
+                                .button("📂 打开目录")
+                                .on_hover_text("在资源管理器中打开该会话目录")
+                                .clicked()
+                            {
+                                actions.push(TabAction::OpenDir(i));
+                                ui.close();
+                            }
+                            if ui
+                                .button("⌨ 在 VSCode 打开")
+                                .on_hover_text("用 VS Code 打开该会话目录（需安装 code 命令并加入 PATH）")
+                                .clicked()
+                            {
+                                actions.push(TabAction::OpenVSCode(i));
+                                ui.close();
+                            }
+                        });
                         // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
                         // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
                         if ui.add(egui::Button::new("×").small().frame(false))
@@ -540,40 +593,6 @@ impl ClientApp {
                     });
                 }
             }
-
-            // 右侧：打开当前页签目录（用户目录已在设置页；检查更新/深浅切换已移到右下角状态栏）。
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 当前激活页签指向的目录：会话页签用其工作目录，首页用当前选中项目路径。
-                let open_dir = match self.tabs.get(self.current) {
-                    Some(Tab::Session(s)) => Path::new(&s.dir).is_dir().then(|| s.dir.clone()),
-                    _ => self
-                        .config
-                        .projects
-                        .get(self.selected_project)
-                        .filter(|p| Path::new(&p.path).is_dir())
-                        .map(|p| p.path.clone()),
-                };
-                if ui
-                    .add_enabled(open_dir.is_some(), egui::Button::new("📁 打开目录"))
-                    .on_hover_text(
-                        if open_dir.is_some() {
-                            "在资源管理器中打开当前页签指向的目录"
-                        } else {
-                            "当前页签没有可用的目录"
-                        },
-                    )
-                    .clicked()
-                {
-                    if let Some(dir) = open_dir {
-                        match std::process::Command::new("explorer").arg(&dir).spawn() {
-                            Ok(_) => {
-                                self.status = Some(format!("已打开目录: {dir}"));
-                            }
-                            Err(e) => self.status = Some(format!("打开目录失败: {e}")),
-                        }
-                    }
-                }
-            });
         });
         for action in actions {
             match action {
@@ -582,6 +601,26 @@ impl ClientApp {
                     self.refresh_focus();
                 }
                 TabAction::Close(i) => self.close_session(i),
+                TabAction::OpenDir(i) => {
+                    if let Some(Tab::Session(s)) = self.tabs.get(i) {
+                        let dir = s.dir.clone();
+                        if Path::new(&dir).is_dir() {
+                            self.open_directory(&dir);
+                        } else {
+                            self.status = Some(format!("目录不存在: {dir}"));
+                        }
+                    }
+                }
+                TabAction::OpenVSCode(i) => {
+                    if let Some(Tab::Session(s)) = self.tabs.get(i) {
+                        let dir = s.dir.clone();
+                        if Path::new(&dir).is_dir() {
+                            self.open_in_vscode(&dir);
+                        } else {
+                            self.status = Some(format!("目录不存在: {dir}"));
+                        }
+                    }
+                }
             }
         }
     }
