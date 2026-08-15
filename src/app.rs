@@ -373,6 +373,27 @@ impl ClientApp {
         }
     }
 
+    /// cmd /c 命令串里的目录参数：含空白时交给引号保护，否则 ^ 转义 cmd 特殊字符。
+    #[cfg(windows)]
+    fn cmd_arg(dir: &str) -> String {
+        if dir.chars().any(char::is_whitespace) {
+            dir.to_string()
+        } else {
+            let mut o = String::new();
+            for c in dir.chars() {
+                match c {
+                    '^' => o.push_str("^^"),
+                    '&' | '|' | '<' | '>' | '(' | ')' => {
+                        o.push('^');
+                        o.push(c);
+                    }
+                    _ => o.push(c),
+                }
+            }
+            o
+        }
+    }
+
     /// 用系统默认文件管理器打开目录（Windows 为 explorer）。
     fn open_directory(&mut self, dir: &str) {
         match std::process::Command::new("explorer").arg(dir).spawn() {
@@ -386,10 +407,17 @@ impl ClientApp {
         #[cfg(windows)]
         let result = {
             use std::os::windows::process::CommandExt;
-            // cmd /c 按 PATHEXT 解析 code → code.cmd；整条命令合成一个字符串并给目录加
-            // 引号，避免含空格路径被 cmd 二次解析拆开。output 捕获退出码以区分成功/未安装。
+            // cmd /c 按 PATHEXT 解析 code → code.cmd。目录必须作为独立参数传入：
+            // 若拼成 "code \"{dir}\"" 一个字符串，Rust 会把内嵌引号转义成 \"，
+            // cmd 不认该转义，含空格路径会被拆成多个参数。目录含空格时 cmd 的引号
+            // 自然保护 & | < > () 等字符，无需转义；不含空格时不加引号，需用 ^
+            // 转义这些字符，防止 cmd 把它们当命令分隔符。
+            // --new-window：已运行实例接手时会把当前窗口切到新目录，出现标题是
+            // 新目录但资源管理器仍显示旧目录的半切换状态（看起来像“把目录当页签
+            // 打开”）；显式开新窗口避免污染已有窗口。
             std::process::Command::new("cmd")
-                .args(["/c", &format!("code \"{dir}\"")])
+                .args(["/c", "code", "--new-window"])
+                .arg(Self::cmd_arg(dir))
                 .creation_flags(0x0800_0000) // CREATE_NO_WINDOW，避免闪黑窗
                 .output()
         };
@@ -1171,5 +1199,23 @@ impl eframe::App for ClientApp {
 
         self.input_dialog(ui);
         self.confirm_dialog(ui);
+    }
+}
+#[cfg(all(test, windows))]
+mod vscode_tests {
+    use super::ClientApp;
+
+    #[test]
+    fn spaced_dir_passes_through_for_quotes() {
+        assert_eq!(ClientApp::cmd_arg(r"D:\AI\with space dir\test"), r"D:\AI\with space dir\test");
+        assert_eq!(ClientApp::cmd_arg(r"D:\AI\with space\foo&bar"), r"D:\AI\with space\foo&bar");
+    }
+
+    #[test]
+    fn specials_escaped_only_without_whitespace() {
+        assert_eq!(ClientApp::cmd_arg(r"D:\AI\foo&bar"), r"D:\AI\foo^&bar");
+        assert_eq!(ClientApp::cmd_arg(r"D:\AI\a|b<c>d(x)"), r"D:\AI\a^|b^<c^>d^(x^)");
+        assert_eq!(ClientApp::cmd_arg(r"D:\AI\caret^char"), r"D:\AI\caret^^char");
+        assert_eq!(ClientApp::cmd_arg(r"D:\p"), r"D:\p");
     }
 }
