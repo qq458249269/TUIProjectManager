@@ -41,6 +41,8 @@ impl InputDialog {
 /// 确认弹窗。
 pub enum ConfirmDialog {
     DeleteProject { index: usize, name: String },
+    /// 会话页签崩溃后的处理选择：重新打开 / 关闭。
+    RelaunchSession { dir: String, title: String, reason: String },
 }
 
 /// 页签栏点击/右键菜单产生的动作。
@@ -432,6 +434,25 @@ impl ClientApp {
         }
     }
 
+    fn relaunch_session(&mut self, dir: String, title: String) {
+        match session::spawn(
+            &title,
+            &dir,
+            &self.config.settings.tui_command,
+            80,
+            24,
+            self.redraw_tx.clone(),
+        ) {
+            Ok(sess) => {
+                self.tabs.push(Tab::Session(sess));
+                self.current = self.tabs.len() - 1;
+                self.term_focused = true;
+                self.status = Some(format!("已重新打开会话: {title}"));
+            }
+            Err(e) => self.status = Some(format!("重新打开会话失败: {e}")),
+        }
+    }
+
     fn close_session(&mut self, idx: usize) {
         if idx == 0 || idx >= self.tabs.len() {
             return;
@@ -455,7 +476,11 @@ impl ClientApp {
         for tab in self.tabs.iter_mut() {
             if let Tab::Session(s) = tab {
                 if !s.exited {
-                    if let Ok(Some(_)) = s.child.try_wait() {
+                    // 解析线程 panic（畸形逃逸序列等）后 term 锁变为 poisoned，
+                    // 该会话已无法渲染，视同退出——避免黑屏页签占着不报。
+                    let poisoned = s.term.lock().is_err();
+                    let exited = poisoned || matches!(s.child.try_wait(), Ok(Some(_)));
+                    if exited {
                         s.exited = true;
                         changed = true;
                     }
@@ -1078,9 +1103,18 @@ impl ClientApp {
             Some(d) => d,
             None => return,
         };
+        let confirm_label;
         let (message, _index) = match &dialog {
             ConfirmDialog::DeleteProject { index, name } => {
+                confirm_label = "确定";
                 (format!("确定删除项目「{name}」吗？"), *index)
+            }
+            ConfirmDialog::RelaunchSession { title, reason, .. } => {
+                confirm_label = "重新打开";
+                (
+                    format!("终端页签「{title}」已崩溃（{reason}），已隔离并关闭。要重新打开它吗？"),
+                    0,
+                )
             }
         };
         let mut yes = false;
@@ -1093,7 +1127,7 @@ impl ClientApp {
                 ui.label(message);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
+                    if ui.button(confirm_label).clicked() {
                         yes = true;
                     }
                     if ui.button("取消").clicked() {
@@ -1110,6 +1144,9 @@ impl ClientApp {
         if yes {
             match dialog {
                 ConfirmDialog::DeleteProject { index, .. } => self.confirm_delete(index),
+                ConfirmDialog::RelaunchSession { dir, title, .. } => {
+                    self.relaunch_session(dir, title)
+                }
             }
         } else if !no {
             self.confirm = Some(dialog);
@@ -1184,14 +1221,43 @@ impl eframe::App for ClientApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(Tab::Session(s)) = self.tabs.get_mut(self.current) {
-                terminal::show_terminal(
-                    ui,
-                    s,
+            if let Some(Tab::Session(_)) = self.tabs.get(self.current) {
+                // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
+                // catch_unwind 捕获后关闭该页签，整个软件继续运行。
+                let (dark, status, term_focused) = (
                     self.config.settings.dark_mode,
                     &mut self.status,
                     &mut self.term_focused,
                 );
+                let sess = match self.tabs.get_mut(self.current) {
+                    Some(Tab::Session(s)) => s,
+                    _ => unreachable!(),
+                };
+                let crashed = match std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        terminal::show_terminal(ui, sess, dark, status, term_focused);
+                    }),
+                ) {
+                    Ok(()) => None,
+                    Err(payload) => Some(
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "未知错误".to_string()),
+                    ),
+                };
+                if let Some(reason) = crashed {
+                    let idx = self.current;
+                    let (dir, title) = match self.tabs.get(idx) {
+                        Some(Tab::Session(s)) => (s.dir.clone(), s.title.clone()),
+                        _ => (String::new(), String::new()),
+                    };
+                    self.close_session(idx);
+                    self.confirm = Some(ConfirmDialog::RelaunchSession { dir, title, reason });
+                    self.status =
+                        Some("该终端页签发生崩溃，已隔离并关闭（其他页签不受影响）。".to_string());
+                }
             } else {
                 self.home_ui(ui);
             }

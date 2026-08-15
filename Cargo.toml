@@ -25,12 +25,13 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 
-# 精简产物：体积优先 + 全量链接 + 去符号 + panic abort。
+# 精简产物：体积优先 + 全量链接 + 去符号。
+# 不用 panic=abort：页签崩溃隔离要靠 catch_unwind 捕获 UI 线程 panic，
+# abort 模式下任何 panic 直接杀进程，无法做到“一个页签崩不影响整个软件”。
 [profile.release]
 opt-level = "z"
 codegen-units = 1
 lto = true
-panic = "abort"
 strip = true
 
 [patch.crates-io]
