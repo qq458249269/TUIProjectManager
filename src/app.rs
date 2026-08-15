@@ -131,7 +131,51 @@ fn set_titlebar_theme(hwnd: isize, dark: bool) {
                 break;
             }
         }
+        // DWM 属性变更后标题栏不会自己重绘（要等 DWM 节流刷新），
+        // 强制重算非客户区让标题栏立即切换明暗。
+        refresh_titlebar(hwnd);
     }
+}
+
+/// 强制重绘标题栏非客户区：SWP_FRAMECHANGED 让 DWM 重新布局非客户区
+/// （触发 WM_NCCALCSIZE），RedrawWindow 立即重绘帧。
+#[cfg(target_os = "windows")]
+unsafe fn refresh_titlebar(hwnd: isize) {
+    unsafe extern "system" {
+        fn SetWindowPos(
+            hwnd: isize,
+            hwnd_insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            uflags: u32,
+        ) -> i32;
+        fn RedrawWindow(
+            hwnd: isize,
+            lprc_update: *const std::ffi::c_void,
+            hrgn_update: isize,
+            uflags: u32,
+        ) -> i32;
+    }
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+    const RDW_FRAME: u32 = 0x0400;
+    const RDW_INVALIDATE: u32 = 0x0001;
+    const RDW_UPDATENOW: u32 = 0x0100;
+    SetWindowPos(
+        hwnd,
+        0,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+    RedrawWindow(hwnd, std::ptr::null(), 0, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 /// 深浅主题下可读的提示色。
