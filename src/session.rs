@@ -195,6 +195,26 @@ pub fn spawn(
 mod tests {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
+
+    /// 宽字符由前导格+随空格两格组成；程序（如 nvim）把光标左移一格时光标会
+    /// 落在随空格上。若渲染侧按“非 WIDE_CHAR 即 1 格宽”画光标方块，白色方块
+    /// 正好盖住汉字右半 → “只显示一半汉字”。渲染代码对随空格按 2 格宽处理。
+    #[test]
+    fn cursor_can_sit_on_wide_spacer() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config as TermConfig;
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), VoidListener);
+        let mut p: alacritty_terminal::vte::ansi::Processor = Default::default();
+        // 写一个汉字（2 格：前导+随空格），再左移 1 格 → 光标停在随空格的列。
+        p.advance(&mut term, "\u{4f60}\u{1b}[D".as_bytes());
+        let pt = term.grid().cursor.point;
+        let cell = &term.grid()[pt];
+        assert!(
+            cell.flags.contains(Flags::WIDE_CHAR_SPACER),
+            "光标应停在随空格上 (flags={:?}), 渲染若按 1 格宽画方块就会盖住半个汉字",
+            cell.flags
+        );
+    }
     use std::time::Duration;
 
     #[test]

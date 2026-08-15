@@ -717,8 +717,13 @@ pub fn show_terminal(
             if col < cols {
                 let cursor_cell = &term.grid()[cpoint];
                 // 宽字符光标：方块/下划线/空心块都按 2 格宽画，避免只盖住半个汉字。
-                let cursor_wide = cursor_cell.flags.contains(Flags::WIDE_CHAR);
-                let x = rect.left() + col as f32 * cell_w;
+                // 光标本身停在宽字符的随空格（后一半）上也一样：若只按 1 格宽画，
+                // 白色方块会正好盖住汉字右半，看起来就是“只显示一半汉字”。
+                let on_spacer = cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                let cursor_wide =
+                    cursor_cell.flags.contains(Flags::WIDE_CHAR) || on_spacer;
+                let col0 = if on_spacer { col.saturating_sub(1) } else { col };
+                let x = rect.left() + col0 as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
                 let w = cell_w * if cursor_wide { 2.0 } else { 1.0 };
                 let cursor_cell_rect =
@@ -750,9 +755,17 @@ pub fn show_terminal(
                                     egui::StrokeKind::Inside,
                                 );
                                 // 反色重绘格内字符（宽字符居中画在整块内），保证光标内内容可读。
-                                let ch = cursor_cell.c;
+                                // 光标停在随空格时自身无字形，取前导格的宽字符重绘。
+                                let ch = if on_spacer {
+                                    term.grid()[Point::new(
+                                        cpoint.line,
+                                        Column(cpoint.column.0.saturating_sub(1)),
+                                    )]
+                                    .c
+                                } else {
+                                    cursor_cell.c
+                                };
                                 if ch != '\0'
-                                    && !cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                                 {
                                     // 字身左对齐，与格内字形一致；宽字符光标块仍盖满 2 格槽。
                                     painter.text(

@@ -396,10 +396,10 @@ impl ClientApp {
         }
     }
 
-    /// 用系统默认文件管理器打开目录（Windows 为 explorer）。
-    fn open_directory(&mut self, dir: &str) {
-        match std::process::Command::new("explorer").arg(dir).spawn() {
-            Ok(_) => self.status = Some(format!("已打开目录: {dir}")),
+    /// 用系统文件管理器（Windows 为 explorer）打开目录，结果写入状态栏。
+    fn open_explorer(&mut self, dir: impl AsRef<Path>) {
+        match std::process::Command::new("explorer").arg(dir.as_ref()).spawn() {
+            Ok(_) => self.status = Some(format!("已打开目录: {}", dir.as_ref().display())),
             Err(e) => self.status = Some(format!("打开目录失败: {e}")),
         }
     }
@@ -658,7 +658,7 @@ impl ClientApp {
                     if let Some(Tab::Session(s)) = self.tabs.get(i) {
                         let dir = s.dir.clone();
                         if Path::new(&dir).is_dir() {
-                            self.open_directory(&dir);
+                            self.open_explorer(&dir);
                         } else {
                             self.status = Some(format!("目录不存在: {dir}"));
                         }
@@ -837,12 +837,7 @@ impl ClientApp {
                 egui::Button::new(RichText::new("📂 打开目录")),
             );
             if open_dir.clicked() {
-                if let Err(e) = std::process::Command::new("explorer")
-                    .arg(&p.path)
-                    .spawn()
-                {
-                    self.status = Some(format!("打开目录失败: {e}"));
-                }
+                self.open_explorer(&p.path);
             }
             if ui.button("重命名").clicked() {
                 self.open_rename();
@@ -979,12 +974,18 @@ impl ClientApp {
                 let dir = std::env::var("USERPROFILE")
                     .or_else(|_| std::env::var("HOME"))
                     .unwrap_or_else(|_| ".".to_string());
-                match std::process::Command::new("explorer").arg(&dir).spawn() {
-                    Ok(_) => {
-                        self.status = Some(format!("已打开用户目录: {dir}"));
-                    }
-                    Err(e) => self.status = Some(format!("打开用户目录失败: {e}")),
-                }
+                self.open_explorer(dir);
+            }
+            if ui
+                .button("📂 打开软件目录")
+                .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
+                .clicked()
+            {
+                let dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                self.open_explorer(dir);
             }
         });
         ui.add_space(12.0);
