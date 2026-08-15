@@ -804,15 +804,45 @@ impl ClientApp {
                     open_url(&url);
                 }
             }
-            // 右下角：检查更新 + 深浅色切换（右侧第一个 = 最右）。
+            // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录 / 检查更新）+ 深浅色切换（右侧第一个 = 最右）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("🔄 检查更新")
-                    .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
-                    .clicked()
-                {
-                    self.check_updates(false);
-                }
+                ui.menu_button("⋯ 更多", |ui| {
+                    ui.set_min_width(170.0);
+                    if ui
+                        .button("📂 打开用户目录")
+                        .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
+                        .clicked()
+                    {
+                        let dir = std::env::var("USERPROFILE")
+                            .or_else(|_| std::env::var("HOME"))
+                            .unwrap_or_else(|_| ".".to_string());
+                        self.open_explorer(dir);
+                        ui.close();
+                    }
+                    if ui
+                        .button("📂 打开软件目录")
+                        .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
+                        .clicked()
+                    {
+                        let dir = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        self.open_explorer(dir);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button("🔄 检查更新")
+                        .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
+                        .clicked()
+                    {
+                        self.check_updates(false);
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("打开用户目录 / 软件目录 / 检查更新");
                 let dark = self.config.settings.dark_mode;
                 let theme_btn = if dark {
                     ui.button("☀ 浅色").on_hover_text("切换到浅色主题，字体与颜色同步切换")
@@ -1056,30 +1086,7 @@ impl ClientApp {
             )).weak());
         });
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
-            if ui
-                .button("📂 打开用户目录")
-                .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
-                .clicked()
-            {
-                let dir = std::env::var("USERPROFILE")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_else(|_| ".".to_string());
-                self.open_explorer(dir);
-            }
-            if ui
-                .button("📂 打开软件目录")
-                .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
-                .clicked()
-            {
-                let dir = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                    .unwrap_or_else(|| PathBuf::from("."));
-                self.open_explorer(dir);
-            }
-        });
+        ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
         if ui.button("← 返回项目列表").clicked() {
             self.screen = Screen::Main;
