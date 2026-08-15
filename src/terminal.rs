@@ -476,14 +476,12 @@ pub fn show_terminal(
     let cursor = content.cursor;
     // 当前选区范围（供高亮与复制共用；alacritty 核心随内容滚动自动维护）。
     let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
+    let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
 
-    let mut job = egui::text::LayoutJob::default();
-    job.break_on_newline = true;
-    // max_width 留 0.5px 余量：行宽恰好等于 cols*cell_w 时避免 egui 因舍入多换一行。
-    job.wrap.max_width = cols as f32 * cell_w + 0.5;
-    job.wrap.max_rows = rows;
-
-    let mut last_vline: Option<i32> = None;
+    // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
+    // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
+    // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
+    // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
     for indexed in content.display_iter {
         let point = indexed.point;
         // display_iter 返回绝对行号（历史区为负行），视口顶对应 line=-offset，
@@ -492,36 +490,23 @@ pub fn show_terminal(
         if vline < 0 || vline >= rows as i32 {
             continue;
         }
-        if let Some(prev) = last_vline {
-            if prev != vline {
-                job.append(
-                    "\n",
-                    0.0,
-                    egui::TextFormat {
-                        line_height: Some(cell_h),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-        last_vline = Some(vline);
-
         let cell = indexed.cell;
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
-        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+        let col = point.column.0 as usize;
+        let x = rect.left() + col as f32 * cell_w;
+        let y = rect.top() + vline as f32 * cell_h;
+        let wide = cell.flags.contains(Flags::WIDE_CHAR);
+        let slot_w = if wide { 2.0 * cell_w } else { cell_w };
 
-        let fg = resolve_color(cell.fg, colors, true, dark);
-        let bg = resolve_color(cell.bg, colors, false, dark);
-        let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
-            (bg, fg)
-        } else {
-            (fg, bg)
-        };
+        let (mut fg, mut bg) = (
+            resolve_color(cell.fg, colors, true, dark),
+            resolve_color(cell.bg, colors, false, dark),
+        );
+        if cell.flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
         // 浅色主题：把暗色主题 TUI 的深背景/浅前景适配成浅色界面可读组合。
         let (fg, bg) = if dark { (fg, bg) } else { adapt_to_light(fg, bg) };
-        // 选中格用蓝底白字高亮。
+        // 选中格用蓝底白字高亮（宽字符的占位格也按同一规则涂底）。
         let (fg, bg) = if sel_range
             .as_ref()
             .is_some_and(|r| cell_selected(r, indexed.point, cell))
@@ -531,24 +516,53 @@ pub fn show_terminal(
             (fg, bg)
         };
 
+        // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景；宽字格位是
+        // 2 格宽，只靠字形的背景（仅 14pt 宽）会露出右半格。
+        if bg != canvas_bg {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(x, y), Vec2::new(slot_w, cell_h)),
+                0.0,
+                bg,
+            );
+        }
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+
         let mut format = egui::TextFormat {
             font_id: font_id.clone(),
             color: fg,
-            background: bg,
             underline: Stroke::NONE,
             // 强制统一行高：CJK fallback 字体（msyh 等）行高与默认等宽字体不同，
             // 不指定会让含中文的行变高，导致整块内容逐行漂移、与光标/选区错位。
             line_height: Some(cell_h),
             ..Default::default()
         };
-        if cell.flags.contains(Flags::UNDERLINE) {
+        if cell.flags.contains(Flags::UNDERLINE) && !wide {
             format.underline = Stroke::new(1.0, fg);
         }
-        job.append(&ch.to_string(), 0.0, format);
+        let text = ch.to_string();
+        if wide {
+            // 宽字水平居中画在 2 格位内（CJK 字形通常比 2×M 窄），下划线横贯整格位。
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = slot_w;
+            job.halign = egui::Align::Center;
+            job.append(&text, 0.0, format);
+            painter.galley(Pos2::new(x, y), painter.layout_job(job), Color32::WHITE);
+            if cell.flags.contains(Flags::UNDERLINE) {
+                painter.hline(
+                    x..=(x + slot_w),
+                    y + cell_h - 1.0,
+                    Stroke::new(1.0, fg),
+                );
+            }
+        } else {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&text, 0.0, format);
+            painter.galley(Pos2::new(x, y), painter.layout_job(job), Color32::WHITE);
+        }
     }
-
-    let galley = painter.layout_job(job);
-    painter.galley(rect.left_top(), galley, Color32::WHITE);
 
     // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
     // 定位策略分两种：
@@ -595,10 +609,13 @@ pub fn show_terminal(
             let col = p.column.0 as usize;
             if col < cols {
                 let cursor_cell = &term.grid()[cpoint];
+                // 宽字符光标：方块/下划线/空心块都按 2 格宽画，避免只盖住半个汉字。
+                let cursor_wide = cursor_cell.flags.contains(Flags::WIDE_CHAR);
                 let x = rect.left() + col as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
+                let w = cell_w * if cursor_wide { 2.0 } else { 1.0 };
                 let cursor_cell_rect =
-                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, cell_h));
 
                 // 光标填充色与画布底色强对比：深色画布→白色光标、浅色画布→
                 // 黑色光标，深浅主题下都清晰可见（不能沿用单元格前景色：浅色
@@ -625,18 +642,20 @@ pub fn show_terminal(
                                     Stroke::new(1.0, fill),
                                     egui::StrokeKind::Inside,
                                 );
-                                // 反色重绘格内字符（宽字符按整字宽画出），保证光标内内容可读。
+                                // 反色重绘格内字符（宽字符居中画在整块内），保证光标内内容可读。
                                 let ch = cursor_cell.c;
                                 if ch != '\0'
                                     && !cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                                 {
-                                    painter.text(
-                                        Pos2::new(x, y + cell_h / 2.0),
-                                        egui::Align2::LEFT_CENTER,
-                                        ch.to_string(),
-                                        font_id.clone(),
-                                        ink,
-                                    );
+                                    let (pos, anchor) = if cursor_wide {
+                                        (
+                                            Pos2::new(x + w / 2.0, y + cell_h / 2.0),
+                                            egui::Align2::CENTER_CENTER,
+                                        )
+                                    } else {
+                                        (Pos2::new(x, y + cell_h / 2.0), egui::Align2::LEFT_CENTER)
+                                    };
+                                    painter.text(pos, anchor, ch.to_string(), font_id.clone(), ink);
                                 }
                             }
                             CursorShape::HollowBlock => {
