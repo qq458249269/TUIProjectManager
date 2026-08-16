@@ -759,7 +759,7 @@ impl ClientApp {
         // 布局内边距保持紧凑（页签间距小）；背景色块比布局框大 2px（见下方
         // rect.expand(2.0)），色块视觉上
         // 更饱满，但不撑大页签间距。
-        let tab_margin = egui::Margin { left: 10, right: 6, top: 3, bottom: 3 };
+        let tab_margin = egui::Margin { left: 2, right: 2, top: 2, bottom: 2 };
         // 各会话页签当前帧的矩形（索引 → rect），拖动落位时用来定位插入点。
         let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut drag_index: Option<usize> = None;

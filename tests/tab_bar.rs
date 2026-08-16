@@ -46,7 +46,7 @@ impl App {
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<Action> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
-        let tab_margin = egui::Margin { left: 10, right: 6, top: 3, bottom: 3 };
+        let tab_margin = egui::Margin { left: 2, right: 2, top: 2, bottom: 2 };
         let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut drag_index: Option<usize> = None;
         self.rects.clear();
