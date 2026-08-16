@@ -78,7 +78,7 @@ impl App {
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = tab_bg(sel_fill, selected, hovering);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand(2.0), 0.0, bg));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
             }
 
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
@@ -134,7 +134,7 @@ impl App {
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                     let bg = tab_bg(sel_fill, selected, hovering);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand(2.0), 0.0, bg));
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
                     tab_rects.push((i, rect));
                 }
             }
