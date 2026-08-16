@@ -756,7 +756,9 @@ impl ClientApp {
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<TabAction> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
-        // 页签块内边距：左侧留白给标题，右侧略窄让 ✕ 更贴边。
+        // 布局内边距保持紧凑（页签间距小）；背景色块比布局框大 2px（见下方
+        // rect.expand(2.0)），色块视觉上
+        // 更饱满，但不撑大页签间距。
         let tab_margin = egui::Margin { left: 10, right: 6, top: 3, bottom: 3 };
         // 各会话页签当前帧的矩形（索引 → rect），拖动落位时用来定位插入点。
         let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
@@ -790,7 +792,7 @@ impl ClientApp {
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = Self::tab_bg(sel_fill, selected, hovering);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand(2.0), 0.0, bg));
             }
 
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
@@ -885,7 +887,7 @@ impl ClientApp {
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                     let bg = Self::tab_bg(sel_fill, selected, hovering);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand(2.0), 0.0, bg));
                     tab_rects.push((i, rect));
                 }
             }

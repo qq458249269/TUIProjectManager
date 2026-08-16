@@ -46,7 +46,7 @@ impl App {
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<Action> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
-        let tab_margin = egui::Margin { left: 16, right: 10, top: 8, bottom: 8 };
+        let tab_margin = egui::Margin { left: 10, right: 6, top: 3, bottom: 3 };
         let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut drag_index: Option<usize> = None;
         self.rects.clear();
@@ -78,7 +78,7 @@ impl App {
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = tab_bg(sel_fill, selected, hovering);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand(2.0), 0.0, bg));
             }
 
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
@@ -134,7 +134,7 @@ impl App {
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                     let bg = tab_bg(sel_fill, selected, hovering);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand(2.0), 0.0, bg));
                     tab_rects.push((i, rect));
                 }
             }
