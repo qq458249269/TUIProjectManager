@@ -53,6 +53,17 @@ enum TabAction {
     OpenVSCode(usize),
 }
 
+/// 项目列表点击/双击/右键菜单产生的动作。
+enum ProjectAction {
+    Select(usize),
+    Launch(usize),
+    OpenDir(usize),
+    OpenVSCode(usize),
+    Rename(usize),
+    EditPath(usize),
+    Delete(usize),
+}
+
 /// 加载中文字体作为 Proportional 与 Monospace 的 fallback。
 fn setup_fonts(ctx: &egui::Context) {
     let candidates = [
@@ -320,6 +331,8 @@ pub struct ClientApp {
     redraw_rx: Receiver<()>,
     /// 页签拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
     drag_tab: Option<usize>,
+    /// 项目列表拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
+    drag_project: Option<usize>,
     /// 原生窗口句柄：启动时把 DWM 标题栏固定为黑色（运行中切换不可靠，直接固定）。
     titlebar_hwnd: isize,
 }
@@ -366,6 +379,7 @@ impl ClientApp {
             redraw_tx,
             redraw_rx,
             drag_tab: None,
+            drag_project: None,
             titlebar_hwnd,
         };
 
@@ -626,6 +640,41 @@ impl ClientApp {
         };
     }
 
+    /// 项目列表中把 from 移到插入点 insert_at（0..=len）。0 无固定项，全列表可移动。
+    /// 选中索引随重排修正，之后调用方负责 save_config 持久化。
+    fn move_project(&mut self, from: usize, insert_at: usize) {
+        let len = self.config.projects.len();
+        if from >= len || insert_at > len {
+            return;
+        }
+        let new_p = if insert_at > from { insert_at - 1 } else { insert_at };
+        if new_p == from {
+            return;
+        }
+        let sel = self.selected_project;
+        let p = self.config.projects.remove(from);
+        self.config.projects.insert(new_p, p);
+        // 重排后修选中索引：元素本身落到 new_p；其余位置随移除/插入平移。
+        self.selected_project = match sel.cmp(&from) {
+            std::cmp::Ordering::Equal => new_p,
+            std::cmp::Ordering::Greater => {
+                let s2 = sel - 1;
+                if s2 >= new_p {
+                    s2 + 1
+                } else {
+                    s2
+                }
+            }
+            std::cmp::Ordering::Less => {
+                if sel >= new_p {
+                    sel + 1
+                } else {
+                    sel
+                }
+            }
+        };
+    }
+
     fn update_exited(&mut self) -> bool {
         let mut changed = false;
         for tab in self.tabs.iter_mut() {
@@ -819,20 +868,55 @@ impl ClientApp {
                         .inner_margin(tab_margin)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
+                            // 最小宽度≈四个汉字（汉字宽度≈字号）：短标题（如单字项目名）
+                            // 不至于把页签缩成一小条，文字与 × 挤在一起、点选/拖拽目标过小。
+                            let min_width =
+                                ui.text_style_height(&egui::TextStyle::Body) * 4.0;
+                            // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
+                            // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
+                            // 点击判定靠帧内对该矩形做命中检查（见下方 clicked 分支）。
+                            // egui 横向布局无 flex：先量出标题与 × 的实际宽度，标题在槽内
+                            // 居中、× 右对齐——把差额拆成“标题左侧垫白”和“标题/× 之间垫白”
+                            // 两部分，等式让标题中心落在槽中心；差额小到撑不开中间空隙时全垫
+                            // 在左侧，正文与 × 紧邻（与自然宽标题行为一致）。
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let title_w = ui.ctx().fonts_mut(|f| {
+                                f.layout_no_wrap(title.clone(), font.clone(), Color32::TRANSPARENT)
+                                    .size()
+                                    .x
+                            });
+                            let close_w = ui.ctx().fonts_mut(|f| {
+                                f.layout_no_wrap("×".to_string(), font, Color32::TRANSPARENT)
+                                    .size()
+                                    .x
+                            });
+                            let s = ui.spacing().item_spacing.x;
+                            let slack = (min_width - title_w - s - close_w).max(0.0);
+                            let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
+                                // 左右空隙对等：pad_l = pad_m + s + close_w → 标题居中。
+                                ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
+                            } else if slack > 0.0 {
+                                (slack, 0.0)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            if pad_l > 0.0 {
+                                ui.add_space(pad_l);
+                            }
                             ui.add(
                                 if selected {
-                                    egui::Label::new(RichText::new(title).strong())
+                                    egui::Label::new(RichText::new(title.clone()).strong())
                                 } else {
-                                    egui::Label::new(RichText::new(title))
+                                    egui::Label::new(RichText::new(title.clone()))
                                 }
                                 // 页签文字不参与文本选择（egui 默认可选中，会在悬停/按下时
                                 // 强制 Text 光标覆盖我们设置的小手，见 label selection 插件
                                 // 的 on_end_pass），一并关掉。
                                 .selectable(false),
                             );
-                            // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
-                            // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
-                            // 点击判定靠帧内对该矩形做命中检查（见下方 clicked 分支）。
+                            if pad_m > 0.0 {
+                                ui.add_space(pad_m);
+                            }
                             (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
                         })
                         .inner;
@@ -1096,7 +1180,11 @@ impl ClientApp {
                     ui.label(RichText::new("暂无项目，点击「＋ 添加」创建一个。").weak());
                 }
                 let sel = self.selected_project;
-                let mut clicked: Option<usize> = None;
+                let sel_fill = ui.visuals().selection.bg_fill;
+                let mut actions: Vec<ProjectAction> = Vec::new();
+                // 各行矩形（索引 → rect），拖动落位时用来定位插入点。
+                let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
+                let mut drag_index: Option<usize> = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1112,17 +1200,199 @@ impl ClientApp {
                             } else {
                                 ui_warn(ui)
                             };
-                            if ui
-                                .selectable_label(sel == i, RichText::new(label).color(color))
-                                .clicked()
-                            {
-                                clicked = Some(i);
+                            // 整行可点可拖（click_and_drag 由 egui 延迟判定拖动，纯点击天然保留）；
+                            // min_size 撑满行宽，整条都能点击/拖起，比只点文字好操作。
+                            let resp = ui.add(
+                                egui::Button::selectable(sel == i, RichText::new(label).color(color))
+                                    .sense(egui::Sense::click_and_drag())
+                                    .min_size(egui::vec2(ui.available_width(), 0.0)),
+                            );
+                            if resp.clicked() {
+                                actions.push(ProjectAction::Select(i));
+                            }
+                            // 双击快速启动（首击已计入 clicked 完成选中，第二击两者同时触发，
+                            // 按先后顺序 Select 先于 Launch 执行，选中状态无竞争）。
+                            if resp.double_clicked() {
+                                actions.push(ProjectAction::Launch(i));
+                            }
+                            // 右键菜单：目录相关动作在目录不存在时置灰。
+                            resp.context_menu(|ui| {
+                                if ui
+                                    .add_enabled(exists, egui::Button::new("▶ 启动 (内嵌页签)"))
+                                    .on_hover_text("启动内嵌终端页签")
+                                    .clicked()
+                                {
+                                    actions.push(ProjectAction::Launch(i));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(exists, egui::Button::new("📂 打开目录"))
+                                    .on_hover_text("在资源管理器中打开该目录")
+                                    .clicked()
+                                {
+                                    actions.push(ProjectAction::OpenDir(i));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(exists, egui::Button::new("⌨ 在 VSCode 打开"))
+                                    .on_hover_text("用 VS Code 打开该目录（需安装 code 命令并加入 PATH）")
+                                    .clicked()
+                                {
+                                    actions.push(ProjectAction::OpenVSCode(i));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("重命名").clicked() {
+                                    actions.push(ProjectAction::Rename(i));
+                                    ui.close();
+                                }
+                                if ui.button("改路径").clicked() {
+                                    actions.push(ProjectAction::EditPath(i));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button("删除")
+                                    .on_hover_text("从列表中移除该项目（不改动磁盘文件）")
+                                    .clicked()
+                                {
+                                    actions.push(ProjectAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            // 拖动悬浮帧：记录源索引；行矩形供落位定位。
+                            if resp.dragged() {
+                                drag_index = Some(i);
+                            }
+                            row_rects.push((i, resp.rect));
+                        }
+                        // 拖动到列表上下边缘时自动滚动，让拖拽能到达视野外的项目。
+                        if self.drag_project.is_some() {
+                            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                                let clip = ui.clip_rect();
+                                let edge = 28.0;
+                                let dy = if pos.y < clip.top() + edge {
+                                    -24.0
+                                } else if pos.y > clip.bottom() - edge {
+                                    24.0
+                                } else {
+                                    0.0
+                                };
+                                if dy != 0.0 {
+                                    ui.scroll_with_delta(egui::vec2(0.0, dy));
+                                    ui.ctx().request_repaint();
+                                }
                             }
                         }
                     });
-                if let Some(i) = clicked {
-                    self.selected_project = i;
-                    self.screen = Screen::Main;
+                // 拖动状态跨帧保存在 self.drag_project：拖动中的每一帧刷新源索引，
+                // 松手帧（dragged() 已变 false）靠它仍拿得到 from。
+                if let Some(i) = drag_index {
+                    self.drag_project = Some(i);
+                }
+                if let Some(from) = self.drag_project {
+                    let pointer = ui.ctx().pointer_interact_pos();
+                    // 悬停目标：指针所在行的上半 → 插到它前面，下半 → 后面；
+                    // 落在最后一行下方 → 末尾，第一行上方 → 开头。
+                    let mut target: Option<(usize, f32)> = None;
+                    if let Some(pos) = pointer {
+                        for (i, rect) in &row_rects {
+                            if pos.y >= rect.top() && pos.y <= rect.bottom() {
+                                let by = if pos.y < rect.center().y {
+                                    rect.top()
+                                } else {
+                                    rect.bottom()
+                                };
+                                target = Some((*i, by));
+                                break;
+                            }
+                        }
+                        if target.is_none() {
+                            if let Some((last_i, last)) = row_rects.last() {
+                                if pos.y > last.bottom() {
+                                    target = Some((*last_i, last.bottom()));
+                                }
+                            }
+                            if let Some((first_i, first)) = row_rects.first() {
+                                if pos.y < first.top() {
+                                    target = Some((*first_i, first.top()));
+                                }
+                            }
+                        }
+                    }
+                    // 插入指示线：横贯列表宽度的细横线。
+                    if let Some((_, by)) = target {
+                        let area = egui::Rect::from_min_max(
+                            egui::pos2(ui.max_rect().left(), by - 1.5),
+                            egui::pos2(ui.max_rect().right(), by + 1.5),
+                        );
+                        ui.painter().rect_filled(area, 0.0, sel_fill);
+                    }
+                    if ui.input(|i| i.pointer.any_released()) {
+                        self.drag_project = None;
+                        if let Some((hov, _)) = target {
+                            let insert_at = match pointer.and_then(|pos| {
+                                row_rects
+                                    .iter()
+                                    .find(|(ii, _)| *ii == hov)
+                                    .map(|(_, r)| (pos, *r))
+                            }) {
+                                Some((pos, r)) => {
+                                    if pos.y < r.center().y {
+                                        hov
+                                    } else {
+                                        hov + 1
+                                    }
+                                }
+                                None => hov + 1,
+                            };
+                            self.move_project(from, insert_at);
+                            self.save_config("已调整项目顺序".to_string());
+                        }
+                    }
+                }
+                for action in actions {
+                    match action {
+                        ProjectAction::Select(i) => {
+                            self.selected_project = i;
+                            self.screen = Screen::Main;
+                        }
+                        ProjectAction::Launch(i) => {
+                            self.selected_project = i;
+                            self.launch_selected();
+                        }
+                        ProjectAction::OpenDir(i) => {
+                            self.selected_project = i;
+                            let Some(p) = self.config.projects.get(i) else { continue };
+                            let dir = p.path.clone();
+                            if Path::new(&dir).is_dir() {
+                                self.open_explorer(&dir);
+                            } else {
+                                self.status = Some(format!("目录不存在: {dir}"));
+                            }
+                        }
+                        ProjectAction::OpenVSCode(i) => {
+                            self.selected_project = i;
+                            let Some(p) = self.config.projects.get(i) else { continue };
+                            let dir = p.path.clone();
+                            if Path::new(&dir).is_dir() {
+                                self.open_in_vscode(&dir);
+                            } else {
+                                self.status = Some(format!("目录不存在: {dir}"));
+                            }
+                        }
+                        ProjectAction::Rename(i) => {
+                            self.selected_project = i;
+                            self.open_rename();
+                        }
+                        ProjectAction::EditPath(i) => {
+                            self.selected_project = i;
+                            self.open_edit_path();
+                        }
+                        ProjectAction::Delete(i) => {
+                            self.selected_project = i;
+                            self.request_delete();
+                        }
+                    }
                 }
             });
 
