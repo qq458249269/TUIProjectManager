@@ -318,6 +318,8 @@ pub struct ClientApp {
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
     redraw_rx: Receiver<()>,
+    /// 页签拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
+    drag_tab: Option<usize>,
     /// 原生窗口句柄：启动时把 DWM 标题栏固定为黑色（运行中切换不可靠，直接固定）。
     titlebar_hwnd: isize,
 }
@@ -363,6 +365,7 @@ impl ClientApp {
             update_rx,
             redraw_tx,
             redraw_rx,
+            drag_tab: None,
             titlebar_hwnd,
         };
 
@@ -588,6 +591,41 @@ impl ClientApp {
         self.status = Some("已关闭会话".to_string());
     }
 
+    /// 会话页签拖动落位：把 from 移到「原索引空间」的插入点 target（1..=len）。
+    /// 0 是固定的首页，不在可移动范围内。
+    fn move_tab(&mut self, from: usize, target: usize) {
+        let len = self.tabs.len();
+        if from == 0 || from >= len || target == 0 || target > len {
+            return;
+        }
+        let new_p = if target > from { target - 1 } else { target };
+        if new_p == from {
+            return;
+        }
+        let c = self.current;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(new_p, tab);
+        // 重排后修 current：元素本身落到 new_p；其余位置随移除/插入平移。
+        self.current = match c.cmp(&from) {
+            std::cmp::Ordering::Equal => new_p,
+            std::cmp::Ordering::Greater => {
+                let c2 = c - 1;
+                if c2 >= new_p {
+                    c2 + 1
+                } else {
+                    c2
+                }
+            }
+            std::cmp::Ordering::Less => {
+                if c >= new_p {
+                    c + 1
+                } else {
+                    c
+                }
+            }
+        };
+    }
+
     fn update_exited(&mut self) -> bool {
         let mut changed = false;
         for tab in self.tabs.iter_mut() {
@@ -704,66 +742,189 @@ impl ClientApp {
 
     // ---- 渲染 ----
 
+    /// 页签块底色：选中 → 实底高亮（蓝），悬停 → 半透明浅染，否则透明。
+    fn tab_bg(sel_fill: Color32, selected: bool, hovered: bool) -> Color32 {
+        if selected {
+            sel_fill
+        } else if hovered {
+            Color32::from_rgba_unmultiplied(sel_fill.r(), sel_fill.g(), sel_fill.b(), 60)
+        } else {
+            Color32::TRANSPARENT
+        }
+    }
+
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<TabAction> = Vec::new();
+        let sel_fill = ui.visuals().selection.bg_fill;
+        // 页签块内边距：左侧留白给标题，右侧略窄让 ✕ 更贴边。
+        let tab_margin = egui::Margin { left: 10, right: 6, top: 3, bottom: 3 };
+        // 各会话页签当前帧的矩形（索引 → rect），拖动落位时用来定位插入点。
+        let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut drag_index: Option<usize> = None;
+
         ui.horizontal(|ui| {
+            // 首页固定最左：不可拖动、不可关闭。
             if let Some(Tab::Home) = self.tabs.first() {
                 let selected = self.current == 0;
-                if ui
-                    .selectable_label(selected, RichText::new("🏠 首页").strong())
-                    .clicked()
-                    && !selected
-                {
+                // 先占一个 Noop 位置，内容画完后 set 成底色 → 色块盖在面板上、垫在文字后。
+                let bg_idx = ui.painter().add(egui::Shape::Noop);
+                let resp = egui::Frame::new()
+                    .corner_radius(4.0)
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(tab_margin)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new("🏠 首页").strong())
+                                .sense(egui::Sense::click()),
+                        )
+                    });
+                if resp.response.clicked() && !selected {
                     actions.push(TabAction::Activate(0));
                 }
+                let rect = resp.response.rect;
+                let hovering = !selected
+                    && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
+                let bg = Self::tab_bg(sel_fill, selected, hovering);
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 4.0, bg));
             }
+
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
-                    // 标题 + 关闭按钮一组，收紧间距让 ✕ 紧贴页签。
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        let title = if s.exited {
-                            format!("{} (已退出)", s.title)
-                        } else {
-                            s.title.clone()
-                        };
-                        let selected = self.current == i;
-                        let tab_resp = ui.selectable_label(selected, title);
-                        if tab_resp.clicked() && !selected {
-                            actions.push(TabAction::Activate(i));
-                        }
-                        // 右键页签弹出菜单：打开目录 / 在 VSCode 打开。
-                        tab_resp.context_menu(|ui| {
-                            if ui
-                                .button("📂 打开目录")
-                                .on_hover_text("在资源管理器中打开该会话目录")
-                                .clicked()
-                            {
-                                actions.push(TabAction::OpenDir(i));
-                                ui.close();
-                            }
-                            if ui
-                                .button("⌨ 在 VSCode 打开")
-                                .on_hover_text("用 VS Code 打开该会话目录（需安装 code 命令并加入 PATH）")
-                                .clicked()
-                            {
-                                actions.push(TabAction::OpenVSCode(i));
-                                ui.close();
-                            }
-                        });
-                        // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
-                        // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
-                        if ui.add(egui::Button::new("×").small().frame(false))
-                            .on_hover_text("关闭会话")
-                            .clicked()
-                        {
-                            actions.push(TabAction::Close(i));
-                        }
-                    });
+                    let title = if s.exited {
+                        format!("{} (已退出)", s.title)
+                    } else {
+                        s.title.clone()
+                    };
+                    let selected = self.current == i;
+                    // 刚拖起的帧里画底色需要 Noop 在内容之前插入，所以先占位。
+                    let bg_idx = ui.painter().add(egui::Shape::Noop);
+                    // 整块可拖（dnd_drag_source 给整块注册 Sense::drag），标题可点击激活。
+                    let inner = ui.dnd_drag_source(
+                        egui::Id::new(("session_tab", i, s.dir.as_str())),
+                        i,
+                        |ui| {
+                            egui::Frame::new()
+                                .corner_radius(4.0)
+                                .fill(Color32::TRANSPARENT)
+                                .inner_margin(tab_margin)
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    let resp = ui.add(
+                                        egui::Label::new(if selected {
+                                            RichText::new(title).strong()
+                                        } else {
+                                            RichText::new(title)
+                                        })
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if resp.clicked() && !selected {
+                                        actions.push(TabAction::Activate(i));
+                                    }
+                                    // 右键页签弹出菜单：打开目录 / 在 VSCode 打开。
+                                    resp.context_menu(|ui| {
+                                        if ui
+                                            .button("📂 打开目录")
+                                            .on_hover_text("在资源管理器中打开该会话目录")
+                                            .clicked()
+                                        {
+                                            actions.push(TabAction::OpenDir(i));
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .button("⌨ 在 VSCode 打开")
+                                            .on_hover_text("用 VS Code 打开该会话目录（需安装 code 命令并加入 PATH）")
+                                            .clicked()
+                                        {
+                                            actions.push(TabAction::OpenVSCode(i));
+                                            ui.close();
+                                        }
+                                    });
+                                    // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
+                                    // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
+                                    // 与标题同处一个 Frame → 关闭按钮包含在选中蓝块内。
+                                    if ui
+                                        .add(egui::Button::new("×").small().frame(false))
+                                        .on_hover_text("关闭会话")
+                                        .clicked()
+                                    {
+                                        actions.push(TabAction::Close(i));
+                                    }
+                                });
+                        },
+                    );
+                    let rect = inner.response.rect;
+                    if inner.response.dragged() {
+                        drag_index = Some(i);
+                    }
+                    let hovering = !selected
+                        && drag_index.is_none()
+                        && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
+                    let bg = Self::tab_bg(sel_fill, selected, hovering);
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 4.0, bg));
+                    tab_rects.push((i, rect));
                 }
             }
         });
+
+        // 拖动状态跨帧保存在 self.drag_tab：拖动中的每一帧刷新源索引，
+        // 松手帧（dragged() 已变 false）靠它仍拿得到 from。
+        if let Some(i) = drag_index {
+            self.drag_tab = Some(i);
+        }
+        if let Some(from) = self.drag_tab {
+            let pointer = ui.ctx().pointer_interact_pos();
+            // 悬停目标：指针所在页签的左半 → 插到它前面，右半 → 后面。
+            let mut target: Option<(usize, f32)> = None;
+            if let Some(pos) = pointer {
+                for (i, rect) in &tab_rects {
+                    if rect.contains(pos) {
+                        let bx = if pos.x < rect.center().x {
+                            rect.left()
+                        } else {
+                            rect.right()
+                        };
+                        target = Some((*i, bx));
+                        break;
+                    }
+                }
+            }
+            // 插入指示条：从页签栏顶部画到底部的细竖线。
+            if let Some((_, bx)) = target {
+                let area = ui.max_rect();
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(bx - 1.0, area.top()),
+                        egui::pos2(bx + 1.0, area.bottom()),
+                    ),
+                    0.0,
+                    sel_fill,
+                );
+            }
+            if ui.input(|i| i.pointer.any_released()) {
+                self.drag_tab = None;
+                if let Some((hov, _)) = target {
+                    let p = match pointer.and_then(|pos| {
+                        tab_rects
+                            .iter()
+                            .find(|(ii, _)| *ii == hov)
+                            .map(|(_, r)| (pos, *r))
+                    }) {
+                        Some((pos, r)) => {
+                            if pos.x < r.center().x {
+                                hov
+                            } else {
+                                hov + 1
+                            }
+                        }
+                        None => hov,
+                    };
+                    self.move_tab(from, p);
+                    self.status = Some("已调整页签顺序".to_string());
+                }
+            }
+        }
+
         for action in actions {
             match action {
                 TabAction::Activate(i) => {
