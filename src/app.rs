@@ -797,66 +797,70 @@ impl ClientApp {
                         s.title.clone()
                     };
                     let selected = self.current == i;
+                    let dir_key = s.dir.as_str();
                     // 刚拖起的帧里画底色需要 Noop 在内容之前插入，所以先占位。
                     let bg_idx = ui.painter().add(egui::Shape::Noop);
-                    // 整块可拖（dnd_drag_source 给整块注册 Sense::drag），标题可点击激活。
-                    let inner = ui.dnd_drag_source(
-                        egui::Id::new(("session_tab", i, s.dir.as_str())),
-                        i,
-                        |ui| {
-                            egui::Frame::new()
-                                .corner_radius(4.0)
-                                .fill(Color32::TRANSPARENT)
-                                .inner_margin(tab_margin)
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    let resp = ui.add(
-                                        egui::Label::new(if selected {
-                                            RichText::new(title).strong()
-                                        } else {
-                                            RichText::new(title)
-                                        })
-                                        .sense(egui::Sense::click()),
-                                    );
-                                    if resp.clicked() && !selected {
-                                        actions.push(TabAction::Activate(i));
-                                    }
-                                    // 右键页签弹出菜单：打开目录 / 在 VSCode 打开。
-                                    resp.context_menu(|ui| {
-                                        if ui
-                                            .button("📂 打开目录")
-                                            .on_hover_text("在资源管理器中打开该会话目录")
-                                            .clicked()
-                                        {
-                                            actions.push(TabAction::OpenDir(i));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .button("⌨ 在 VSCode 打开")
-                                            .on_hover_text("用 VS Code 打开该会话目录（需安装 code 命令并加入 PATH）")
-                                            .clicked()
-                                        {
-                                            actions.push(TabAction::OpenVSCode(i));
-                                            ui.close();
-                                        }
-                                    });
-                                    // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
-                                    // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
-                                    // 与标题同处一个 Frame → 关闭按钮包含在选中蓝块内。
-                                    if ui
-                                        .add(egui::Button::new("×").small().frame(false))
-                                        .on_hover_text("关闭会话")
-                                        .clicked()
-                                    {
-                                        actions.push(TabAction::Close(i));
-                                    }
-                                });
-                        },
+                    // 整块交互：一个 Sense::click_and_drag 控件同时承担 单击（激活/关闭）
+                    // 与 按住拖动（重排）。不用 dnd_drag_source：其内部容器的 dragged 标志
+                    // 读取不可靠（egui 0.36 压测见 tests/tab_click.rs），会把点击和拖动都
+                    // 搅在一起，还自带 Grab 光标；click_and_drag 由 egui 延迟判定拖动
+                    // （指针过了阈值才算拖动），纯点击天然保留，光标也不再变
+                    // 成拖拽手势。
+                    let (close_rect, frame_resp) = egui::Frame::new()
+                        .corner_radius(4.0)
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(tab_margin)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.add(if selected {
+                                egui::Label::new(RichText::new(title).strong())
+                            } else {
+                                egui::Label::new(RichText::new(title))
+                            });
+                            // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
+                            // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
+                            // 点击判定靠帧内对该矩形做命中检查（见下方 clicked 分支）。
+                            (ui.add(egui::Label::new("×")).rect, ui.response())
+                        })
+                        .inner;
+                    let rect = frame_resp.rect;
+                    // 交互层注册在内容之后（更上层），点击/拖动都落在它身上。
+                    let resp = ui.interact(
+                        rect,
+                        egui::Id::new(("session_tab", i, dir_key)),
+                        egui::Sense::click_and_drag(),
                     );
-                    let rect = inner.response.rect;
-                    if inner.response.dragged() {
+                    if resp.dragged() {
                         drag_index = Some(i);
                     }
+                    if resp.clicked() {
+                        let pos = ui.ctx().pointer_interact_pos();
+                        // 指针按在 × 上 —— 关闭；否则 —— 激活（已激活的页签 no-op）。
+                        if pos.is_some_and(|p| close_rect.contains(p)) {
+                            actions.push(TabAction::Close(i));
+                        } else if !selected {
+                            actions.push(TabAction::Activate(i));
+                        }
+                    }
+                    // 右键页签弹出菜单：打开目录 / 在 VSCode 打开（整块右键都响应）。
+                    resp.context_menu(|ui| {
+                        if ui
+                            .button("📂 打开目录")
+                            .on_hover_text("在资源管理器中打开该会话目录")
+                            .clicked()
+                        {
+                            actions.push(TabAction::OpenDir(i));
+                            ui.close();
+                        }
+                        if ui
+                            .button("⌨ 在 VSCode 打开")
+                            .on_hover_text("用 VS Code 打开该会话目录（需安装 code 命令并加入 PATH）")
+                            .clicked()
+                        {
+                            actions.push(TabAction::OpenVSCode(i));
+                            ui.close();
+                        }
+                    });
                     let hovering = !selected
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
