@@ -46,7 +46,7 @@ impl App {
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<Action> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
-        let tab_margin = egui::Margin { left: 10, right: 6, top: 3, bottom: 3 };
+        let tab_margin = egui::Margin { left: 12, right: 8, top: 5, bottom: 5 };
         let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut drag_index: Option<usize> = None;
         self.rects.clear();
@@ -56,11 +56,12 @@ impl App {
                 let selected = self.current == 0;
                 let bg_idx = ui.painter().add(egui::Shape::Noop);
                 let resp = egui::Frame::new()
-                    .corner_radius(4.0)
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(tab_margin)
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new("🏠 首页").strong()))
+                        ui.add(
+                            egui::Label::new(RichText::new("🏠 首页").strong()).selectable(false),
+                        )
                     });
                 let rect = resp.response.rect;
                 // 交互层注册在内容之后：单击切回首页。不用 Label 自带 sense——
@@ -69,11 +70,15 @@ impl App {
                 if hit.clicked() && !selected {
                     actions.push(Action::Activate(0));
                 }
+                // 首页是按钮：悬停显示小手。
+                if hit.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
                 self.home_rect = Some(rect);
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = tab_bg(sel_fill, selected, hovering);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 4.0, bg));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
             }
 
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
@@ -84,17 +89,19 @@ impl App {
                     let dir_key = s.dir;
                     let bg_idx = ui.painter().add(egui::Shape::Noop);
                     let (close_rect, frame_resp) = egui::Frame::new()
-                        .corner_radius(4.0)
                         .fill(Color32::TRANSPARENT)
                         .inner_margin(tab_margin)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.add(if selected {
-                                egui::Label::new(RichText::new(title).strong())
-                            } else {
-                                egui::Label::new(RichText::new(title))
-                            });
-                            (ui.add(egui::Label::new("×")).rect, ui.response())
+                            ui.add(
+                                if selected {
+                                    egui::Label::new(RichText::new(title).strong())
+                                } else {
+                                    egui::Label::new(RichText::new(title))
+                                }
+                                .selectable(false),
+                            );
+                            (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
                         })
                         .inner;
                     let rect = frame_resp.rect;
@@ -114,11 +121,20 @@ impl App {
                             actions.push(Action::Activate(i));
                         }
                     }
+                    // × 上悬停 → 小手（其余区域保持普通箭头）。
+                    if resp.hovered()
+                        && ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .is_some_and(|p| close_rect.contains(p))
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
                     let hovering = !selected
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                     let bg = tab_bg(sel_fill, selected, hovering);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 4.0, bg));
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
                     tab_rects.push((i, rect));
                 }
             }
@@ -259,8 +275,13 @@ fn click_close_drag_cursor() {
     assert_eq!(h.current, 1);
     frame(&ctx, vec![Event::PointerMoved(home.center())], &mut h);
     frame(&ctx, vec![btn(home.center(), true)], &mut h);
-    frame(&ctx, vec![btn(home.center(), false)], &mut h);
+    let home_cur = frame(&ctx, vec![btn(home.center(), false)], &mut h);
     assert_eq!(h.current, 0, "点击首页应切回");
+    assert_eq!(
+        home_cur,
+        egui::CursorIcon::PointingHand,
+        "悬停首页应显示小手"
+    );
 
     // 1) 点击 t2 → 激活
     let mut a = new_app();
@@ -270,15 +291,28 @@ fn click_close_drag_cursor() {
     assert_eq!(a.current, 2, "点击应激活 tab2");
     assert_eq!(cur, egui::CursorIcon::Default, "点击时不展现 Grab");
 
-    // 2) 悬停 → 普通光标（无 Grab）
+    // 2) 悬停页签正文 → 普通光标（无 Grab）；悬停 × → 小手
+    // 注意：hovered 标志在 headless 里滞后一帧，同位置的 move 各发两次。
     let cur = frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut a);
-    assert_eq!(cur, egui::CursorIcon::Default, "悬停不设置任何光标（默认普通）");
+    let cur = frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut a);
+    assert_eq!(cur, egui::CursorIcon::Default, "页签正文悬停为普通箭头");
+    let xp_hover = egui::pos2(t1.right() - 3.5, t1.center().y);
+    let cur = frame(&ctx, vec![Event::PointerMoved(xp_hover)], &mut a);
+    let cur = frame(&ctx, vec![Event::PointerMoved(xp_hover)], &mut a);
+    assert_eq!(
+        cur,
+        egui::CursorIcon::PointingHand,
+        "悬停 × 上应显示小手"
+    );
+    let cur = frame(&ctx, vec![Event::PointerMoved(t3.center())], &mut a);
+    let cur = frame(&ctx, vec![Event::PointerMoved(t3.center())], &mut a);
+    assert_eq!(cur, egui::CursorIcon::Default, "其他页签正文仍为普通箭头");
 
     // 3) 点击 t1 的 × → 关闭 t1
     let mut b = new_app();
     frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut b);
-    // × 在右侧：取 t1 右边缘往里一点
-    let xp = egui::pos2(t1.right() - 4.0, t1.center().y);
+    // × 在右侧：右内边距 8，取 × 字形内部（≈ [right-7.3, right]）
+    let xp = egui::pos2(t1.right() - 3.5, t1.center().y);
     frame(&ctx, vec![btn(xp, true)], &mut b);
     frame(&ctx, vec![btn(xp, false)], &mut b);
     assert_eq!(titles(&b), vec!["H", "bbb", "ccc"], "点击 × 应关闭该页签");

@@ -773,7 +773,10 @@ impl ClientApp {
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(tab_margin)
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new("🏠 首页").strong()))
+                        ui.add(
+                            egui::Label::new(RichText::new("🏠 首页").strong())
+                                .selectable(false),
+                        )
                     });
                 let rect = resp.response.rect;
                 // 交互层注册在内容之后：单击切回首页。出于一致性与可读性，
@@ -787,7 +790,7 @@ impl ClientApp {
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = Self::tab_bg(sel_fill, selected, hovering);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 4.0, bg));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
             }
 
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
@@ -814,15 +817,21 @@ impl ClientApp {
                         .inner_margin(tab_margin)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.add(if selected {
-                                egui::Label::new(RichText::new(title).strong())
-                            } else {
-                                egui::Label::new(RichText::new(title))
-                            });
+                            ui.add(
+                                if selected {
+                                    egui::Label::new(RichText::new(title).strong())
+                                } else {
+                                    egui::Label::new(RichText::new(title))
+                                }
+                                // 页签文字不参与文本选择（egui 默认可选中，会在悬停/按下时
+                                // 强制 Text 光标覆盖我们设置的小手，见 label selection 插件
+                                // 的 on_end_pass），一并关掉。
+                                .selectable(false),
+                            );
                             // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
                             // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
                             // 点击判定靠帧内对该矩形做命中检查（见下方 clicked 分支）。
-                            (ui.add(egui::Label::new("×")).rect, ui.response())
+                            (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
                         })
                         .inner;
                     let rect = frame_resp.rect;
@@ -863,11 +872,20 @@ impl ClientApp {
                             ui.close();
                         }
                     });
+                    // × 上悬停 → 小手（其余区域保持普通箭头，暗示可点/可拖）。
+                    if resp.hovered()
+                        && ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .is_some_and(|p| close_rect.contains(p))
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
                     let hovering = !selected
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                     let bg = Self::tab_bg(sel_fill, selected, hovering);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 4.0, bg));
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
                     tab_rects.push((i, rect));
                 }
             }
