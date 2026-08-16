@@ -24,6 +24,7 @@ struct App {
     current: usize,
     drag_tab: Option<usize>,
     rects: Vec<(usize, Rect)>,
+    home_rect: Option<Rect>,
 }
 
 enum Action {
@@ -59,12 +60,16 @@ impl App {
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(tab_margin)
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new("🏠 首页").strong()).sense(egui::Sense::click()))
+                        ui.add(egui::Label::new(RichText::new("🏠 首页").strong()))
                     });
-                if resp.response.clicked() && !selected {
+                let rect = resp.response.rect;
+                // 交互层注册在内容之后：单击切回首页。不用 Label 自带 sense——
+                // Frame 的 response 是另一个控件，读不到内层 label 的点击。
+                let hit = ui.interact(rect, egui::Id::new("home_tab"), Sense::click());
+                if hit.clicked() && !selected {
                     actions.push(Action::Activate(0));
                 }
-                let rect = resp.response.rect;
+                self.home_rect = Some(rect);
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = tab_bg(sel_fill, selected, hovering);
@@ -193,6 +198,8 @@ fn new_app() -> App {
         current: 0,
         drag_tab: None,
         rects: Vec::new(),
+        home_rect: None,
+
     }
 }
 
@@ -238,11 +245,22 @@ fn click_close_drag_cursor() {
     // 第二帧才有真实的 rect（ui.response() 基于上一帧）
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(10.0, 10.0))], &mut app);
     let (home, t1, t2, t3) = (
-        app.rects[0].1,
+        app.home_rect.unwrap(),
         app.rects.iter().find(|(i, _)| *i == 1).unwrap().1,
         app.rects.iter().find(|(i, _)| *i == 2).unwrap().1,
         app.rects.iter().find(|(i, _)| *i == 3).unwrap().1,
     );
+
+    // 0) 从会话切回首页：先激活 tab1，再点首页
+    let mut h = new_app();
+    frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut h);
+    frame(&ctx, vec![btn(t1.center(), true)], &mut h);
+    frame(&ctx, vec![btn(t1.center(), false)], &mut h);
+    assert_eq!(h.current, 1);
+    frame(&ctx, vec![Event::PointerMoved(home.center())], &mut h);
+    frame(&ctx, vec![btn(home.center(), true)], &mut h);
+    frame(&ctx, vec![btn(home.center(), false)], &mut h);
+    assert_eq!(h.current, 0, "点击首页应切回");
 
     // 1) 点击 t2 → 激活
     let mut a = new_app();

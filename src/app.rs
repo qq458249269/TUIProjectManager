@@ -773,15 +773,17 @@ impl ClientApp {
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(tab_margin)
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new("🏠 首页").strong())
-                                .sense(egui::Sense::click()),
-                        )
+                        ui.add(egui::Label::new(RichText::new("🏠 首页").strong()))
                     });
-                if resp.response.clicked() && !selected {
+                let rect = resp.response.rect;
+                // 交互层注册在内容之后：单击切回首页。出于一致性与可读性，
+                // 不用 Label 自带的 sense——其点击不会反映到 Frame 的 response 上
+                // （egui 里 Frame 的 response 是另一块无点击感的控件）。
+                // 只感 click、不感 drag：首页固定最左，不可拖动、不可关闭。
+                let hit = ui.interact(rect, egui::Id::new("home_tab"), egui::Sense::click());
+                if hit.clicked() && !selected {
                     actions.push(TabAction::Activate(0));
                 }
-                let rect = resp.response.rect;
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = Self::tab_bg(sel_fill, selected, hovering);
