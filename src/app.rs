@@ -1135,7 +1135,7 @@ impl ClientApp {
     fn broadcast_theme(&mut self) {
         let dark = self.config.settings.dark_mode;
         let (fg, bg) = if dark { ("ffffff", "16161a") } else { ("000000", "ffffff") };
-        let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\\\x1b]11;rgb:{bg}/{bg}/{bg}\x1b\\\\")
+        let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\x1b]11;rgb:{bg}/{bg}/{bg}\x1b\\")
             .into_bytes();
         for tab in &mut self.tabs {
             if let Tab::Session(s) = tab {

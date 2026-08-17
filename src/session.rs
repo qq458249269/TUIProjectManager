@@ -105,7 +105,7 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
                 osc_color = true;
                 let c = if osc_num == 10 { fg } else { bg };
                 out.extend_from_slice(
-                    format!("\x1b]{osc_num};rgb:{c}/{c}/{c}\x1b\\\\").as_bytes(),
+                    format!("\x1b]{osc_num};rgb:{c}/{c}/{c}\x1b\\").as_bytes(),
                 );
             } else if osc_num == 4 {
                 if let Some(rest) = body.strip_suffix(b";?") {
@@ -113,7 +113,7 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
                         if idx <= 15 {
                             osc_color = true;
                             out.extend_from_slice(
-                                format!("\x1b]4;{idx};rgb:000000/000000/000000\x1b\\\\").as_bytes(),
+                                format!("\x1b]4;{idx};rgb:000000/000000/000000\x1b\\").as_bytes(),
                             );
                         }
                     }
@@ -439,6 +439,57 @@ mod tests {
             "终端内容中没有 HELLO123, 实际: {text}"
         );
 
+        let _ = sess.child.kill();
+    }
+
+    /// 复现“启动/切换主题自动输入反斜杠”的根因：OSC 应答/广播的 ST 终止符必须是
+    /// `\x1b\`（ESC+单个反斜杠）。写成 `\x1b\\\\` 会多出一个 0x5c，被不识 OSC
+    /// 的 shell 直接回显（启动答一次=一个 `\`，主题广播两个序列=`\\`）。
+    /// 另：不认 OSC 的 shell（cmd）根本不应收到颜色广播（osc_theme_aware 守卫）。
+    #[test]
+    fn shell_gets_no_stray_backslashes() {
+        fn term_text(sess: &Session) -> String {
+            let term = sess.term.lock().unwrap();
+            let content = term.renderable_content();
+            let mut text = String::new();
+            for idx in content.display_iter {
+                let cell = idx.cell;
+                if cell.c != '\0' && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    text.push(cell.c);
+                }
+            }
+            text
+        }
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = eframe::egui::Context::default();
+        let mut sess = spawn("t", ".", "cmd", 80, 24, tx, ctx).expect("spawn cmd");
+        std::thread::sleep(Duration::from_millis(1500));
+        let text = term_text(&sess);
+        // cmd 提示符本身含反斜杠（D:\…>），只检“提示符后被自动输入的内容”：
+        // 最后一行应恰好结束在 `>` 上，之后不得有任何回显字符。
+        let last = text.lines().rev().find(|l| !l.trim().is_empty());
+        assert!(
+            last.is_some_and(|l| l.trim_end().ends_with('>')),
+            "启动后 shell 被自动输入了内容（最后一行不是空提示符）:\n{text}"
+        );
+
+        // OSC 颜色查询应答的 ST 终止符必须恰好是 ESC+单个反斜杠，
+        // 不能多出第二个 0x5c（那就是“自动输入的反斜杠”）。
+        let listener = SessionListener {
+            writer: std::sync::mpsc::sync_channel(1).0,
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+        };
+        let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
+        let (reply, aware) =
+            reply_to_queries(&term, b"\x1b]11;?\x1b\\", true).expect("OSC11 查询应答");
+        assert!(aware, "OSC 11 查询应标记 osc_theme_aware");
+        let s = String::from_utf8_lossy(&reply);
+        assert!(
+            s.ends_with("\x1b\\") && !s[..s.len() - 2].contains('\\'),
+            "OSC 应答 ST 必须是 ESC+单个反斜杠，实际: {s:?}"
+        );
         let _ = sess.child.kill();
     }
 
