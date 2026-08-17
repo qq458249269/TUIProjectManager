@@ -102,6 +102,14 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     } else {
         egui::ThemePreference::Light
     });
+    // 选中文字强制白色：egui 默认把选中字色设为 selection.stroke 的浅蓝
+    // （深色 192,222,255），落在同色系蓝底（0,92,128）上发蓝发虚；改白色后
+    // 深浅两主题都要生效（主题切换时 set_theme 会覆盖回默认 selection）。
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let mut visuals = ctx.style_of(theme).visuals.clone();
+        visuals.selection.stroke.color = Color32::WHITE;
+        ctx.set_visuals_of(theme, visuals);
+    }
 }
 
 /// 从 eframe 的创建上下文里取原生窗口句柄（Windows HWND）。
