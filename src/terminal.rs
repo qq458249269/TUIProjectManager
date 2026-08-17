@@ -458,18 +458,12 @@ pub fn show_terminal(
             }
         }
         Some(TermAction::Paste) => {
-            // 剪贴板有文件（Explorer 复制/剪切）→ 直接填路径；否则走系统文本
-            // 粘贴（清掉选区，下一帧 egui 投递 Event::Paste，聚焦终端后可写入）。
-            let files = crate::clipboard::clipboard_files();
-            if files.is_empty() {
-                if let Ok(mut t) = sess.term.lock() {
-                    t.selection = None;
-                }
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-                *term_focused = true;
-            } else {
-                let _ = sess.writer.try_send(files.join(" ").into_bytes());
+            // 清掉选区再触发系统粘贴：下一帧 egui 投递 Event::Paste，聚焦终端后才能写入。
+            if let Ok(mut t) = sess.term.lock() {
+                t.selection = None;
             }
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            *term_focused = true;
         }
         Some(TermAction::ClearInput) => {
             // 等效按住退格键直到清空：从视口顶行到光标处整块统计字符数，再发送
@@ -519,31 +513,6 @@ pub fn show_terminal(
     let mut preedit = String::new();
 
     if *term_focused {
-        // 剪贴板文件粘贴（Ctrl+V，winit 消息钩子置位，见 clipboard.rs）：
-        // 用户复制/剪切了文件 → 把路径空格拼接直接填入，不走系统文本粘贴。
-        if crate::clipboard::FILES_PASTE_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            let paths = crate::clipboard::clipboard_files();
-            if !paths.is_empty() {
-                bytes_out.push(paths.join(" ").into_bytes());
-            }
-        }
-
-        // 拖拽文件入终端：egui 把 dropped_files 派发给每个面板，只有鼠标
-        // 落在本终端矩形内才收下（多个终端各取各的，不重复）。
-        let dropped = ui.input(|i| i.raw.dropped_files.clone());
-        if !dropped.is_empty() {
-            let pointer = ui.input(|i| i.pointer.latest_pos());
-            if pointer.is_some_and(|p| rect.contains(p)) {
-                let paths: Vec<String> = dropped
-                    .iter()
-                    .filter_map(|f| f.path().to_str().map(|s| s.to_string()))
-                    .collect();
-                if !paths.is_empty() {
-                    bytes_out.push(paths.join(" ").into_bytes());
-                }
-            }
-        }
-
         let events = ui.input(|i| i.events.clone());
         let alt_down = ui.input(|i| i.modifiers.alt);
         for ev in &events {
@@ -689,15 +658,12 @@ pub fn show_terminal(
         }
         // 浅色主题：把暗色主题 TUI 的深背景/浅前景适配成浅色界面可读组合。
         let (fg, bg) = if dark { (fg, bg) } else { adapt_to_light(fg, bg) };
-        // 选中格用白字深蓝灰底高亮（宽字符的占位格也按同一规则涂底）。
-        // 底不用饱和蓝 (0,110,210)：14px 汉字笔划细，白字与蓝底的抗锯齿中间色
-        // 是浅蓝（如 #2080D8），与底色同色系 → 汉字看着“没变白、看不清”；
-        // 深蓝灰 (48,58,80) 下中间色变成深灰，字形轮廓清晰。
+        // 选中格用蓝底白字高亮（宽字符的占位格也按同一规则涂底）。
         let (fg, bg) = if sel_range
             .as_ref()
             .is_some_and(|r| cell_selected(r, indexed.point, cell))
         {
-            (Color32::WHITE, Color32::from_rgb(48, 58, 80))
+            (Color32::WHITE, Color32::from_rgb(0, 110, 210))
         } else {
             (fg, bg)
         };

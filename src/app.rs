@@ -95,11 +95,6 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 }
 
-/// 页签选中底色：固定深浅两套，不跟 selection visuals 走——选区底色改为深色后，
-/// 浅色主题页签的深色标题不能落在深底上。
-const TAB_SEL_DARK: Color32 = Color32::from_rgb(0, 92, 128);
-const TAB_SEL_LIGHT: Color32 = Color32::from_rgb(144, 209, 255);
-
 /// 应用深浅主题（egui 全部控件/字体颜色随之切换）。
 fn apply_theme(ctx: &egui::Context, dark: bool) {
     ctx.set_theme(if dark {
@@ -107,14 +102,11 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     } else {
         egui::ThemePreference::Light
     });
-    // 选中文字强制纯白 + 选中底色统一换成深蓝灰：
-    // 1) egui 默认把选中字色设为 selection.stroke 的浅蓝（深色 192,222,255，
-    //    落在同色系蓝底上发蓝），强制白字；
-    // 2) 浅色主题的选中底默认 144,209,255 是浅蓝，白字在上面几乎看不见，
-    //    必须换成深底（与终端选区同色），白字才读得出。
+    // 选中文字强制纯白：egui 默认把选中字色设为 selection.stroke 的浅蓝
+    // （深色 192,222,255），落在同色系蓝底（0,92,128）上发蓝发虚。
+    // all_styles_mut 直接改双主题内部样式，深浅切换都会生效。
     ctx.all_styles_mut(|style| {
         style.visuals.selection.stroke.color = Color32::WHITE;
-        style.visuals.selection.bg_fill = Color32::from_rgb(48, 58, 80);
     });
 }
 
@@ -827,7 +819,6 @@ impl ClientApp {
     // ---- 渲染 ----
 
     /// 页签块底色：选中 → 实底高亮（蓝），悬停 → 半透明浅染，否则透明。
-    /// 用固定色而非 selection 视觉：选区底色已改深，页签不能跟着变。
     fn tab_bg(sel_fill: Color32, selected: bool, hovered: bool) -> Color32 {
         if selected {
             sel_fill
@@ -840,11 +831,7 @@ impl ClientApp {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<TabAction> = Vec::new();
-        let sel_fill = if ui.visuals().dark_mode {
-            TAB_SEL_DARK
-        } else {
-            TAB_SEL_LIGHT
-        };
+        let sel_fill = ui.visuals().selection.bg_fill;
         // 布局内边距保持紧凑（页签间距小）；背景色块比布局框大：左右各 5px、
         // 上下各 2px（见下方 rect.expand2），色块视觉上
         // 更饱满，但不撑大页签间距。
@@ -1998,10 +1985,6 @@ impl eframe::App for ClientApp {
 
         self.input_dialog(ui);
         self.confirm_dialog(ui);
-
-        // 剪贴板文件粘贴标志：无终端页签聚焦（如首页）时没人消费，这里兜底清掉，
-        // 避免切回终端页后“闪击”出一次迟到的文件粘贴。
-        crate::clipboard::FILES_PASTE_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 #[cfg(all(test, windows))]

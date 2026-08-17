@@ -1,7 +1,6 @@
 #![windows_subsystem = "windows"]
 
 mod app;
-mod clipboard;
 mod config;
 mod session;
 mod terminal;
@@ -29,20 +28,11 @@ fn main() -> eframe::Result {
     if config.window.maximized {
         viewport = viewport.with_maximized(true);
     }
-    let mut options = eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport,
         ..Default::default()
     };
-    // 在 winit 消息泵里、窗口过程之前拦 Ctrl+V：剪贴板只有文件（无文本）时
-    // egui-winit 会把按键整体吞掉，这里先置位标志供下一帧消费（见 clipboard.rs）。
-    #[cfg(target_os = "windows")]
-    {
-        use winit::platform::windows::EventLoopBuilderExtWindows as _;
-        options.event_loop_builder = Some(Box::new(|builder| {
-            builder.with_msg_hook(|msg| clipboard::msg_hook(msg));
-        }));
-    }
 
     eframe::run_native(
         &format!("TUI 项目管理器 v{}", app_version()),
