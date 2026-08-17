@@ -14,6 +14,8 @@ pub struct Session {
     pub title: String,
     /// 启动目录。
     pub dir: String,
+    /// 本页签启动用的 TUI 命令（切命令后用于标记当前项/重载）。
+    pub cmd: String,
     /// 终端仿真状态。
     pub term: Arc<Mutex<Term<SessionListener>>>,
     /// 向 PTY 写入输入的通道发送端（实际写由专用后台线程执行，
@@ -29,11 +31,12 @@ pub struct Session {
     pub exited: bool,
 }
 
-/// 终端事件监听器：把终端要求的写回 PTY，并通知界面重绘。
+/// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
 #[derive(Clone)]
 pub struct SessionListener {
     writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     redraw: std::sync::mpsc::SyncSender<()>,
+    ctx: eframe::egui::Context,
 }
 
 impl EventListener for SessionListener {
@@ -42,6 +45,9 @@ impl EventListener for SessionListener {
             // 只投递到后台写入线程，绝不在解析线程里阻塞写
             //（解析线程持有 term 锁时会回调这里）。
             let _ = self.writer.try_send(text.as_bytes().to_vec());
+        } else if let Event::ClipboardStore(_, text) = &event {
+            // opencode 等 TUI 的 OSC 52 复制：直接写系统剪贴板。egui Context 线程安全。
+            self.ctx.copy_text(text.clone());
         }
         // try_send：通道容量 1，满则丢弃，刷新信号合并为一个。
         // 必须非阻塞：解析线程持有 term 锁时回调这里，若 send 阻塞，
@@ -91,6 +97,7 @@ pub fn spawn(
     cols: u16,
     rows: u16,
     redraw: std::sync::mpsc::SyncSender<()>,
+    ctx: eframe::egui::Context,
 ) -> Result<Session, String> {
     let pty_system = native_pty_system();
     let size = PtySize {
@@ -111,6 +118,10 @@ pub fn spawn(
     for arg in &parts[1..] {
         cmd.arg(arg.clone());
     }
+    // opencode/node 系 TUI 依据 TERM/COLORTERM 决定是否输出颜色；
+    // 不设的话会退化成无彩色渲染。
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
     let dir = sanitize(dir);
     if !dir.is_empty() {
         cmd.cwd(Path::new(&dir));
@@ -145,6 +156,7 @@ pub fn spawn(
     let listener = SessionListener {
         writer: writer_tx.clone(),
         redraw,
+        ctx,
     };
 
     let term = Term::new(
@@ -182,6 +194,7 @@ pub fn spawn(
     Ok(Session {
         title: title.to_string(),
         dir: dir.to_string(),
+        cmd: tui_command.to_string(),
         term,
          writer: writer_tx,
         master: pair.master,
@@ -228,7 +241,8 @@ mod tests {
     #[test]
     fn spawn_run_and_render() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let mut sess = spawn("test", ".", "cmd", 80, 24, tx).expect("spawn 失败");
+        let ctx = eframe::egui::Context::default();
+        let mut sess = spawn("test", ".", "cmd", 80, 24, tx, ctx).expect("spawn 失败");
         sess.writer.try_send(b"echo HELLO123\r".to_vec()).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
 
@@ -254,7 +268,8 @@ mod tests {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::grid::Scroll;
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let mut sess = spawn("test", ".", "cmd", 80, 24, tx).expect("spawn 失败");
+        let ctx = eframe::egui::Context::default();
+        let mut sess = spawn("test", ".", "cmd", 80, 24, tx, ctx).expect("spawn 失败");
         // 输出 50 行，超出 24 行屏幕后产生历史缓冲。
         sess.writer
             .try_send(b"for /L %i in (1,1,50) do @echo line%i\r".to_vec())

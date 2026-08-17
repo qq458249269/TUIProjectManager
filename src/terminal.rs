@@ -348,7 +348,24 @@ pub fn show_terminal(
             if lines == 0 {
                 lines = if delta > 0.0 { 1 } else { -1 };
             }
-            if let Ok(mut t) = sess.term.lock() {
+            // 应用开启了鼠标上报（opencode 聊天列表等）→ 把滚轮转成 SGR 事件发给
+            // 应用让它自己滚；否则滚动仿真器自身的历史缓冲（普通 shell / vim）。
+            // 注意：opencode 在备用屏（alt screen）下无历史缓冲，这条分支是它唯一的滚屏途径。
+            let mouse_on = sess
+                .term
+                .lock()
+                .map(|t| t.mode().intersects(TermMode::MOUSE_MODE))
+                .unwrap_or(false);
+            if mouse_on {
+                let pos = ui.input(|i| i.pointer.latest_pos()).unwrap_or(rect.center());
+                let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1).clamp(1, cols);
+                let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1).clamp(1, rows);
+                let up = lines > 0;
+                for _ in 0..lines.abs().clamp(1, 32) {
+                    let b = if up { 64 } else { 65 };
+                    let _ = sess.writer.try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
+                }
+            } else if let Ok(mut t) = sess.term.lock() {
                 t.scroll_display(Scroll::Delta(lines));
             }
             ui.ctx().request_repaint();

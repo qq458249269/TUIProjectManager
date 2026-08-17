@@ -51,6 +51,7 @@ enum TabAction {
     Close(usize),
     OpenDir(usize),
     OpenVSCode(usize),
+    SwitchCommand(usize, String),
 }
 
 /// 项目列表点击/双击/右键菜单产生的动作。
@@ -335,6 +336,8 @@ pub struct ClientApp {
     drag_project: Option<usize>,
     /// 原生窗口句柄：启动时把 DWM 标题栏固定为黑色（运行中切换不可靠，直接固定）。
     titlebar_hwnd: isize,
+    /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入，并估算 PTY 启动尺寸。
+    ctx: egui::Context,
 }
 
 impl ClientApp {
@@ -355,6 +358,7 @@ impl ClientApp {
         // 重绘信号用容量 1 的有界通道：任意多个终端会话/后台线程并发投递时，
         // 通道满即丢弃新信号（try_send），刷新请求被合并——不会出现消息堆积。
         let (redraw_tx, redraw_rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = cc.egui_ctx.clone();
         let (check_tx, update_rx) = std::sync::mpsc::channel();
         let saved_tabs = config.tabs.clone();
         let saved_active = config.tabs.active;
@@ -381,6 +385,7 @@ impl ClientApp {
             drag_tab: None,
             drag_project: None,
             titlebar_hwnd,
+            ctx,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -409,6 +414,7 @@ impl ClientApp {
                 80,
                 24,
                 app.redraw_tx.clone(),
+                app.ctx.clone(),
             ) {
                 Ok(sess) => {
                     app.tabs.push(Tab::Session(sess));
@@ -486,8 +492,15 @@ impl ClientApp {
                 }
             }
         }
-        let cols = 80u16;
-        let rows = 24u16;
+        // 用实际可用面积估算 PTY 尺寸，而不是固定 80x24：
+        // opencode 恢复历史会话时会按启动时的窗口尺寸整屏重排，
+        // 若估算尺寸与仿真网格相差过大，绝对定位的写入位置就会错乱。
+        let font_id = egui::FontId::monospace(terminal::TERM_FONT_SIZE);
+        let cell_w = self.ctx.fonts_mut(|f| f.glyph_width(&font_id, 'M')).max(1.0);
+        let cell_h = self.ctx.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
+        let screen = self.ctx.content_rect();
+        let cols = (((screen.width() - 300.0).max(160.0) / cell_w) as usize).clamp(20, 500) as u16;
+        let rows = (((screen.height() - 64.0).max(120.0) / cell_h) as usize).clamp(10, 300) as u16;
         match session::spawn(
             &project.name,
             &project.path,
@@ -495,6 +508,7 @@ impl ClientApp {
             cols,
             rows,
             self.redraw_tx.clone(),
+            self.ctx.clone(),
         ) {
             Ok(sess) => {
                 self.tabs.push(Tab::Session(sess));
@@ -576,6 +590,7 @@ impl ClientApp {
             80,
             24,
             self.redraw_tx.clone(),
+            self.ctx.clone(),
         ) {
             Ok(sess) => {
                 self.tabs.push(Tab::Session(sess));
@@ -854,6 +869,8 @@ impl ClientApp {
                     };
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
+                    // 本页签当前启动命令（切换菜单里勾选当前项）。
+                    let tab_cmd = s.cmd.clone();
                     // 刚拖起的帧里画底色需要 Noop 在内容之前插入，所以先占位。
                     let bg_idx = ui.painter().add(egui::Shape::Noop);
                     // 整块交互：一个 Sense::click_and_drag 控件同时承担 单击（激活/关闭）
@@ -956,6 +973,34 @@ impl ClientApp {
                         {
                             actions.push(TabAction::OpenVSCode(i));
                             ui.close();
+                        }
+                        ui.separator();
+                        // 切换该页签的启动命令：在设置里配置的 TUI 命令列表中选一个，
+                        // 选完立即用新命令重启本页签（保持目录与页签位置）。
+                        if self.config.settings.tui_commands.is_empty() {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new("🔧 切换启动命令（无可用命令，请在设置中添加）"),
+                            );
+                        } else {
+                            ui.menu_button("🔧 切换启动命令", |ui| {
+                                ui.set_min_width(180.0);
+                                for cmd in &self.config.settings.tui_commands {
+                                    let cur = cmd.trim() == tab_cmd.trim();
+                                    if cur {
+                                        ui.label(
+                                            RichText::new(format!("✅ {cmd}")).weak(),
+                                        );
+                                    } else if ui
+                                        .button(cmd.clone())
+                                        .on_hover_text("用此命令重新启动当前页签（会话内容会清空）")
+                                        .clicked()
+                                    {
+                                        actions.push(TabAction::SwitchCommand(i, cmd.clone()));
+                                        ui.close();
+                                    }
+                                }
+                            });
                         }
                     });
                     // × 上悬停 → 小手（其余区域保持普通箭头，暗示可点/可拖）。
@@ -1062,6 +1107,50 @@ impl ClientApp {
                         }
                     }
                 }
+                TabAction::SwitchCommand(i, cmd) => self.switch_tab_command(i, cmd),
+            }
+        }
+    }
+
+    fn switch_tab_command(&mut self, idx: usize, cmd: String) {
+        if idx == 0 || idx >= self.tabs.len() {
+            return;
+        }
+        let Some(Tab::Session(s)) = self.tabs.get_mut(idx) else { return };
+        if s.cmd.trim() == cmd.trim() {
+            return;
+        }
+        let dir = s.dir.clone();
+        let title = s.title.clone();
+        if !s.exited {
+            let _ = s.child.kill();
+        }
+        self.tabs.remove(idx);
+        match session::spawn(
+            &title,
+            &dir,
+            &cmd,
+            80,
+            24,
+            self.redraw_tx.clone(),
+            self.ctx.clone(),
+        ) {
+            Ok(sess) => {
+                self.tabs.insert(idx, Tab::Session(sess));
+                self.current = idx;
+                self.term_focused = true;
+                self.refresh_focus();
+                self.status = Some(format!("已切换到命令: {cmd}"));
+            }
+            Err(e) => {
+                self.status = Some(format!("切换命令失败: {e}"));
+                if self.current >= self.tabs.len() {
+                    self.current = self.tabs.len().saturating_sub(1);
+                }
+                if self.current == 0 {
+                    self.screen = Screen::Main;
+                }
+                self.refresh_focus();
             }
         }
     }
