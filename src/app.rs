@@ -1133,8 +1133,15 @@ impl ClientApp {
             .into_bytes();
         for tab in &mut self.tabs {
             if let Tab::Session(s) = tab {
-                s.theme_dark.store(dark, std::sync::atomic::Ordering::Relaxed);
-                if !s.exited {
+                s.theme_dark
+                    .store(dark, std::sync::atomic::Ordering::Relaxed);
+                // 只推给应答过 OSC 10/11/4 颜色查询的会话（opencode 等）。
+                // shell/cmd 从不查询这类序列，收到 `ESC]10;...ESC\` 会把 OSC 终止符
+                // 的 `\` 直接回显成“自动输入了反斜杠”，不能广播。
+                if !s.exited
+                    && s.osc_theme_aware
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     let _ = s.writer.try_send(msg.clone());
                 }
             }

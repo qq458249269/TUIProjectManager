@@ -30,6 +30,9 @@ pub struct Session {
     pub grid_size: (u16, u16),
     /// 当前深浅主题（应答 OSC 10/11 颜色查询用，由 UI 线程更新）。
     pub theme_dark: Arc<AtomicBool>,
+    /// 是否应答过 OSC 10/11/4 颜色查询（一旦应答，说明该子进程能理解 OSC 颜色，
+    /// 主题切换时的主动颜色广播才安全；shell 等从不查询，收到广播只会乱码）。
+    pub osc_theme_aware: Arc<AtomicBool>,
     /// 子进程是否已退出。
     pub exited: bool,
 }
@@ -60,6 +63,8 @@ impl EventListener for SessionListener {
 }
 
 /// 响应终端能力探测序列（TUI 启动时常用），返回要写回 PTY 的应答字节。
+/// 返回值（字节, 是否应答过 OSC 10/11/4 颜色查询）：后者供主题广播判断
+/// 该会话是否 OS 色，避免向 cmd 等不响 OSC 的 shell 推颜色序列。
 /// 全部是标准 VT/xterm 行为，对任意 TUI（cmd/shell/nvim/opencode 等）通用：
 /// - DSR 光标位置（ESC[6n → ESC[r;cR）
 /// - 主 DA（ESC[c → ESC[?1;2c）与 XTVERSION（ESC[>0q → ESC[>0;136;0c）
@@ -67,9 +72,11 @@ impl EventListener for SessionListener {
 /// - kitty 键盘协议查询（ESC[?u → 回同样 ESC[?u 表示不支持）
 /// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
 /// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
-/// 查询序列可能跨块被截断，扫描单块即可——探测都发生在启动后的单次写入里。
-fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<Vec<u8>> {
+/// 返回 (应答字节, 是否应答了 OSC 颜色查询)。查询序列可能跨块被截断，扫描
+/// 单块即可——探测都发生在启动后的单次写入里。
+fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
+    let mut osc_color = false;
     let mut i = 0usize;
     while i + 2 <= bytes.len() {
         if bytes[i] != 0x1b {
@@ -95,6 +102,7 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
             // 颜色查询：\x1b]10;? 前景 / \x1b]11;? 背景 / \x1b]4;N;? 调色板。
             let (fg, bg) = if dark { ("ffffff", "16161a") } else { ("000000", "ffffff") };
             if (osc_num == 10 || osc_num == 11) && body == b"?" {
+                osc_color = true;
                 let c = if osc_num == 10 { fg } else { bg };
                 out.extend_from_slice(
                     format!("\x1b]{osc_num};rgb:{c}/{c}/{c}\x1b\\\\").as_bytes(),
@@ -103,6 +111,7 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
                 if let Some(rest) = body.strip_suffix(b";?") {
                     if let Ok(idx) = String::from_utf8_lossy(rest).parse::<u32>() {
                         if idx <= 15 {
+                            osc_color = true;
                             out.extend_from_slice(
                                 format!("\x1b]4;{idx};rgb:000000/000000/000000\x1b\\\\").as_bytes(),
                             );
@@ -162,7 +171,7 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
             out.extend_from_slice(b"\x1b[4;0;0t");
         }
     }
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then_some((out, osc_color))
 }
 
 /// 去掉路径/命令里可能混入的不可见 Unicode 控制符（如复制粘贴带进来的
@@ -283,12 +292,14 @@ pub fn spawn(
     // 整屏重画的原始字节，内容必然错行。按真实终端行为回复即可。
     let reply_tx = writer_tx.clone();
     let theme_dark = Arc::new(AtomicBool::new(true));
+    let osc_theme_aware = Arc::new(AtomicBool::new(false));
 
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
+        let osc_theme_aware = osc_theme_aware.clone();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -302,11 +313,16 @@ pub fn spawn(
                     Ok(n) => {
                         let mut term = term.lock().unwrap();
                         parser.advance(&mut *term, &buf[..n]);
-                        if let Some(reply) = reply_to_queries(
+                        if let Some((reply, osc_color)) = reply_to_queries(
                             &mut *term,
                             &buf[..n],
                             theme_dark.load(Ordering::Relaxed),
                         ) {
+                            // 应答过 OSC 颜色查询 = 该子进程懂 OSC 颜色，之后主题
+                            // 切换时才有资格收到主动颜色广播（见 app::broadcast_theme）。
+                            if osc_color {
+                                osc_theme_aware.store(true, Ordering::Relaxed);
+                            }
                             // try_send 非阻塞：解析线程持 term 锁，绝不可阻塞等回车。
                             let _ = reply_tx.try_send(reply);
                         }
@@ -326,6 +342,7 @@ pub fn spawn(
         child,
         grid_size: (cols, rows),
         theme_dark,
+        osc_theme_aware,
         exited: false,
     })
 }
@@ -346,7 +363,7 @@ mod tests {
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
         let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
-        let r = reply_to_queries(&term, bytes, true).unwrap();
+        let r = reply_to_queries(&term, bytes, true).unwrap().0;
         let s = String::from_utf8_lossy(&r);
         assert!(s.contains("\x1b[1;1R"), "DSR 光标应答: {s}");
         assert!(s.contains("\x1b[?2026;1$y"), "DECRQM 2026: {s}");
@@ -355,15 +372,20 @@ mod tests {
         assert!(s.contains("\x1b[4;0;0t"), "XTWINOPS: {s}");
         assert!(s.contains("\x1b]11;rgb:16161a/16161a/16161a"), "OSC11 深色底: {s}");
         // 主 DA 与 XTVERSION。
-        let r2 = reply_to_queries(&term, b"\x1b[c\x1b[>0q", true).unwrap();
+        let r2 = reply_to_queries(&term, b"\x1b[c\x1b[>0q", true).unwrap().0;
         let s2 = String::from_utf8_lossy(&r2);
         assert!(s2.contains("\x1b[?1;2c"), "主 DA: {s2}");
         assert!(s2.contains("\x1b[>0;136;0c"), "XTVERSION: {s2}");
         // 浅色主题下 OSC 11 回白底。
         let r3 = reply_to_queries(&term, b"\x1b]11;?\x1b\\", false).unwrap();
-        assert!(String::from_utf8_lossy(&r3).contains("rgb:ffffff/ffffff/ffffff"));
+        assert!(String::from_utf8_lossy(&r3.0).contains("rgb:ffffff/ffffff/ffffff"));
         // 非查询内容不回。
         assert!(reply_to_queries(&term, b"hello", true).is_none());
+        // 应答过 OSC 颜色查询 → 第二返回值标记 true（供主题广播判断是否安全）。
+        let (_, osc) = reply_to_queries(&term, b"\x1b]10;?\x1b\\", true).unwrap();
+        assert!(osc, "OSC 10 颜色查询应答应标记 osc_theme_aware");
+        let (_, osc2) = reply_to_queries(&term, b"\x1b[c", true).unwrap();
+        assert!(!osc2, "主 DA 应答不应标记 OSC 颜色");
     }
 
     /// 宽字符由前导格+随空格两格组成；程序（如 nvim）把光标左移一格时光标会
