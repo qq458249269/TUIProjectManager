@@ -13,6 +13,9 @@ raw-window-handle = "0.6"
 rfd = "0.15"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# 与 eframe 0.36.1 同一版本号（0.30.13）：EventLoopBuilder 类型必须对齐，
+# 否则 with_msg_hook 等 platform 扩展特性接不上 eframe 内部的 Builder 实例。
+winit = "0.30.13"
 
 [build-dependencies]
 winres = "0.1"
