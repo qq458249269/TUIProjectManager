@@ -1,3 +1,8 @@
 /target
 /config
 /version.txt
+
+# 本机工具残留（rust 工具链缓存与意外创建的占位文件）
+/.cargo_home/
+/.rustup_home/
+/Continue=silentlycontinue
