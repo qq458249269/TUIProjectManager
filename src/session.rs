@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -27,6 +28,8 @@ pub struct Session {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
     /// 上次渲染的网格尺寸，用于检测是否需要 resize。
     pub grid_size: (u16, u16),
+    /// 当前深浅主题（应答 OSC 10/11 颜色查询用，由 UI 线程更新）。
+    pub theme_dark: Arc<AtomicBool>,
     /// 子进程是否已退出。
     pub exited: bool,
 }
@@ -54,6 +57,112 @@ impl EventListener for SessionListener {
         // 会与 UI 线程的 term.lock() 渲染互相等待而死锁。
         let _ = self.redraw.try_send(());
     }
+}
+
+/// 响应终端能力探测序列（TUI 启动时常用），返回要写回 PTY 的应答字节。
+/// 全部是标准 VT/xterm 行为，对任意 TUI（cmd/shell/nvim/opencode 等）通用：
+/// - DSR 光标位置（ESC[6n → ESC[r;cR）
+/// - 主 DA（ESC[c → ESC[?1;2c）与 XTVERSION（ESC[>0q → ESC[>0;136;0c）
+/// - DECRQM 模式查询（ESC[?...$p → ESC[?...;m$y）
+/// - kitty 键盘协议查询（ESC[?u → 回同样 ESC[?u 表示不支持）
+/// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
+/// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
+/// 查询序列可能跨块被截断，扫描单块即可——探测都发生在启动后的单次写入里。
+fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if bytes[i + 1] == b']' {
+            // OSC：\x1b] 数字 ; 内容 终止符(BEL 或 ESC\)。内容以 ? 结尾=查询。
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let osc_num: u32 = bytes[i + 2..j].iter().map(|b| *b as char).collect::<String>().parse().unwrap_or(0);
+            if j < bytes.len() && bytes[j] == b';' {
+                j += 1;
+            }
+            let body_start = j;
+            while j < bytes.len() && bytes[j] != 0x07 && !(bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\') {
+                j += 1;
+            }
+            let body = &bytes[body_start..j];
+            i = (j + 1).min(bytes.len());
+            // 颜色查询：\x1b]10;? 前景 / \x1b]11;? 背景 / \x1b]4;N;? 调色板。
+            let (fg, bg) = if dark { ("ffffff", "16161a") } else { ("000000", "ffffff") };
+            if (osc_num == 10 || osc_num == 11) && body == b"?" {
+                let c = if osc_num == 10 { fg } else { bg };
+                out.extend_from_slice(
+                    format!("\x1b]{osc_num};rgb:{c}/{c}/{c}\x1b\\\\").as_bytes(),
+                );
+            } else if osc_num == 4 {
+                if let Some(rest) = body.strip_suffix(b";?") {
+                    if let Ok(idx) = String::from_utf8_lossy(rest).parse::<u32>() {
+                        if idx <= 15 {
+                            out.extend_from_slice(
+                                format!("\x1b]4;{idx};rgb:000000/000000/000000\x1b\\\\").as_bytes(),
+                            );
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if bytes[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        let mut params = String::new();
+        while j < bytes.len()
+            && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b'?' || bytes[j] == b'>')
+        {
+            params.push(bytes[j] as char);
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'$' {
+            j += 1; // DECRQM 的中间字节：\x1b[?N$p
+        }
+        if j >= bytes.len() {
+            break; // 序列不完整，等下一块
+        }
+        let fin = bytes[j];
+        i = j + 1;
+        if params == "6" && fin == b'n' {
+            // DSR 光标位置：汇报视口内光标行列（1-based）。
+            let cursor = term.renderable_content().cursor.point;
+            out.extend_from_slice(
+                format!("\x1b[{};{}R", cursor.line.0 + 1, cursor.column.0 + 1).as_bytes(),
+            );
+        } else if params.is_empty() && fin == b'c' {
+            // 主 DA（VT100 标识）：报支持高级视频属性的终端。
+            out.extend_from_slice(b"\x1b[?1;2c");
+        } else if params.starts_with('>') && fin == b'q' {
+            // XTVERSION（ESC[>0q 等）：报成 xterm 风格，让 TUI 识别为交互终端。
+            out.extend_from_slice(b"\x1b[>0;136;0c");
+        } else if params.starts_with('?') && fin == b'u' {
+            // kitty 键盘协议不支持：按协议回同样的 CSI ? u。
+            out.extend_from_slice(b"\x1b[?u");
+        } else if params.starts_with('?') && fin == b'p' {
+            // DECRQM：1 = 支持且处于该模式，0 = 不识别。
+            // 我们能转发 SGR 滚轮（1000/1006）；括号粘贴、同步输出、断字簇按启用答复；
+            // 像素鼠标（1016）我们根本不发像素数据，回不识别以免 app 改用像素坐标。
+            let n: i64 = params[1..].parse().unwrap_or(-1);
+            let state = match n {
+                1000 | 1006 | 2004 | 2026 | 2027 => 1,
+                _ => 0,
+            };
+            out.extend_from_slice(format!("\x1b[?{};{}$y", n, state).as_bytes());
+        } else if params == "14" && fin == b't' {
+            // XTWINOPS 14：像素尺寸未知，回 0 表示知道但无数据。
+            out.extend_from_slice(b"\x1b[4;0;0t");
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// 去掉路径/命令里可能混入的不可见 Unicode 控制符（如复制粘贴带进来的
@@ -168,10 +277,18 @@ pub fn spawn(
     // 通知子进程终端尺寸（部分程序需要）。
     let _ = pair.master.resize(size);
 
+    // 终端能力查询应答（opencode/opentui 启动时会探测终端交互能力：DSR、
+    // DECRQM、XTWINOPS 等）。不回会导致 app 判定“非交互终端”，从而不启用
+    // 鼠标捕获——滚轮只能滚仿真器自己的滚动缓冲，而这类 TUI 的滚动缓冲里是
+    // 整屏重画的原始字节，内容必然错行。按真实终端行为回复即可。
+    let reply_tx = writer_tx.clone();
+    let theme_dark = Arc::new(AtomicBool::new(true));
+
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
     {
         let term = term.clone();
+        let theme_dark = theme_dark.clone();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -185,6 +302,14 @@ pub fn spawn(
                     Ok(n) => {
                         let mut term = term.lock().unwrap();
                         parser.advance(&mut *term, &buf[..n]);
+                        if let Some(reply) = reply_to_queries(
+                            &mut *term,
+                            &buf[..n],
+                            theme_dark.load(Ordering::Relaxed),
+                        ) {
+                            // try_send 非阻塞：解析线程持 term 锁，绝不可阻塞等回车。
+                            let _ = reply_tx.try_send(reply);
+                        }
                     }
                 }
             }
@@ -200,6 +325,7 @@ pub fn spawn(
         master: pair.master,
         child,
         grid_size: (cols, rows),
+        theme_dark,
         exited: false,
     })
 }
@@ -208,6 +334,37 @@ pub fn spawn(
 mod tests {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
+
+    /// 终端能力应答器：标准 VT 序列的应答都要对（opencode 等 TUI 靠它判定
+    /// 终端是否交互）。
+    #[test]
+    fn reply_to_queries_standard() {
+        let listener = SessionListener {
+            writer: std::sync::mpsc::sync_channel(1).0,
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+        };
+        let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
+        let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
+        let r = reply_to_queries(&term, bytes, true).unwrap();
+        let s = String::from_utf8_lossy(&r);
+        assert!(s.contains("\x1b[1;1R"), "DSR 光标应答: {s}");
+        assert!(s.contains("\x1b[?2026;1$y"), "DECRQM 2026: {s}");
+        assert!(s.contains("\x1b[?1000;1$y"), "DECRQM 1000: {s}");
+        assert!(s.contains("\x1b[?u"), "kitty 键盘: {s}");
+        assert!(s.contains("\x1b[4;0;0t"), "XTWINOPS: {s}");
+        assert!(s.contains("\x1b]11;rgb:16161a/16161a/16161a"), "OSC11 深色底: {s}");
+        // 主 DA 与 XTVERSION。
+        let r2 = reply_to_queries(&term, b"\x1b[c\x1b[>0q", true).unwrap();
+        let s2 = String::from_utf8_lossy(&r2);
+        assert!(s2.contains("\x1b[?1;2c"), "主 DA: {s2}");
+        assert!(s2.contains("\x1b[>0;136;0c"), "XTVERSION: {s2}");
+        // 浅色主题下 OSC 11 回白底。
+        let r3 = reply_to_queries(&term, b"\x1b]11;?\x1b\\", false).unwrap();
+        assert!(String::from_utf8_lossy(&r3).contains("rgb:ffffff/ffffff/ffffff"));
+        // 非查询内容不回。
+        assert!(reply_to_queries(&term, b"hello", true).is_none());
+    }
 
     /// 宽字符由前导格+随空格两格组成；程序（如 nvim）把光标左移一格时光标会
     /// 落在随空格上。若渲染侧按“非 WIDE_CHAR 即 1 格宽”画光标方块，白色方块

@@ -417,6 +417,8 @@ impl ClientApp {
                 app.ctx.clone(),
             ) {
                 Ok(sess) => {
+                    sess.theme_dark
+                        .store(app.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
                     app.tabs.push(Tab::Session(sess));
                     restored += 1;
                 }
@@ -511,6 +513,8 @@ impl ClientApp {
             self.ctx.clone(),
         ) {
             Ok(sess) => {
+                sess.theme_dark
+                    .store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
                 self.tabs.push(Tab::Session(sess));
                 self.current = self.tabs.len() - 1;
                 self.term_focused = true;
@@ -593,6 +597,8 @@ impl ClientApp {
             self.ctx.clone(),
         ) {
             Ok(sess) => {
+                sess.theme_dark
+                    .store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
                 self.tabs.push(Tab::Session(sess));
                 self.current = self.tabs.len() - 1;
                 self.term_focused = true;
@@ -1112,6 +1118,23 @@ impl ClientApp {
         }
     }
 
+    /// 通知所有会话当前主题：更新应答器用的标志，并主动广播 OSC 10/11 颜色
+    /// （opencode 等 TUI 启动时会查询终端颜色来匹配自己的配色）。
+    fn broadcast_theme(&mut self) {
+        let dark = self.config.settings.dark_mode;
+        let (fg, bg) = if dark { ("ffffff", "16161a") } else { ("000000", "ffffff") };
+        let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\\\x1b]11;rgb:{bg}/{bg}/{bg}\x1b\\\\")
+            .into_bytes();
+        for tab in &mut self.tabs {
+            if let Tab::Session(s) = tab {
+                s.theme_dark.store(dark, std::sync::atomic::Ordering::Relaxed);
+                if !s.exited {
+                    let _ = s.writer.try_send(msg.clone());
+                }
+            }
+        }
+    }
+
     fn switch_tab_command(&mut self, idx: usize, cmd: String) {
         if idx == 0 || idx >= self.tabs.len() {
             return;
@@ -1136,6 +1159,8 @@ impl ClientApp {
             self.ctx.clone(),
         ) {
             Ok(sess) => {
+                sess.theme_dark
+                    .store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
                 self.tabs.insert(idx, Tab::Session(sess));
                 self.current = idx;
                 self.term_focused = true;
@@ -1239,6 +1264,9 @@ impl ClientApp {
                     self.config.settings.dark_mode = !dark;
                     apply_theme(ui.ctx(), self.config.settings.dark_mode);
                     self.save_config("已切换主题".to_string());
+                    // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色（
+                    // opencode 等 TUI 会据此匹配自己的配色）。
+                    self.broadcast_theme();
                     ui.ctx().request_repaint();
                 }
             });
