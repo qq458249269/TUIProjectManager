@@ -71,6 +71,39 @@ fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
     (f, b)
 }
 
+/// 深色主题下提亮过暗的颜色（色相不变），保证与深画布底色有足够对比。
+/// 过亮的颜色在深底上一般对比足够，不额外压暗；浅色主题压暗见 `adapt_to_light`。
+fn adapt_to_dark(fg: Color32, bg: Color32) -> (Color32, Color32) {
+    let lum = |c: Color32| {
+        0.2126 * c.r() as f32 / 255.0
+            + 0.7152 * c.g() as f32 / 255.0
+            + 0.0722 * c.b() as f32 / 255.0
+    };
+    let neutral = |c: Color32| {
+        let max = c.r().max(c.g()).max(c.b()) as f32;
+        let min = c.r().min(c.g()).min(c.b()) as f32;
+        max - min < 32.0
+    };
+    let mut f = fg;
+    let mut b = bg;
+    // 背景过浅将沉暗，维持深色主题纯度。
+    if lum(b) > 0.75 {
+        b = TERM_BG_DARK;
+    }
+    // 前景过暗（ANSI 黑/深灰/深蓝…）在深底几近不可见：混合向白提亮到目标
+    // 亮度 0.4（色相比不变：灰保持灰、蓝变浅蓝，而非通道放大把纯蓝吹成 255
+    // 却仍只有 0.07 亮度）。过亮中性前景归一为白。
+    let fl = lum(f);
+    if fl > 0.72 && neutral(f) {
+        f = Color32::WHITE;
+    } else if fl < 0.22 {
+        let t = ((0.4 - fl) / (1.0 - fl)).clamp(0.0, 0.6);
+        let mix = |v: u8| (v as f32 + (255.0 - v as f32) * t).round() as u8;
+        f = Color32::from_rgb(mix(f.r()), mix(f.g()), mix(f.b()));
+    }
+    (f, b)
+}
+
 /// 终端右键菜单动作。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TermAction {
@@ -656,30 +689,37 @@ pub fn show_terminal(
         if cell.flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
-        // 浅色主题：把暗色主题 TUI 的深背景/浅前景适配成浅色界面可读组合。
-        let (fg, bg) = if dark { (fg, bg) } else { adapt_to_light(fg, bg) };
-        // 选中格用蓝底白字高亮（宽字符的占位格也按同一规则涂底）。
+        // 浅/深主题下各取所需：浅色压暗过浅颜色、深色提亮过暗颜色（色相不变），
+        // 其余沿用 ANSI 原色 —— 保留终端原本的配色，只做可读性微调。
+        let (fg, bg) = if dark { adapt_to_dark(fg, bg) } else { adapt_to_light(fg, bg) };
+        // 选中格统一为浅灰底深字，深浅一致。
+        // （蓝底白字在旧代码里曾遮盖汉字：因为随空格在字形后涂背景，盖住了
+        // 前导格刚画的宽字 —— 见下文随空格在背景前跳过。）
         let (fg, bg) = if sel_range
             .as_ref()
             .is_some_and(|r| cell_selected(r, indexed.point, cell))
         {
-            (Color32::WHITE, Color32::from_rgb(0, 110, 210))
+            (Color32::from_gray(24), Color32::from_gray(176))
         } else {
             (fg, bg)
         };
 
-        // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景；宽字槽宽
-        // 占满 2 格（含随空格连回前导格），只靠字形的背景（仅 14pt 宽）会露出
-        // 右半格，选区边界落在随空格时也能盖满整个汉字。
+        // 随空格（宽字符占位格）必须在背景涂之前跳过：它的 2 格槽矩形与前导格
+        // 完全重叠，槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，
+        // 选区盖住随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形
+        // 画完后盖住它 —— 就是选中时汉字“消失”的根因。
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+
+        // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景。宽字槽宽占满
+        // 2 格（随空格已跳过，此处只画前导格），只靠字形背景（14pt）会露右半格。
         if bg != canvas_bg {
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(x_slot, y), Vec2::new(slot_w, cell_h)),
                 0.0,
                 bg,
             );
-        }
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
         }
         let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
@@ -944,6 +984,29 @@ fn light_adapt_keeps_bright_colors_readable() {
     // 深背景仍映射为白。
     let (_, b) = adapt_to_light(yellow, Color32::BLACK);
     assert_eq!(b, TERM_BG_LIGHT);
+}
+
+/// 深色主题：过暗前景在深底提亮到可读（色相比不变）；过亮中性前景归白。
+#[cfg(test)]
+#[test]
+fn dark_adapt_lightens_dark_colors() {
+    let lum = |c: Color32| {
+        0.2126 * c.r() as f32 / 255.0
+            + 0.7152 * c.g() as f32 / 255.0
+            + 0.0722 * c.b() as f32 / 255.0
+    };
+    // ANSI 深蓝 #000080(0,0,139)：向白提亮到 >0.28 亮度，且蓝通道仍最高。
+    let navy = Color32::from_rgb(0, 0, 139);
+    let (f, _) = adapt_to_dark(navy, TERM_BG_DARK);
+    assert!(lum(f) > 0.28, "深蓝应提亮到 >0.28，当前 {f:?} lum={:.3}", lum(f));
+    assert!(f.b() > f.r().max(f.g()), "提亮不应改变色相（蓝仍最高），当前 {f:?}");
+    // 纯黑前景 → 提亮为中性浅灰，仍可读。
+    let (fb, _) = adapt_to_dark(Color32::BLACK, TERM_BG_DARK);
+    assert!(lum(fb) > 0.25, "黑色应提亮，当前 {fb:?} lum={:.3}", lum(fb));
+    // 过浅背景沉暗为深色画布。
+    assert_eq!(adapt_to_dark(Color32::WHITE, Color32::WHITE).1, TERM_BG_DARK);
+    // 已亮前景不被压暗。
+    assert_eq!(adapt_to_dark(Color32::WHITE, TERM_BG_DARK).0, Color32::WHITE);
 }
 
 #[cfg(test)]

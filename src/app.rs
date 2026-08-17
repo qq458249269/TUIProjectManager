@@ -102,11 +102,17 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     } else {
         egui::ThemePreference::Light
     });
-    // 选中文字强制纯白：egui 默认把选中字色设为 selection.stroke 的浅蓝
-    // （深色 192,222,255），落在同色系蓝底（0,92,128）上发蓝发虚。
-    // all_styles_mut 直接改双主题内部样式，深浅切换都会生效。
+    // 全局文本纯色：深色模式一律纯白、浅色模式一律纯黑，覆盖列表/按钮/状态栏等
+    // 所有控件自带的灰色系配色（显式 RichText 强调色仍保留）。
+    // 选中底色统一淡灰、选中文字近黑：深浅主题一致，汉字笔划在淡灰底上最稳。
     ctx.all_styles_mut(|style| {
-        style.visuals.selection.stroke.color = Color32::WHITE;
+        style.visuals.override_text_color = Some(if dark {
+            Color32::WHITE
+        } else {
+            Color32::BLACK
+        });
+        style.visuals.selection.bg_fill = Color32::from_gray(176);
+        style.visuals.selection.stroke.color = Color32::from_gray(24);
     });
 }
 
