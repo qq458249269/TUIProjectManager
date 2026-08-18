@@ -2825,6 +2825,7 @@ name = "tui-project-manager"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "clipboard-win",
  "eframe",
  "portable-pty",
  "raw-window-handle",

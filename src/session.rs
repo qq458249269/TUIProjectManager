@@ -35,6 +35,8 @@ pub struct Session {
     pub osc_theme_aware: Arc<AtomicBool>,
     /// 子进程是否已退出。
     pub exited: bool,
+    /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
+    pub last_clipboard_seq: Option<std::num::NonZeroU32>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -344,6 +346,7 @@ pub fn spawn(
         theme_dark,
         osc_theme_aware,
         exited: false,
+        last_clipboard_seq: None,
     })
 }
 

@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 alacritty_terminal = "0.26"
+# 读剪贴板 CF_HDROP（资源管理器复制文件后的文件列表）；已是 arboard 的传递依赖，直接声明零新增编译。
+clipboard-win = "5.4"
 # 关掉默认特性：去掉 wgpu/wayland/x11/accesskit/links，只用 glow 渲染器，
 # 体积和链接依赖都大幅缩减（links 会拉入 webbrowser，后者在 gnu 工具链下缺 shlwapi）。
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }

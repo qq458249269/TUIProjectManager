@@ -11,6 +11,8 @@ use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
 use crate::session::{Session, SessionListener};
+// 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
+use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw};
 
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
@@ -136,6 +138,64 @@ fn copy_selection(
         }
         _ => false,
     }
+}
+
+/// 从剪贴板读文件绝对路径列表（CF_HDROP，资源管理器 Ctrl+C 复制/剪切的文件）。
+/// 剪贴板被占用或无文件时返回空。
+fn clipboard_files() -> Vec<String> {
+    match get_clipboard(FileList) {
+        Ok(files) => files,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 把绝对路径转成相对会话启动目录的路径（Windows 路径不区分大小写）：
+/// 在目录内 → 相对路径；目录外 → 保留绝对路径。前缀必须落在分隔符上，
+/// 避免 `D:\code` 误把 `D:\code2\a.txt` 裁成 `2\a.txt`。
+fn rel_to_cwd(abs: &str, cwd: &str) -> String {
+    let abs = abs.replace('/', "\\");
+    let cwd_owned = cwd.replace('/', "\\");
+    let cwd = cwd_owned.trim_end_matches('\\');
+    let a = abs.to_lowercase();
+    let c = cwd.to_lowercase();
+    if !c.is_empty()
+        && a.len() > c.len()
+        && a.starts_with(&c)
+        && abs.get(c.len()..).is_some_and(|rest| rest.starts_with('\\'))
+    {
+        abs[c.len()..].trim_start_matches('\\').to_string()
+    } else {
+        abs
+    }
+}
+
+/// 粘到终端的单条路径：含空格/引号时加双引号，避免 shell 把路径拆词。
+/// ponytail: cmd 里引号内无法转义引号，所以含引号直接删掉（极端少见，够用为止）。
+fn path_for_input(p: &str) -> String {
+    if p.chars().any(|c| c == ' ' || c == '"') {
+        format!("\"{}\"", p.replace('"', ""))
+    } else {
+        p.to_string()
+    }
+}
+
+/// 把剪贴板/拖放的文件列表转成相对路径并写入终端输入行。
+/// 返回是否写入了路径（入参为空时返回 false，调用方回退到文本粘贴）。
+fn paste_file_paths(sess: &Session, files: &[String], status: &mut Option<String>) -> bool {
+    if files.is_empty() {
+        return false;
+    }
+    let mapped: Vec<String> = files
+        .iter()
+        .map(|p| path_for_input(&rel_to_cwd(p, &sess.dir)))
+        .collect();
+    let _ = sess.writer.try_send(mapped.join(" ").into_bytes());
+    *status = Some(if mapped.len() == 1 {
+        format!("已粘贴文件相对路径：{}", mapped[0])
+    } else {
+        format!("已粘贴 {} 个文件路径", mapped.len())
+    });
+    true
 }
 
 /// 计算 csi 修饰参数：无修饰则用普通 \x1b[A 形式。
@@ -491,11 +551,15 @@ pub fn show_terminal(
             }
         }
         Some(TermAction::Paste) => {
-            // 清掉选区再触发系统粘贴：下一帧 egui 投递 Event::Paste，聚焦终端后才能写入。
+            // 剪贴板里是文件（复制过文件）→ 直接粘贴相对路径；
+            // 否则清掉选区触发系统文本粘贴，下一帧 egui 投递 Event::Paste。
+            let files = clipboard_files();
             if let Ok(mut t) = sess.term.lock() {
                 t.selection = None;
             }
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            if !paste_file_paths(sess, &files, status) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
             *term_focused = true;
         }
         Some(TermAction::ClearInput) => {
@@ -545,7 +609,53 @@ pub fn show_terminal(
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
     let mut preedit = String::new();
 
+    // 拖放文件到终端区域：把文件的相对路径粘贴到当前输入行（不要求终端已聚焦）。
+    let dropped = ui.input(|i| i.raw.dropped_files.clone());
+    if !dropped.is_empty() {
+        let pos = ui.input(|i| i.pointer.latest_pos()).unwrap_or(rect.center());
+        if rect.contains(pos) {
+            *term_focused = true;
+            resp.request_focus();
+            let files: Vec<String> = dropped
+                .iter()
+                .map(|f| f.path().to_string_lossy().into_owned())
+                .collect();
+            if paste_file_paths(sess, &files, status) {
+                if let Ok(mut t) = sess.term.lock() {
+                    t.selection = None;
+                }
+            }
+        }
+    } else if ui.input(|i| !i.raw.hovered_files.is_empty()) {
+        // 拖拽悬停时的提示：还没松手，先告诉用户会粘什么。
+        let pos = ui.input(|i| i.pointer.latest_pos()).unwrap_or(rect.center());
+        if rect.contains(pos) {
+            *status = Some("释放鼠标以把文件相对路径粘贴到终端".to_string());
+        }
+    }
+
     if *term_focused {
+        // 剪贴板里只有文件（资源管理器复制）时，egui 的 Ctrl+V 不产生任何事件
+        // （它只读文本剪贴板，没文本就直接吞掉按键）。用剪贴板序列号兜底：
+        // 序列变化 + Ctrl 按下 + 指针在终端上 + 无文本选区，视为一次“粘贴文件”
+        // 手势。数字签变化只认领一次，避免每次按住 Ctrl 都重复注入。
+        if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+            let seq = clip_raw::seq_num();
+            if sess.last_clipboard_seq != seq {
+                sess.last_clipboard_seq = seq;
+                let has_sel = sess
+                    .term
+                    .lock()
+                    .map(|t| t.selection.is_some())
+                    .unwrap_or(false);
+                let over_term = ui
+                    .input(|i| i.pointer.latest_pos().map_or(false, |p| rect.contains(p)));
+                if !has_sel && over_term {
+                    paste_file_paths(sess, &clipboard_files(), status);
+                }
+            }
+        }
+
         let events = ui.input(|i| i.events.clone());
         let alt_down = ui.input(|i| i.modifiers.alt);
         for ev in &events {
@@ -605,6 +715,10 @@ pub fn show_terminal(
                     bytes_out.push(vec![0x18]); // Ctrl+X
                 }
                 egui::Event::Paste(text) => {
+                    // 剪贴板中是文件 → 粘贴文件相对路径（优先于文本粘贴）。
+                    if paste_file_paths(sess, &clipboard_files(), status) {
+                        continue;
+                    }
                     if !text.is_empty() {
                         // 多行粘贴：支持括号粘贴的应用（nvim 等）按字面插入，
                         // 否则把换行转成 \r，让 shell 逐行执行。
@@ -1149,5 +1263,42 @@ mod tests {
         assert_eq!(key_bytes(egui::Key::Num5, false, true, false), Some(b"\x1b5".to_vec()));
         // alt+ctrl+a -> ESC + 0x01
         assert_eq!(key_bytes(egui::Key::A, true, true, false), Some(b"\x1b\x01".to_vec()));
+    }
+
+    /// 相对路径转换：大小写不敏感、目录边界必须落分隔符、目录外保留绝对。
+    #[test]
+    fn rel_path_vs_cwd() {
+        // 目录内 → 相对（cwd 大小写不同也成立）。
+        assert_eq!(
+            rel_to_cwd(r"D:\code\my-project\src\main.rs", r"D:\CODE\my-project"),
+            r"src\main.rs"
+        );
+        // 前缀歧义：D:\code 不能把 D:\code2 裁掉。
+        assert_eq!(
+            rel_to_cwd(r"D:\code\my-project2\a.txt", r"D:\code\my-project"),
+            r"D:\code\my-project2\a.txt"
+        );
+        // 就是目录本身 → 绝对。
+        assert_eq!(
+            rel_to_cwd(r"D:\code\my-project", r"D:\code\my-project"),
+            r"D:\code\my-project"
+        );
+        // 目录外 → 绝对。
+        assert_eq!(
+            rel_to_cwd(r"E:\other\a.txt", r"D:\code\my-project"),
+            r"E:\other\a.txt"
+        );
+        // 正斜杠统一为反斜杠。
+        assert_eq!(rel_to_cwd("D:/code/my-project/a.txt", r"D:\code\my-project"), r"a.txt");
+        // 空 cwd（相对目录启动的会话）→ 绝对。
+        assert_eq!(rel_to_cwd(r"D:\a.txt", ""), r"D:\a.txt");
+    }
+
+    #[test]
+    fn path_quote_when_space() {
+        assert_eq!(path_for_input(r"src\main.rs"), r"src\main.rs");
+        assert_eq!(path_for_input(r"my dir\a.txt"), "\"my dir\\a.txt\"");
+        // 含引号直接删掉（cmd 引号内无法转义），仍按含特殊字符加双引号。
+        assert_eq!(path_for_input("say\"hi.txt"), "\"sayhi.txt\"");
     }
 }
