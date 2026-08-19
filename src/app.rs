@@ -357,6 +357,8 @@ pub struct ClientApp {
     drag_tab: Option<usize>,
     /// 项目列表拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
     drag_project: Option<usize>,
+    /// 设置页命令列表拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
+    drag_command: Option<usize>,
     /// 点击「启动」待 spawn 的会话（下一帧会话页签布局里按精确尺寸启动）。
     pending_launch: Vec<PendingLaunch>,
     /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
@@ -416,6 +418,7 @@ impl ClientApp {
             redraw_rx,
             drag_tab: None,
             drag_project: None,
+            drag_command: None,
             pending_launch: Vec::new(),
             pending_restore: Vec::new(),
             restore_active: None,
@@ -1585,35 +1588,67 @@ impl ClientApp {
             }
         });
         ui.separator();
-        ui.label(
-            RichText::new(format!(
-                "TUI 命令: {}  （在设置中修改）",
-                self.config.settings.tui_command
-            ))
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "TUI 命令: {}  （在设置中修改）",
+                    self.config.settings.tui_command
+                ))
+                .weak(),
+            );
+            if ui
+                .small_button("复制")
+                .on_hover_text("把当前正在使用的 TUI 启动命令复制到剪贴板")
+                .clicked()
+            {
+                self.ctx.copy_text(self.config.settings.tui_command.clone());
+                self.status = Some(format!(
+                    "已复制启动命令: {}",
+                    self.config.settings.tui_command
+                ));
+            }
+        });
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.heading("设置");
         ui.separator();
-        ui.label("TUI 启动命令（点击选择启动时要用的命令，可添加多个，改动自动保存）:");
+        ui.label("TUI 启动命令（点击选择启动时要用的命令，可添加多个，拖动排序，改动自动保存）:");
         ui.add_space(4.0);
 
         let mut dirty = false;
         let mut remove_idx: Option<usize> = None;
+        // 各行矩形（索引 → rect），拖动落位时用来定位插入点。
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut drag_index: Option<usize> = None;
+        let sel_fill = ui.visuals().selection.bg_fill;
         for (i, cmd) in self.settings_commands.iter().enumerate() {
             ui.horizontal(|ui| {
                 let selected = *cmd == self.settings_command;
-                let resp = ui.selectable_label(
-                    selected,
-                    RichText::new(if selected { format!("◉ {cmd}") } else { format!("○ {cmd}") }),
+                // 整行可点可拖（click_and_drag 由 egui 延迟判定拖动，纯点击天然保留）；
+                // 不设 min_size：让「删除/复制」排在右侧不顶行，否则全宽会把按钮顶到下一行。
+                // selectable_label 即 Button::selectable。
+                let resp = ui.add(
+                    egui::Button::selectable(
+                        selected,
+                        RichText::new(if selected {
+                            format!("◉ {cmd}")
+                        } else {
+                            format!("○ {cmd}")
+                        }),
+                    )
+                    .sense(egui::Sense::click_and_drag()),
                 );
                 if resp.clicked() {
                     self.settings_command = cmd.clone();
                     dirty = true;
                 }
+                // 拖动悬浮帧：记录源索引；行矩形供落位定位。
+                if resp.dragged() {
+                    drag_index = Some(i);
+                }
+                row_rects.push((i, resp.rect));
                 if ui
                     .small_button("删除")
                     .on_hover_text("从命令列表中移除")
@@ -1621,7 +1656,88 @@ impl ClientApp {
                 {
                     remove_idx = Some(i);
                 }
+                // 复制命令到系统剪贴板：可粘贴到终端/配置别处使用。
+                if ui
+                    .small_button("复制")
+                    .on_hover_text("把此命令复制到系统剪贴板")
+                    .clicked()
+                {
+                    self.ctx.copy_text(cmd.clone());
+                    self.status = Some(format!("已复制命令: {cmd}"));
+                }
             });
+        }
+        // 拖动状态跨帧保存在 self.drag_command：拖动中的每一帧刷新源索引，
+        // 松手帧（dragged() 已变 false）靠它仍拿得到 from。
+        if let Some(i) = drag_index {
+            self.drag_command = Some(i);
+        }
+        if let Some(from) = self.drag_command {
+            let pointer = ui.ctx().pointer_interact_pos();
+            // 悬停目标：指针所在行的上半 → 插到它前面，下半 → 后面；
+            // 落在最后一行下方 → 末尾，第一行上方 → 开头。
+            let mut target: Option<(usize, f32)> = None;
+            if let Some(pos) = pointer {
+                for (i, rect) in &row_rects {
+                    if pos.y >= rect.top() && pos.y <= rect.bottom() {
+                        let by = if pos.y < rect.center().y {
+                            rect.top()
+                        } else {
+                            rect.bottom()
+                        };
+                        target = Some((*i, by));
+                        break;
+                    }
+                }
+                if target.is_none() {
+                    if let Some((last_i, last)) = row_rects.last() {
+                        if pos.y > last.bottom() {
+                            target = Some((*last_i, last.bottom()));
+                        }
+                    }
+                    if let Some((first_i, first)) = row_rects.first() {
+                        if pos.y < first.top() {
+                            target = Some((*first_i, first.top()));
+                        }
+                    }
+                }
+            }
+            // 插入指示线：横贯列表宽度的细横线。
+            if let Some((_, by)) = target {
+                let area = egui::Rect::from_min_max(
+                    egui::pos2(ui.max_rect().left(), by - 1.5),
+                    egui::pos2(ui.max_rect().right(), by + 1.5),
+                );
+                ui.painter().rect_filled(area, 0.0, sel_fill);
+            }
+            if ui.input(|i| i.pointer.any_released()) {
+                self.drag_command = None;
+                if let Some((hov, _)) = target {
+                    let insert_at = match pointer.and_then(|pos| {
+                        row_rects
+                            .iter()
+                            .find(|(ii, _)| *ii == hov)
+                            .map(|(_, r)| (pos, *r))
+                    }) {
+                        Some((pos, r)) => {
+                            if pos.y < r.center().y {
+                                hov
+                            } else {
+                                hov + 1
+                            }
+                        }
+                        None => hov + 1,
+                    };
+                    // 在原索引空间里算新位置，落下后按新序写回；
+                    // settings_command 按值关联，重排后选中项自然跟随，无需修索引。
+                    let new_p = if insert_at > from { insert_at - 1 } else { insert_at };
+                    if new_p != from {
+                        let c = self.settings_commands.remove(from);
+                        self.settings_commands.insert(new_p, c);
+                        dirty = true;
+                    }
+                }
+            }
         }
         if let Some(i) = remove_idx {
             if i < self.settings_commands.len() {
