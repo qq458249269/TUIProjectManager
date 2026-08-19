@@ -1,5 +1,5 @@
-use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -20,8 +20,9 @@ use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw};
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
 
-/// 备用屏历史回看的最大行数（防内存失控；10k 行足够回看很久的全屏 TUI 输出）。
-const ALT_HISTORY_MAX_LINES: usize = 10_000;
+/// 自攒历史的最大行数（防内存失控；每个会话只在页签可见时捕捉，5k 行足够
+/// 回看很久的全屏 TUI 输出）。
+const ALT_HISTORY_MAX_LINES: usize = 5_000;
 /// 历史捕捉节流：全屏 TUI 动画（spinner 等）每帧重绘，限制快照频率。
 const ALT_CAPTURE_INTERVAL: Duration = Duration::from_millis(120);
 /// 整屏重画型 TUI（没检测到整行上移）的兜底判据：变化格占比达到该阈值时，
@@ -461,8 +462,12 @@ fn changed_cells_ratio(a: &[String], b: &[String]) -> f32 {
     diff as f32 / total.max(1) as f32
 }
 
-/// 每帧调用：备用屏激活时把“从视口顶滚出去的历史行”追进 `alt.lines`，并更新
-/// 当前视口快照；失活时清空历史（备用屏会话结束，避免串到下一次）。
+/// 每帧调用：把“从视口顶滚出去的历史行”追进 `alt.lines`。
+///
+/// 通用设计：无论备用屏还是主屏、无论应用走换行滚动还是绝对定位重绘，都按
+/// 视口快照差异捕捉滚出视口顶的行（同时给全屏重绘型 TUI 兜底整帧）。滚轮优先
+/// 用仿真器原生滚动缓冲（普通 shell / vim），滚不动才回看这份自攒历史。内存
+/// 封顶 ALT_HISTORY_MAX_LINES，且只在页签可见（渲染帧）时捕捉。
 fn capture_alt_history(
     alt: &mut crate::session::AltHistory,
     term: &Term<impl EventListener>,
@@ -471,17 +476,14 @@ fn capture_alt_history(
     now: Instant,
 ) {
     let active = term.mode().contains(TermMode::ALT_SCREEN);
-    if !active {
-        if alt.active {
-            alt.lines.clear();
-            alt.prev = None;
-            alt.cur = Vec::new();
-            alt.view = 0;
-        }
-        alt.active = false;
-        return;
+    if !active && alt.active {
+        // 从备用屏退出：那一屏的历史属于刚结束的备用屏会话，清掉避免残留。
+        alt.lines.clear();
+        alt.prev = None;
+        alt.cur = Vec::new();
+        alt.view = 0;
     }
-    alt.active = true;
+    alt.active = active;
     let cur = alt_rows(term, rows, cols);
     alt.cur = cur.clone();
     if alt
@@ -510,7 +512,7 @@ fn capture_alt_history(
     }
 }
 
-/// 渲染备用屏历史回看视图：上半部分为攒下的历史行，下半部分为当前实时网格，
+/// 渲染自攒历史回看视图：上半部分为攒下的历史行，下半部分为当前实时网格，
 /// 全部按纯文本绘制（回看历史只求可读，不保留配色；回到实时后恢复逐格渲染）。
 fn render_alt_history(
     painter: &egui::Painter,
@@ -563,6 +565,29 @@ fn render_alt_history(
         FontId::proportional(12.0),
         if dark { Color32::from_gray(160) } else { Color32::from_gray(90) },
     );
+}
+
+/// 在自攒历史里滚动回看：向上（lines>0）增加回看行数，向下减少；全屏 TUI 在
+/// 实时底部还要向下滚也视为已消费（没有可滚内容）。返回是否有历史可回看。
+fn scroll_view_history(alt: &mut crate::session::AltHistory, lines: i32, status: &mut Option<String>) -> bool {
+    if alt.lines.is_empty() {
+        return false;
+    }
+    let n = lines.unsigned_abs() as usize;
+    if lines > 0 {
+        let was = alt.view;
+        alt.view = (alt.view + n).min(alt.lines.len());
+        if was == 0 && alt.view > 0 {
+            *status = Some("正在回看全屏 TUI 历史（滚轮向下回到实时）".to_string());
+        }
+    } else if alt.view > 0 {
+        let was = alt.view;
+        alt.view = alt.view.saturating_sub(n);
+        if was > 0 && alt.view == 0 {
+            *status = Some("已回到实时视图".to_string());
+        }
+    }
+    true
 }
 
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
@@ -629,46 +654,37 @@ pub fn show_terminal(
             if lines == 0 {
                 lines = if delta > 0.0 { 1 } else { -1 };
             }
-            // 备用屏（全屏 TUI）没有仿真器滚动缓冲；且本机 ConPTY 会改写宿主写
-            // 入的 SGR/X10 鼠标序列（实测到达子进程时被吞前缀/改字节），把滚轮
-            // 转发给应用根本不生效。改为回看自攒的备用屏历史（见 capture_alt_history）。
-            // 只有普通屏幕（shell / vim 等）才走 SGR 转发或仿真器滚动缓冲。
-            let alt_scrolled = {
-                let alt_active = sess
-                    .term
-                    .lock()
-                    .map(|t| t.mode().contains(TermMode::ALT_SCREEN))
-                    .unwrap_or(false);
-                if alt_active && !sess.alt.lines.is_empty() {
-                    let n = lines.unsigned_abs() as usize;
-                    if lines > 0 {
-                        let was_view = sess.alt.view;
-                        sess.alt.view = (sess.alt.view + n).min(sess.alt.lines.len());
-                        if was_view == 0 && sess.alt.view > 0 {
-                            *status =
-                                Some("正在回看全屏 TUI 历史（滚轮向下回到实时）".to_string());
-                        }
-                    } else if sess.alt.view > 0 {
-                        let was_view = sess.alt.view;
-                        sess.alt.view = sess.alt.view.saturating_sub(n);
-                        if was_view > 0 && sess.alt.view == 0 {
-                            *status = Some("已回到实时视图".to_string());
-                        }
+            // 滚轮通用策略：先滚仿真器原生缓冲（普通 shell / vim 有内容可滚）；
+            // 滚不动（备用屏无缓冲，或主屏全屏重绘型 TUI 只用绝对定位、无换行
+            // 滚动）→ 回看自攒的视口历史（capture_alt_history 每帧在攒，两种
+            // 形态都覆盖，通用且不受 ConPTY 是否吞备用屏序列影响）。
+            let (handled, moved) = match sess.term.lock() {
+                Ok(mut t) => {
+                    let before = t.grid().display_offset();
+                    t.scroll_display(Scroll::Delta(lines));
+                    let moved = t.grid().display_offset() != before;
+                    if moved {
+                        (false, true)
+                    } else {
+                        (scroll_view_history(&mut sess.alt, lines, &mut *status), false)
                     }
-                    true
-                } else {
-                    false
                 }
+                Err(_) => (false, false),
             };
-            if !alt_scrolled {
-                // 应用开启了鼠标上报（普通屏幕下的鼠标应用）→ 把滚轮转成 SGR 事件
-                // 发给应用让它自己滚；否则滚动仿真器自身的历史缓冲（shell / vim）。
-                let mouse_on = sess
+            if !handled && !moved {
+                // 仅主屏带鼠标上报的应用（非 ConPTY 平台）保留 SGR 转发兜底；
+                // 备用屏与自攒历史已消费的滚轮都不再往下走。
+                let (alt, mouse_on) = sess
                     .term
                     .lock()
-                    .map(|t| t.mode().intersects(TermMode::MOUSE_MODE))
-                    .unwrap_or(false);
-                if mouse_on {
+                    .map(|t| {
+                        (
+                            t.mode().contains(TermMode::ALT_SCREEN),
+                            t.mode().intersects(TermMode::MOUSE_MODE),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                if mouse_on && !alt {
                     let pos = ui.input(|i| i.pointer.latest_pos()).unwrap_or(rect.center());
                     let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
                         .clamp(1, cols);
@@ -680,8 +696,6 @@ pub fn show_terminal(
                         let _ =
                             sess.writer.try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
                     }
-                } else if let Ok(mut t) = sess.term.lock() {
-                    t.scroll_display(Scroll::Delta(lines));
                 }
             }
             ui.ctx().request_repaint();
@@ -995,7 +1009,7 @@ pub fn show_terminal(
     // 备用屏历史捕捉：把“从视口顶滚出去的整屏行”攒进 alt.lines，
     // 供全屏 TUI（opencode/jcode）滚轮回看（详见 AltHistory 注释）。
     capture_alt_history(&mut sess.alt, &term, rows, cols, Instant::now());
-    if sess.alt.view > 0 && term.mode().contains(TermMode::ALT_SCREEN) {
+    if sess.alt.view > 0 {
         render_alt_history(&painter, &sess.alt, rect, rows, cols, cell_h, &font_id, dark);
         return;
     }
@@ -1609,5 +1623,32 @@ mod tests {
         assert!(!alt.active, "退出备用屏后应标记失活");
         assert!(alt.lines.is_empty());
         assert_eq!(alt.view, 0);
+    }
+
+    /// 通用化：opencode/jcode 在本机 ConPTY 下根本没进备用屏（1049h 被吃），
+    /// 而是画在主屏。主屏全屏重绘（绝对定位改写、无换行滚动）同样要能自攒
+    /// 历史，滚轮滚不动仿真器缓冲时回看它。
+    #[test]
+    fn viewport_history_generic_for_main_screen() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config as TermConfig;
+        use alacritty_terminal::term::Term as ATerm;
+        use alacritty_terminal::vte::ansi::Processor as P;
+
+        // 主屏全屏重绘型 TUI（模拟 opencode 在 ConPTY 下的实际形态）。
+        let mut term = ATerm::new(TermConfig::default(), &TermSize::new(8, 4), VoidListener);
+        let mut p: P = Default::default();
+        let mut alt = crate::session::AltHistory::default();
+        let t0 = Instant::now();
+
+        p.advance(&mut term, b"\x1b[2J\x1b[HAAA\r\nBBB\r\nCCC\r\nDDD");
+        capture_alt_history(&mut alt, &term, 4, 8, t0);
+        assert!(alt.lines.is_empty(), "首帧没有可滚出的行");
+
+        // 用绝对定位把内容上移一行、底部补新行（全程无换行滚动）。
+        p.advance(&mut term, b"\x1b[HBBB\x1b[2HCCC\x1b[3HDDD\x1b[4HEEE");
+        capture_alt_history(&mut alt, &term, 4, 8, t0 + Duration::from_millis(200));
+        let hist = alt.lines.iter().map(|s| s.trim_end().to_string()).collect::<Vec<_>>();
+        assert_eq!(hist, vec!["AAA"], "主屏全屏 TUI 也应自攒历史");
     }
 }

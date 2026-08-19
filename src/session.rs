@@ -37,29 +37,31 @@ pub struct Session {
     pub exited: bool,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
-    /// 备用屏（全屏 TUI）的历史回看状态，见 `AltHistory`。
+    /// 全屏 TUI 的历史回看状态（备用屏与主屏通用），见 `AltHistory`。
     pub alt: AltHistory,
 }
 
-/// 全屏 TUI（备用屏）的历史回看状态。
+/// 全屏 TUI 的历史回看状态。
 ///
-/// 为什么需要它：opencode/jcode 这类 TUI 走备用屏（alt screen），备用屏没有
-/// 仿真器滚动缓冲；而 Windows ConPTY 会把宿主写进去的 SGR/X10 鼠标序列改写掉
-/// （实测 `\x1b[<64;3;12M` 到达子进程时变成 X10 载荷字节 `60 23 2c`、`\x1b[M`
-/// 前缀被吞），所以“把滚轮转发给应用自己滚”的路子在这台机器上根本不成立。
-/// 这里改为自攒历史：每帧比较备用屏网格，检测“内容从视口顶滚出一行”，把滚出的
-/// 行追加进 `lines`；滚轮在 `lines` 里回看，滚到底回到实时视图。
+/// 为什么需要它：opencode/jcode 这类 TUI 用绝对定位整屏重绘（备用屏或主屏都
+/// 一样），不产生换行滚动，仿真器缓冲里没有原生滚动内容；而本机 Windows
+/// ConPTY 还会改写宿主写入的 SGR/X10 鼠标序列（实测 `\x1b[<64;3;12M` 到达
+/// 子进程时变成 X10 载荷字节 `60 23 2c`、`\x1b[M` 前缀被吞），连备用屏切换
+/// 序列 `\x1b[?1049h` 也到不了仿真器，所以“滚轮转 SGR 给应用自己滚”的路子
+/// 在这台机器上不成立。
+/// 这里通用自攒视口历史：每帧比较视口快照，检测“内容从视口顶滚出一行”，把滚出
+/// 的行追加进 `lines`；滚轮滚不动仿真器缓冲时回看 `lines`，滚到底回到实时视图。
 #[derive(Default)]
 pub struct AltHistory {
-    /// 从视口顶滚出去的行（备用屏内容），按时间先后排列，容量封顶。
+    /// 从视口顶滚出去的行，按时间先后排列，容量封顶。
     pub lines: std::collections::VecDeque<String>,
-    /// 当前备用屏视口行文本（渲染历史视图的底部“实时”部分用）。
+    /// 当前视口行文本（渲染历史视图的底部“实时”部分用）。
     pub cur: Vec<String>,
     /// 上一次捕捉的视口快照，用于判断内容上移了几行。
     pub prev: Option<Vec<String>>,
     /// 距实时末尾回看了多少行（0=实时）。
     pub view: usize,
-    /// 备用屏当前是否激活（失活时清空历史，避免串到下一次备用屏会话）。
+    /// 备用屏当前是否激活（备用屏会话结束时清空历史，避免串到下一次）。
     pub active: bool,
     /// 捕捉节流：动画（spinner 等）每帧重绘，限制快照频率防失控。
     pub last_capture: Option<std::time::Instant>,
@@ -545,6 +547,7 @@ mod tests {
             "import fs from 'fs';\n",
             "process.stdin.setRawMode(true);\n",
             "process.stdout.write('READY');\n",
+            "process.stdout.write('\\u001b[?1049h');\n",
             "process.stdout.write('\\u001b[?1000h\\u001b[?1006h');\n",
             "process.stdin.on('data',d=>fs.appendFileSync('_sgr_echo.log',Buffer.from(d).toString('hex')+'\\n'));\n",
         );
@@ -552,6 +555,14 @@ mod tests {
         let _ = std::fs::remove_file(log_file);
         let mut sess = spawn("t", ".", "node _sgr_echo.mjs", 80, 24, tx, ctx).expect("spawn node");
         std::thread::sleep(Duration::from_millis(2000));
+
+        // ConPTY 是否把输出方向的备用屏切换（?1049h）原样送到仿真器。
+        let alt_bit = sess
+            .term
+            .lock()
+            .map(|t| t.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
+            .unwrap_or(false);
+        println!("DBG_ALT alt_screen={alt_bit}");
 
         let check = |bytes: &[u8]| {
             sess.writer.try_send(bytes.to_vec()).unwrap();
