@@ -37,34 +37,6 @@ pub struct Session {
     pub exited: bool,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
-    /// 全屏 TUI 的历史回看状态（备用屏与主屏通用），见 `AltHistory`。
-    pub alt: AltHistory,
-}
-
-/// 全屏 TUI 的历史回看状态。
-///
-/// 为什么需要它：opencode/jcode 这类 TUI 用绝对定位整屏重绘（备用屏或主屏都
-/// 一样），不产生换行滚动，仿真器缓冲里没有原生滚动内容；而本机 Windows
-/// ConPTY 还会改写宿主写入的 SGR/X10 鼠标序列（实测 `\x1b[<64;3;12M` 到达
-/// 子进程时变成 X10 载荷字节 `60 23 2c`、`\x1b[M` 前缀被吞），连备用屏切换
-/// 序列 `\x1b[?1049h` 也到不了仿真器，所以“滚轮转 SGR 给应用自己滚”的路子
-/// 在这台机器上不成立。
-/// 这里通用自攒视口历史：每帧比较视口快照，检测“内容从视口顶滚出一行”，把滚出
-/// 的行追加进 `lines`；滚轮滚不动仿真器缓冲时回看 `lines`，滚到底回到实时视图。
-#[derive(Default)]
-pub struct AltHistory {
-    /// 从视口顶滚出去的行，按时间先后排列，容量封顶。
-    pub lines: std::collections::VecDeque<String>,
-    /// 当前视口行文本（渲染历史视图的底部“实时”部分用）。
-    pub cur: Vec<String>,
-    /// 上一次捕捉的视口快照，用于判断内容上移了几行。
-    pub prev: Option<Vec<String>>,
-    /// 距实时末尾回看了多少行（0=实时）。
-    pub view: usize,
-    /// 备用屏当前是否激活（备用屏会话结束时清空历史，避免串到下一次）。
-    pub active: bool,
-    /// 捕捉节流：动画（spinner 等）每帧重绘，限制快照频率防失控。
-    pub last_capture: Option<std::time::Instant>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -375,7 +347,6 @@ pub fn spawn(
         osc_theme_aware,
         exited: false,
         last_clipboard_seq: None,
-        alt: AltHistory::default(),
     })
 }
 
