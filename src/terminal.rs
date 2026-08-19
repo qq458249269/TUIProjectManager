@@ -443,6 +443,23 @@ fn should_pgup_fallback<L: EventListener>(
     non_blank_rows(term, rows) >= 3
 }
 
+/// 按当前可用面积与等宽字体计算终端网格行列数。
+/// 会话页签里终端占满整个中央面板（无左侧项目栏）；启动会话时用它取精确尺寸，
+/// 避免用窗口减固定余量的估算值 spawn（那会让 TUI 启动时按错误尺寸画页面）。
+pub fn term_grid_size(ui: &egui::Ui) -> Option<(usize, usize)> {
+    let font_id = FontId::monospace(TERM_FONT_SIZE);
+    let cell_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+    let cell_h = ui.ctx().fonts_mut(|f| f.row_height(&font_id));
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return None;
+    }
+    let avail = ui.available_size();
+    Some((
+        (avail.x / cell_w).floor().max(1.0) as usize,
+        (avail.y / cell_h).floor().max(1.0) as usize,
+    ))
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
 pub fn show_terminal(
     ui: &mut egui::Ui,
@@ -451,16 +468,14 @@ pub fn show_terminal(
     status: &mut Option<String>,
     term_focused: &mut bool,
 ) {
+    let (cols, rows) = match term_grid_size(ui) {
+        Some(g) => g,
+        None => return,
+    };
+    let avail = ui.available_size();
     let font_id = FontId::monospace(TERM_FONT_SIZE);
     let cell_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let cell_h = ui.ctx().fonts_mut(|f| f.row_height(&font_id));
-    if cell_w <= 0.0 || cell_h <= 0.0 {
-        return;
-    }
-
-    let avail = ui.available_size();
-    let cols = (avail.x / cell_w).floor().max(1.0) as usize;
-    let rows = (avail.y / cell_h).floor().max(1.0) as usize;
 
     if sess.grid_size != (cols as u16, rows as u16) {
         if let Ok(mut t) = sess.term.lock() {

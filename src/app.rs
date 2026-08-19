@@ -21,6 +21,17 @@ pub enum Tab {
     Session(Session),
 }
 
+/// 待下一帧在会话页签布局里启动的会话。
+/// 点击「启动」时若立刻 spawn，窗口还停在首页布局，拿不到终端真实可用面积，
+/// 只能估算（窗口减左栏/状态栏余量），与会话页签全宽实际面积恒差一截；TUI
+/// 启动即按估算尺寸整屏画页，首帧 resize 事件偶发丢失 → 页面尺寸对不上窗口。
+/// 推迟一帧：下一帧的中央面板布局已切到会话页签，按精确尺寸 spawn，零纠正。
+pub struct PendingLaunch {
+    pub title: String,
+    pub dir: String,
+    pub cmd: String,
+}
+
 /// 输入弹窗的类型与当前文本。
 pub enum InputDialog {
     AddProject { name: String, path: String },
@@ -346,9 +357,18 @@ pub struct ClientApp {
     drag_tab: Option<usize>,
     /// 项目列表拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
     drag_project: Option<usize>,
+    /// 点击「启动」待 spawn 的会话（下一帧会话页签布局里按精确尺寸启动）。
+    pending_launch: Vec<PendingLaunch>,
+    /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
+    pending_restore: Vec<PendingLaunch>,
+    /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
+    restore_active: Option<usize>,
+    /// 终端上次渲染的真实网格尺寸：重开崩溃页签/切启动命令时按它 spawn，
+    /// 避免再走 80x24 → 首帧 resize 的错尺寸启动路径。
+    last_term_size: (u16, u16),
     /// 原生窗口句柄：启动时把 DWM 标题栏固定为黑色（运行中切换不可靠，直接固定）。
     titlebar_hwnd: isize,
-    /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入，并估算 PTY 启动尺寸。
+    /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
 }
 
@@ -396,12 +416,17 @@ impl ClientApp {
             redraw_rx,
             drag_tab: None,
             drag_project: None,
+            pending_launch: Vec::new(),
+            pending_restore: Vec::new(),
+            restore_active: None,
+            last_term_size: (80, 24),
             titlebar_hwnd,
             ctx,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
-        let mut restored = 0usize;
+        // 不在构造期 spawn：此时窗口未布局，只有估算尺寸，会走错尺寸启动路径；
+        // 收集成 pending_restore，等首帧会话页签布局里按精确尺寸启动（见 ui()）。
         for d in &saved_tabs.dirs {
             if !Path::new(d).is_dir() {
                 continue;
@@ -419,28 +444,14 @@ impl ClientApp {
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| d.clone())
                 });
-            match session::spawn(
-                &name,
-                d,
-                &app.config.settings.tui_command,
-                80,
-                24,
-                app.redraw_tx.clone(),
-                app.ctx.clone(),
-            ) {
-                Ok(sess) => {
-                    sess.theme_dark
-                        .store(app.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
-                    app.tabs.push(Tab::Session(sess));
-                    restored += 1;
-                }
-                Err(_) => {}
-            }
+            app.pending_restore.push(PendingLaunch {
+                title: name,
+                dir: d.clone(),
+                cmd: app.config.settings.tui_command.clone(),
+            });
         }
-        if restored > 0 {
-            app.current = saved_active.min(app.tabs.len() - 1);
-            app.term_focused = app.current != 0;
-            app.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+        if !app.pending_restore.is_empty() {
+            app.restore_active = Some(saved_active);
         }
         // 每次启动自动检查一次更新。
         app.check_updates(true);
@@ -506,37 +517,16 @@ impl ClientApp {
                 }
             }
         }
-        // 用实际可用面积估算 PTY 尺寸，而不是固定 80x24：
-        // opencode 恢复历史会话时会按启动时的窗口尺寸整屏重排，
-        // 若估算尺寸与仿真网格相差过大，绝对定位的写入位置就会错乱。
-        let font_id = egui::FontId::monospace(terminal::TERM_FONT_SIZE);
-        let cell_w = self.ctx.fonts_mut(|f| f.glyph_width(&font_id, 'M')).max(1.0);
-        let cell_h = self.ctx.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
-        let screen = self.ctx.content_rect();
-        let cols = (((screen.width() - 300.0).max(160.0) / cell_w) as usize).clamp(20, 500) as u16;
-        let rows = (((screen.height() - 64.0).max(120.0) / cell_h) as usize).clamp(10, 300) as u16;
-        match session::spawn(
-            &project.name,
-            &project.path,
-            &self.config.settings.tui_command,
-            cols,
-            rows,
-            self.redraw_tx.clone(),
-            self.ctx.clone(),
-        ) {
-            Ok(sess) => {
-                sess.theme_dark
-                    .store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
-                self.tabs.push(Tab::Session(sess));
-                self.current = self.tabs.len() - 1;
-                self.term_focused = true;
-                self.screen = Screen::Main;
-                self.status = Some(format!("已启动: {}", project.name));
-                // 每次新开页签自动检查一次更新。
-                self.check_updates(true);
-            }
-            Err(e) => self.status = Some(format!("启动失败: {e}")),
-        }
+        // 不在点击帧直接 spawn：此时还在首页布局，拿不到会话页签的真实可用面积；
+        // 旧实现的估算（窗口宽-左栏 300px、高-64px）与会话页签全宽实际面积恒差一截，
+        // TUI 启动即按估算尺寸整屏画页，首帧 resize 事件偶发丢失 → 页面尺寸对不上。
+        // 推迟到下一帧会话页签布局里按精确尺寸启动（见 ui() 的 pending_launch）。
+        self.pending_launch.push(PendingLaunch {
+            title: project.name.clone(),
+            dir: project.path,
+            cmd: self.config.settings.tui_command.clone(),
+        });
+        self.status = Some(format!("正在启动: {}", project.name));
     }
 
     /// cmd /c 命令串里的目录参数：含空白时交给引号保护，否则 ^ 转义 cmd 特殊字符。
@@ -599,12 +589,15 @@ impl ClientApp {
     }
 
     fn relaunch_session(&mut self, dir: String, title: String) {
+        // 按实际渲染尺寸 spawn：会话页签仍是当前视图，last_term_size 即真实尺寸，
+        // 避免固定 80x24 → 首帧 resize 的错尺寸启动路径（同新开页签竞态）。
+        let (cols, rows) = self.last_term_size;
         match session::spawn(
             &title,
             &dir,
             &self.config.settings.tui_command,
-            80,
-            24,
+            cols,
+            rows,
             self.redraw_tx.clone(),
             self.ctx.clone(),
         ) {
@@ -1168,12 +1161,14 @@ impl ClientApp {
             let _ = s.child.kill();
         }
         self.tabs.remove(idx);
+        // 按实际渲染尺寸 spawn：会话页签仍是当前视图，last_term_size 即真实尺寸。
+        let (cols, rows) = self.last_term_size;
         match session::spawn(
             &title,
             &dir,
             &cmd,
-            80,
-            24,
+            cols,
+            rows,
             self.redraw_tx.clone(),
             self.ctx.clone(),
         ) {
@@ -1947,7 +1942,83 @@ impl eframe::App for ClientApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // 待启动会话在此 spawn：中央面板布局已定，ui.available_size() 即终端真实
+            // 面积，按它算行列数启动，TUI 首帧即按最终尺寸画整屏页，无需 resize 纠正。
+            let pending = std::mem::take(&mut self.pending_launch);
+            if !pending.is_empty() {
+                let geom = terminal::term_grid_size(ui);
+                for p in pending {
+                    let (cols, rows) = geom.unwrap_or((80, 24));
+                    match session::spawn(
+                        &p.title,
+                        &p.dir,
+                        &p.cmd,
+                        cols as u16,
+                        rows as u16,
+                        self.redraw_tx.clone(),
+                        self.ctx.clone(),
+                    ) {
+                        Ok(sess) => {
+                            sess.theme_dark.store(
+                                self.config.settings.dark_mode,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            self.tabs.push(Tab::Session(sess));
+                            self.current = self.tabs.len() - 1;
+                            self.term_focused = true;
+                            self.screen = Screen::Main;
+                            self.status = Some(format!("已启动: {}", p.title));
+                        }
+                        Err(e) => {
+                            self.status = Some(format!("启动失败: {e}"));
+                        }
+                    }
+                }
+                self.check_updates(true);
+            }
+
+            // 启动时恢复上次的会话：同样等首帧会话页签布局按精确尺寸启动。
+            let pending = std::mem::take(&mut self.pending_restore);
+            if !pending.is_empty() {
+                let geom = terminal::term_grid_size(ui);
+                let mut restored = 0usize;
+                for p in pending {
+                    let (cols, rows) = geom.unwrap_or((80, 24));
+                    match session::spawn(
+                        &p.title,
+                        &p.dir,
+                        &p.cmd,
+                        cols as u16,
+                        rows as u16,
+                        self.redraw_tx.clone(),
+                        self.ctx.clone(),
+                    ) {
+                        Ok(sess) => {
+                            sess.theme_dark.store(
+                                self.config.settings.dark_mode,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            self.tabs.push(Tab::Session(sess));
+                            restored += 1;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if let Some(active) = self.restore_active.take() {
+                    self.current = active.min(self.tabs.len() - 1);
+                    self.term_focused = self.current != 0;
+                }
+                if restored > 0 {
+                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+                }
+            }
+
             if let Some(Tab::Session(_)) = self.tabs.get(self.current) {
+                // 记录本次终端真实网格尺寸：重开崩溃页签/切换启动命令时按它 spawn，
+                // 避免 80x24 起步等首帧 resize 的错尺寸启动路径。
+                if let Some(geom) = terminal::term_grid_size(ui) {
+                    self.last_term_size = (geom.0 as u16, geom.1 as u16);
+                }
                 // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
                 // catch_unwind 捕获后关闭该页签，整个软件继续运行。
                 let (dark, status, term_focused) = (
