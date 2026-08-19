@@ -37,6 +37,32 @@ pub struct Session {
     pub exited: bool,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
+    /// 备用屏（全屏 TUI）的历史回看状态，见 `AltHistory`。
+    pub alt: AltHistory,
+}
+
+/// 全屏 TUI（备用屏）的历史回看状态。
+///
+/// 为什么需要它：opencode/jcode 这类 TUI 走备用屏（alt screen），备用屏没有
+/// 仿真器滚动缓冲；而 Windows ConPTY 会把宿主写进去的 SGR/X10 鼠标序列改写掉
+/// （实测 `\x1b[<64;3;12M` 到达子进程时变成 X10 载荷字节 `60 23 2c`、`\x1b[M`
+/// 前缀被吞），所以“把滚轮转发给应用自己滚”的路子在这台机器上根本不成立。
+/// 这里改为自攒历史：每帧比较备用屏网格，检测“内容从视口顶滚出一行”，把滚出的
+/// 行追加进 `lines`；滚轮在 `lines` 里回看，滚到底回到实时视图。
+#[derive(Default)]
+pub struct AltHistory {
+    /// 从视口顶滚出去的行（备用屏内容），按时间先后排列，容量封顶。
+    pub lines: std::collections::VecDeque<String>,
+    /// 当前备用屏视口行文本（渲染历史视图的底部“实时”部分用）。
+    pub cur: Vec<String>,
+    /// 上一次捕捉的视口快照，用于判断内容上移了几行。
+    pub prev: Option<Vec<String>>,
+    /// 距实时末尾回看了多少行（0=实时）。
+    pub view: usize,
+    /// 备用屏当前是否激活（失活时清空历史，避免串到下一次备用屏会话）。
+    pub active: bool,
+    /// 捕捉节流：动画（spinner 等）每帧重绘，限制快照频率防失控。
+    pub last_capture: Option<std::time::Instant>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -347,6 +373,7 @@ pub fn spawn(
         osc_theme_aware,
         exited: false,
         last_clipboard_seq: None,
+        alt: AltHistory::default(),
     })
 }
 
@@ -494,6 +521,62 @@ mod tests {
             "OSC 应答 ST 必须是 ESC+单个反斜杠，实际: {s:?}"
         );
         let _ = sess.child.kill();
+    }
+
+    // 本机 ConPTY 对宿主写入的 SGR 鼠标输入的处理（备用屏滚轮转发是否成立）。
+    // node 兼任子进程：把收到的每个输入按 hex 追加到 _sgr_echo.log。
+    #[test]
+    fn conpty_mangles_sgr_mouse_input() {
+        // node 未安装时跳过（Windows GUI 机器一般都有 dev 环境）。
+        if std::process::Command::new("node")
+            .args(["--version"])
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = eframe::egui::Context::default();
+        // node 的 -e 参数经 portable-pty 命令行拼接后会被空格拆散（脚本含空格），
+        // 改用无空格路径的脚本文件：与真实 TUI 的启动方式（单文件可执行）一致。
+        let echo_file = "_sgr_echo.mjs";
+        let log_file = "_sgr_echo.log";
+        let script = concat!(
+            "import fs from 'fs';\n",
+            "process.stdin.setRawMode(true);\n",
+            "process.stdout.write('READY');\n",
+            "process.stdout.write('\\u001b[?1000h\\u001b[?1006h');\n",
+            "process.stdin.on('data',d=>fs.appendFileSync('_sgr_echo.log',Buffer.from(d).toString('hex')+'\\n'));\n",
+        );
+        std::fs::write(echo_file, script).unwrap();
+        let _ = std::fs::remove_file(log_file);
+        let mut sess = spawn("t", ".", "node _sgr_echo.mjs", 80, 24, tx, ctx).expect("spawn node");
+        std::thread::sleep(Duration::from_millis(2000));
+
+        let check = |bytes: &[u8]| {
+            sess.writer.try_send(bytes.to_vec()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        };
+        check(b"hi");
+        check(b"\x1b[A");
+        check(b"\x1b[<64;3;12M");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let log = std::fs::read_to_string(log_file).unwrap_or_default();
+        // 纯文本与 CSI 按键能原样穿过 ConPTY（自攒历史的滚轮兜底依赖普通
+        // 输入通路仍正常，避免一修滚轮坏键盘）。
+        assert!(log.contains("6869"), "纯文本应原样到达:\n{log}");
+        assert!(log.contains("1b5b41"), "CSI 按键应原样到达:\n{log}");
+        // 本机 ConPTY 会把 SGR 滚轮序列改写掉（实测变 X10 载荷字节/吞前缀），
+        // 所以备用屏滚轮不能指望“转 SGR 给应用”，只能走自攒历史。
+        // 若某天 ConPTY 能原样透传，这里会失败提醒可恢复 SGR 转发。
+        assert!(
+            !log.contains("1b5b3c3634333b31324d"),
+            "SGR 滚轮序列意外原样到达（ConPTY 行为已变，可恢复 SGR 转发）:\n{log}"
+        );
+        let _ = sess.child.kill();
+        let _ = std::fs::remove_file(echo_file);
+        let _ = std::fs::remove_file(log_file);
     }
 
     #[test]

@@ -1,14 +1,17 @@
 use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::Term;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
+use std::time::{Duration, Instant};
 
 use crate::session::{Session, SessionListener};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
@@ -16,6 +19,14 @@ use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw};
 
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
+
+/// 备用屏历史回看的最大行数（防内存失控；10k 行足够回看很久的全屏 TUI 输出）。
+const ALT_HISTORY_MAX_LINES: usize = 10_000;
+/// 历史捕捉节流：全屏 TUI 动画（spinner 等）每帧重绘，限制快照频率。
+const ALT_CAPTURE_INTERVAL: Duration = Duration::from_millis(120);
+/// 整屏重画型 TUI（没检测到整行上移）的兜底判据：变化格占比达到该阈值时，
+/// 把整个旧视口记为一帧进历史。spinner 这类少量格变化不会触发。
+const ALT_FULL_FRAME_CHANGE_RATIO: f32 = 0.2;
 
 /// 深浅主题下的终端画布底色。
 const TERM_BG_DARK: Color32 = Color32::from_rgb(22, 22, 26);
@@ -382,6 +393,178 @@ fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
             && range.contains(Point::new(point.line, point.column + 1)))
 }
 
+/// 把备用屏当前网格转成视口行文本。宽字符占 2 格、随空格跳过，控制字符按空格
+/// 处理；按显示宽度截断到 `cols` 格，保证与逐格渲染的行宽一致。
+fn alt_rows<L: EventListener>(term: &Term<L>, rows: usize, cols: usize) -> Vec<String> {
+    let grid = term.grid();
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut s = String::new();
+        let mut w = 0usize;
+        for c in 0..cols {
+            let cell = &grid[Point::new(Line(r as i32), Column(c))];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let ch = cell.c;
+            let wide = cell.flags.contains(Flags::WIDE_CHAR);
+            let step = if wide { 2 } else { 1 };
+            if w + step > cols {
+                break;
+            }
+            w += step;
+            s.push(if (ch as u32) < 0x20 { ' ' } else { ch });
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// 备用屏内容“整行上移”检测：返回从视口顶滚出去的行数（0 = 未检测到，如清屏
+/// 重画、动画局部刷新）。
+///
+/// 规则：存在 k，使 旧第 k..rows-1 行 == 新第 0..rows-1-k 行，且 k ≤ rows-2。
+/// 末行（页脚/输入行）作通配、常见不变；限制 k ≤ rows-2 防止“仅末行变化”被
+/// 误判成整屏滚动。opencode 这类聊天 TUI 追加新消息时旧内容整体上移，正好命中。
+fn scrolled_out_rows(prev: &[String], cur: &[String]) -> usize {
+    let rows = prev.len().min(cur.len());
+    if rows < 3 {
+        return 0;
+    }
+    for k in (1..=rows - 2).rev() {
+        if prev[k..rows - 1] == cur[..rows - 1 - k] {
+            return k;
+        }
+    }
+    0
+}
+
+/// 两帧视口文本逐格（按字节）差异占比，用于整屏重画型 TUI 的历史兜底。
+fn changed_cells_ratio(a: &[String], b: &[String]) -> f32 {
+    let rows = a.len().min(b.len());
+    if rows == 0 {
+        return 0.0;
+    }
+    let mut diff = 0usize;
+    let mut total = 0usize;
+    for i in 0..rows {
+        let sa = a[i].as_bytes();
+        let sb = b[i].as_bytes();
+        let n = sa.len().max(sb.len());
+        total += n;
+        for j in 0..n {
+            if sa.get(j).copied().unwrap_or(b' ') != sb.get(j).copied().unwrap_or(b' ') {
+                diff += 1;
+            }
+        }
+    }
+    diff as f32 / total.max(1) as f32
+}
+
+/// 每帧调用：备用屏激活时把“从视口顶滚出去的历史行”追进 `alt.lines`，并更新
+/// 当前视口快照；失活时清空历史（备用屏会话结束，避免串到下一次）。
+fn capture_alt_history(
+    alt: &mut crate::session::AltHistory,
+    term: &Term<impl EventListener>,
+    rows: usize,
+    cols: usize,
+    now: Instant,
+) {
+    let active = term.mode().contains(TermMode::ALT_SCREEN);
+    if !active {
+        if alt.active {
+            alt.lines.clear();
+            alt.prev = None;
+            alt.cur = Vec::new();
+            alt.view = 0;
+        }
+        alt.active = false;
+        return;
+    }
+    alt.active = true;
+    let cur = alt_rows(term, rows, cols);
+    alt.cur = cur.clone();
+    if alt
+        .last_capture
+        .map_or(true, |t| now.duration_since(t) >= ALT_CAPTURE_INTERVAL)
+    {
+        if let Some(prev) = &alt.prev {
+            let k = scrolled_out_rows(prev, &cur);
+            if k > 0 {
+                // 内容整行上移：滚出视口顶的 k 行进入历史。
+                for row in &prev[..k] {
+                    alt.lines.push_back(row.clone());
+                }
+            } else if changed_cells_ratio(prev, &cur) >= ALT_FULL_FRAME_CHANGE_RATIO {
+                // 整屏重画（无上移对齐）：把整个旧视口记为一帧，滚动按帧回看。
+                for row in prev {
+                    alt.lines.push_back(row.clone());
+                }
+            }
+            while alt.lines.len() > ALT_HISTORY_MAX_LINES {
+                alt.lines.pop_front();
+            }
+        }
+        alt.prev = Some(cur);
+        alt.last_capture = Some(now);
+    }
+}
+
+/// 渲染备用屏历史回看视图：上半部分为攒下的历史行，下半部分为当前实时网格，
+/// 全部按纯文本绘制（回看历史只求可读，不保留配色；回到实时后恢复逐格渲染）。
+fn render_alt_history(
+    painter: &egui::Painter,
+    alt: &crate::session::AltHistory,
+    rect: Rect,
+    rows: usize,
+    cols: usize,
+    cell_h: f32,
+    font_id: &FontId,
+    dark: bool,
+) {
+    let fg = color_for(dark, Color32::WHITE, Color32::BLACK);
+    let bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
+    painter.rect_filled(rect, 0.0, bg);
+
+    let lines = &alt.lines;
+    let start = lines.len().saturating_sub(alt.view);
+    let ring_shown = lines.len() - start;
+    for i in 0..rows {
+        let text: &str = if i < ring_shown {
+            lines.get(start + i).map(String::as_str).unwrap_or("")
+        } else {
+            alt.cur.get(i - ring_shown).map(String::as_str).unwrap_or("")
+        };
+        // 按显示宽度截断到 cols 格（宽字符按 2 格估），保证横向对齐。
+        let mut w = 0usize;
+        let mut end = 0usize;
+        for (j, ch) in text.char_indices() {
+            let step = if ch.is_ascii() { 1 } else { 2 };
+            if w + step > cols {
+                break;
+            }
+            w += step;
+            end = j + ch.len_utf8();
+        }
+        let text = if end < text.len() { &text[..end] } else { text };
+        painter.text(
+            Pos2::new(rect.left(), rect.top() + (i as f32 + 0.5) * cell_h),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font_id.clone(),
+            fg,
+        );
+    }
+    // 角落里提示“回看历史”，避免全屏 TUI 画面冻结被误认为应用卡住。
+    painter.text(
+        Pos2::new(rect.right() - 4.0, rect.top() + 4.0),
+        egui::Align2::RIGHT_TOP,
+        "↑ 历史",
+        FontId::proportional(12.0),
+        if dark { Color32::from_gray(160) } else { Color32::from_gray(90) },
+    );
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
 pub fn show_terminal(
     ui: &mut egui::Ui,
@@ -417,6 +600,11 @@ pub fn show_terminal(
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
     let term_id = resp.id;
     if resp.clicked() {
+        // 点击终端视为要回到实时：退出历史回看并把焦点交给终端。
+        if sess.alt.view > 0 {
+            sess.alt.view = 0;
+            *status = Some("已回到实时视图".to_string());
+        }
         *term_focused = true;
         resp.request_focus();
     }
@@ -441,25 +629,60 @@ pub fn show_terminal(
             if lines == 0 {
                 lines = if delta > 0.0 { 1 } else { -1 };
             }
-            // 应用开启了鼠标上报（opencode 聊天列表等）→ 把滚轮转成 SGR 事件发给
-            // 应用让它自己滚；否则滚动仿真器自身的历史缓冲（普通 shell / vim）。
-            // 注意：opencode 在备用屏（alt screen）下无历史缓冲，这条分支是它唯一的滚屏途径。
-            let mouse_on = sess
-                .term
-                .lock()
-                .map(|t| t.mode().intersects(TermMode::MOUSE_MODE))
-                .unwrap_or(false);
-            if mouse_on {
-                let pos = ui.input(|i| i.pointer.latest_pos()).unwrap_or(rect.center());
-                let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1).clamp(1, cols);
-                let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1).clamp(1, rows);
-                let up = lines > 0;
-                for _ in 0..lines.abs().clamp(1, 32) {
-                    let b = if up { 64 } else { 65 };
-                    let _ = sess.writer.try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
+            // 备用屏（全屏 TUI）没有仿真器滚动缓冲；且本机 ConPTY 会改写宿主写
+            // 入的 SGR/X10 鼠标序列（实测到达子进程时被吞前缀/改字节），把滚轮
+            // 转发给应用根本不生效。改为回看自攒的备用屏历史（见 capture_alt_history）。
+            // 只有普通屏幕（shell / vim 等）才走 SGR 转发或仿真器滚动缓冲。
+            let alt_scrolled = {
+                let alt_active = sess
+                    .term
+                    .lock()
+                    .map(|t| t.mode().contains(TermMode::ALT_SCREEN))
+                    .unwrap_or(false);
+                if alt_active && !sess.alt.lines.is_empty() {
+                    let n = lines.unsigned_abs() as usize;
+                    if lines > 0 {
+                        let was_view = sess.alt.view;
+                        sess.alt.view = (sess.alt.view + n).min(sess.alt.lines.len());
+                        if was_view == 0 && sess.alt.view > 0 {
+                            *status =
+                                Some("正在回看全屏 TUI 历史（滚轮向下回到实时）".to_string());
+                        }
+                    } else if sess.alt.view > 0 {
+                        let was_view = sess.alt.view;
+                        sess.alt.view = sess.alt.view.saturating_sub(n);
+                        if was_view > 0 && sess.alt.view == 0 {
+                            *status = Some("已回到实时视图".to_string());
+                        }
+                    }
+                    true
+                } else {
+                    false
                 }
-            } else if let Ok(mut t) = sess.term.lock() {
-                t.scroll_display(Scroll::Delta(lines));
+            };
+            if !alt_scrolled {
+                // 应用开启了鼠标上报（普通屏幕下的鼠标应用）→ 把滚轮转成 SGR 事件
+                // 发给应用让它自己滚；否则滚动仿真器自身的历史缓冲（shell / vim）。
+                let mouse_on = sess
+                    .term
+                    .lock()
+                    .map(|t| t.mode().intersects(TermMode::MOUSE_MODE))
+                    .unwrap_or(false);
+                if mouse_on {
+                    let pos = ui.input(|i| i.pointer.latest_pos()).unwrap_or(rect.center());
+                    let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
+                        .clamp(1, cols);
+                    let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
+                        .clamp(1, rows);
+                    let up = lines > 0;
+                    for _ in 0..lines.abs().clamp(1, 32) {
+                        let b = if up { 64 } else { 65 };
+                        let _ =
+                            sess.writer.try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
+                    }
+                } else if let Ok(mut t) = sess.term.lock() {
+                    t.scroll_display(Scroll::Delta(lines));
+                }
             }
             ui.ctx().request_repaint();
         }
@@ -480,15 +703,18 @@ pub fn show_terminal(
                 Column((col as usize).min(cols.saturating_sub(1))),
             ))
         };
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
-                t.selection =
-                    Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
-            }
-        } else if resp.dragged_by(egui::PointerButton::Primary) {
-            if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
-                if let Some(sel) = t.selection.as_mut() {
-                    sel.update(pos, Side::Left);
+        // 回看历史时禁用拖拽选区（历史视图不是实时网格，坐标会错位）。
+        if sess.alt.view == 0 {
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                    t.selection =
+                        Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
+                }
+            } else if resp.dragged_by(egui::PointerButton::Primary) {
+                if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                    if let Some(sel) = t.selection.as_mut() {
+                        sel.update(pos, Side::Left);
+                    }
                 }
             }
         }
@@ -745,6 +971,10 @@ pub fn show_terminal(
     // 投��用户输入到后台写入线程（非��塞）。
     // 有输入时先回到实时视图底部：正在回看历史时输入，应回到最新内容。
     if !bytes_out.is_empty() {
+        if sess.alt.view > 0 {
+            sess.alt.view = 0;
+            *status = Some("已回到实时视图".to_string());
+        }
         if let Ok(mut t) = sess.term.lock() {
             if t.grid().display_offset() != 0 {
                 t.scroll_display(Scroll::Bottom);
@@ -762,6 +992,13 @@ pub fn show_terminal(
         Ok(t) => t,
         Err(_) => return,
     };
+    // 备用屏历史捕捉：把“从视口顶滚出去的整屏行”攒进 alt.lines，
+    // 供全屏 TUI（opencode/jcode）滚轮回看（详见 AltHistory 注释）。
+    capture_alt_history(&mut sess.alt, &term, rows, cols, Instant::now());
+    if sess.alt.view > 0 && term.mode().contains(TermMode::ALT_SCREEN) {
+        render_alt_history(&painter, &sess.alt, rect, rows, cols, cell_h, &font_id, dark);
+        return;
+    }
     let content = term.renderable_content();
     let offset = content.display_offset;
     let colors = &content.colors;
@@ -1300,5 +1537,77 @@ mod tests {
         assert_eq!(path_for_input(r"my dir\a.txt"), "\"my dir\\a.txt\"");
         // 含引号直接删掉（cmd 引号内无法转义），仍按含特殊字符加双引号。
         assert_eq!(path_for_input("say\"hi.txt"), "\"sayhi.txt\"");
+    }
+
+    /// 备用屏“整行上移”检测：追加新行 → 顶行滚出视口进历史；仅末行变化 /
+    /// 清屏重画不误判。
+    #[test]
+    fn alt_history_scroll_detection() {
+        let prev = ["A", "B", "C", "D"].map(String::from);
+        let cur = ["B", "C", "D", "E"].map(String::from);
+        assert_eq!(scrolled_out_rows(&prev, &cur), 1);
+
+        // 一次滚出多行。
+        let prev2 = ["A", "B", "C", "D", "E", "F"].map(String::from);
+        let cur2 = ["D", "E", "F", "G", "H", "I"].map(String::from);
+        assert_eq!(scrolled_out_rows(&prev2, &cur2), 3);
+
+        // 仅末行（页脚/输入行）变化 → 不误判成整屏滚动。
+        let prev3 = ["A", "B", "C", "f1"].map(String::from);
+        let cur3 = ["A", "B", "C", "f2"].map(String::from);
+        assert_eq!(scrolled_out_rows(&prev3, &cur3), 0);
+
+        // 清屏重画（无整行上移）→ 0。
+        let prev4 = ["A", "B", "C", "D"].map(String::from);
+        let cur4 = ["X", "Y", "Z", "W"].map(String::from);
+        assert_eq!(scrolled_out_rows(&prev4, &cur4), 0);
+
+        // 行数不足 3 → 0。
+        let small = ["a".to_string(), "b".to_string()];
+        assert_eq!(scrolled_out_rows(&small, &small), 0);
+    }
+
+    /// 备用屏历史捕捉端到端：输出 4 行 → 追加 1 行 → 顶行进入历史；
+    /// 退出备用屏 → 历史清空。
+    #[test]
+    fn alt_history_capture_collects_scrolled_out_rows() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config as TermConfig;
+        use alacritty_terminal::term::Term as ATerm;
+        use alacritty_terminal::vte::ansi::Processor as P;
+
+        let mut term = ATerm::new(TermConfig::default(), &TermSize::new(8, 4), VoidListener);
+        let mut p: P = Default::default();
+        let mut alt = crate::session::AltHistory::default();
+        let t0 = Instant::now();
+
+        // 进入备用屏并清屏，输出 4 行。
+        p.advance(&mut term, b"\x1b[?1049h\x1b[2J\x1b[H");
+        p.advance(&mut term, b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        capture_alt_history(&mut alt, &term, 4, 8, t0);
+        assert!(alt.active, "备用屏应标记激活");
+        assert!(alt.lines.is_empty(), "首帧没有可滚出的行");
+        let cur0 = alt.cur.iter().map(|s| s.trim_end().to_string()).collect::<Vec<_>>();
+        assert_eq!(cur0, vec!["AAA", "BBB", "CCC", "DDD"]);
+
+        // 再输出一行：旧顶行 AAA 滚出视口进入历史（间隔超过捕捉节流）。
+        p.advance(&mut term, b"\r\nEEE");
+        capture_alt_history(&mut alt, &term, 4, 8, t0 + Duration::from_millis(200));
+        let hist = alt.lines.iter().map(|s| s.trim_end().to_string()).collect::<Vec<_>>();
+        assert_eq!(hist, vec!["AAA"]);
+        let cur1 = alt.cur.iter().map(|s| s.trim_end().to_string()).collect::<Vec<_>>();
+        assert_eq!(cur1, vec!["BBB", "CCC", "DDD", "EEE"]);
+
+        // 回看 1 行：历史行 AAA + 实时 [BBB,CCC,DDD] 的顶部。
+        alt.view = 1;
+        let start = alt.lines.len() - alt.view;
+        assert_eq!(alt.lines[start].trim_end(), "AAA");
+
+        // 退出备用屏 → 历史与回看位置清空。
+        p.advance(&mut term, b"\x1b[?1049l");
+        capture_alt_history(&mut alt, &term, 4, 8, t0 + Duration::from_millis(400));
+        assert!(!alt.active, "退出备用屏后应标记失活");
+        assert!(alt.lines.is_empty());
+        assert_eq!(alt.view, 0);
     }
 }
