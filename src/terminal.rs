@@ -413,15 +413,29 @@ fn non_blank_rows<L: EventListener>(term: &Term<L>, rows: usize) -> usize {
 /// 成 PgUp/PgDn 发给应用，让应用滚自己的历史 —— 无需自攒任何缓存，恢复会话
 /// 也从字节 0 起天然可用（应用自己持有全部历史）。
 ///
-/// 判定：备用屏（真实进入 1049h 的 TUI，如 less/vim/htop）直接命中；主屏场景
-/// （本机 ConPTY 下 opencode 的形态）要求仿真器缓冲为空 + 屏上非空白行数 ≥3
-/// （排除空提示符/刚 cls 的 cmd）。缓冲判断严格用 ==0：alacritty 实现里
-/// `\x1b[2J` 清屏会把一行推进缓冲（实测），而 opencode 实际输出流恒为 0（帧首
-/// `\x1b[H`+`\x1b[K`×rows，绝无 2J）；shell 有过任何换行输出即 >0 自动排除。
-/// 若将来目标 TUI 用 2J 清屏导致不命中，把 ==0 放宽到 ≤2 即可。
-fn should_pgup_fallback<L: EventListener>(term: &Term<L>, rows: usize) -> bool {
+/// 判定（优先级从上到下）：
+/// 1. 备用屏（真实进入 1049h 的 TUI，如 less/vim/htop）直接命中；
+/// 2. 输出流有大量光标定位（CSI H/f ≥100 且 5 秒内活跃）→ 全屏重绘型 TUI，
+///    如本机 ConPTY 下的 opencode。这个信号会话级持久：即使 opencode 中途
+///    偶发换行输出让 history>0，滚轮仍滚它的对话历史，而不是滚仿真器缓冲
+///    里那点零散输出（“滚动终端本体”的体验错误）。shell 输出从不用 CSI H，
+///    永不误判；
+/// 3. 兜底：history==0 且屏上非空白行数 ≥3（排除空提示符/刚 cls 的 cmd）。
+///    history 判断严格用 ==0：alacritty 实现里 `\x1b[2J` 清屏会把一行推进
+///    缓冲（实测），而 opencode 实际输出流恒为 0（帧首 `\x1b[H`+`\x1b[K`×rows，
+///    绝无 2J）；shell 有过任何换行输出即 >0 自动排除。
+fn should_pgup_fallback<L: EventListener>(
+    term: &Term<L>,
+    rows: usize,
+    csi_pos: &std::sync::Mutex<(u32, std::time::Instant)>,
+) -> bool {
     if term.mode().contains(TermMode::ALT_SCREEN) {
         return true;
+    }
+    if let Ok(c) = csi_pos.lock() {
+        if c.0 >= 100 && c.1.elapsed() < std::time::Duration::from_secs(5) {
+            return true;
+        }
     }
     if alacritty_terminal::grid::Dimensions::history_size(term.grid()) != 0 {
         return false;
@@ -516,7 +530,7 @@ pub fn show_terminal(
                                     .writer
                                     .try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
                             }
-                        } else if should_pgup_fallback(&t, rows) {
+                        } else if should_pgup_fallback(&t, rows, &sess.csi_pos) {
                             // 一格滚轮 ≈3 行，一次 PgUp ≈ 一页；按行数折算再发。
                             let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
                             let key = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
@@ -1369,15 +1383,20 @@ mod tests {
         assert_eq!(path_for_input("say\"hi.txt"), "\"sayhi.txt\"");
     }
 
-    /// 滚轮翻译 PgUp/PgDn 的判定：备用屏直接命中；主屏全屏重绘型 TUI（模拟
-    /// opencode 在本机 ConPTY 下的形态：绝对定位铺满、无换行滚动、history=0）
-    /// 命中；shell 有滚动缓冲 / 空提示符（刚 cls 的 cmd）不命中。
+    /// 滚轮翻译 PgUp/PgDn 的判定：备用屏直接命中；全屏重绘信号（CSI H 计数）
+    /// 活跃时即使 history>0 也命中（opencode 偶发换行输出后的场景）；兜底判定
+    /// 主屏铺满 + history=0 命中；shell 有滚动缓冲 / 空提示符不命中。
     #[test]
     fn wheel_pgup_fallback_detection() {
         use alacritty_terminal::event::VoidListener;
         use alacritty_terminal::term::Config as TermConfig;
         use alacritty_terminal::term::Term as ATerm;
         use alacritty_terminal::vte::ansi::Processor as P;
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        // 全屏重绘信号（默认不活跃：计数 0）。
+        let idle_signal = Mutex::new((0u32, Instant::now()));
 
         // 主屏全屏重绘型 TUI：绝对定位写满 5 行（不碰最后一行避免换行滚动）。
         let mut term = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
@@ -1388,7 +1407,29 @@ mod tests {
             0,
             "绝对定位改写不应产生滚动缓冲"
         );
-        assert!(should_pgup_fallback(&term, 6), "主屏铺满、无缓冲 → 命中");
+        assert!(should_pgup_fallback(&term, 6, &idle_signal), "主屏铺满、无缓冲 → 命中");
+
+        // 全屏重绘信号活跃 + 仿真器缓冲已有内容（opencode 偶发换行输出）
+        // → 仍命中：滚轮滚应用自己的历史，而不是滚仿真器缓冲（"滚动终端本体"）。
+        let active_signal = Mutex::new((200u32, Instant::now()));
+        let mut term5 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
+        let mut p5: P = Default::default();
+        p5.advance(
+            &mut term5,
+            b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7",
+        );
+        assert_ne!(
+            alacritty_terminal::grid::Dimensions::history_size(term5.grid()),
+            0
+        );
+        assert!(should_pgup_fallback(&term5, 6, &active_signal), "CSI H 活跃 + history>0 → 命中");
+
+        // 信号过期（5 秒前的 CSI H）→ 回落到 history 判定，不命中。
+        let stale_signal = Mutex::new((200u32, Instant::now() - std::time::Duration::from_secs(6)));
+        assert!(
+            !should_pgup_fallback(&term5, 6, &stale_signal),
+            "信号过期 → 按 history 判定，不命中"
+        );
 
         // 带启动清屏（\x1b[2J 会推进一行缓冲）的全屏 TUI 不命中：见
         // should_pgup_fallback 的注释，opencode 实际输出流没有 2J，严格 ==0 已够。
@@ -1396,13 +1437,13 @@ mod tests {
         let mut p2: P = Default::default();
         p2.advance(&mut term2, b"\x1b[2J\x1b[HAAA\x1b[2HBBB\x1b[3HCCC\x1b[4HDDD\x1b[5HEEE");
         assert!(
-            !should_pgup_fallback(&term2, 6),
+            !should_pgup_fallback(&term2, 6, &idle_signal),
             "2J 清屏推进了缓冲 → 不命中（宽松化判决见注释）"
         );
 
         // 备用屏（less/vim）→ 命中。
         p.advance(&mut term, b"\x1b[?1049h\x1b[2J\x1b[HHi");
-        assert!(should_pgup_fallback(&term, 6), "备用屏 → 命中");
+        assert!(should_pgup_fallback(&term, 6, &idle_signal), "备用屏 → 命中");
 
         // shell：换行滚动产生缓冲 → 不命中（走原生 scroll_display）。
         let mut term3 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
@@ -1416,12 +1457,12 @@ mod tests {
             1,
             "多出一行应滚进缓冲"
         );
-        assert!(!should_pgup_fallback(&term3, 6), "有滚动缓冲 → 不命中");
+        assert!(!should_pgup_fallback(&term3, 6, &idle_signal), "有滚动缓冲 → 不命中");
 
         // 空提示符（刚 cls 的 cmd）：缓冲为空但非空白行不足 → 不命中。
         let mut term4 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
         let mut p4: P = Default::default();
         p4.advance(&mut term4, b"\x1b[HPrompt>");
-        assert!(!should_pgup_fallback(&term4, 6), "空提示符 → 不命中");
+        assert!(!should_pgup_fallback(&term4, 6, &idle_signal), "空提示符 → 不命中");
     }
 }

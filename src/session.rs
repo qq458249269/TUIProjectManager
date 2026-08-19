@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::test::TermSize;
@@ -35,6 +36,11 @@ pub struct Session {
     pub osc_theme_aware: Arc<AtomicBool>,
     /// 子进程是否已退出。
     pub exited: bool,
+    /// 全屏重绘型 TUI 信号：输出流里累计的光标定位（CSI H/f）次数与最近一次
+    /// 时间。opencode 这类全屏 TUI 每帧用绝对定位重绘（30+ 次/帧），shell 输出
+    /// 从不用；滚轮据此把事件翻译成 PgUp/PgDn 而非滚仿真器缓冲，详见
+    /// terminal::should_pgup_fallback。
+    pub csi_pos: Arc<Mutex<(u32, Instant)>>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
 }
@@ -298,10 +304,12 @@ pub fn spawn(
 
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
+    let csi_pos = Arc::new(Mutex::new((0u32, Instant::now())));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
         let osc_theme_aware = osc_theme_aware.clone();
+        let csi_pos = csi_pos.clone();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -313,6 +321,26 @@ pub fn spawn(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // 统计光标定位（CSI H/f）：全屏重绘型 TUI 的判据（见
+                        // terminal::should_pgup_fallback）。跳过参数直到最终字节。
+                        let chunk = &buf[..n];
+                        let mut i = 0;
+                        while i + 1 < chunk.len() {
+                            if chunk[i] == 0x1b && chunk[i + 1] == b'[' {
+                                let mut j = i + 2;
+                                while j < chunk.len() && !(0x40..=0x7e).contains(&chunk[j]) {
+                                    j += 1;
+                                }
+                                if j < chunk.len() && (chunk[j] == b'H' || chunk[j] == b'f') {
+                                    let mut c = csi_pos.lock().unwrap();
+                                    c.0 = c.0.saturating_add(1);
+                                    c.1 = Instant::now();
+                                }
+                                i = j + 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
                         let mut term = term.lock().unwrap();
                         parser.advance(&mut *term, &buf[..n]);
                         if let Some((reply, osc_color)) = reply_to_queries(
@@ -346,6 +374,7 @@ pub fn spawn(
         theme_dark,
         osc_theme_aware,
         exited: false,
+        csi_pos,
         last_clipboard_seq: None,
     })
 }
