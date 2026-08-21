@@ -63,6 +63,7 @@ enum TabAction {
     OpenDir(usize),
     OpenVSCode(usize),
     SwitchCommand(usize, String),
+    Restart(usize),
 }
 
 /// 项目列表点击/双击/右键菜单产生的动作。
@@ -988,6 +989,14 @@ impl ClientApp {
                             actions.push(TabAction::OpenVSCode(i));
                             ui.close();
                         }
+                        if ui
+                            .button("🔄 重新启动")
+                            .on_hover_text("结束当前会话并重新启动该页签")
+                            .clicked()
+                        {
+                            actions.push(TabAction::Restart(i));
+                            ui.close();
+                        }
                         ui.separator();
                         // 切换该页签的启动命令：在设置里配置的 TUI 命令列表中选一个，
                         // 选完立即用新命令重启本页签（保持目录与页签位置）。
@@ -1122,6 +1131,50 @@ impl ClientApp {
                     }
                 }
                 TabAction::SwitchCommand(i, cmd) => self.switch_tab_command(i, cmd),
+                TabAction::Restart(i) => self.restart_tab(i),
+            }
+        }
+    }
+
+    fn restart_tab(&mut self, idx: usize) {
+        if idx == 0 || idx >= self.tabs.len() {
+            return;
+        }
+        let Some(Tab::Session(s)) = self.tabs.get_mut(idx) else { return };
+        let dir = s.dir.clone();
+        let title = s.title.clone();
+        let cmd = s.cmd.clone();
+        if !s.exited {
+            let _ = s.child.kill();
+        }
+        self.tabs.remove(idx);
+        let (cols, rows) = self.last_term_size;
+        match session::spawn(
+            &title,
+            &dir,
+            &cmd,
+            cols,
+            rows,
+            self.redraw_tx.clone(),
+            self.ctx.clone(),
+        ) {
+            Ok(sess) => {
+                sess.theme_dark.store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
+                self.tabs.insert(idx, Tab::Session(sess));
+                self.current = idx;
+                self.term_focused = true;
+                self.refresh_focus();
+                self.status = Some(format!("已重新启动: {title}"));
+            }
+            Err(e) => {
+                self.status = Some(format!("重新启动失败: {e}"));
+                if self.current >= self.tabs.len() {
+                    self.current = self.tabs.len().saturating_sub(1);
+                }
+                if self.current == 0 {
+                    self.screen = Screen::Main;
+                }
+                self.refresh_focus();
             }
         }
     }
