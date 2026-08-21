@@ -1012,10 +1012,12 @@ impl ClientApp {
                     }
                     if resp.clicked() {
                         let pos = ui.ctx().pointer_interact_pos();
-                        // 指针按在 × 上 —— 关闭；否则 —— 激活（已激活的页签 no-op）。
+                        // 指针按在 × 上 —— 关闭；否则 —— 激活。即便已激活也推送 Activate，
+                        // 让「输出结束」对号在点击当前页签时也能被清除（已激活时 current 赋同值
+                        // 是无操作，仅触发 has_been_viewed 置位）。
                         if pos.is_some_and(|p| close_rect.contains(p)) {
                             actions.push(TabAction::Close(i));
-                        } else if !selected {
+                        } else {
                             actions.push(TabAction::Activate(i));
                         }
                     }
