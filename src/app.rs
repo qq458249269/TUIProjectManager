@@ -345,7 +345,6 @@ pub struct ClientApp {
     pub settings_command: String,
     pub settings_commands: Vec<String>,
     pub settings_new_command: String,
-    pub settings_refresh_fps: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
     pub term_focused: bool,
@@ -408,7 +407,6 @@ impl ClientApp {
             settings_command,
             settings_commands,
             settings_new_command: String::new(),
-            settings_refresh_fps: config::DEFAULT_REFRESH_FPS.to_string(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
             term_focused: false,
@@ -476,7 +474,6 @@ impl ClientApp {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
-        self.settings_refresh_fps = self.config.settings.refresh_fps.to_string();
         self.screen = Screen::Settings;
         self.term_focused = false;
     }
@@ -879,40 +876,35 @@ impl ClientApp {
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
-                    // 根据终端输出状态显示图标：输出中=...循环、输出结束=√（点击后清除）。
-                    let status_icon = if s.exited {
-                        String::new()
+                    // 状态图标：固定宽度单字符（Proportional 下柱条/对号统一等宽，切换不抖动）。
+                    // 输出中=柱状等宽动画（300ms 刷新一次）；输出结束/进程退出=对号（点击页签后清除）。
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let last = s.last_output_ms.load(Ordering::Relaxed);
+                    let viewed = s.has_been_viewed.load(Ordering::Relaxed);
+                    // 注意：对号只能用 √ (U+221A)。✓/✔ (U+2713/U+2714) 在本字体栈（egui
+                    // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportional
+                    // 族（Monospace 族缺这些字形）。
+                    let icon: Option<char> = if s.exited {
+                        if viewed { None } else { Some('√') }
+                    } else if last == 0 {
+                        None
+                    } else if now_ms.saturating_sub(last) < 1000 {
+                        // 最近 1s 内有输出 → 柱状等宽动画（300ms 刷新一次，省 CPU）。
+                        const BARS: &[char] = &['▁', '▂', '▃', '▅', '▆', '▇'];
+                        let idx = (now_ms / 300) as usize % BARS.len();
+                        Some(BARS[idx])
+                    } else if !viewed {
+                        Some('√')
                     } else {
-                        let now_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let last = s.last_output_ms.load(Ordering::Relaxed);
-                        let viewed = s.has_been_viewed.load(Ordering::Relaxed);
-                        if last == 0 {
-                            String::new()
-                        } else if now_ms.saturating_sub(last) < 1000 {
-                            // 最近 1s 内有输出 → 旋转字符循环（按设置的刷新帧率切换）。
-                            let fps = self.config.settings.refresh_fps.clamp(10, 60);
-                            let interval_ms = 1000 / fps;
-                            let idx = (now_ms / interval_ms) as u32;
-                            match idx % 4 {
-                                0 => "  . ",
-                                1 => " .. ",
-                                2 => "... ",
-                                _ => "..  ",
-                            }
-                            .to_string()
-                        } else if !viewed {
-                            "√  ".to_string()
-                        } else {
-                            String::new()
-                        }
+                        None
                     };
                     let title = if s.exited {
                         format!("{} (已退出)", s.title)
                     } else {
-                        format!("{status_icon}{}", s.title)
+                        s.title.clone()
                     };
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
@@ -944,6 +936,13 @@ impl ClientApp {
                             // 两部分，等式让标题中心落在槽中心；差额小到撑不开中间空隙时全垫
                             // 在左侧，正文与 × 紧邻（与自然宽标题行为一致）。
                             let font = egui::TextStyle::Body.resolve(ui.style());
+                            // 图标槽宽 = 柱条字符宽度（Proportional 下所有柱条等宽）。对号也放进
+                            // 同一等宽槽内居中，任何状态下图标区宽度恒定，切换不引起页签宽度抖动。
+                            let slot_w = ui.ctx().fonts_mut(|f| {
+                                f.layout_no_wrap("▇".to_string(), font.clone(), Color32::TRANSPARENT)
+                                    .size()
+                                    .x
+                            });
                             let title_w = ui.ctx().fonts_mut(|f| {
                                 f.layout_no_wrap(title.clone(), font.clone(), Color32::TRANSPARENT)
                                     .size()
@@ -955,7 +954,14 @@ impl ClientApp {
                                     .x
                             });
                             let s = ui.spacing().item_spacing.x;
-                            let slack = (min_width - title_w - s - close_w).max(0.0);
+                            // 图标恒定占一个等宽槽宽；图标与标题之间留一个项距（与标题/× 之间一致）。
+                            let icon_w = if icon.is_some() { slot_w } else { 0.0 };
+                            let icon_title_w = if icon_w > 0.0 {
+                                icon_w + s + title_w
+                            } else {
+                                title_w
+                            };
+                            let slack = (min_width - icon_title_w - s - close_w).max(0.0);
                             let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
                                 // 左右空隙对等：pad_l = pad_m + s + close_w → 标题居中。
                                 ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
@@ -966,6 +972,16 @@ impl ClientApp {
                             };
                             if pad_l > 0.0 {
                                 ui.add_space(pad_l);
+                            }
+                            if let Some(c) = icon {
+                                // 状态图标：固定等宽槽 + 高亮色（egui 0.36 无字体级加粗，strong()
+                                // 提亮对比，视觉上更醒目）。
+                                let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                                ui.add_sized(
+                                    egui::vec2(slot_w, row_h),
+                                    egui::Label::new(RichText::new(c.to_string()).strong())
+                                        .selectable(false),
+                                );
                             }
                             ui.add(
                                 if selected {
@@ -1879,30 +1895,9 @@ impl ClientApp {
             self.save_config("设置已自动保存".to_string());
         }
         ui.add_space(12.0);
-        ui.label("界面刷新帧率（输入 10-60 帧/秒，默认 10）:");
-        ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.settings_refresh_fps)
-                    .desired_width(60.0),
-            );
-            ui.label("FPS");
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if resp.lost_focus() || enter {
-                if let Ok(v) = self.settings_refresh_fps.trim().parse::<u64>() {
-                    let v = v.clamp(10, 60);
-                    if v != self.config.settings.refresh_fps {
-                        self.config.settings.refresh_fps = v;
-                        self.settings_refresh_fps = v.to_string();
-                        self.save_config("已更新刷新率".to_string());
-                    }
-                }
-            }
-            ui.label(RichText::new(format!(
-                "当前: {} FPS，换算刷新间隔约 {}ms/帧",
-                self.config.settings.refresh_fps,
-                1000 / self.config.settings.refresh_fps.max(1).min(60),
-            )).weak());
-        });
+        // 空闲基线刷新已固定为 1s（终端输出时实时重绘，不受此限制）。
+        // 保留 refresh_fps 配置项以兼容旧配置文件，但不再影响刷新。
+        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n对号 √ 只在未查看过时显示，点击页签后消失。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
@@ -2106,12 +2101,24 @@ impl eframe::App for ClientApp {
             set_titlebar_theme(self.titlebar_hwnd);
         }
 
-        // 固定帧率基线刷新（默认 10fps=100ms，设置中可调 10-60）：纯消息驱动时
-        // 鼠标不动/无事件的空闲期，状态栏等界面元素不会刷新，体验异常。
-        // request_repaint_after 每帧续上一帧，形成恒定基线。
-        // （光标常显不闪烁，见 show_terminal，无需为此高频率重绘。）
-        let fps = self.config.settings.refresh_fps.clamp(10, 60);
-        ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
+        // 动态基线刷新：任一会话最近 1s 内有输出 → 300ms 刷新（页签柱状动画以 300ms
+        // 换帧）；否则空闲期降到 1s，大幅降低持续整屏重绘的 CPU 占用（此前默认 10fps
+        // =100ms 持续空转）。request_repaint_after 每帧续上一帧，形成恒定基线；
+        // 终端输出本身经 redraw_tx 即时触发重绘（不依赖此基线）。
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let animating = self.tabs.iter().any(|t| {
+            if let Tab::Session(s) = t {
+                let last = s.last_output_ms.load(Ordering::Relaxed);
+                last != 0 && now_ms.saturating_sub(last) < 1000
+            } else {
+                false
+            }
+        });
+        let base_ms = if animating { 300 } else { 1000 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(base_ms));
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
