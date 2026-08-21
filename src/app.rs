@@ -375,8 +375,6 @@ pub struct ClientApp {
     titlebar_hwnd: isize,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
-    /// 转圈动画帧计数器。
-    spin_frame: u32,
 }
 
 impl ClientApp {
@@ -430,7 +428,6 @@ impl ClientApp {
             last_term_size: (80, 24),
             titlebar_hwnd,
             ctx,
-            spin_frame: 0,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -895,12 +892,13 @@ impl ClientApp {
                         if last == 0 {
                             String::new()
                         } else if now_ms.saturating_sub(last) < 500 {
-                            // 最近 500ms 内有输出 → ... 循环（4 帧一轮，固定 3 字符宽）。
-                            match self.spin_frame % 4 {
-                                0 => ".  ",
-                                1 => ".. ",
-                                2 => "...",
-                                _ => "   ",
+                            // 最近 500ms 内有输出 → 旋转字符循环（每 500ms 切换一次）。
+                            let idx = (now_ms / 500) as u32;
+                            match idx % 4 {
+                                0 => "— ",
+                                1 => "/ ",
+                                2 => "| ",
+                                _ => "\\ ",
                             }
                             .to_string()
                         } else if !viewed {
@@ -2112,7 +2110,6 @@ impl eframe::App for ClientApp {
         // （光标常显不闪烁，见 show_terminal，无需为此高频率重绘。）
         let fps = self.config.settings.refresh_fps.clamp(10, 60);
         ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
-        self.spin_frame = self.spin_frame.wrapping_add(1);
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {

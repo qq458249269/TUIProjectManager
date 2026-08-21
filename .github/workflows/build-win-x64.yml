@@ -102,6 +102,17 @@ jobs:
           }
           exit 0
 
+      - name: 收集最近 10 条提交记录
+        id: commits
+        shell: pwsh
+        run: |
+          $log = git log --oneline -10 --format="- %h %s"
+          $log = $log -join "`n"
+          Write-Host "最近提交:`n$log"
+          "COMMITS<<EOF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $log | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EOF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -126,6 +137,9 @@ jobs:
             - 界面: 右下角可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗
             - 刷新: 默认 10fps 基线刷新，设置中可调（10-60 FPS）
             - 配置: 自动保存到 exe 同级的 `config/config.json`
+
+            ## 最近更新
+            ${{ env.COMMITS }}
           files: target/release/tui-project-manager.exe
           draft: false
           prerelease: true
