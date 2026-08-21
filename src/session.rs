@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::test::TermSize;
@@ -43,6 +43,10 @@ pub struct Session {
     pub csi_pos: Arc<Mutex<(u32, Instant)>>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
+    /// 最近一次收到 PTY 输出的时间戳（millis since epoch），读取线程写、UI 线程读。
+    pub last_output_ms: Arc<AtomicU64>,
+    /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
+    pub has_been_viewed: Arc<AtomicBool>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -305,11 +309,13 @@ pub fn spawn(
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
     let csi_pos = Arc::new(Mutex::new((0u32, Instant::now())));
+    let last_output_ms = Arc::new(AtomicU64::new(0));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
         let osc_theme_aware = osc_theme_aware.clone();
         let csi_pos = csi_pos.clone();
+        let last_output_ms = last_output_ms.clone();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -321,6 +327,12 @@ pub fn spawn(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // 记录最近一次输出时间（供 UI 判断是否正在输出）。
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        last_output_ms.store(now_ms, Ordering::Relaxed);
                         // 统计光标定位（CSI H/f）：全屏重绘型 TUI 的判据（见
                         // terminal::should_pgup_fallback）。跳过参数直到最终字节。
                         let chunk = &buf[..n];
@@ -376,6 +388,8 @@ pub fn spawn(
         exited: false,
         csi_pos,
         last_clipboard_seq: None,
+        last_output_ms,
+        has_been_viewed: Arc::new(AtomicBool::new(false)),
     })
 }
 

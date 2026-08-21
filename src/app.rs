@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -373,6 +375,8 @@ pub struct ClientApp {
     titlebar_hwnd: isize,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
+    /// 转圈动画帧计数器。
+    spin_frame: u32,
 }
 
 impl ClientApp {
@@ -426,6 +430,7 @@ impl ClientApp {
             last_term_size: (80, 24),
             titlebar_hwnd,
             ctx,
+            spin_frame: 0,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -877,10 +882,37 @@ impl ClientApp {
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
+                    // 根据终端输出状态显示图标：输出中=...循环、输出结束=√（点击后清除）。
+                    let status_icon = if s.exited {
+                        String::new()
+                    } else {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let last = s.last_output_ms.load(Ordering::Relaxed);
+                        let viewed = s.has_been_viewed.load(Ordering::Relaxed);
+                        if last == 0 {
+                            String::new()
+                        } else if now_ms.saturating_sub(last) < 500 {
+                            // 最近 500ms 内有输出 → ... 循环（4 帧一轮，固定 3 字符宽）。
+                            match self.spin_frame % 4 {
+                                0 => ".  ",
+                                1 => ".. ",
+                                2 => "...",
+                                _ => "   ",
+                            }
+                            .to_string()
+                        } else if !viewed {
+                            "√  ".to_string()
+                        } else {
+                            String::new()
+                        }
+                    };
                     let title = if s.exited {
                         format!("{} (已退出)", s.title)
                     } else {
-                        s.title.clone()
+                        format!("{status_icon}{}", s.title)
                     };
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
@@ -1108,6 +1140,10 @@ impl ClientApp {
                 TabAction::Activate(i) => {
                     self.current = i;
                     self.refresh_focus();
+                    // 点击页签后清除「输出结束」对号。
+                    if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
+                        s.has_been_viewed.store(true, Ordering::Relaxed);
+                    }
                 }
                 TabAction::Close(i) => self.close_session(i),
                 TabAction::OpenDir(i) => {
@@ -2076,6 +2112,7 @@ impl eframe::App for ClientApp {
         // （光标常显不闪烁，见 show_terminal，无需为此高频率重绘。）
         let fps = self.config.settings.refresh_fps.clamp(10, 60);
         ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
+        self.spin_frame = self.spin_frame.wrapping_add(1);
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
