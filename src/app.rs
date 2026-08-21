@@ -891,14 +891,16 @@ impl ClientApp {
                         let viewed = s.has_been_viewed.load(Ordering::Relaxed);
                         if last == 0 {
                             String::new()
-                        } else if now_ms.saturating_sub(last) < 500 {
-                            // 最近 500ms 内有输出 → 旋转字符循环（每 500ms 切换一次）。
-                            let idx = (now_ms / 500) as u32;
+                        } else if now_ms.saturating_sub(last) < 1000 {
+                            // 最近 1s 内有输出 → 旋转字符循环（按设置的刷新帧率切换）。
+                            let fps = self.config.settings.refresh_fps.clamp(10, 60);
+                            let interval_ms = 1000 / fps;
+                            let idx = (now_ms / interval_ms) as u32;
                             match idx % 4 {
-                                0 => "— ",
-                                1 => "/ ",
-                                2 => "| ",
-                                _ => "\\ ",
+                                0 => "  . ",
+                                1 => " .. ",
+                                2 => "... ",
+                                _ => "..  ",
                             }
                             .to_string()
                         } else if !viewed {
