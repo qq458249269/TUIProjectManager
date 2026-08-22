@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
@@ -140,8 +139,8 @@ fn hwnd_of(cc: &eframe::CreationContext<'_>) -> isize {
     }
 }
 
-/// 固定深色标题栏：egui 的 ThemePreference 只改面板颜色，标题栏由 DWM 绘制，
-/// 需要显式 DwmSetWindowAttribute。固定为黑色标题栏，不随深浅主题切换。
+// 固定深色标题栏：egui 的 ThemePreference 只改面板颜色，标题栏由 DWM 绘制，
+// 需要显式 DwmSetWindowAttribute。固定为黑色标题栏，不随深浅主题切换。
 #[link(name = "dwmapi")]
 unsafe extern "system" {
     fn DwmSetWindowAttribute(
@@ -226,16 +225,18 @@ unsafe fn refresh_titlebar(hwnd: isize) {
     const RDW_FRAME: u32 = 0x0400;
     const RDW_INVALIDATE: u32 = 0x0001;
     const RDW_UPDATENOW: u32 = 0x0100;
-    SetWindowPos(
-        hwnd,
-        0,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-    );
-    RedrawWindow(hwnd, std::ptr::null(), 0, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        RedrawWindow(hwnd, std::ptr::null(), 0, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
+    }
 }
 
 /// 深浅主题下可读的提示色。
@@ -878,32 +879,40 @@ impl ClientApp {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
                     // 状态图标：固定宽度单字符（Proportional 下柱条/对号统一等宽，切换不抖动）。
-                    // 输出中=柱状等宽动画（300ms 刷新一次）；输出结束/进程退出=对号（点击页签后清除）。
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    // 检测逻辑：
+                    // - 有输出活动 → 柱状动画（正在回答）
+                    // - 输出停止一段时间 → ✅（回答完成，待查看）
+                    // - 已查看或无输出 → 无图标
                     let count = s.output_count.load(Ordering::Relaxed);
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
                     // 注意：对号用 ✅ (U+2705)。✓/✔ (U+2713/U+2714) 在本字体栈（egui
                     // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportional
                     // 族（Monospace 族缺这些字形）。
-                    // 持续输出判定：累计>=2 次输出且最近 2 秒内仍有输出 → TUI 动画/大量输出；
-                    // 单次输出（能力查询/输入回显）不触发加载动画；空闲 2 秒后动画停。
-                    let silent = s.last_output_instant.lock().map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(2));
-                    let continuous = count >= 2 && !silent;
+                    // 输出活动判定：最近 500ms 内有输出 → 正在回答；空闲 500ms → 回答完成。
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let last_ms = s.last_output_ms.load(Ordering::Relaxed);
+                    let silent = now_ms.saturating_sub(last_ms) > 500;
+                    // 核心逻辑：
+                    // - 输出中 → 柱状动画（正在回答）
+                    // - 输出停止且非前台页签 → ✅（回答完成，待查看）
+                    // - 激活页签（viewed=true）→ 不显示图标（前台无需提示）
+                    // - 无输出 → 无图标
                     let icon: Option<char> = if s.exited {
+                        // 进程已退出：未查看显示 ✅，已查看隐藏
                         if viewed { None } else { Some('✅') }
-                    } else if count == 0 {
-                        None
-                    } else if continuous {
-                        // 持续输出 → 柱状等宽动画（300ms 刷新一次，省 CPU）。
+                    } else if count > 0 && !silent {
+                        // 有输出且近期活跃 → 柱状等宽动画（正在回答）
                         const BARS: &[char] = &['▁', '▂', '▃', '▅', '▆', '▇'];
                         let idx = (now_ms / 300) as usize % BARS.len();
                         Some(BARS[idx])
-                    } else if !viewed {
+                    } else if count > 0 && !viewed {
+                        // 有输出但已停止，且未查看（非前台页签）→ ✅
                         Some('✅')
                     } else {
+                        // 无输出，或已查看（前台页签）→ 无图标
                         None
                     };
                     let title = if s.exited {
@@ -2115,17 +2124,14 @@ impl eframe::App for ClientApp {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        // 动画刷新：有输出活动时 300ms 刷新一次，无活动时 1000ms 刷新一次
         let animating = self.tabs.iter().any(|t| {
             if let Tab::Session(s) = t {
-                let packed = s.output_times.load(Ordering::Relaxed);
-                let prev_ds = (packed >> 32) as u32;
-                let last_ds = packed as u32;
                 let count = s.output_count.load(Ordering::Relaxed);
-                let now_ds = (now_ms / 1000) as u32;
-                count >= 2
-                    && prev_ds != 0
-                    && now_ds.saturating_sub(last_ds) < 5
-                    && last_ds.saturating_sub(prev_ds) < 5
+                // 检测近期是否有输出活动（500ms 内）
+                let last_ms = s.last_output_ms.load(Ordering::Relaxed);
+                let silent = now_ms.saturating_sub(last_ms) > 500;
+                count > 0 && !silent
             } else {
                 false
             }

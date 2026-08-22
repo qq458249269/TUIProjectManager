@@ -43,11 +43,9 @@ pub struct Session {
     pub csi_pos: Arc<Mutex<(u32, Instant)>>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
-    /// 最近两次输出的时间戳打包（upper32=prev_ms/1000, lower32=last_ms/1000）。
-    /// 连续两次输出间隔<500ms 视为持续输出（TUI 动画），间隔>500ms 视为单次事件（能力查询）。
-    pub output_times: Arc<AtomicU64>,
-    /// 最近一次有输出的绝对时间（供 UI 精确判定连续输出是否已停）。
-    pub last_output_instant: Arc<Mutex<Instant>>,
+    /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
+    /// 使用 AtomicU64 代替 Mutex<Instant>，避免读取时加锁。
+    pub last_output_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
@@ -315,17 +313,20 @@ pub fn spawn(
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
     let csi_pos = Arc::new(Mutex::new((0u32, Instant::now())));
-    let output_times = Arc::new(AtomicU64::new(0));
     let output_count = Arc::new(AtomicU32::new(0));
-    let last_output_instant = Arc::new(Mutex::new(Instant::now()));
+    let last_output_ms = Arc::new(AtomicU64::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    ));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
         let osc_theme_aware = osc_theme_aware.clone();
         let csi_pos = csi_pos.clone();
-        let output_times = output_times.clone();
         let output_count = output_count.clone();
-        let last_output_instant = last_output_instant.clone();
+        let last_output_ms = last_output_ms.clone();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -336,35 +337,18 @@ pub fn spawn(
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        // 清零 output_times：进程退出后动画立即停。
-                        output_times.store(0, Ordering::Relaxed);
                         let _ = redraw_reader.send(());
                         break;
                     },
                     Ok(n) => {
                         // 记录输出时间戳（供 UI 判断是否持续输出）。
-                        // packed = (prev_ms/1000 << 32) | (last_ms/1000)。
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
-                        let now_ds = (now_ms / 1000) as u32; // deciseconds
-                        loop {
-                            let old = output_times.load(Ordering::Relaxed);
-                            let last_ds = old as u32;
-                            // 连续输出（间隔<5s）：滚动更新 prev。
-                            let new_prev = if now_ds.saturating_sub(last_ds) < 5 { last_ds } else { 0 };
-                            let new_packed = ((new_prev as u64) << 32) | (now_ds as u64);
-                            if output_times
-                                .compare_exchange_weak(old, new_packed, Ordering::Relaxed, Ordering::Relaxed)
-                                .is_ok()
-                            {
-                                break;
-                            }
-                        }
                         output_count.fetch_add(1, Ordering::Relaxed);
-                        // 更新绝对时间戳：UI 据此精确判定输出是否已停（2 秒静默即停动画）。
-                        *last_output_instant.lock().unwrap() = Instant::now();
+                        // 更新时间戳（原子操作，无锁）：UI 据此判定输出是否已停。
+                        last_output_ms.store(now_ms, Ordering::Relaxed);
                         // 统计光标定位（CSI H/f）：全屏重绘型 TUI 的判据（见
                         // terminal::should_pgup_fallback）。跳过参数直到最终字节。
                         let chunk = &buf[..n];
@@ -420,9 +404,8 @@ pub fn spawn(
         exited: false,
         csi_pos,
         last_clipboard_seq: None,
-        output_times,
         output_count,
-        last_output_instant,
+        last_output_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
     })
 }
