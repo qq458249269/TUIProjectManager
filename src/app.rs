@@ -882,22 +882,32 @@ impl ClientApp {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let last = s.last_output_ms.load(Ordering::Relaxed);
+                    let now_ds = (now_ms / 1000) as u32;
+                    let packed = s.output_times.load(Ordering::Relaxed);
+                    let prev_ds = (packed >> 32) as u32;
+                    let last_ds = packed as u32;
+                    let count = s.output_count.load(Ordering::Relaxed);
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
-                    // 注意：对号只能用 √ (U+221A)。✓/✔ (U+2713/U+2714) 在本字体栈（egui
-                    // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportional
+                    // 注意：对号用 ✅ (U+2705)。✓/✔ (U+2713/U+2714) 在本字体栈（egui
+                    // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportio nal
                     // 族（Monospace 族缺这些字形）。
+                    // 持续输出判定：两次输出间隔<5s 且累计>=2 次 → TUI 动画/大量输出；
+                    // 单次输出（能力查询/输入回显）不触发加载动画。
+                    let continuous = count >= 2
+                        && prev_ds != 0
+                        && now_ds.saturating_sub(last_ds) < 5
+                        && last_ds.saturating_sub(prev_ds) < 5;
                     let icon: Option<char> = if s.exited {
-                        if viewed { None } else { Some('√') }
-                    } else if last == 0 {
+                        if viewed { None } else { Some('✅') }
+                    } else if count == 0 {
                         None
-                    } else if now_ms.saturating_sub(last) < 1000 {
-                        // 最近 1s 内有输出 → 柱状等宽动画（300ms 刷新一次，省 CPU）。
+                    } else if continuous {
+                        // 持续输出 → 柱状等宽动画（300ms 刷新一次，省 CPU）。
                         const BARS: &[char] = &['▁', '▂', '▃', '▅', '▆', '▇'];
                         let idx = (now_ms / 300) as usize % BARS.len();
                         Some(BARS[idx])
                     } else if !viewed {
-                        Some('√')
+                        Some('✅')
                     } else {
                         None
                     };
@@ -936,10 +946,10 @@ impl ClientApp {
                             // 两部分，等式让标题中心落在槽中心；差额小到撑不开中间空隙时全垫
                             // 在左侧，正文与 × 紧邻（与自然宽标题行为一致）。
                             let font = egui::TextStyle::Body.resolve(ui.style());
-                            // 图标槽宽 = 柱条字符宽度（Proportional 下所有柱条等宽）。对号也放进
-                            // 同一等宽槽内居中，任何状态下图标区宽度恒定，切换不引起页签宽度抖动。
+                            // 图标槽宽 = ✅ emoji 宽度（所有图标中最宽）。柱条居中于槽内，
+                            // 任何状态下图标区宽度恒定，切换不引起页签宽度抖动。
                             let slot_w = ui.ctx().fonts_mut(|f| {
-                                f.layout_no_wrap("▇".to_string(), font.clone(), Color32::TRANSPARENT)
+                                f.layout_no_wrap("✅".to_string(), font.clone(), Color32::TRANSPARENT)
                                     .size()
                                     .x
                             });
@@ -955,12 +965,7 @@ impl ClientApp {
                             });
                             let s = ui.spacing().item_spacing.x;
                             // 图标恒定占一个等宽槽宽；图标与标题之间留一个项距（与标题/× 之间一致）。
-                            let icon_w = if icon.is_some() { slot_w } else { 0.0 };
-                            let icon_title_w = if icon_w > 0.0 {
-                                icon_w + s + title_w
-                            } else {
-                                title_w
-                            };
+                            let icon_title_w = slot_w + s + title_w;
                             let slack = (min_width - icon_title_w - s - close_w).max(0.0);
                             let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
                                 // 左右空隙对等：pad_l = pad_m + s + close_w → 标题居中。
@@ -973,14 +978,18 @@ impl ClientApp {
                             if pad_l > 0.0 {
                                 ui.add_space(pad_l);
                             }
+                            // 状态图标槽：恒定 slot_w 宽度，无图标时渲染透明占位。
+                            let row_h = ui.text_style_height(&egui::TextStyle::Body);
                             if let Some(c) = icon {
-                                // 状态图标：固定等宽槽 + 高亮色（egui 0.36 无字体级加粗，strong()
-                                // 提亮对比，视觉上更醒目）。
-                                let row_h = ui.text_style_height(&egui::TextStyle::Body);
                                 ui.add_sized(
                                     egui::vec2(slot_w, row_h),
                                     egui::Label::new(RichText::new(c.to_string()).strong())
                                         .selectable(false),
+                                );
+                            } else {
+                                ui.add_sized(
+                                    egui::vec2(slot_w, row_h),
+                                    egui::Label::new(" ").selectable(false),
                                 );
                             }
                             ui.add(
@@ -1899,7 +1908,7 @@ impl ClientApp {
         ui.add_space(12.0);
         // 空闲基线刷新已固定为 1s（终端输出时实时重绘，不受此限制）。
         // 保留 refresh_fps 配置项以兼容旧配置文件，但不再影响刷新。
-        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n对号 √ 只在未查看过时显示，点击页签后消失。").weak());
+        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n对号 ✅ 只在未查看过时显示，点击页签后消失。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
@@ -2113,8 +2122,15 @@ impl eframe::App for ClientApp {
             .as_millis() as u64;
         let animating = self.tabs.iter().any(|t| {
             if let Tab::Session(s) = t {
-                let last = s.last_output_ms.load(Ordering::Relaxed);
-                last != 0 && now_ms.saturating_sub(last) < 1000
+                let packed = s.output_times.load(Ordering::Relaxed);
+                let prev_ds = (packed >> 32) as u32;
+                let last_ds = packed as u32;
+                let count = s.output_count.load(Ordering::Relaxed);
+                let now_ds = (now_ms / 1000) as u32;
+                count >= 2
+                    && prev_ds != 0
+                    && now_ds.saturating_sub(last_ds) < 5
+                    && last_ds.saturating_sub(prev_ds) < 5
             } else {
                 false
             }
