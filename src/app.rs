@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
@@ -882,21 +883,15 @@ impl ClientApp {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let now_ds = (now_ms / 1000) as u32;
-                    let packed = s.output_times.load(Ordering::Relaxed);
-                    let prev_ds = (packed >> 32) as u32;
-                    let last_ds = packed as u32;
                     let count = s.output_count.load(Ordering::Relaxed);
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
                     // 注意：对号用 ✅ (U+2705)。✓/✔ (U+2713/U+2714) 在本字体栈（egui
-                    // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportio nal
+                    // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportional
                     // 族（Monospace 族缺这些字形）。
-                    // 持续输出判定：两次输出间隔<5s 且累计>=2 次 → TUI 动画/大量输出；
-                    // 单次输出（能力查询/输入回显）不触发加载动画。
-                    let continuous = count >= 2
-                        && prev_ds != 0
-                        && now_ds.saturating_sub(last_ds) < 5
-                        && last_ds.saturating_sub(prev_ds) < 5;
+                    // 持续输出判定：累计>=2 次输出且最近 2 秒内仍有输出 → TUI 动画/大量输出；
+                    // 单次输出（能力查询/输入回显）不触发加载动画；空闲 2 秒后动画停。
+                    let silent = s.last_output_instant.lock().map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(2));
+                    let continuous = count >= 2 && !silent;
                     let icon: Option<char> = if s.exited {
                         if viewed { None } else { Some('✅') }
                     } else if count == 0 {
