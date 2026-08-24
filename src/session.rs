@@ -50,6 +50,8 @@ pub struct Session {
     pub output_count: Arc<AtomicU32>,
     /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
     pub has_been_viewed: Arc<AtomicBool>,
+    /// TUI 是否正在等待用户输入/选择（输出停止 + 光标可见）。
+    pub input_waiting: Arc<AtomicBool>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -436,6 +438,7 @@ pub fn spawn(
         output_count,
         last_output_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
+        input_waiting: Arc::new(AtomicBool::new(false)),
     })
 }
 

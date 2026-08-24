@@ -2293,6 +2293,27 @@ impl eframe::App for ClientApp {
 
         self.input_dialog(ui);
         self.confirm_dialog(ui);
+
+        // 更新窗口标题栏：有会话在等待输入时在标题中提示。
+        let waiting_tab = self.tabs.iter().find_map(|tab| {
+            if let Tab::Session(s) = tab {
+                if s.input_waiting.load(Ordering::Relaxed) && !s.exited {
+                    Some(s.title.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        let base_title = format!("TUI 项目管理器 v{}", crate::app_version());
+        let title = if let Some(name) = waiting_tab {
+            format!("{} ⏸ {} 需要输入", base_title, name)
+        } else {
+            base_title
+        };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 }
 #[cfg(all(test, windows))]

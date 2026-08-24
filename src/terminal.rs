@@ -1,3 +1,6 @@
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -7,7 +10,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
@@ -115,8 +118,8 @@ enum TermAction {
     Copy,
     /// 从剪贴板粘贴到终端。
     Paste,
-    /// 清空当前输入行内容（等效按住退格键直到清空）。
-    ClearInput,
+    /// 清空全部输入（含 Shift+Enter 换行的多行内容）。
+    ClearAllInput,
 }
 
 /// 有选中文本时复制到系统剪贴板（并清除选区），返回是否复制了内容。
@@ -387,18 +390,23 @@ fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
 /// 屏上非空白行数（行内存在任一非空白字符即计 1），用于区分全屏重绘型 TUI
 /// 与留白为主的空 shell 提示符。
 fn non_blank_rows<L: EventListener>(term: &Term<L>, rows: usize) -> usize {
-    let mut seen = std::collections::HashSet::new();
+    // 栈上 bitset 替代 HashSet：rows 通常 <200，256 bit 够用，零堆分配。
+    let mut bits = [0u32; 8]; // 256 bits
+    let mut count = 0;
     for idx in term.renderable_content().display_iter {
         let vline = idx.point.line.0;
-        if vline < 0 || vline >= rows as i32 {
+        if vline < 0 || vline as usize >= rows {
             continue;
         }
-        let cell = idx.cell;
-        if cell.c != '\0' && cell.c != ' ' {
-            seen.insert(vline);
+        let v = vline as usize;
+        let word = v / 32;
+        let bit = 1u32 << (v % 32);
+        if bits[word] & bit == 0 && idx.cell.c != '\0' && idx.cell.c != ' ' {
+            bits[word] |= bit;
+            count += 1;
         }
     }
-    seen.len()
+    count
 }
 
 /// 滚轮是否应翻译成 PgUp/PgDn 发送给应用自己滚动。
@@ -539,19 +547,18 @@ pub fn show_terminal(
                             let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
                                 .clamp(1, rows);
                             let up = lines > 0;
-                            for _ in 0..lines.abs().clamp(1, 32) {
+                            // 每次滚轮事件最多发 3 次鼠标滚动，避免跳太远。
+                            for _ in 0..lines.abs().clamp(1, 3) {
                                 let b = if up { 64 } else { 65 };
                                 let _ = sess
                                     .writer
                                     .try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
                             }
                         } else if should_pgup_fallback(&t, rows, &sess.csi_pos) {
-                            // 一格滚轮 ≈3 行，一次 PgUp ≈ 一页；按行数折算再发。
-                            let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
+                            // 每次滚轮事件只发 1 次 PgUp/PgDn：
+                            // 一次 PgUp ≈ 一整页（24-50 行），发多次会跳太远。
                             let key = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
-                            for _ in 0..count {
-                                let _ = sess.writer.try_send(key.to_vec());
-                            }
+                            let _ = sess.writer.try_send(key.to_vec());
                         }
                     }
                 }
@@ -622,10 +629,10 @@ pub fn show_terminal(
         ui.separator();
         if ui
             .button("🧹 清空输入")
-            .on_hover_text("清除当前输入行全部内容（Ctrl+U 清行首 + Ctrl+K 清行尾）")
+            .on_hover_text("清除全部输入（含 Shift+Enter 多行内容）")
             .clicked()
         {
-            menu_action = Some(TermAction::ClearInput);
+            menu_action = Some(TermAction::ClearAllInput);
             ui.close();
         }
     });
@@ -658,11 +665,22 @@ pub fn show_terminal(
             }
             *term_focused = true;
         }
-        Some(TermAction::ClearInput) => {
-            // Ctrl+U (0x15) 清光标到行首，Ctrl+K (0x0b) 清光标到行尾，
-            // 组合确保整行输入被清空，无论光标在行中何处。
-            let _ = sess.writer.try_send(vec![0x15, 0x0b]);
-            *status = Some("已清空当前输入".to_string());
+        Some(TermAction::ClearAllInput) => {
+            // 多行清空：先移到输入最末尾，再连续退格逐字符删除。
+            // 退格键（0x7F）是所有文本输入框的通用操作，不依赖 TUI 的
+            // Ctrl+U/Ctrl+A 等快捷键映射（TUI 里这些键行为不一定和 readline 一致）。
+            let mut bytes = Vec::with_capacity(2400);
+            // 先移到最底部：Down + End 反复 200 次覆盖极端多行
+            for _ in 0..200 {
+                bytes.extend_from_slice(b"\x1b[B"); // Down
+                bytes.extend_from_slice(b"\x1b[F"); // End
+            }
+            // 再连续退格删除全部字符（2000 个覆盖大量输入）
+            for _ in 0..2000 {
+                bytes.push(0x7f); // Backspace
+            }
+            let _ = sess.writer.try_send(bytes);
+            *status = Some("已清空全部输入".to_string());
         }
         None => {}
     }
@@ -719,25 +737,42 @@ pub fn show_terminal(
 
         let events = ui.input(|i| i.events.clone());
         let alt_down = ui.input(|i| i.modifiers.alt);
+        // IME 组合状态：上一帧 preedit 非空则正在组合。
+        // 组合期间屏蔽原始按键（拼音字母、Enter/Space 确认键）和 Text 事件，
+        // 防止拼音字母/确认键泄漏到终端造成卡顿或误执行不完整输入。
+        let mut ime_composing = !preedit.is_empty();
+        let mut committed_this_frame = false;
         for ev in &events {
             match ev {
-                egui::Event::Text(text) => {
-                    if alt_down || text.is_empty() {
-                        continue;
-                    }
-                    bytes_out.push(text.as_bytes().to_vec());
-                }
                 egui::Event::Ime(ime) if owns_ime => match ime {
                     egui::ImeEvent::Commit(text) => {
+                        ime_composing = false;
+                        committed_this_frame = true;
                         if !alt_down && !text.is_empty() {
                             bytes_out.push(text.as_bytes().to_vec());
                         }
                     }
                     egui::ImeEvent::Preedit { text, .. } => {
                         preedit.clone_from(text);
+                        ime_composing = !text.is_empty();
                     }
                     _ => {}
                 },
+                // IME 组合期间跳过原始按键：拼音字母、Enter/Space 确认键
+                // 都不应到达终端（终端会把它们当普通输入处理）。
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if ime_composing => {
+                    // Esc 组合期间可清除选区，但不转发给终端。
+                    if *key == egui::Key::Escape {
+                        if let Ok(mut t) = sess.term.lock() {
+                            t.selection = None;
+                        }
+                    }
+                }
                 egui::Event::Key {
                     key,
                     pressed: true,
@@ -758,6 +793,14 @@ pub fn show_terminal(
                     if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
                         bytes_out.push(bytes);
                     }
+                }
+                // Text 事件：IME 组合期间或刚提交时跳过，避免拼音字母泄漏
+                // 和 Commit+Text 双重提交导致重复输入。
+                egui::Event::Text(text) => {
+                    if ime_composing || committed_this_frame || alt_down || text.is_empty() {
+                        continue;
+                    }
+                    bytes_out.push(text.as_bytes().to_vec());
                 }
                 egui::Event::Copy => {
                     // 有选区时 Ctrl+C 复制选区；无选区才发 SIGINT（0x03）。
@@ -823,6 +866,22 @@ pub fn show_terminal(
         Ok(t) => t,
         Err(_) => return,
     };
+
+    // 检测 TUI 是否在等待用户输入：输出已停止 + 光标可见（SHOW_CURSOR）
+    // → 大概率在等待用户输入/选择/确认。
+    {
+        let show_cursor = term.mode().contains(TermMode::SHOW_CURSOR);
+        let last_ms = sess.last_output_ms.load(Ordering::Relaxed);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let output_silent = now_ms.saturating_sub(last_ms) > 1000;
+        let has_output = sess.output_count.load(Ordering::Relaxed) > 0;
+        let waiting = has_output && show_cursor && output_silent;
+        sess.input_waiting.store(waiting, Ordering::Relaxed);
+    }
+
     let content = term.renderable_content();
     let offset = content.display_offset;
     let colors = &content.colors;
@@ -835,6 +894,8 @@ pub fn show_terminal(
     // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
     // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
+    // 栈上缓冲区：逐格渲染时避免每格 ch.to_string() 堆分配。
+    let mut char_buf = [0u8; 4];
     for indexed in content.display_iter {
         let point = indexed.point;
         // display_iter 返回绝对行号（历史区为负行），视口顶对应 line=-offset，
@@ -844,6 +905,10 @@ pub fn show_terminal(
             continue;
         }
         let cell = indexed.cell;
+        // 随空格（宽字符占位格）提前跳过：避免白做颜色计算。
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         let col = point.column.0 as usize;
         let x = rect.left() + col as f32 * cell_w;
         let y = rect.top() + vline as f32 * cell_h;
@@ -879,11 +944,9 @@ pub fn show_terminal(
             (fg, bg)
         };
 
-        // 随空格（宽字符占位格）必须在背景涂之前跳过：它的 2 格槽矩形与前导格
-        // 完全重叠，槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，
-        // 选区盖住随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形
-        // 画完后盖住它 —— 就是选中时汉字“消失”的根因。
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+        // 快速路径：空白格 + 默认背景 + 无下划线 → 无内容可画，跳过 LayoutJob。
+        if ch == ' ' && bg == canvas_bg && !cell.flags.contains(Flags::UNDERLINE) {
             continue;
         }
 
@@ -896,7 +959,6 @@ pub fn show_terminal(
                 bg,
             );
         }
-        let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
         let mut format = egui::TextFormat {
             font_id: font_id.clone(),
@@ -910,7 +972,7 @@ pub fn show_terminal(
         if cell.flags.contains(Flags::UNDERLINE) && !wide {
             format.underline = Stroke::new(1.0, fg);
         }
-        let text = ch.to_string();
+        let text = ch.encode_utf8(&mut char_buf);
         if wide {
             // 宽字左对齐画在 2 格位起点（与终端惯例一致：字身贴槽左沿，
             // 槽宽仍按 2 格，选区/光标块/下划线盖满整槽；若居中则每个汉字
@@ -933,17 +995,54 @@ pub fn show_terminal(
         }
     }
 
-    // 光标：直接用 grid 光标位置，支持方块/下划线/竖线/空心四种形状。
-    // 深色画布白色光标、浅色画布黑色光标；失焦时画空心边框。
+    // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
+    // 定位策略分两种：
+    // 1) SHOW_CURSOR 开启的常规应用（cmd/nvim 等）：按 grid 光标位置精确绘制，
+    //    方向键移动光标时 grid 光标跟着走，位置永远正确。
+    // 2) pi 等 TUI 常驻 DECSET 25 隐藏光标（shape=Hidden、show_cursor=false），
+    //    并把终端光标停靠在输入框末尾的固定列——直接照画会停在错误位置，且不随
+    //    方向键移动（实测 pi 停靠 (11,79)，输入在 (11,5)）。这类 TUI 会用
+    //    "空白格 + 非默认前后景色"的单元格自绘真实输入光标（实测随方向键移动），
+    //    所以先在该行找这种自绘光标格、画在那里；找不到才退回停靠位置。
     let mut cursor_rect: Option<Rect> = None;
     {
-        let p = cursor.point;
+        // 光标位置：
+        // - SHOW_CURSOR 开启（cmd/nvim 等）：按 grid 光标位置，精确跟随方向键。
+        // - pi 等 TUI 常驻 DECSET 25 隐藏光标，并把终端光标停靠在最后写入行的
+        //   末尾（实测列固定不动，不随方向键走），改用自绘光标：pi 用
+        //   (Black,White) 反色格画输入光标，格内是字符或空格，随方向键移动。
+        //   自底向上整屏找反色格：输入行在 UI 最下方，必然优先命中；停靠行
+        //   是灰色状态行时（启动瞬间）也不会误判。找不到才退回停靠位置。
+        let show = term.mode().contains(TermMode::SHOW_CURSOR);
+        let mut cpoint = cursor.point;
+        if !show {
+            let is_caret = |cell: &Cell| {
+                matches!(
+                    (cell.fg, cell.bg),
+                    (Color::Named(NamedColor::Black), Color::Named(NamedColor::White))
+                        | (Color::Named(NamedColor::White), Color::Named(NamedColor::Black))
+                )
+            };
+            'outer: for r in (0..rows).rev() {
+                let line = Line(r as i32 - offset as i32);
+                for col in 0..cols {
+                    let cell = &term.grid()[Point::new(line, Column(col))];
+                    if is_caret(cell) {
+                        cpoint = Point::new(line, Column(col));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let p = cpoint;
         let vline = p.line.0 + offset as i32;
         if vline >= 0 && vline < rows as i32 {
             let col = p.column.0 as usize;
             if col < cols {
-                let cursor_cell = &term.grid()[p];
+                let cursor_cell = &term.grid()[cpoint];
                 // 宽字符光标：方块/下划线/空心块都按 2 格宽画，避免只盖住半个汉字。
+                // 光标本身停在宽字符的随空格（后一半）上也一样：若只按 1 格宽画，
+                // 白色方块会正好盖住汉字右半，看起来就是"只显示一半汉字"。
                 let on_spacer = cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER);
                 let cursor_wide =
                     cursor_cell.flags.contains(Flags::WIDE_CHAR) || on_spacer;
@@ -954,9 +1053,16 @@ pub fn show_terminal(
                 let cursor_cell_rect =
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, cell_h));
 
-                // 深色画布→白色光标、浅色画布→黑色光标。
-                let fill = if dark { Color32::WHITE } else { Color32::BLACK };
-                // Hidden 形状兜底成 Block。
+                // 光标填充色与画布底色强对比：深色画布→白色光标、浅色画布→
+                // 黑色光标，深浅主题下都清晰可见（不能沿用单元格前景色：浅色
+                // 主题下暗色配色 TUI 的前景色接近白，白块落在白底上就是光标消失）。
+                let (fill, ink) = if dark {
+                    (Color32::WHITE, Color32::BLACK)
+                } else {
+                    (Color32::BLACK, Color32::WHITE)
+                };
+                let border = fill;
+                // Hidden 形状兜底成 Block：隐藏 = 不画，那就强制画个方块。
                 let shape = if cursor.shape == CursorShape::Hidden {
                     CursorShape::Block
                 } else {
@@ -965,17 +1071,41 @@ pub fn show_terminal(
                 if *term_focused {
                         match shape {
                             CursorShape::Block => {
-                            // 半透明覆盖：底层文字仍可见，无需反色重绘字符。
-                            let alpha = if dark { 160 } else { 140 };
-                            let fill =
-                                Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), alpha);
-                            painter.rect_filled(cursor_cell_rect, 0.0, fill);
-                        }
+                                painter.rect_filled(cursor_cell_rect, 0.0, fill);
+                                painter.rect_stroke(
+                                    cursor_cell_rect,
+                                    0.0,
+                                    Stroke::new(1.0, fill),
+                                    egui::StrokeKind::Inside,
+                                );
+                                // 反色重绘格内字符（宽字符居中画在整块内），保证光标内内容可读。
+                                // 光标停在随空格时自身无字形，取前导格的宽字符重绘。
+                                let ch = if on_spacer {
+                                    term.grid()[Point::new(
+                                        cpoint.line,
+                                        Column(cpoint.column.0.saturating_sub(1)),
+                                    )]
+                                    .c
+                                } else {
+                                    cursor_cell.c
+                                };
+                                if ch != '\0'
+                                {
+                                    // 字身左对齐，与格内字形一致；宽字符光标块仍盖满 2 格槽。
+                                    painter.text(
+                                        Pos2::new(x, y + cell_h / 2.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        ch.to_string(),
+                                        font_id.clone(),
+                                        ink,
+                                    );
+                                }
+                            }
                             CursorShape::HollowBlock => {
                                 painter.rect_stroke(
                                     cursor_cell_rect,
                                     0.0,
-                                    Stroke::new(2.0, fill),
+                                    Stroke::new(2.0, border),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -1007,7 +1137,7 @@ pub fn show_terminal(
         painter.rect_stroke(
             cursor_cell_rect,
             0.0,
-            Stroke::new(1.5, fill),
+            Stroke::new(1.5, border),
             egui::StrokeKind::Inside,
         );
     }
