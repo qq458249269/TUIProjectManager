@@ -172,12 +172,18 @@ fn is_titlebar_dark(hwnd: isize) -> bool {
 }
 
 fn set_titlebar_theme(hwnd: isize) {
-    if hwnd == 0 {
-        return;
-    }
-    // DWMWA_USE_IMMERSIVE_DARK_MODE：20H1+ 用 20，老版本回退 19；
-    // 失败就试下一个，都失败说明系统不支持，忽略。
-    let value: i32 = 1; // 固定黑色标题栏
+    set_dwm_dark(hwnd);
+    // DWM 属性变更后标题栏不会自己重绘（要等 DWM 节流刷新），
+    // 强制重算非客户区让标题栏立即生效。
+    unsafe { refresh_titlebar(hwnd); }
+}
+
+/// 只设 DWM 深色属性，不调 refresh_titlebar（避免 SWP_FRAMECHANGED 重置 hover 跟踪，
+/// 导致 Windows「鼠标悬停激活窗口」失效）。
+#[cfg(target_os = "windows")]
+fn set_dwm_dark(hwnd: isize) {
+    if hwnd == 0 { return; }
+    let value: i32 = 1;
     unsafe {
         for attr in [20u32, 19u32] {
             let ok = DwmSetWindowAttribute(
@@ -186,13 +192,8 @@ fn set_titlebar_theme(hwnd: isize) {
                 &value as *const i32 as *const std::ffi::c_void,
                 4,
             );
-            if ok >= 0 {
-                break;
-            }
+            if ok >= 0 { break; }
         }
-        // DWM 属性变更后标题栏不会自己重绘（要等 DWM 节流刷新），
-        // 强制重算非客户区让标题栏立即生效。
-        refresh_titlebar(hwnd);
     }
 }
 
@@ -2113,7 +2114,7 @@ impl eframe::App for ClientApp {
         // 的 preferred_theme（None），运行时 set_theme(Dark) 存不进去。这里每帧轮询
         // DWM 属性，被谁都重置成非深色就立刻补设——10fps × 一次 dwmapi 读取可忽略。
         if !is_titlebar_dark(self.titlebar_hwnd) {
-            set_titlebar_theme(self.titlebar_hwnd);
+            set_dwm_dark(self.titlebar_hwnd);
         }
 
         // 动态基线刷新：任一会话最近 1s 内有输出 → 300ms 刷新（页签柱状动画以 300ms
