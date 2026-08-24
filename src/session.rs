@@ -334,6 +334,9 @@ pub fn spawn(
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::default();
             let mut buf = [0u8; 0x10_000];
+            // 上次计入 output_count 的时间戳，用于去抖：
+            // 输入回显是短时间内的突发小块，AI 回答是持续的稳定流。
+            let mut last_counted_ms: u64 = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -346,28 +349,54 @@ pub fn spawn(
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
-                        output_count.fetch_add(1, Ordering::Relaxed);
                         // 更新时间戳（原子操作，无锁）：UI 据此判定输出是否已停。
                         last_output_ms.store(now_ms, Ordering::Relaxed);
-                        // 统计光标定位（CSI H/f）：全屏重绘型 TUI 的判据（见
-                        // terminal::should_pgup_fallback）。跳过参数直到最终字节。
+                        // 分析输出内容：区分 TUI 自带动画 vs 实际回答文本。
+                        // TUI 动画特征：转义序列（ESC + [）占比高，可读文本少。
+                        // 实际回答特征：可读文本（ printable ASCII + CJK）占主体。
                         let chunk = &buf[..n];
+                        let mut esc_bytes: u32 = 0;
+                        let mut printable: u32 = 0;
                         let mut i = 0;
-                        while i + 1 < chunk.len() {
-                            if chunk[i] == 0x1b && chunk[i + 1] == b'[' {
+                        while i < chunk.len() {
+                            if chunk[i] == 0x1b && i + 1 < chunk.len() && chunk[i + 1] == b'[' {
+                                // CSI 序列：跳过参数字节直到最终字节（0x40-0x7E）。
+                                esc_bytes += 2; // ESC + [
                                 let mut j = i + 2;
                                 while j < chunk.len() && !(0x40..=0x7e).contains(&chunk[j]) {
+                                    esc_bytes += 1;
                                     j += 1;
                                 }
-                                if j < chunk.len() && (chunk[j] == b'H' || chunk[j] == b'f') {
-                                    let mut c = csi_pos.lock().unwrap();
-                                    c.0 = c.0.saturating_add(1);
-                                    c.1 = Instant::now();
+                                if j < chunk.len() {
+                                    esc_bytes += 1; // 最终字节
+                                    // 统计光标定位（CSI H/f）用于 pgup fallback 判据。
+                                    if chunk[j] == b'H' || chunk[j] == b'f' {
+                                        let mut c = csi_pos.lock().unwrap();
+                                        c.0 = c.0.saturating_add(1);
+                                        c.1 = Instant::now();
+                                    }
                                 }
                                 i = j + 1;
+                            } else if (0x20..=0x7E).contains(&chunk[i]) || chunk[i] >= 0xC0 {
+                                // 可读字符：ASCII 可见 + UTF-8 多字节起始。
+                                printable += 1;
+                                i += 1;
                             } else {
+                                // 其他控制字符（ BEL, BS, TAB 等），不计入任何一方。
                                 i += 1;
                             }
+                        }
+                        let total = (esc_bytes + printable) as f64;
+                        // 转义序列占比 >30% 或无可读文本 → TUI 动画，不计入 output_count。
+                        let is_animation = total == 0.0 || esc_bytes as f64 / total > 0.3;
+                        // 仅实际回答内容计入 output_count（触发前台动画/完成标记）。
+                        // 去抖：短输出（输入回显）在300ms内连续出现时只计一次，
+                        // 避免用户输入触发「回答中」动画。持续流式输出间隔>300ms 不受影响。
+                        if !is_animation
+                            && (now_ms.saturating_sub(last_counted_ms) > 300 || printable >= 20)
+                        {
+                            output_count.fetch_add(1, Ordering::Relaxed);
+                            last_counted_ms = now_ms;
                         }
                         let mut term = term.lock().unwrap();
                         parser.advance(&mut *term, &buf[..n]);
