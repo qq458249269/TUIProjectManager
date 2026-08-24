@@ -7,7 +7,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, Rgb};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
@@ -933,54 +933,17 @@ pub fn show_terminal(
         }
     }
 
-    // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
-    // 定位策略分两种：
-    // 1) SHOW_CURSOR 开启的常规应用（cmd/nvim 等）：按 grid 光标位置精确绘制，
-    //    方向键移动光标时 grid 光标跟着走，位置永远正确。
-    // 2) pi 等 TUI 常驻 DECSET 25 隐藏光标（shape=Hidden、show_cursor=false），
-    //    并把终端光标停靠在输入框末尾的固定列——直接照画会停在错误位置，且不随
-    //    方向键移动（实测 pi 停靠 (11,79)，输入在 (11,5)）。这类 TUI 会用
-    //    “空白格 + 非默认前后景色”的单元格自绘真实输入光标（实测随方向键移动），
-    //    所以先在该行找这种自绘光标格、画在那里；找不到才退回停靠位置。
+    // 光标：直接用 grid 光标位置，支持方块/下划线/竖线/空心四种形状。
+    // 深色画布白色光标、浅色画布黑色光标；失焦时画空心边框。
     let mut cursor_rect: Option<Rect> = None;
     {
-        // 光标位置：
-        // - SHOW_CURSOR 开启（cmd/nvim 等）：按 grid 光标位置，精确跟随方向键。
-        // - pi 等 TUI 常驻 DECSET 25 隐藏光标，并把终端光标停靠在最后写入行的
-        //   末尾（实测列固定不动，不随方向键走），改用自绘光标：pi 用
-        //   (Black,White) 反色格画输入光标，格内是字符或空格，随方向键移动。
-        //   自底向上整屏找反色格：输入行在 UI 最下方，必然优先命中；停靠行
-        //   是灰色状态行时（启动瞬间）也不会误判。找不到才退回停靠位置。
-        let show = term.mode().contains(TermMode::SHOW_CURSOR);
-        let mut cpoint = cursor.point;
-        if !show {
-            let is_caret = |cell: &Cell| {
-                matches!(
-                    (cell.fg, cell.bg),
-                    (Color::Named(NamedColor::Black), Color::Named(NamedColor::White))
-                        | (Color::Named(NamedColor::White), Color::Named(NamedColor::Black))
-                )
-            };
-            'outer: for r in (0..rows).rev() {
-                let line = Line(r as i32 - offset as i32);
-                for col in 0..cols {
-                    let cell = &term.grid()[Point::new(line, Column(col))];
-                    if is_caret(cell) {
-                        cpoint = Point::new(line, Column(col));
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        let p = cpoint;
+        let p = cursor.point;
         let vline = p.line.0 + offset as i32;
         if vline >= 0 && vline < rows as i32 {
             let col = p.column.0 as usize;
             if col < cols {
-                let cursor_cell = &term.grid()[cpoint];
+                let cursor_cell = &term.grid()[p];
                 // 宽字符光标：方块/下划线/空心块都按 2 格宽画，避免只盖住半个汉字。
-                // 光标本身停在宽字符的随空格（后一半）上也一样：若只按 1 格宽画，
-                // 白色方块会正好盖住汉字右半，看起来就是“只显示一半汉字”。
                 let on_spacer = cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER);
                 let cursor_wide =
                     cursor_cell.flags.contains(Flags::WIDE_CHAR) || on_spacer;
@@ -991,16 +954,9 @@ pub fn show_terminal(
                 let cursor_cell_rect =
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, cell_h));
 
-                // 光标填充色与画布底色强对比：深色画布→白色光标、浅色画布→
-                // 黑色光标，深浅主题下都清晰可见（不能沿用单元格前景色：浅色
-                // 主题下暗色配色 TUI 的前景色接近白，白块落在白底上就是光标消失）。
-                let (fill, ink) = if dark {
-                    (Color32::WHITE, Color32::BLACK)
-                } else {
-                    (Color32::BLACK, Color32::WHITE)
-                };
-                let border = fill;
-                // Hidden 形状兜底成 Block：隐藏 = 不画，那就强制画个方块。
+                // 深色画布→白色光标、浅色画布→黑色光标。
+                let fill = if dark { Color32::WHITE } else { Color32::BLACK };
+                // Hidden 形状兜底成 Block。
                 let shape = if cursor.shape == CursorShape::Hidden {
                     CursorShape::Block
                 } else {
@@ -1009,41 +965,17 @@ pub fn show_terminal(
                 if *term_focused {
                         match shape {
                             CursorShape::Block => {
-                                painter.rect_filled(cursor_cell_rect, 0.0, fill);
-                                painter.rect_stroke(
-                                    cursor_cell_rect,
-                                    0.0,
-                                    Stroke::new(1.0, fill),
-                                    egui::StrokeKind::Inside,
-                                );
-                                // 反色重绘格内字符（宽字符居中画在整块内），保证光标内内容可读。
-                                // 光标停在随空格时自身无字形，取前导格的宽字符重绘。
-                                let ch = if on_spacer {
-                                    term.grid()[Point::new(
-                                        cpoint.line,
-                                        Column(cpoint.column.0.saturating_sub(1)),
-                                    )]
-                                    .c
-                                } else {
-                                    cursor_cell.c
-                                };
-                                if ch != '\0'
-                                {
-                                    // 字身左对齐，与格内字形一致；宽字符光标块仍盖满 2 格槽。
-                                    painter.text(
-                                        Pos2::new(x, y + cell_h / 2.0),
-                                        egui::Align2::LEFT_CENTER,
-                                        ch.to_string(),
-                                        font_id.clone(),
-                                        ink,
-                                    );
-                                }
-                            }
+                            // 半透明覆盖：底层文字仍可见，无需反色重绘字符。
+                            let alpha = if dark { 160 } else { 140 };
+                            let fill =
+                                Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), alpha);
+                            painter.rect_filled(cursor_cell_rect, 0.0, fill);
+                        }
                             CursorShape::HollowBlock => {
                                 painter.rect_stroke(
                                     cursor_cell_rect,
                                     0.0,
-                                    Stroke::new(2.0, border),
+                                    Stroke::new(2.0, fill),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -1075,7 +1007,7 @@ pub fn show_terminal(
         painter.rect_stroke(
             cursor_cell_rect,
             0.0,
-            Stroke::new(1.5, border),
+            Stroke::new(1.5, fill),
             egui::StrokeKind::Inside,
         );
     }
