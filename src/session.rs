@@ -44,14 +44,15 @@ pub struct Session {
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
-    /// 使用 AtomicU64 代替 Mutex<Instant>，避免读取时加锁。
     pub last_output_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
     pub has_been_viewed: Arc<AtomicBool>,
-    /// TUI 是否正在等待用户输入/选择（输出停止 + 光标可见）。
-    pub input_waiting: Arc<AtomicBool>,
+    /// 终端光标是否隐藏（DECSET 25 关闭 / TUI 自行管理光标）。
+    /// 每帧渲染时由 terminal::show_terminal 写入，供 app 页签图标判断
+    /// TUI 是否处于交互模式（光标可见 = 等待用户输入/选择）。
+    pub cursor_hidden: Arc<AtomicBool>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -291,7 +292,7 @@ pub fn spawn(
     let redraw_reader = redraw.clone();
     let listener = SessionListener {
         writer: writer_tx.clone(),
-        redraw: redraw.clone(),
+        redraw,
         ctx,
     };
 
@@ -312,9 +313,6 @@ pub fn spawn(
     let theme_dark = Arc::new(AtomicBool::new(true));
     let osc_theme_aware = Arc::new(AtomicBool::new(false));
 
-    // 读取子进程输出的线程。
-    let term = Arc::new(Mutex::new(term));
-    let csi_pos = Arc::new(Mutex::new((0u32, Instant::now())));
     let output_count = Arc::new(AtomicU32::new(0));
     let last_output_ms = Arc::new(AtomicU64::new(
         SystemTime::now()
@@ -322,6 +320,9 @@ pub fn spawn(
             .unwrap_or_default()
             .as_millis() as u64,
     ));
+    // 读取子进程输出的线程。
+    let term = Arc::new(Mutex::new(term));
+    let csi_pos = Arc::new(Mutex::new((0u32, Instant::now())));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
@@ -351,27 +352,22 @@ pub fn spawn(
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
-                        // 更新时间戳（原子操作，无锁）：UI 据此判定输出是否已停。
                         last_output_ms.store(now_ms, Ordering::Relaxed);
                         // 分析输出内容：区分 TUI 自带动画 vs 实际回答文本。
-                        // TUI 动画特征：转义序列（ESC + [）占比高，可读文本少。
-                        // 实际回答特征：可读文本（ printable ASCII + CJK）占主体。
                         let chunk = &buf[..n];
                         let mut esc_bytes: u32 = 0;
                         let mut printable: u32 = 0;
                         let mut i = 0;
                         while i < chunk.len() {
                             if chunk[i] == 0x1b && i + 1 < chunk.len() && chunk[i + 1] == b'[' {
-                                // CSI 序列：跳过参数字节直到最终字节（0x40-0x7E）。
-                                esc_bytes += 2; // ESC + [
+                                esc_bytes += 2;
                                 let mut j = i + 2;
                                 while j < chunk.len() && !(0x40..=0x7e).contains(&chunk[j]) {
                                     esc_bytes += 1;
                                     j += 1;
                                 }
                                 if j < chunk.len() {
-                                    esc_bytes += 1; // 最终字节
-                                    // 统计光标定位（CSI H/f）用于 pgup fallback 判据。
+                                    esc_bytes += 1;
                                     if chunk[j] == b'H' || chunk[j] == b'f' {
                                         let mut c = csi_pos.lock().unwrap();
                                         c.0 = c.0.saturating_add(1);
@@ -380,20 +376,14 @@ pub fn spawn(
                                 }
                                 i = j + 1;
                             } else if (0x20..=0x7E).contains(&chunk[i]) || chunk[i] >= 0xC0 {
-                                // 可读字符：ASCII 可见 + UTF-8 多字节起始。
                                 printable += 1;
                                 i += 1;
                             } else {
-                                // 其他控制字符（ BEL, BS, TAB 等），不计入任何一方。
                                 i += 1;
                             }
                         }
                         let total = (esc_bytes + printable) as f64;
-                        // 转义序列占比 >30% 或无可读文本 → TUI 动画，不计入 output_count。
                         let is_animation = total == 0.0 || esc_bytes as f64 / total > 0.3;
-                        // 仅实际回答内容计入 output_count（触发前台动画/完成标记）。
-                        // 去抖：短输出（输入回显）在300ms内连续出现时只计一次，
-                        // 避免用户输入触发「回答中」动画。持续流式输出间隔>300ms 不受影响。
                         if !is_animation
                             && (now_ms.saturating_sub(last_counted_ms) > 300 || printable >= 20)
                         {
@@ -407,12 +397,9 @@ pub fn spawn(
                             &buf[..n],
                             theme_dark.load(Ordering::Relaxed),
                         ) {
-                            // 应答过 OSC 颜色查询 = 该子进程懂 OSC 颜色，之后主题
-                            // 切换时才有资格收到主动颜色广播（见 app::broadcast_theme）。
                             if osc_color {
                                 osc_theme_aware.store(true, Ordering::Relaxed);
                             }
-                            // try_send 非阻塞：解析线程持 term 锁，绝不可阻塞等回车。
                             let _ = reply_tx.try_send(reply);
                         }
                     }
@@ -438,7 +425,7 @@ pub fn spawn(
         output_count,
         last_output_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
-        input_waiting: Arc::new(AtomicBool::new(false)),
+        cursor_hidden: Arc::new(AtomicBool::new(true)),
     })
 }
 

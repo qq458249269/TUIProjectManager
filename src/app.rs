@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
+
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -158,12 +159,14 @@ unsafe extern "system" {
 }
 
 /// 标题栏当前是否已是深色（DWM 属性 20 读回是否为 1）。
+#[cfg(target_os = "windows")]
 fn is_titlebar_dark(hwnd: isize) -> bool {
+    if hwnd == 0 { return false; }
     let mut v: i32 = 0;
     let hr = unsafe {
         DwmGetWindowAttribute(
             hwnd,
-            20, // DWMWA_USE_IMMERSIVE_DARK_MODE（Win10 2004+；旧版本上 attr19 由 set 回退）
+            20, // DWMWA_USE_IMMERSIVE_DARK_MODE
             &mut v as *mut i32 as *mut std::ffi::c_void,
             4,
         )
@@ -171,15 +174,7 @@ fn is_titlebar_dark(hwnd: isize) -> bool {
     hr >= 0 && v == 1
 }
 
-fn set_titlebar_theme(hwnd: isize) {
-    set_dwm_dark(hwnd);
-    // DWM 属性变更后标题栏不会自己重绘（要等 DWM 节流刷新），
-    // 强制重算非客户区让标题栏立即生效。
-    unsafe { refresh_titlebar(hwnd); }
-}
-
-/// 只设 DWM 深色属性，不调 refresh_titlebar（避免 SWP_FRAMECHANGED 重置 hover 跟踪，
-/// 导致 Windows「鼠标悬停激活窗口」失效）。
+/// 只设 DWM 深色属性，不调 refresh_titlebar（避免 SWP_FRAMECHANGED 重置 hover 跟踪）。
 #[cfg(target_os = "windows")]
 fn set_dwm_dark(hwnd: isize) {
     if hwnd == 0 { return; }
@@ -197,8 +192,18 @@ fn set_dwm_dark(hwnd: isize) {
     }
 }
 
+/// 设 DWM 深色 + 强制重绘标题栏（SWP_FRAMECHANGED）。仅初始化时调一次。
+#[cfg(target_os = "windows")]
+fn set_titlebar_theme(hwnd: isize) {
+    if hwnd == 0 { return; }
+    set_dwm_dark(hwnd);
+    unsafe { refresh_titlebar(hwnd); }
+}
+
 /// 强制重绘标题栏非客户区：SWP_FRAMECHANGED 让 DWM 重新布局非客户区
 /// （触发 WM_NCCALCSIZE），RedrawWindow 立即重绘帧。
+/// 注意：每次调用会重置 winit 的 hover 跟踪，导致「鼠标悬停激活窗口」失效，
+/// 因此只在初始化时调用，不在每帧轮询中调用。
 #[cfg(target_os = "windows")]
 unsafe fn refresh_titlebar(hwnd: isize) {
     unsafe extern "system" {
@@ -348,6 +353,7 @@ pub struct ClientApp {
     pub settings_command: String,
     pub settings_commands: Vec<String>,
     pub settings_new_command: String,
+    pub settings_refresh_fps: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
     pub term_focused: bool,
@@ -373,7 +379,7 @@ pub struct ClientApp {
     /// 终端上次渲染的真实网格尺寸：重开崩溃页签/切启动命令时按它 spawn，
     /// 避免再走 80x24 → 首帧 resize 的错尺寸启动路径。
     last_term_size: (u16, u16),
-    /// 原生窗口句柄：启动时把 DWM 标题栏固定为黑色（运行中切换不可靠，直接固定）。
+    /// 原生窗口句柄：每帧轮询确保标题栏始终深色（防御 WM_SETTINGCHANGE 重置）。
     titlebar_hwnd: isize,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
@@ -410,6 +416,7 @@ impl ClientApp {
             settings_command,
             settings_commands,
             settings_new_command: String::new(),
+            settings_refresh_fps: config::DEFAULT_REFRESH_FPS.to_string(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
             term_focused: false,
@@ -428,6 +435,7 @@ impl ClientApp {
             restore_active: None,
             last_term_size: (80, 24),
             titlebar_hwnd,
+
             ctx,
         };
 
@@ -477,6 +485,7 @@ impl ClientApp {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
+        self.settings_refresh_fps = self.config.settings.refresh_fps.to_string();
         self.screen = Screen::Settings;
         self.term_focused = false;
     }
@@ -879,41 +888,29 @@ impl ClientApp {
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
-                    // 状态图标：固定宽度单字符（Proportional 下柱条/对号统一等宽，切换不抖动）。
-                    // 检测逻辑：
-                    // - 有输出活动 → 柱状动画（正在回答）
-                    // - 输出停止一段时间 → ✅（回答完成，待查看）
-                    // - 已查看或无输出 → 无图标
+                    // 状态图标：固定宽度单字符。
                     let count = s.output_count.load(Ordering::Relaxed);
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
-                    // 注意：对号用 ✅ (U+2705)。✓/✔ (U+2713/U+2714) 在本字体栈（egui
-                    // 内置 + msyh 回退）里缺字形，会渲染成空框；柱条也只能用 Proportional
-                    // 族（Monospace 族缺这些字形）。
-                    // 输出活动判定：最近 500ms 内有输出 → 正在回答；空闲 500ms → 回答完成。
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let last_ms = s.last_output_ms.load(Ordering::Relaxed);
                     let silent = now_ms.saturating_sub(last_ms) > 500;
-                    // 核心逻辑：
-                    // - 输出中 → 柱状动画（正在回答）
-                    // - 输出停止且非前台页签 → ✅（回答完成，待查看）
-                    // - 激活页签（viewed=true）→ 不显示图标（前台无需提示）
-                    // - 无输出 → 无图标
-                    let icon: Option<char> = if s.exited {
-                        // 进程已退出：未查看显示 ✅，已查看隐藏
-                        if viewed { None } else { Some('✅') }
+                    // 状态图标：活跃动画用单字符柱条，TUI 等待输入用 ✏️。
+                    // ✏️ 条件：有输出 + 输出已停止 + 光标可见（TUI 交互模式）+ 未查看。
+                    // 光标可见性由 terminal::show_terminal 每帧写入 cursor_hidden。
+                    let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
+                    let icon: Option<&str> = if s.exited {
+                        if viewed { None } else { Some("✅") }
                     } else if count > 0 && !silent {
-                        // 有输出且近期活跃 → 柱状等宽动画（正在回答）
-                        const BARS: &[char] = &['▁', '▂', '▃', '▅', '▆', '▇'];
+                        const BARS: &[&str] = &["▁", "▂", "▃", "▅", "▆", "▇"];
                         let idx = (now_ms / 300) as usize % BARS.len();
                         Some(BARS[idx])
-                    } else if count > 0 && !viewed {
-                        // 有输出但已停止，且未查看（非前台页签）→ ✅
-                        Some('✅')
+                    } else if count > 0 && cursor_vis && !viewed {
+                        // 输出已停止 + 光标可见 → TUI 等待用户选择/输入
+                        Some("✏️")
                     } else {
-                        // 无输出，或已查看（前台页签）→ 无图标
                         None
                     };
                     let title = if s.exited {
@@ -951,10 +948,8 @@ impl ClientApp {
                             // 两部分，等式让标题中心落在槽中心；差额小到撑不开中间空隙时全垫
                             // 在左侧，正文与 × 紧邻（与自然宽标题行为一致）。
                             let font = egui::TextStyle::Body.resolve(ui.style());
-                            // 图标槽宽 = ✅ emoji 宽度（所有图标中最宽）。柱条居中于槽内，
-                            // 任何状态下图标区宽度恒定，切换不引起页签宽度抖动。
                             let slot_w = ui.ctx().fonts_mut(|f| {
-                                f.layout_no_wrap("✅".to_string(), font.clone(), Color32::TRANSPARENT)
+                                f.layout_no_wrap("✏️".to_string(), font.clone(), Color32::TRANSPARENT)
                                     .size()
                                     .x
                             });
@@ -969,7 +964,6 @@ impl ClientApp {
                                     .x
                             });
                             let s = ui.spacing().item_spacing.x;
-                            // 图标恒定占一个等宽槽宽；图标与标题之间留一个项距（与标题/× 之间一致）。
                             let icon_title_w = slot_w + s + title_w;
                             let slack = (min_width - icon_title_w - s - close_w).max(0.0);
                             let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
@@ -1027,8 +1021,7 @@ impl ClientApp {
                     if resp.clicked() {
                         let pos = ui.ctx().pointer_interact_pos();
                         // 指针按在 × 上 —— 关闭；否则 —— 激活。即便已激活也推送 Activate，
-                        // 让「输出结束」对号在点击当前页签时也能被清除（已激活时 current 赋同值
-                        // 是无操作，仅触发 has_been_viewed 置位）。
+                        // 让「输出结束」对号在点击当前页签时也能被清除。
                         if pos.is_some_and(|p| close_rect.contains(p)) {
                             actions.push(TabAction::Close(i));
                         } else {
@@ -1170,12 +1163,12 @@ impl ClientApp {
         for action in actions {
             match action {
                 TabAction::Activate(i) => {
-                    self.current = i;
-                    self.refresh_focus();
                     // 点击页签后清除「输出结束」对号。
                     if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
                         s.has_been_viewed.store(true, Ordering::Relaxed);
                     }
+                    self.current = i;
+                    self.refresh_focus();
                 }
                 TabAction::Close(i) => self.close_session(i),
                 TabAction::OpenDir(i) => {
@@ -1911,9 +1904,7 @@ impl ClientApp {
             self.save_config("设置已自动保存".to_string());
         }
         ui.add_space(12.0);
-        // 空闲基线刷新已固定为 1s（终端输出时实时重绘，不受此限制）。
-        // 保留 refresh_fps 配置项以兼容旧配置文件，但不再影响刷新。
-        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n对号 ✅ 只在未查看过时显示，点击页签后消失。").weak());
+        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n✏️ = TUI 等待选择，✅ = 输出结束待查看，点击页签后消失。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
@@ -2109,27 +2100,21 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 深色标题栏免疫层：winit 0.30 在 WM_SETTINGCHANGE（系统主题/显示设置变化）
-        // 时会把窗口重应用为系统默认（本项目机器上默认浅色），因为它只认 build 时
-        // 的 preferred_theme（None），运行时 set_theme(Dark) 存不进去。这里每帧轮询
-        // DWM 属性，被谁都重置成非深色就立刻补设——10fps × 一次 dwmapi 读取可忽略。
+        // 固定深色标题栏：每帧检查 DWM 属性，被系统重置（WM_SETTINGCHANGE）时补设。
+        // 只调 DwmSetWindowAttribute（不调 refresh_titlebar），不干扰 hover 跟踪。
         if !is_titlebar_dark(self.titlebar_hwnd) {
             set_dwm_dark(self.titlebar_hwnd);
         }
 
         // 动态基线刷新：任一会话最近 1s 内有输出 → 300ms 刷新（页签柱状动画以 300ms
-        // 换帧）；否则空闲期降到 1s，大幅降低持续整屏重绘的 CPU 占用（此前默认 10fps
-        // =100ms 持续空转）。request_repaint_after 每帧续上一帧，形成恒定基线；
-        // 终端输出本身经 redraw_tx 即时触发重绘（不依赖此基线）。
+        // 换帧）；否则空闲期降到 1s，大幅降低持续整屏重绘的 CPU 占用。
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        // 动画刷新：有输出活动时 300ms 刷新一次，无活动时 1000ms 刷新一次
         let animating = self.tabs.iter().any(|t| {
             if let Tab::Session(s) = t {
                 let count = s.output_count.load(Ordering::Relaxed);
-                // 检测近期是否有输出活动（500ms 内）
                 let last_ms = s.last_output_ms.load(Ordering::Relaxed);
                 let silent = now_ms.saturating_sub(last_ms) > 500;
                 count > 0 && !silent
@@ -2167,6 +2152,10 @@ impl eframe::App for ClientApp {
                 self.config.window.size = Some([r.width(), r.height()]);
             }
         }
+
+        // 窗口标题保持固定，不根据等待输入状态动态修改。
+        // 动态标题会频繁调用 send_viewport_cmd，可能干扰 winit 的 hover 跟踪，
+        // 导致 Windows「鼠标悬停激活窗口」失效。等待输入提示改用页签 ✏️ 图标。
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2294,27 +2283,6 @@ impl eframe::App for ClientApp {
 
         self.input_dialog(ui);
         self.confirm_dialog(ui);
-
-        // 更新窗口标题栏：有会话在等待输入时在标题中提示。
-        let waiting_tab = self.tabs.iter().find_map(|tab| {
-            if let Tab::Session(s) = tab {
-                if s.input_waiting.load(Ordering::Relaxed) && !s.exited {
-                    Some(s.title.as_str())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
-        let base_title = format!("TUI 项目管理器 v{}", crate::app_version());
-        let title = if let Some(name) = waiting_tab {
-            format!("{} ⏸ {} 需要输入", base_title, name)
-        } else {
-            base_title
-        };
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 }
 #[cfg(all(test, windows))]
