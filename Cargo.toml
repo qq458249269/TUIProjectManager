@@ -28,11 +28,12 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 
-# 精简产物：体积优先 + 全量链接 + 去符号。
+# 精简产物：全量链接 + 去符号。opt-level 用 2 而非 z：终端逐格渲染是热循环，
+# z 的体积/对齐取舍实测明显慢于 2；lto+strip 已把体积差拉回可接受范围。
 # 不用 panic=abort：页签崩溃隔离要靠 catch_unwind 捕获 UI 线程 panic，
 # abort 模式下任何 panic 直接杀进程，无法做到“一个页签崩不影响整个软件”。
 [profile.release]
-opt-level = "z"
+opt-level = 2
 codegen-units = 1
 lto = true
 strip = true

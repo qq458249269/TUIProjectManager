@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -344,6 +345,23 @@ fn version_newer(a: &str, b: &str) -> bool {
     false
 }
 
+/// 项目目录存在性（带 TTL 缓存）。每帧 UI 都要显示目录状态，直接 is_dir()
+/// 是每帧每项目一次文件系统调用；2 秒内复用上次结果，过期才重新采样。
+/// 独立成函数拿 cache 参数而非 &mut self：调用点在遍历 self.config 的
+/// 循环里，避免借用冲突。
+fn dir_exists(cache: &mut HashMap<String, (bool, Instant)>, path: &str) -> bool {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    let now = Instant::now();
+    if let Some(&(ok, at)) = cache.get(path) {
+        if now.duration_since(at) < TTL {
+            return ok;
+        }
+    }
+    let ok = Path::new(path).is_dir();
+    cache.insert(path.to_string(), (ok, now));
+    ok
+}
+
 pub struct ClientApp {
     pub config: config::Config,
     pub tabs: Vec<Tab>,
@@ -383,6 +401,13 @@ pub struct ClientApp {
     titlebar_hwnd: isize,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
+    /// 项目目录存在性缓存：path → (是否存在, 采样时间)。首页列表与详情页
+    /// 每帧都要画“目录存在/不存在”，直接 is_dir() 是每帧每项目一次磁盘
+    /// 调用（网络盘上明显拖帧），TTL 内复用结果。
+    dir_exists_cache: HashMap<String, (bool, Instant)>,
+    /// 页签标题排版宽度缓存：title → 宽度。标题几乎不变，避免每页签每帧
+    /// 一次全量 layout_no_wrap 测宽。
+    title_width_cache: HashMap<String, f32>,
 }
 
 impl ClientApp {
@@ -437,6 +462,8 @@ impl ClientApp {
             titlebar_hwnd,
 
             ctx,
+            dir_exists_cache: HashMap::new(),
+            title_width_cache: HashMap::new(),
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -854,6 +881,21 @@ impl ClientApp {
         let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut drag_index: Option<usize> = None;
 
+        // 字体度量整帧一次（原实现每个页签内部做三次全量排版测宽）：
+        // 图标槽与 × 的宽度对所有页签相同；标题宽度按字符串缓存，标题
+        // 不变时零排版成本。
+        let tab_font = egui::TextStyle::Body.resolve(ui.style());
+        let slot_w = ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap("✏️".to_string(), tab_font.clone(), Color32::TRANSPARENT)
+                .size()
+                .x
+        });
+        let close_w = ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap("×".to_string(), tab_font.clone(), Color32::TRANSPARENT)
+                .size()
+                .x
+        });
+
         ui.horizontal(|ui| {
             // 首页固定最左：不可拖动、不可关闭。
             if let Some(Tab::Home) = self.tabs.first() {
@@ -895,20 +937,27 @@ impl ClientApp {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let last_ms = s.last_output_ms.load(Ordering::Relaxed);
-                    let silent = now_ms.saturating_sub(last_ms) > 500;
-                    // 状态图标：活跃动画用单字符柱条，TUI 等待输入用 ✏️。
-                    // ✏️ 条件：有输出 + 输出已停止 + 光标可见（TUI 交互模式）+ 未查看。
-                    // 光标可见性由 terminal::show_terminal 每帧写入 cursor_hidden。
+                    // ── TUI 状态检测 ──
+                    let is_tui = s.alt_screen.load(Ordering::Relaxed);
                     let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
+                    let last_content = s.last_content_ms.load(Ordering::Relaxed);
+                    let content_silent = now_ms.saturating_sub(last_content) > 500;
+                    let last_any = s.last_output_ms.load(Ordering::Relaxed);
+                    let any_silent = now_ms.saturating_sub(last_any) > 500;
+                    // 图标逻辑：
+                    //   ✅ 已退出未查看
+                    //   ▁▂▃▅▆▇ 有近期输出（活跃）
+                    //   ✏️ TUI 明确等待用户选择/输入：光标可见 + 空闲 + 有历史输出
+                    //      （光标隐藏 = TUI 在动画/输出中，不算等待输入）
                     let icon: Option<&str> = if s.exited {
                         if viewed { None } else { Some("✅") }
-                    } else if count > 0 && !silent {
+                    } else if !any_silent && count > 0 {
+                        // 有近期输出 → 活跃动画柱条（TUI 和普通应用通用）
                         const BARS: &[&str] = &["▁", "▂", "▃", "▅", "▆", "▇"];
                         let idx = (now_ms / 300) as usize % BARS.len();
                         Some(BARS[idx])
-                    } else if count > 0 && cursor_vis && !viewed {
-                        // 输出已停止 + 光标可见 → TUI 等待用户选择/输入
+                    } else if is_tui && cursor_vis && content_silent && count > 0 && !viewed {
+                        // TUI 空闲 + 光标可见 = 明确等待用户选择/输入
                         Some("✏️")
                     } else {
                         None
@@ -947,21 +996,13 @@ impl ClientApp {
                             // 居中、× 右对齐——把差额拆成“标题左侧垫白”和“标题/× 之间垫白”
                             // 两部分，等式让标题中心落在槽中心；差额小到撑不开中间空隙时全垫
                             // 在左侧，正文与 × 紧邻（与自然宽标题行为一致）。
-                            let font = egui::TextStyle::Body.resolve(ui.style());
-                            let slot_w = ui.ctx().fonts_mut(|f| {
-                                f.layout_no_wrap("✏️".to_string(), font.clone(), Color32::TRANSPARENT)
-                                    .size()
-                                    .x
-                            });
-                            let title_w = ui.ctx().fonts_mut(|f| {
-                                f.layout_no_wrap(title.clone(), font.clone(), Color32::TRANSPARENT)
-                                    .size()
-                                    .x
-                            });
-                            let close_w = ui.ctx().fonts_mut(|f| {
-                                f.layout_no_wrap("×".to_string(), font, Color32::TRANSPARENT)
-                                    .size()
-                                    .x
+                            // slot_w/close_w 整帧已量好；title_w 走缓存（标题不变不排版）。
+                            let title_w = *self.title_width_cache.entry(title.clone()).or_insert_with(|| {
+                                ui.ctx().fonts_mut(|f| {
+                                    f.layout_no_wrap(title.clone(), tab_font.clone(), Color32::TRANSPARENT)
+                                        .size()
+                                        .x
+                                })
                             });
                             let s = ui.spacing().item_spacing.x;
                             let icon_title_w = slot_w + s + title_w;
@@ -991,11 +1032,12 @@ impl ClientApp {
                                     egui::Label::new(" ").selectable(false),
                                 );
                             }
+                            // 标题按借用传入，不再每帧 clone 两份 String。
                             ui.add(
                                 if selected {
-                                    egui::Label::new(RichText::new(title.clone()).strong())
+                                    egui::Label::new(RichText::new(title.as_str()).strong())
                                 } else {
-                                    egui::Label::new(RichText::new(title.clone()))
+                                    egui::Label::new(RichText::new(title.as_str()))
                                 }
                                 // 页签文字不参与文本选择（egui 默认可选中，会在悬停/按下时
                                 // 强制 Text 光标覆盖我们设置的小手，见 label selection 插件
@@ -1430,6 +1472,15 @@ impl ClientApp {
                 let sel = self.selected_project;
                 let sel_fill = ui.visuals().selection.bg_fill;
                 let mut actions: Vec<ProjectAction> = Vec::new();
+                // 目录存在性批量走 TTL 缓存（每帧全列表 is_dir 是磁盘调用）。
+                let exists_list: Vec<bool> = {
+                    let cache = &mut self.dir_exists_cache;
+                    self.config
+                        .projects
+                        .iter()
+                        .map(|p| dir_exists(cache, &p.path))
+                        .collect()
+                };
                 // 各行矩形（索引 → rect），拖动落位时用来定位插入点。
                 let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
                 let mut drag_index: Option<usize> = None;
@@ -1437,7 +1488,7 @@ impl ClientApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (i, p) in self.config.projects.iter().enumerate() {
-                            let exists = Path::new(&p.path).is_dir();
+                            let exists = exists_list[i];
                             let label = if exists {
                                 format!("● {}", p.name)
                             } else {
@@ -1661,7 +1712,7 @@ impl ClientApp {
             ui.label("在左侧选择或添加一个项目，然后点击「启动」，将在一个内嵌终端页签中于该项目目录运行配置的 TUI 程序。");
             return;
         };
-        let exists = Path::new(&p.path).is_dir();
+        let exists = dir_exists(&mut self.dir_exists_cache, &p.path);
 
         ui.heading(&p.name);
         ui.separator();
@@ -2082,6 +2133,12 @@ impl Drop for ClientApp {
 
 impl eframe::App for ClientApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 清理启动时创建的 .running 标记文件。
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+                let _ = std::fs::remove_file(exe.with_file_name(format!("{name}.running")));
+            }
+        }
         // 记录打开中的终端页签（退出后下次启动自动重新拉起）。
         self.config.tabs = config::TabsState {
             dirs: self
@@ -2141,17 +2198,20 @@ impl eframe::App for ClientApp {
             ctx.request_repaint();
         }
 
-        // 记录窗口状态，退出时保存。
-        let vp = ctx.input(|i| i.viewport().clone());
-        self.config.window.maximized = vp.maximized.unwrap_or(false);
-        if !self.config.window.maximized {
-            if let Some(r) = vp.outer_rect {
-                self.config.window.pos = Some([r.min.x, r.min.y]);
+        // 记录窗口状态，退出时保存。只读需要的三个字段，
+        // 不整份 clone ViewportInfo（内含多个 String 字段，每帧一次）。
+        ctx.input(|i| {
+            let vp = i.viewport();
+            self.config.window.maximized = vp.maximized.unwrap_or(false);
+            if !self.config.window.maximized {
+                if let Some(r) = vp.outer_rect {
+                    self.config.window.pos = Some([r.min.x, r.min.y]);
+                }
+                if let Some(r) = vp.inner_rect {
+                    self.config.window.size = Some([r.width(), r.height()]);
+                }
             }
-            if let Some(r) = vp.inner_rect {
-                self.config.window.size = Some([r.width(), r.height()]);
-            }
-        }
+        });
 
         // 窗口标题保持固定，不根据等待输入状态动态修改。
         // 动态标题会频繁调用 send_viewport_cmd，可能干扰 winit 的 hover 跟踪，
@@ -2234,12 +2294,11 @@ impl eframe::App for ClientApp {
                 }
             }
 
-            if let Some(Tab::Session(_)) = self.tabs.get(self.current) {
-                // 记录本次终端真实网格尺寸：重开崩溃页签/切换启动命令时按它 spawn，
-                // 避免 80x24 起步等首帧 resize 的错尺寸启动路径。
-                if let Some(geom) = terminal::term_grid_size(ui) {
-                    self.last_term_size = (geom.0 as u16, geom.1 as u16);
-                }
+            if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
+                // 记录本次终端真实网格尺寸（show_terminal 每帧同步进 grid_size，
+                // 直接读，省去再查一次字体度量）：重开崩溃页签/切换启动命令时按它
+                // spawn，避免 80x24 起步等首帧 resize 的错尺寸启动路径。
+                self.last_term_size = s.grid_size;
                 // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
                 // catch_unwind 捕获后关闭该页签，整个软件继续运行。
                 let (dark, status, term_focused) = (

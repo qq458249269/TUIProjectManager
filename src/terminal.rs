@@ -1,12 +1,9 @@
 use std::sync::atomic::Ordering;
 
-use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::Term;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
@@ -29,20 +26,7 @@ fn color_for(dark: bool, dark_c: Color32, light_c: Color32) -> Color32 {
     if dark { dark_c } else { light_c }
 }
 
-/// 把 alacritty 颜色解析为 egui 颜色。缺省色时按主题兜底：
-/// 深色=白字深底，浅色=黑字白底（与深浅切换同步）。
-fn resolve_color(color: Color, colors: &Colors, is_fg: bool, dark: bool) -> Color32 {
-    let rgb = match color {
-        Color::Spec(rgb) => Some(rgb),
-        Color::Indexed(i) => colors[i as usize],
-        Color::Named(n) => colors[n],
-    };
-    match rgb {
-        Some(Rgb { r, g, b }) => Color32::from_rgb(r, g, b),
-        None if is_fg => color_for(dark, Color32::WHITE, Color32::BLACK),
-        None => color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT),
-    }
-}
+
 
 /// 浅色主题下把暗色主题 TUI 的配色映射为可读组合：
 /// 深背景 → 白；亮灰/白前景 → 黑；过亮的饱和前景（亮黄、亮青、亮绿、亮紫…）
@@ -386,65 +370,6 @@ fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
             && range.contains(Point::new(point.line, point.column + 1)))
 }
 
-/// 屏上非空白行数（行内存在任一非空白字符即计 1），用于区分全屏重绘型 TUI
-/// 与留白为主的空 shell 提示符。
-fn non_blank_rows<L: EventListener>(term: &Term<L>, rows: usize) -> usize {
-    let mut seen = std::collections::HashSet::new();
-    for idx in term.renderable_content().display_iter {
-        let vline = idx.point.line.0;
-        if vline < 0 || vline >= rows as i32 {
-            continue;
-        }
-        let cell = idx.cell;
-        if cell.c != '\0' && cell.c != ' ' {
-            seen.insert(vline);
-        }
-    }
-    seen.len()
-}
-
-/// 滚轮是否应翻译成 PgUp/PgDn 发送给应用自己滚动。
-///
-/// 为什么：opencode/jcode 这类全屏 TUI 用绝对定位整屏重绘，不产生换行滚动，
-/// 仿真器缓冲为空（history=0），滚轮滚不动原生缓冲；本机 ConPTY 又会改写
-/// 宿主写入的 SGR/X10 鼠标序列（实测 `\x1b[<64;3;12M` 到达子进程变成
-/// `\x1b[[C`、X10 前缀被吞成载荷乱码），且 opencode 根本没开鼠标上报，
-/// “滚轮转鼠标事件给应用”的路子在这台机器上不成立。这些 TUI 普遍支持
-/// PgUp/PgDn 滚动自己的历史（opencode 界面提示 “Use pgup … to navigate
-/// through conversation history”，实测 `\x1b[5~` 确实滚动），所以把滚轮翻译
-/// 成 PgUp/PgDn 发给应用，让应用滚自己的历史 —— 无需自攒任何缓存，恢复会话
-/// 也从字节 0 起天然可用（应用自己持有全部历史）。
-///
-/// 判定（优先级从上到下）：
-/// 1. 备用屏（真实进入 1049h 的 TUI，如 less/vim/htop）直接命中；
-/// 2. 输出流有大量光标定位（CSI H/f ≥100 且 5 秒内活跃）→ 全屏重绘型 TUI，
-///    如本机 ConPTY 下的 opencode。这个信号会话级持久：即使 opencode 中途
-///    偶发换行输出让 history>0，滚轮仍滚它的对话历史，而不是滚仿真器缓冲
-///    里那点零散输出（“滚动终端本体”的体验错误）。shell 输出从不用 CSI H，
-///    永不误判；
-/// 3. 兜底：history==0 且屏上非空白行数 ≥3（排除空提示符/刚 cls 的 cmd）。
-///    history 判断严格用 ==0：alacritty 实现里 `\x1b[2J` 清屏会把一行推进
-///    缓冲（实测），而 opencode 实际输出流恒为 0（帧首 `\x1b[H`+`\x1b[K`×rows，
-///    绝无 2J）；shell 有过任何换行输出即 >0 自动排除。
-fn should_pgup_fallback<L: EventListener>(
-    term: &Term<L>,
-    rows: usize,
-    csi_pos: &std::sync::Mutex<(u32, std::time::Instant)>,
-) -> bool {
-    if term.mode().contains(TermMode::ALT_SCREEN) {
-        return true;
-    }
-    if let Ok(c) = csi_pos.lock() {
-        if c.0 >= 100 && c.1.elapsed() < std::time::Duration::from_secs(5) {
-            return true;
-        }
-    }
-    if alacritty_terminal::grid::Dimensions::history_size(term.grid()) != 0 {
-        return false;
-    }
-    non_blank_rows(term, rows) >= 3
-}
-
 /// 按当前可用面积与等宽字体计算终端网格行列数。
 /// 会话页签里终端占满整个中央面板（无左侧项目栏）；启动会话时用它取精确尺寸，
 /// 避免用窗口减固定余量的估算值 spawn（那会让 TUI 启动时按错误尺寸画页面）。
@@ -470,14 +395,17 @@ pub fn show_terminal(
     status: &mut Option<String>,
     term_focused: &mut bool,
 ) {
-    let (cols, rows) = match term_grid_size(ui) {
-        Some(g) => g,
-        None => return,
-    };
-    let avail = ui.available_size();
+    // 字体度量每帧只查一次（原实现 term_grid_size 内外各查一次，每帧锁 4 次
+    // 字体缓存）；行列数就地按可用面积折算，与 term_grid_size 同一套公式。
     let font_id = FontId::monospace(TERM_FONT_SIZE);
-    let cell_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font_id, 'M'));
-    let cell_h = ui.ctx().fonts_mut(|f| f.row_height(&font_id));
+    let (cell_w, cell_h) =
+        ui.ctx().fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return;
+    }
+    let avail = ui.available_size();
+    let cols = ((avail.x / cell_w).floor().max(1.0)) as usize;
+    let rows = ((avail.y / cell_h).floor().max(1.0)) as usize;
 
     if sess.grid_size != (cols as u16, rows as u16) {
         if let Ok(mut t) = sess.term.lock() {
@@ -507,98 +435,160 @@ pub fn show_terminal(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT));
 
-    // 鼠标滚轮查看滚动缓冲：只需悬停在终端区域，不需要终端获得焦点。
-    // 直接复用 egui 的平滑滚动量（与 ScrollArea 方向一致：正值=向上滚=更早内容），
-    // 并消费掉避免被后续控件重复使用；滚动后立即重绘，不等 0.3s 基线。
+    // ── 读取终端鼠标模式（一次性锁，后续所有分支复用） ──
+    let term_mode_snapshot = sess.term.lock().map(|t| *t.mode()).ok();
+    // 只检查实际启用的鼠标上报模式：MOUSE_REPORT_CLICK / MOUSE_MOTION。
+    // SGR_MOUSE 是编码格式修饰符，单独存在不代表子进程想要鼠标事件。
+    let mouse_reporting = term_mode_snapshot.map_or(false, |m| {
+        m.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION)
+    });
+    let alt_screen = term_mode_snapshot
+        .unwrap_or(TermMode::empty())
+        .contains(TermMode::ALT_SCREEN);
+
+    // ── 鼠标滚轮 ──
     if resp.hovered() {
         let delta = ui.input(|i| i.smooth_scroll_delta.y);
         if delta != 0.0 {
             ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
-            // 平滑滚动量常 <1 行，按行高折算并保证至少 1 行，否则触摸板/精密滚轮无反应。
             let mut lines = (delta / cell_h).round() as i32;
             if lines == 0 {
                 lines = if delta > 0.0 { 1 } else { -1 };
             }
-            // 滚轮通用策略：
-            // 1. 先滚仿真器原生缓冲（普通 shell / vim 有内容可滚）。
-            // 2. 滚不动时：应用开了鼠标上报 → 按 SGR 转发滚轮（htop 等原生
-            //    console 应用在 ConPTY 下能正确收到）；否则是全屏重绘型 TUI
-            //    （备用屏，或主屏 history=0 + 铺满文字，如本机 ConPTY 下的
-            //    opencode）→ 翻译成 PgUp/PgDn 发给应用，让应用滚自己的历史
-            //    （opencode 实测有效），无需自攒任何缓存。
-            match sess.term.lock() {
-                Ok(mut t) => {
-                    let before = t.grid().display_offset();
-                    t.scroll_display(Scroll::Delta(lines));
-                    let moved = t.grid().display_offset() != before;
-                    if !moved {
-                        if t.mode().intersects(TermMode::MOUSE_MODE) {
-                            let pos = ui
-                                .input(|i| i.pointer.latest_pos())
-                                .unwrap_or(rect.center());
-                            let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
-                                .clamp(1, cols);
-                            let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
-                                .clamp(1, rows);
-                            let up = lines > 0;
-                            for _ in 0..lines.abs().clamp(1, 32) {
-                                let b = if up { 64 } else { 65 };
-                                let _ = sess
-                                    .writer
-                                    .try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
-                            }
-                        } else if should_pgup_fallback(&t, rows, &sess.csi_pos) {
-                            // 一格滚轮 ≈3 行，一次 PgUp ≈ 一页；按行数折算再发。
-                            let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
-                            let key = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
-                            for _ in 0..count {
-                                let _ = sess.writer.try_send(key.to_vec());
-                            }
-                        }
-                    }
+            if mouse_reporting {
+                // 子进程开了鼠标上报 → SGR 鼠标滚轮事件。
+                let pos = ui
+                    .input(|i| i.pointer.latest_pos())
+                    .unwrap_or(rect.center());
+                let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
+                    .clamp(1, cols);
+                let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
+                    .clamp(1, rows);
+                let up = lines > 0;
+                for _ in 0..lines.abs().clamp(1, 32) {
+                    let b = if up { 64 } else { 65 };
+                    let _ = sess
+                        .writer
+                        .try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
                 }
-                Err(_) => {}
+            } else if alt_screen {
+                // ALT_SCREEN 无鼠标上报（opencode 等）→ PgUp/PgDn。
+                let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
+                let key: &[u8] = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
+                for _ in 0..count {
+                    let _ = sess.writer.try_send(key.to_vec());
+                }
+            } else {
+                // 普通 shell / 主屏 TUI（pi 等）→ 滚仿真器缓冲。
+                if let Ok(mut t) = sess.term.lock() {
+                    t.scroll_display(Scroll::Delta(lines));
+                }
             }
             ui.ctx().request_repaint();
         }
-    }
-
-    // 文本选择：左键拖拽选中（选区由 alacritty 核心维护，随内容滚动/换行自动
-    // 跟随），左键单击清除选择，右键复制选中文本。
-    if let Ok(mut t) = sess.term.lock() {
-        let offset = t.grid().display_offset();
-        let point_at = |pos: Pos2| -> Option<Point> {
-            let col = ((pos.x - rect.left()) / cell_w).floor() as i64;
-            let row = ((pos.y - rect.top()) / cell_h).floor() as i64;
-            if row < 0 || col < 0 {
-                return None;
-            }
-            Some(Point::new(
-                Line(row as i32 - offset as i32),
-                Column((col as usize).min(cols.saturating_sub(1))),
-            ))
+    }    // ── 鼠标点击 / 移动 / 拖拽 → 按模式转发或本地处理 ──
+    if mouse_reporting {
+        // 子进程开了鼠标上报 → 把 egui 鼠标事件编码为 SGR 序列写入 PTY。
+        // 按下/释放/移动分别对应 SGR 的 M（按下）/m（释放）。
+        let to_col_row = |pos: Pos2| -> (usize, usize) {
+            let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
+                .clamp(1, cols);
+            let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
+                    .clamp(1, rows);
+            (col, row)
         };
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
-                t.selection =
-                    Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
-            }
-        } else if resp.dragged_by(egui::PointerButton::Primary) {
-            if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
-                if let Some(sel) = t.selection.as_mut() {
-                    sel.update(pos, Side::Left);
-                }
+
+        // --- 按下 / 释放 / 拖拽移动：直接从 egui 原始指针状态检测，
+        //    不依赖 resp.drag_started()/clicked()——后者在 Sense::click_and_drag()
+        //    下有时序问题（drag_started 同帧 clicked=false，导致纯点击漏发释放）。
+        let ptr_any_down = ui.input(|i| i.pointer.any_down());
+        let ptr_pressed = ui.input(|i| {
+            i.pointer.button_pressed(egui::PointerButton::Primary)
+                || i.pointer.button_pressed(egui::PointerButton::Secondary)
+                || i.pointer.button_pressed(egui::PointerButton::Middle)
+        });
+        let ptr_released = ui.input(|i| i.pointer.any_released());
+
+        if resp.hovered() && ptr_pressed {
+            // 按下：检测哪个按钮
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                let (col, row) = to_col_row(pos);
+                let btn = ui.input(|i| {
+                    if i.pointer.button_pressed(egui::PointerButton::Primary) {
+                        0
+                    } else if i.pointer.button_pressed(egui::PointerButton::Secondary) {
+                        2
+                    } else if i.pointer.button_pressed(egui::PointerButton::Middle) {
+                        1
+                    } else {
+                        0
+                    }
+                });
+                let _ = sess.writer.try_send(
+                    format!("\x1b[<{btn};{col};{row}M").into_bytes(),
+                );
+                ui.ctx().request_repaint();
             }
         }
-        if resp.clicked() {
-            t.selection = None;
+
+        // --- 拖拽移动（按下期间指针移动） ---
+        if ptr_any_down {
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                let (col, row) = to_col_row(pos);
+                let btn = 32; // motion flag
+                let _ = sess.writer.try_send(
+                    format!("\x1b[<{btn};{col};{row}M").into_bytes(),
+                );
+            }
+        }
+
+        // --- 释放 ---
+        if ptr_released {
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                let (col, row) = to_col_row(pos);
+                let _ = sess
+                    .writer
+                    .try_send(format!("\x1b[<0;{col};{row}m").into_bytes());
+                ui.ctx().request_repaint();
+            }
+        }
+    } else {
+        // 无鼠标上报 → egui 本地文本选择。
+        if let Ok(mut t) = sess.term.lock() {
+            let disp_off = t.grid().display_offset();
+            let point_at = |pos: Pos2| -> Option<Point> {
+                let col = ((pos.x - rect.left()) / cell_w).floor() as i64;
+                let row = ((pos.y - rect.top()) / cell_h).floor() as i64;
+                if row < 0 || col < 0 {
+                    return None;
+                }
+                Some(Point::new(
+                    Line(row as i32 - disp_off as i32),
+                    Column((col as usize).min(cols.saturating_sub(1))),
+                ))
+            };
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                    t.selection =
+                        Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
+                }
+            } else if resp.dragged_by(egui::PointerButton::Primary) {
+                if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                    if let Some(sel) = t.selection.as_mut() {
+                        sel.update(pos, Side::Left);
+                    }
+                }
+            }
+            if resp.clicked() {
+                t.selection = None;
+            }
         }
     }
 
     // 右键弹菜单：复制 / 粘贴 / 清空输入（不再右键直接粘贴，避免误触）。
-    // context_menu 闭包内再拿 term 锁；必须在上面 lock 块之外调用，否则同一
-    // 帧先锁后闭包再锁会死锁。
+    // mouse reporting 模式下跳过——右键事件已作为 SGR 序列转发给子进程。
     let mut menu_action: Option<TermAction> = None;
+    if !mouse_reporting {
     resp.context_menu(|ui| {
         let has_selection = sess
             .term
@@ -703,6 +693,7 @@ pub fn show_terminal(
         }
         None => {}
     }
+    } // end if !mouse_reporting
 
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
     let mut preedit = String::new();
@@ -754,100 +745,97 @@ pub fn show_terminal(
             }
         }
 
-        let events = ui.input(|i| i.events.clone());
-        let alt_down = ui.input(|i| i.modifiers.alt);
-        for ev in &events {
-            match ev {
-                egui::Event::Text(text) => {
-                    if alt_down || text.is_empty() {
-                        continue;
+        // 事件在单次 input 闭包内就地处理：原实现先 clone 整个事件列表再遍历，
+        // 每帧多一次分配 + 全量拷贝（egui Event 含 String/IME 文本）。
+        ui.input(|i| {
+            let alt_down = i.modifiers.alt;
+            for ev in &i.events {
+                match ev {
+                    egui::Event::Text(text) => {
+                        if alt_down || text.is_empty() {
+                            continue;
+                        }
+                        bytes_out.push(text.as_bytes().to_vec());
                     }
-                    bytes_out.push(text.as_bytes().to_vec());
-                }
-                egui::Event::Ime(ime) if owns_ime => match ime {
-                    egui::ImeEvent::Commit(text) => {
-                        if !alt_down && !text.is_empty() {
-                            bytes_out.push(text.as_bytes().to_vec());
+                    egui::Event::Ime(ime) if owns_ime => match ime {
+                        egui::ImeEvent::Commit(text) => {
+                            if !alt_down && !text.is_empty() {
+                                bytes_out.push(text.as_bytes().to_vec());
+                            }
+                        }
+                        egui::ImeEvent::Preedit { text, .. } => {
+                            preedit.clone_from(text);
+                        }
+                        _ => {}
+                    },
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        let ctrl = modifiers.ctrl || modifiers.command;
+                        let alt = modifiers.alt;
+                        let shift = modifiers.shift;
+
+                        // Esc 清除文本选择（按键仍转发给终端，兼容 vim 等应用）。
+                        if *key == egui::Key::Escape {
+                            if let Ok(mut t) = sess.term.lock() {
+                                t.selection = None;
+                            }
+                        }
+
+                        if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
+                            bytes_out.push(bytes);
                         }
                     }
-                    egui::ImeEvent::Preedit { text, .. } => {
-                        preedit.clone_from(text);
+                    egui::Event::Copy => {
+                        // 有选区时 Ctrl+C 复制选区；无选区才发 SIGINT（0x03）。
+                        let mut copied = false;
+                        if let Ok(mut t) = sess.term.lock() {
+                            copied = copy_selection(&t, ui.ctx(), status);
+                            if copied {
+                                t.selection = None;
+                            }
+                        }
+                        if !copied {
+                            bytes_out.push(vec![0x03]);
+                        }
+                    }
+                    egui::Event::Cut => {
+                        bytes_out.push(vec![0x18]); // Ctrl+X
+                    }
+                    egui::Event::Paste(text) => {
+                        // 剪贴板中是文件 → 粘贴文件相对路径（优先于文本粘贴）。
+                        if paste_file_paths(sess, &clipboard_files(), status) {
+                            continue;
+                        }
+                        if !text.is_empty() {
+                            // 多行粘贴：支持括号粘贴的应用（nvim 等）按字面插入，
+                            // 否则把换行转成 \r，让 shell 逐行执行。
+                            let bracketed = sess
+                                .term
+                                .lock()
+                                .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
+                                .unwrap_or(false);
+                            if bracketed {
+                                let mut v = b"\x1b[200~".to_vec();
+                                v.extend_from_slice(text.as_bytes());
+                                v.extend_from_slice(b"\x1b[201~");
+                                bytes_out.push(v);
+                            } else {
+                                bytes_out.push(text.replace('\n', "\r").into_bytes());
+                            }
+                        }
                     }
                     _ => {}
-                },
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => {
-                    let ctrl = modifiers.ctrl || modifiers.command;
-                    let alt = modifiers.alt;
-                    let shift = modifiers.shift;
-
-                    // Esc 清除文本选择（按键仍转发给终端，兼容 vim 等应用）。
-                    if *key == egui::Key::Escape {
-                        if let Ok(mut t) = sess.term.lock() {
-                            t.selection = None;
-                        }
-                    }
-
-                    if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
-                        bytes_out.push(bytes);
-                    }
                 }
-                egui::Event::Copy => {
-                    // 有选区时 Ctrl+C 复制选区；无选区才发 SIGINT（0x03）。
-                    let mut copied = false;
-                    if let Ok(mut t) = sess.term.lock() {
-                        copied = copy_selection(&t, ui.ctx(), status);
-                        if copied {
-                            t.selection = None;
-                        }
-                    }
-                    if !copied {
-                        bytes_out.push(vec![0x03]);
-                    }
-                }
-                egui::Event::Cut => {
-                    bytes_out.push(vec![0x18]); // Ctrl+X
-                }
-                egui::Event::Paste(text) => {
-                    // 剪贴板中是文件 → 粘贴文件相对路径（优先于文本粘贴）。
-                    if paste_file_paths(sess, &clipboard_files(), status) {
-                        continue;
-                    }
-                    if !text.is_empty() {
-                        // 多行粘贴：支持括号粘贴的应用（nvim 等）按字面插入，
-                        // 否则把换行转成 \r，让 shell 逐行执行。
-                        let bracketed = sess
-                            .term
-                            .lock()
-                            .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
-                            .unwrap_or(false);
-                        if bracketed {
-                            let mut v = b"\x1b[200~".to_vec();
-                            v.extend_from_slice(text.as_bytes());
-                            v.extend_from_slice(b"\x1b[201~");
-                            bytes_out.push(v);
-                        } else {
-                            bytes_out.push(text.replace('\n', "\r").into_bytes());
-                        }
-                    }
-                }
-                _ => {}
             }
-        }
+        });
     }
 
-    // 投��用户输入到后台写入线程（非��塞）。
-    // 有输入时先回到实时视图底部：正在回看历史时输入，应回到最新内容。
+    // 投递用户输入到后台写入线程（非阻塞）。
     if !bytes_out.is_empty() {
-        if let Ok(mut t) = sess.term.lock() {
-            if t.grid().display_offset() != 0 {
-                t.scroll_display(Scroll::Bottom);
-            }
-        }
         let mut all = Vec::new();
         for b in &bytes_out {
             all.extend_from_slice(b);
@@ -856,7 +844,10 @@ pub fn show_terminal(
     }
 
     // ---- 渲染网格 ----
-    let term = match sess.term.lock() {
+    // 先克隆 Arc 再拿锁：渲染循环里要写 sess.galley_cache（缓存复用），
+    // 若守卫直接借自 sess.term，会与可变借用冲突。
+    let term_arc = sess.term.clone();
+    let term = match term_arc.lock() {
         Ok(t) => t,
         Err(_) => return,
     };
@@ -868,19 +859,36 @@ pub fn show_terminal(
     let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
 
+    // ── 预计算 ANSI 256 色查找表：把每格 resolve_color 的 match+from_rgb
+    //    降为一次数组索引。colors 快照在帧首取一次，256 项遍历摊到整帧。
+    let mut ansi_rgb: [Color32; 256] = [Color32::TRANSPARENT; 256];
+    for i in 0..256usize {
+        if let Some(Rgb { r, g, b }) = colors[i] {
+            ansi_rgb[i] = Color32::from_rgb(r, g, b);
+        }
+    }
+    let default_fg = color_for(dark, Color32::WHITE, Color32::BLACK);
+    let default_bg = canvas_bg;
+
     // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
     // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
     // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
+    //
     for indexed in content.display_iter {
         let point = indexed.point;
-        // display_iter 返回绝对行号（历史区为负行），视口顶对应 line=-offset，
-        // 所以屏幕行号是 line + offset（写成减法会把历史行全部过滤成空白）。
         let vline = point.line.0 + offset as i32;
         if vline < 0 || vline >= rows as i32 {
             continue;
         }
         let cell = indexed.cell;
+        // 随空格（宽字符占位格）直接跳过：它的 2 格槽矩形与前导格完全重叠，
+        // 槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，选区盖住
+        // 随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形画完后
+        // 盖住它 —— 就是选中时汉字“消失”的根因。它自身永远无字形，先走先跳。
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         let col = point.column.0 as usize;
         let x = rect.left() + col as f32 * cell_w;
         let y = rect.top() + vline as f32 * cell_h;
@@ -889,15 +897,24 @@ pub fn show_terminal(
         // 窄格 1 格。背景/选区/光标下划线统一按槽绘制——选区边界落在宽字符的
         // 任意一列（含随空格）时整个汉字同色，不会再出现左半正常色、右半被高亮
         // 盖住的“半字”效果。字形仍左对齐画在前导格起点（spacer 无字形）。
-        let (slot_col, slot_cells) =
-            cjk_slot(col, wide, cell.flags.contains(Flags::WIDE_CHAR_SPACER));
+        let (slot_col, slot_cells) = cjk_slot(col, wide, false);
         let x_slot = rect.left() + slot_col as f32 * cell_w;
         let slot_w = slot_cells as f32 * cell_w;
 
-        let (mut fg, mut bg) = (
-            resolve_color(cell.fg, colors, true, dark),
-            resolve_color(cell.bg, colors, false, dark),
-        );
+        let underlined = cell.flags.contains(Flags::UNDERLINE);
+        let selected = sel_range.as_ref().is_some_and(|r| cell_selected(r, point, cell));
+
+        // 用预计算查找表替换 resolve_color：Indexed/Named 走数组，Spec 直转。
+        let resolve = |c: Color, default: Color32| -> Color32 {
+            match c {
+                Color::Spec(Rgb { r, g, b }) => Color32::from_rgb(r, g, b),
+                Color::Indexed(i) => ansi_rgb.get(i as usize).copied().unwrap_or(default),
+                // NamedColor 枚举值可超过 255（Cursor=256, Foreground=258 等），
+                // 必须做越界保护，否则直接 panic。
+                Color::Named(n) => ansi_rgb.get(n as usize).copied().unwrap_or(default),
+            }
+        };
+        let (mut fg, mut bg) = (resolve(cell.fg, default_fg), resolve(cell.bg, default_bg));
         if cell.flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
@@ -906,21 +923,18 @@ pub fn show_terminal(
         let (fg, bg) = if dark { adapt_to_dark(fg, bg) } else { adapt_to_light(fg, bg) };
         // 选中格统一为浅灰底深字，深浅一致。
         // （蓝底白字在旧代码里曾遮盖汉字：因为随空格在字形后涂背景，盖住了
-        // 前导格刚画的宽字 —— 见下文随空格在背景前跳过。）
-        let (fg, bg) = if sel_range
-            .as_ref()
-            .is_some_and(|r| cell_selected(r, indexed.point, cell))
-        {
+        // 前导格刚画的宽字 —— 见上文随空格在背景前跳过。）
+        let (fg, bg) = if selected {
             (Color32::from_gray(24), Color32::from_gray(176))
         } else {
             (fg, bg)
         };
 
-        // 随空格（宽字符占位格）必须在背景涂之前跳过：它的 2 格槽矩形与前导格
-        // 完全重叠，槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，
-        // 选区盖住随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形
-        // 画完后盖住它 —— 就是选中时汉字“消失”的根因。
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+
+        // 空白格快速跳过：默认底色、未选中（否则底色已是高亮灰）、无下划线的
+        // 空格无任何可见输出，连 LayoutJob 都不用建 —— 空屏帧的主要开销就在这。
+        if ch == ' ' && bg == canvas_bg && !underlined {
             continue;
         }
 
@@ -933,40 +947,48 @@ pub fn show_terminal(
                 bg,
             );
         }
-        let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
-        let mut format = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: fg,
-            underline: Stroke::NONE,
-            // 强制统一行高：CJK fallback 字体（msyh 等）行高与默认等宽字体不同，
-            // 不指定会让含中文的行变高，导致整块内容逐行漂移、与光标/选区错位。
-            line_height: Some(cell_h),
-            ..Default::default()
-        };
-        if cell.flags.contains(Flags::UNDERLINE) && !wide {
-            format.underline = Stroke::new(1.0, fg);
-        }
-        let text = ch.to_string();
-        if wide {
-            // 宽字左对齐画在 2 格位起点（与终端惯例一致：字身贴槽左沿，
-            // 槽宽仍按 2 格，选区/光标块/下划线盖满整槽；若居中则每个汉字
-            // 左右各内缩 1.43px，字与相邻 ASCII、行首字都显出偏移）。
-            let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = slot_w;
-            job.append(&text, 0.0, format);
-            painter.galley(Pos2::new(x, y), painter.layout_job(job), Color32::WHITE);
-            if cell.flags.contains(Flags::UNDERLINE) {
-                painter.hline(
-                    x..=(x + slot_w),
-                    y + cell_h - 1.0,
-                    Stroke::new(1.0, fg),
-                );
+        // Galley 缓存查找/回填。键里的“窄格下划线”只影响 TextFormat.underline；
+        // 宽字符下划线是事后手画的横线，不进排版，故宽字该位恒 false。
+        let key = (ch, fg, underlined && !wide, wide);
+        let galley = match sess.galley_cache.get(&key) {
+            Some(g) => g.clone(),
+            None => {
+                // 上限保护：调色板花哨的 TUI 可能组合出海量键，超限整体清空，
+                // 排版成本只在清空后的第一帧回升一次。
+                if sess.galley_cache.len() >= 8192 {
+                    sess.galley_cache.clear();
+                }
+                let mut format = egui::TextFormat {
+                    font_id: font_id.clone(),
+                    color: fg,
+                    underline: Stroke::NONE,
+                    // 强制统一行高：CJK fallback 字体（msyh 等）行高与默认等宽字体不同，
+                    // 不指定会让含中文的行变高，导致整块内容逐行漂移、与光标/选区错位。
+                    line_height: Some(cell_h),
+                    ..Default::default()
+                };
+                if key.2 {
+                    format.underline = Stroke::new(1.0, fg);
+                }
+                let mut job = egui::text::LayoutJob::default();
+                if wide {
+                    // 宽字左对齐画在 2 格位起点（与终端惯例一致：字身贴槽左沿，
+                    // 槽宽仍按 2 格，选区/光标块/下划线盖满整槽；若居中则每个汉字
+                    // 左右各内缩 1.43px，字与相邻 ASCII、行首字都显出偏移）。
+                    job.wrap.max_width = slot_w;
+                }
+                let text = ch.to_string();
+                job.append(&text, 0.0, format);
+                let g = painter.layout_job(job);
+                sess.galley_cache.insert(key, g.clone());
+                g
             }
-        } else {
-            let mut job = egui::text::LayoutJob::default();
-            job.append(&text, 0.0, format);
-            painter.galley(Pos2::new(x, y), painter.layout_job(job), Color32::WHITE);
+        };
+        painter.galley(Pos2::new(x, y), galley, Color32::WHITE);
+
+        if wide && underlined {
+            painter.hline(x..=(x + slot_w), y + cell_h - 1.0, Stroke::new(1.0, fg));
         }
     }
 
@@ -991,22 +1013,44 @@ pub fn show_terminal(
         let show = term.mode().contains(TermMode::SHOW_CURSOR);
         let mut cpoint = cursor.point;
         if !show {
-            let is_caret = |cell: &Cell| {
-                matches!(
-                    (cell.fg, cell.bg),
-                    (Color::Named(NamedColor::Black), Color::Named(NamedColor::White))
-                        | (Color::Named(NamedColor::White), Color::Named(NamedColor::Black))
-                )
+            // 全屏扫描代价 rows×cols，每帧都扫不划算：内容只在解析线程变化，
+            // 用解析代数做缓存键——没变就直接复用上次找到的自绘光标位置；
+            // 任一变了才重扫并回填缓存。
+            let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
+            let disp_off = offset;
+            let cached = match sess.caret_scan {
+                Some((g, line, col)) if g == cur_gen => {
+                    Some(Point::new(line, col))
+                }
+                _ => None,
             };
-            'outer: for r in (0..rows).rev() {
-                let line = Line(r as i32 - offset as i32);
-                for col in 0..cols {
-                    let cell = &term.grid()[Point::new(line, Column(col))];
-                    if is_caret(cell) {
-                        cpoint = Point::new(line, Column(col));
-                        break 'outer;
+            let found = cached.or_else(|| {
+                let is_caret = |cell: &Cell| {
+                    matches!(
+                        (cell.fg, cell.bg),
+                        (Color::Named(NamedColor::Black), Color::Named(NamedColor::White))
+                            | (Color::Named(NamedColor::White), Color::Named(NamedColor::Black))
+                    )
+                };
+                // 自底向上找反色格：输入行在 UI 最下方，必然优先命中。
+                let mut hit = None;
+                'outer: for r in (0..rows).rev() {
+                    let line = Line(r as i32 - disp_off as i32);
+                    for col in 0..cols {
+                        let cell = &term.grid()[Point::new(line, Column(col))];
+                        if is_caret(cell) {
+                            hit = Some(Point::new(line, Column(col)));
+                            break 'outer;
+                        }
                     }
                 }
+                if let Some(p) = hit {
+                    sess.caret_scan = Some((cur_gen, p.line, p.column));
+                }
+                hit
+            });
+            if let Some(p) = found {
+                cpoint = p;
             }
         }
         let p = cpoint;
@@ -1121,8 +1165,8 @@ pub fn show_terminal(
         }
     }
 
-    // 记录光标可见性：TUI 光标可见（Block/Beam/Underline/HollowBlock）时
-    // 通常处于交互模式（等待用户输入/选择），供页签 ✏️ 图标判定。
+    // 记录终端状态标志，供 app 页签图标判定 TUI 运行状态。
+    sess.alt_screen.store(alt_screen, Ordering::Relaxed);
     sess.cursor_hidden
         .store(cursor.shape == CursorShape::Hidden, Ordering::Relaxed);
 
@@ -1403,88 +1447,5 @@ mod tests {
         assert_eq!(path_for_input(r"my dir\a.txt"), "\"my dir\\a.txt\"");
         // 含引号直接删掉（cmd 引号内无法转义），仍按含特殊字符加双引号。
         assert_eq!(path_for_input("say\"hi.txt"), "\"sayhi.txt\"");
-    }
-
-    /// 滚轮翻译 PgUp/PgDn 的判定：备用屏直接命中；全屏重绘信号（CSI H 计数）
-    /// 活跃时即使 history>0 也命中（opencode 偶发换行输出后的场景）；兜底判定
-    /// 主屏铺满 + history=0 命中；shell 有滚动缓冲 / 空提示符不命中。
-    #[test]
-    fn wheel_pgup_fallback_detection() {
-        use alacritty_terminal::event::VoidListener;
-        use alacritty_terminal::term::Config as TermConfig;
-        use alacritty_terminal::term::Term as ATerm;
-        use alacritty_terminal::vte::ansi::Processor as P;
-        use std::sync::Mutex;
-        use std::time::Instant;
-
-        // 全屏重绘信号（默认不活跃：计数 0）。
-        let idle_signal = Mutex::new((0u32, Instant::now()));
-
-        // 主屏全屏重绘型 TUI：绝对定位写满 5 行（不碰最后一行避免换行滚动）。
-        let mut term = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
-        let mut p: P = Default::default();
-        p.advance(&mut term, b"\x1b[HAAA\x1b[2HBBB\x1b[3HCCC\x1b[4HDDD\x1b[5HEEE");
-        assert_eq!(
-            alacritty_terminal::grid::Dimensions::history_size(term.grid()),
-            0,
-            "绝对定位改写不应产生滚动缓冲"
-        );
-        assert!(should_pgup_fallback(&term, 6, &idle_signal), "主屏铺满、无缓冲 → 命中");
-
-        // 全屏重绘信号活跃 + 仿真器缓冲已有内容（opencode 偶发换行输出）
-        // → 仍命中：滚轮滚应用自己的历史，而不是滚仿真器缓冲（"滚动终端本体"）。
-        let active_signal = Mutex::new((200u32, Instant::now()));
-        let mut term5 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
-        let mut p5: P = Default::default();
-        p5.advance(
-            &mut term5,
-            b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7",
-        );
-        assert_ne!(
-            alacritty_terminal::grid::Dimensions::history_size(term5.grid()),
-            0
-        );
-        assert!(should_pgup_fallback(&term5, 6, &active_signal), "CSI H 活跃 + history>0 → 命中");
-
-        // 信号过期（5 秒前的 CSI H）→ 回落到 history 判定，不命中。
-        let stale_signal = Mutex::new((200u32, Instant::now() - std::time::Duration::from_secs(6)));
-        assert!(
-            !should_pgup_fallback(&term5, 6, &stale_signal),
-            "信号过期 → 按 history 判定，不命中"
-        );
-
-        // 带启动清屏（\x1b[2J 会推进一行缓冲）的全屏 TUI 不命中：见
-        // should_pgup_fallback 的注释，opencode 实际输出流没有 2J，严格 ==0 已够。
-        let mut term2 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
-        let mut p2: P = Default::default();
-        p2.advance(&mut term2, b"\x1b[2J\x1b[HAAA\x1b[2HBBB\x1b[3HCCC\x1b[4HDDD\x1b[5HEEE");
-        assert!(
-            !should_pgup_fallback(&term2, 6, &idle_signal),
-            "2J 清屏推进了缓冲 → 不命中（宽松化判决见注释）"
-        );
-
-        // 备用屏（less/vim）→ 命中。
-        p.advance(&mut term, b"\x1b[?1049h\x1b[2J\x1b[HHi");
-        assert!(should_pgup_fallback(&term, 6, &idle_signal), "备用屏 → 命中");
-
-        // shell：换行滚动产生缓冲 → 不命中（走原生 scroll_display）。
-        let mut term3 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
-        let mut p3: P = Default::default();
-        p3.advance(
-            &mut term3,
-            b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7",
-        );
-        assert_eq!(
-            alacritty_terminal::grid::Dimensions::history_size(term3.grid()),
-            1,
-            "多出一行应滚进缓冲"
-        );
-        assert!(!should_pgup_fallback(&term3, 6, &idle_signal), "有滚动缓冲 → 不命中");
-
-        // 空提示符（刚 cls 的 cmd）：缓冲为空但非空白行不足 → 不命中。
-        let mut term4 = ATerm::new(TermConfig::default(), &TermSize::new(8, 6), VoidListener);
-        let mut p4: P = Default::default();
-        p4.advance(&mut term4, b"\x1b[HPrompt>");
-        assert!(!should_pgup_fallback(&term4, 6, &idle_signal), "空提示符 → 不命中");
     }
 }

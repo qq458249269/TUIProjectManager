@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod session;
+mod term_gl;
 mod terminal;
 
 use eframe::egui;
@@ -13,7 +14,27 @@ pub fn app_version() -> &'static str {
     option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+/// 启动时解除 exe 文件锁定，让安装器/CI 可以覆盖写入新版本。
+/// 步骤：
+///   1. 清理上次崩溃残留的 .running 文件
+///   2. 重命名 `app.exe` → `app.exe.running`（rename 不需要写权限，进程运行中也能成功，原名立即空出）
+///   3. 复制 `app.exe.running` → `app.exe`（目录里始终有一份可用的 exe，安装器可通过 .running 判断旧版本是否在运行）
+/// 当前进程通过 OS 旧句柄继续执行 app.exe.running，不受影响。
+fn unlock_exe() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+            if let Some(parent) = exe.parent() {
+                let _ = std::fs::remove_file(parent.join(format!("{name}.running")));
+            }
+            let running = exe.with_file_name(format!("{name}.running"));
+            let _ = std::fs::rename(&exe, &running);
+            let _ = std::fs::copy(&running, &exe);
+        }
+    }
+}
+
 fn main() -> eframe::Result {
+    unlock_exe();
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])

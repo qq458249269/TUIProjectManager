@@ -1,13 +1,18 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::term_gl::DirtyTracker;
 
 use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
+use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// 一个在应用内页签中运行的终端会话。
@@ -36,23 +41,39 @@ pub struct Session {
     pub osc_theme_aware: Arc<AtomicBool>,
     /// 子进程是否已退出。
     pub exited: bool,
-    /// 全屏重绘型 TUI 信号：输出流里累计的光标定位（CSI H/f）次数与最近一次
-    /// 时间。opencode 这类全屏 TUI 每帧用绝对定位重绘（30+ 次/帧），shell 输出
-    /// 从不用；滚轮据此把事件翻译成 PgUp/PgDn 而非滚仿真器缓冲，详见
-    /// terminal::should_pgup_fallback。
-    pub csi_pos: Arc<Mutex<(u32, Instant)>>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     pub last_output_ms: Arc<AtomicU64>,
+    /// 最近一次有「实际内容」输出的时间戳（毫秒）。排除纯 escape 序列的
+    /// TUI 动画帧（光标移动、屏幕重绘），只在有可打印字符输出时更新。
+    /// UI 用它区分「TUI 自带动画」（content 静默）vs「正在产生内容」（content 活跃）。
+    pub last_content_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
     pub has_been_viewed: Arc<AtomicBool>,
+    /// 终端是否处于备用屏（ALT_SCREEN / DECSET 1049）。
+    /// htop/vim/opencode/nano 等全屏 TUI 启用，普通 shell 不启用。
+    /// 由 terminal::show_terminal 每帧写入，供 app 页签检测 TUI 模式。
+    pub alt_screen: Arc<AtomicBool>,
     /// 终端光标是否隐藏（DECSET 25 关闭 / TUI 自行管理光标）。
     /// 每帧渲染时由 terminal::show_terminal 写入，供 app 页签图标判断
     /// TUI 是否处于交互模式（光标可见 = 等待用户输入/选择）。
     pub cursor_hidden: Arc<AtomicBool>,
+    /// 解析代数：读取线程每消费一块子进程输出 +1。渲染侧据此判断
+    /// caret_scan 缓存是否过期（内容只在解析线程变化）。
+    pub parse_gen: Arc<AtomicU64>,
+    /// 隐藏光标（DECSET 25 关）时的自绘光标格扫描缓存：
+    /// (解析代数, 行, 列)。代数没变就直接复用，
+    /// 免去每帧 rows×cols 的全屏网格扫描。offset 恒为 0。
+    pub caret_scan: Option<(u64, Line, Column)>,
+    /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
+    /// 同一格式每帧只排版一次；上限 8192 条，超出整体清空防膨胀。
+    pub galley_cache:
+        HashMap<(char, egui::Color32, bool, bool), std::sync::Arc<egui::epaint::Galley>>,
+    /// GPU 渲染器脏区跟踪：帧间逐格对比哈希，光标闪烁/打字只重绘变化格。
+    pub dirty: DirtyTracker,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -77,6 +98,10 @@ impl EventListener for SessionListener {
         // 必须非阻塞：解析线程持有 term 锁时回调这里，若 send 阻塞，
         // 会与 UI 线程的 term.lock() 渲染互相等待而死锁。
         let _ = self.redraw.try_send(());
+        // 直接请求重绘（Context 线程安全）：空闲基线是 1s 轮询，若只靠
+        // logic() 里消费通道，PTY 输出刚错过一帧就要等最多 1s 才显示——
+        // 打字回显也是 PTY 输出，会明显发粘。这里即时唤醒下一帧。
+        self.ctx.request_repaint();
     }
 }
 
@@ -314,22 +339,23 @@ pub fn spawn(
     let osc_theme_aware = Arc::new(AtomicBool::new(false));
 
     let output_count = Arc::new(AtomicU32::new(0));
-    let last_output_ms = Arc::new(AtomicU64::new(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    ));
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let last_output_ms = Arc::new(AtomicU64::new(now_ts));
+    let last_content_ms = Arc::new(AtomicU64::new(now_ts));
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
-    let csi_pos = Arc::new(Mutex::new((0u32, Instant::now())));
+    let parse_gen = Arc::new(AtomicU64::new(0));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
         let osc_theme_aware = osc_theme_aware.clone();
-        let csi_pos = csi_pos.clone();
         let output_count = output_count.clone();
         let last_output_ms = last_output_ms.clone();
+        let last_content_ms = last_content_ms.clone();
+        let parse_gen = parse_gen.clone();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -347,6 +373,8 @@ pub fn spawn(
                         break;
                     },
                     Ok(n) => {
+                        // 解析代数 +1：渲染侧的自绘光标扫描缓存随之失效。
+                        parse_gen.fetch_add(1, Ordering::Relaxed);
                         // 记录输出时间戳（供 UI 判断是否持续输出）。
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -368,11 +396,6 @@ pub fn spawn(
                                 }
                                 if j < chunk.len() {
                                     esc_bytes += 1;
-                                    if chunk[j] == b'H' || chunk[j] == b'f' {
-                                        let mut c = csi_pos.lock().unwrap();
-                                        c.0 = c.0.saturating_add(1);
-                                        c.1 = Instant::now();
-                                    }
                                 }
                                 i = j + 1;
                             } else if (0x20..=0x7E).contains(&chunk[i]) || chunk[i] >= 0xC0 {
@@ -383,17 +406,33 @@ pub fn spawn(
                             }
                         }
                         let total = (esc_bytes + printable) as f64;
-                        let is_animation = total == 0.0 || esc_bytes as f64 / total > 0.3;
-                        if !is_animation
-                            && (now_ms.saturating_sub(last_counted_ms) > 300 || printable >= 20)
-                        {
-                            output_count.fetch_add(1, Ordering::Relaxed);
-                            last_counted_ms = now_ms;
+                        // TUI 动画帧特征：escape 序列占比高 + 块较小（光标移动/屏幕重绘）。
+                        // 着色文本的 escape 占比也可能高（颜色码），但块通常较大。
+                        let esc_ratio = if total > 0.0 { esc_bytes as f64 / total } else { 0.0 };
+                        let is_animation = total == 0.0
+                            || (esc_ratio > 0.5 && n < 200)
+                            || esc_ratio > 0.8;
+                        if !is_animation {
+                            // 非动画输出：更新「实际内容」时间戳，UI 用它区分
+                            // TUI 自带动画（光标移动/屏幕重绘）vs 真正的内容输出。
+                            last_content_ms.store(now_ms, Ordering::Relaxed);
+                            if now_ms.saturating_sub(last_counted_ms) > 300 || printable >= 20 {
+                                output_count.fetch_add(1, Ordering::Relaxed);
+                                last_counted_ms = now_ms;
+                            }
                         }
-                        let mut term = term.lock().unwrap();
-                        parser.advance(&mut *term, &buf[..n]);
+                        // 分片推进解析器，每片释放一次锁：整块 64KB 全程持锁时，
+                        // 高吞吐输出的 TUI 会让每帧来取锁的 UI 渲染线程排队卡顿；
+                        // 切成 8KB 小片后渲染线程可在片间插空拿到锁。
+                        // vte 的状态机本就支持序列跨 advance 调用续解析，切片安全。
+                        const PARSE_SLICE: usize = 8192;
+                        for start in (0..n).step_by(PARSE_SLICE) {
+                            let end = (start + PARSE_SLICE).min(n);
+                            let mut t = term.lock().unwrap();
+                            parser.advance(&mut *t, &buf[start..end]);
+                        }
                         if let Some((reply, osc_color)) = reply_to_queries(
-                            &mut *term,
+                            &mut term.lock().unwrap(),
                             &buf[..n],
                             theme_dark.load(Ordering::Relaxed),
                         ) {
@@ -420,12 +459,16 @@ pub fn spawn(
         theme_dark,
         osc_theme_aware,
         exited: false,
-        csi_pos,
         last_clipboard_seq: None,
         output_count,
         last_output_ms,
+        last_content_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
+        alt_screen: Arc::new(AtomicBool::new(false)),
         cursor_hidden: Arc::new(AtomicBool::new(true)),
+        parse_gen,
+        caret_scan: None,        galley_cache: HashMap::new(),
+        dirty: DirtyTracker::new(),
     })
 }
 
