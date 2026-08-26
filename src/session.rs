@@ -94,9 +94,12 @@ pub struct Session {
     /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
     pub snapshot_scratch: Vec<(Point, Cell)>,
     /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
-    /// 同一格式每帧只排版一次；上限 8192 条，超出整体清空防膨胀。
+    /// 同一格式每帧只排版一次；上限 8192 条，超出按 generation 淘汰最旧 25%，
+    /// 避免整表清空后首帧全量重建的卡顿峰值。
     pub galley_cache:
-        HashMap<(char, egui::Color32, bool, bool), std::sync::Arc<egui::epaint::Galley>>,
+        HashMap<(char, egui::Color32, bool, bool), (std::sync::Arc<egui::epaint::Galley>, u64)>,
+    /// galley_cache 淘汰代数：每次淘汰 +1，新插入继承当前代数。
+    pub galley_gen: u64,
     /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
     pub gpu: Option<crate::term_gl::TermGpu>,
 }
@@ -474,25 +477,35 @@ pub fn spawn(
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::default();
             let mut buf = [0u8; 0x10_000];
-            // 上次计入 output_count 的时间戳，用于去抖：
-            // 输入回显是短时间内的突发小块，AI 回答是持续的稳定流。
             let mut last_counted_ms: u64 = 0;
+            // 后台页签攒批缓冲：降低加锁频率，减少对前台的锁竞争。
+            let mut pending: Vec<u8> = Vec::new();
+            let mut last_flush = std::time::Instant::now();
+            const BG_BATCH_BYTES: usize = 4096;
+            const BG_BATCH_MS: u64 = 5;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
+                        // 后台攒批剩余数据刷入。
+                        if !pending.is_empty() {
+                            parse_gen.fetch_add(1, Ordering::Relaxed);
+                            const PARSE_SLICE: usize = 8192;
+                            for start in (0..pending.len()).step_by(PARSE_SLICE) {
+                                let end = (start + PARSE_SLICE).min(pending.len());
+                                let mut t = term.lock().unwrap();
+                                parser.advance(&mut *t, &pending[start..end]);
+                            }
+                            pending.clear();
+                        }
                         let _ = redraw_reader.send(());
                         break;
                     },
                     Ok(n) => {
-                        // 解析代数 +1：渲染侧的自绘光标扫描缓存随之失效。
                         parse_gen.fetch_add(1, Ordering::Relaxed);
-                        // 记录输出时间戳（供 UI 判断是否持续输出）。
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
-                        // 回显延迟探针：输入后 500ms 内到来的输出视为回显，
-                        // 记录「按键→首块回显」耗时（TUIPM_LATENCY_DEBUG=1 打印）。
                         if latency_debug() {
                             let since = now_ms.saturating_sub(reader_input_ms.load(Ordering::Relaxed));
                             if since > 0 && since <= 500 {
@@ -535,44 +548,62 @@ pub fn spawn(
                             }
                         }
                         let total = (esc_bytes + printable) as f64;
-                        // TUI 动画帧特征：escape 序列占比高 + 块较小（光标移动/屏幕重绘）。
-                        // 着色文本的 escape 占比也可能高（颜色码），但块通常较大。
                         let esc_ratio = if total > 0.0 { esc_bytes as f64 / total } else { 0.0 };
                         let is_animation = total == 0.0
                             || (esc_ratio > 0.5 && n < 200)
                             || esc_ratio > 0.8;
                         if !is_animation {
-                            // 非动画输出：更新「实际内容」时间戳，UI 用它区分
-                            // TUI 自带动画（光标移动/屏幕重绘）vs 真正的内容输出。
                             last_content_ms.store(now_ms, Ordering::Relaxed);
                             if now_ms.saturating_sub(last_counted_ms) > 300 || printable >= 20 {
                                 output_count.fetch_add(1, Ordering::Relaxed);
                                 last_counted_ms = now_ms;
                             }
                         }
-                        // 分片推进解析器，每片释放一次锁：整块 64KB 全程持锁时，
-                        // 高吞吐输出的 TUI 会让每帧来取锁的 UI 渲染线程排队卡顿；
-                        // 切成 8KB 小片后渲染线程可在片间插空拿到锁。
-                        // vte 的状态机本就支持序列跨 advance 调用续解析，切片安全。
-                        const PARSE_SLICE: usize = 8192;
-                        for start in (0..n).step_by(PARSE_SLICE) {
-                            let end = (start + PARSE_SLICE).min(n);
-                            let mut t = term.lock().unwrap();
-                            parser.advance(&mut *t, &buf[start..end]);
-                        }
-                        if let Some((reply, osc_color)) = reply_to_queries(
-                            &mut term.lock().unwrap(),
-                            &buf[..n],
-                            theme_dark.load(Ordering::Relaxed),
-                        ) {
-                            if osc_color {
-                                osc_theme_aware.store(true, Ordering::Relaxed);
+                        // 后台页签：攒批后再加锁解析，降低加锁频率。
+                        // 前台页签：立即分片解析，保证打字回显低延迟。
+                        let is_fg = reader_fg.load(Ordering::Relaxed);
+                        if is_fg {
+                            const PARSE_SLICE: usize = 8192;
+                            for start in (0..n).step_by(PARSE_SLICE) {
+                                let end = (start + PARSE_SLICE).min(n);
+                                let mut t = term.lock().unwrap();
+                                parser.advance(&mut *t, &buf[start..end]);
                             }
-                            let _ = reply_tx.try_send(reply);
-                        }
-                        // 前台才唤醒 UI 重绘（见 SessionListener::send_event 同款逻辑）。
-                        if reader_fg.load(Ordering::Relaxed) {
+                            if let Some((reply, osc_color)) = reply_to_queries(
+                                &mut term.lock().unwrap(),
+                                &buf[..n],
+                                theme_dark.load(Ordering::Relaxed),
+                            ) {
+                                if osc_color {
+                                    osc_theme_aware.store(true, Ordering::Relaxed);
+                                }
+                                let _ = reply_tx.try_send(reply);
+                            }
                             let _ = redraw_reader.send(());
+                        } else {
+                            // 后台攒批：攒满 4KB 或超时 5ms 才加锁喂一次。
+                            pending.extend_from_slice(&buf[..n]);
+                            let elapsed = last_flush.elapsed().as_millis() as u64;
+                            if pending.len() >= BG_BATCH_BYTES || elapsed >= BG_BATCH_MS {
+                                const PARSE_SLICE: usize = 8192;
+                                for start in (0..pending.len()).step_by(PARSE_SLICE) {
+                                    let end = (start + PARSE_SLICE).min(pending.len());
+                                    let mut t = term.lock().unwrap();
+                                    parser.advance(&mut *t, &pending[start..end]);
+                                }
+                                if let Some((reply, osc_color)) = reply_to_queries(
+                                    &mut term.lock().unwrap(),
+                                    &pending,
+                                    theme_dark.load(Ordering::Relaxed),
+                                ) {
+                                    if osc_color {
+                                        osc_theme_aware.store(true, Ordering::Relaxed);
+                                    }
+                                    let _ = reply_tx.try_send(reply);
+                                }
+                                pending.clear();
+                                last_flush = std::time::Instant::now();
+                            }
                         }
                     }
                 }
@@ -604,6 +635,7 @@ pub fn spawn(
         caret_scan: None,
         snapshot_scratch: Vec::new(),
         galley_cache: HashMap::new(),
+        galley_gen: 0,
         gpu: None,
         last_input_ms,
         drag_press_pos: None,

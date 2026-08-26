@@ -618,7 +618,10 @@ pub fn show_terminal(
         }
     }
 
-    // 本地文本选择：两种模式都启用。左键拖拽选中文本，单击清除。
+    // 本地文本选择 + 右键菜单选区检查合并为一次加锁：
+    // 原来选区处理和 has_selection 各自加锁，两段锁之间读者线程可能
+    // 处理 PTY 输出清掉选区 → 右键菜单「复制」恒灰。
+    let mut has_selection = false;
     {
         let primary_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         let latest_pos = ui.input(|i| i.pointer.latest_pos());
@@ -650,14 +653,6 @@ pub fn show_terminal(
             if resp.clicked() {
                 t.selection = None;
             }
-            // 快速拖选兜底：低帧率（如 10fps 基线）下「按下→拖动→释放」全部
-            // 落在同一帧时，egui 判定既非 click（移动超阈值）也非 drag
-            // （release 清空 potential_drag_id），上面的 drag_started_by 分支
-            // 永远不触发，选区建不出来 → 右键菜单「复制」恒灰。这里用原始
-            // 指针状态自建：释放帧若按下/松开都在矩形内且位移明显、且常规
-            // 路径没建过选区，则补一次跨点选区。
-            // 注意同帧手势里指针状态已是帧末（latest_pos = 释放点），
-            // 按下点只能从原始事件里取。
             if primary_released && sess.drag_press_pos.is_none() {
                 sess.drag_press_pos = ui.input(|i| {
                     i.raw.events.iter().find_map(|e| match e {
@@ -698,6 +693,8 @@ pub fn show_terminal(
                     }
                 }
             }
+            // 在同一次加锁内完成选区状态读取，消除与右键菜单之间的竞态窗口。
+            has_selection = t.selection.is_some();
         }
     }
 
@@ -705,14 +702,6 @@ pub fn show_terminal(
     // 任何模式下都可用——右键不再转发给子进程。
     let mut menu_action: Option<TermAction> = None;
     {
-    // 选区状态在菜单闭包外检查：闭包内加锁时读者线程可能已在两段
-    // 锁之间处理了 PTY 输出（全屏 TUI 刷新帧大量输出），把选区清掉。
-    // 提前检查消除竞态窗口。
-    let has_selection = sess
-        .term
-        .lock()
-        .map(|t| t.selection.is_some())
-        .unwrap_or(false);
     resp.context_menu(|ui| {
         if ui
             .add_enabled(has_selection, egui::Button::new("📋 复制"))
@@ -782,22 +771,17 @@ pub fn show_terminal(
                 .lock()
                 .map(|t| {
                     let cur = t.renderable_content().cursor.point;
-                    let offset = t.grid().display_offset();
                     let mut n = 0usize;
-                    for r in 0..rows {
-                        let line = Line(r as i32 - offset as i32);
-                        let max_col = if line == cur.line {
-                            cur.column.0.min(cols)
-                        } else {
-                            cols
-                        };
-                        for col in 0..max_col {
-                            let cell = &t.grid()[Point::new(line, Column(col))];
-                            if cell.c != '\0'
-                                && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                            {
-                                n += 1;
-                            }
+                    // 只清光标所在行：从列 0 到光标位置。
+                    // 原实现从视口第 0 行扫到光标，会把 TUI 输出行也计入，
+                    // 导致过多退格让输入框只清了一部分就乱掉。
+                    let max_col = cur.column.0.min(cols);
+                    for col in 0..max_col {
+                        let cell = &t.grid()[Point::new(cur.line, Column(col))];
+                        if cell.c != '\0'
+                            && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                        {
+                            n += 1;
                         }
                     }
                     n
@@ -957,7 +941,10 @@ pub fn show_terminal(
                                 v.extend_from_slice(b"\x1b[201~");
                                 bytes_out.push(v);
                             } else {
-                                bytes_out.push(text.replace('\n', "\r").into_bytes());
+                                // Windows 剪贴板换行是 \r\n，先归一化为 \n
+                                // 再替换为 \r，避免 \r\n → \r\r 双回车乱码。
+                                let cleaned = text.replace("\r\n", "\n").replace('\n', "\r");
+                                bytes_out.push(cleaned.into_bytes());
                             }
                         }
                     }
@@ -1216,12 +1203,14 @@ pub fn show_terminal(
         // 宽字符下划线是事后手画的横线，不进排版，故宽字该位恒 false。
         let key = (ch, fg, underlined && !wide, wide);
         let galley = match sess.galley_cache.get(&key) {
-            Some(g) => g.clone(),
+            Some((g, _)) => g.clone(),
             None => {
-                // 上限保护：调色板花哨的 TUI 可能组合出海量键，超限整体清空，
-                // 排版成本只在清空后的第一帧回升一次。
+                // LRU 淘汰：超限时按 generation 淘汰最旧 25%，
+                // 避免整表清空后首帧全量重建的卡顿峰值。
                 if sess.galley_cache.len() >= 8192 {
-                    sess.galley_cache.clear();
+                    let cutoff = sess.galley_gen.saturating_sub(sess.galley_gen / 4);
+                    sess.galley_cache.retain(|_, (_, g)| *g > cutoff);
+                    sess.galley_gen += 1;
                 }
                 let mut format = egui::TextFormat {
                     font_id: font_id.clone(),
@@ -1245,7 +1234,7 @@ pub fn show_terminal(
                 let text = ch.to_string();
                 job.append(&text, 0.0, format);
                 let g = painter.layout_job(job);
-                sess.galley_cache.insert(key, g.clone());
+                sess.galley_cache.insert(key, (g.clone(), sess.galley_gen));
                 g
             }
         };
