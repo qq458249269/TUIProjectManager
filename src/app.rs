@@ -382,6 +382,9 @@ pub struct ClientApp {
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
     redraw_rx: Receiver<()>,
+    /// 主题切换后的延迟全量重绘时刻：立即清缓存之外，等子进程重绘尘埃落定
+    /// 后（约 400ms）再清一遍所有会话缓存并强制整帧，兜住晚到的脏状态。
+    theme_settle_at: Option<std::time::Instant>,
     /// 页签拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
     drag_tab: Option<usize>,
     /// 项目列表拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
@@ -452,6 +455,7 @@ impl ClientApp {
             update_rx,
             redraw_tx,
             redraw_rx,
+            theme_settle_at: None,
             drag_tab: None,
             drag_project: None,
             drag_command: None,
@@ -1286,13 +1290,21 @@ impl ClientApp {
     /// （opencode 等 TUI 启动时会查询终端颜色来匹配自己的配色）。
     fn broadcast_theme(&mut self) {
         let dark = self.config.settings.dark_mode;
-        let (fg, bg) = if dark { ("ffffff", "16161a") } else { ("000000", "ffffff") };
-        let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\x1b]11;rgb:{bg}/{bg}/{bg}\x1b\\")
+        // rgb 分量必须是 1~4 位十六进制（X 约定，表示 16 位值）：之前发 6 位
+        // （"rgb:ffffff/…"）是非法格式，opencode 解析出错值后用坏调色板重绘，
+        // 表现为字体颜色错、文字残缺、栅格乱，且切回主题也不恢复。
+        let (fg, bg) = if dark { ("ffff", "1616/1616/1a1a") } else { ("0000", "ffff/ffff/ffff") };
+        let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\x1b]11;rgb:{bg}\x1b\\")
             .into_bytes();
         for tab in &mut self.tabs {
             if let Tab::Session(s) = tab {
                 s.theme_dark
                     .store(dark, std::sync::atomic::Ordering::Relaxed);
+                // 强制全量重绘：galley 里烘焙的是旧主题适配后的字形颜色；
+                // 自绘光标扫描缓存也一并作废。否则出现汉字颜色错乱、
+                // 光标块停在旧位置的残留。
+                s.galley_cache.clear();
+                s.caret_scan = None;
                 // 只推给应答过 OSC 10/11/4 颜色查询的会话（opencode 等）。
                 // shell/cmd 从不查询这类序列，收到 `ESC]10;...ESC\` 会把 OSC 终止符
                 // 的 `\` 直接回显成“自动输入了反斜杠”，不能广播。
@@ -1440,6 +1452,10 @@ impl ClientApp {
                     // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色（
                     // opencode 等 TUI 会据此匹配自己的配色）。
                     self.broadcast_theme();
+                    // 延迟全量重绘：子进程收到广播后重绘需要时间，晚到的输出可能
+                    // 在清缓存之后才写入；定时再清一次并强制整帧，兜住这类脏状态。
+                    self.theme_settle_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
                     ui.ctx().request_repaint();
                 }
             });
@@ -2163,14 +2179,43 @@ impl eframe::App for ClientApp {
             set_dwm_dark(self.titlebar_hwnd);
         }
 
+        // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
+        for (i, t) in self.tabs.iter().enumerate() {
+            if let Tab::Session(s) = t {
+                s.foreground.store(i == self.current, Ordering::Relaxed);
+            }
+        }
+
+        // 主题切换后的延迟全量重绘：到点后把所有会话缓存再清一遍并强制整帧。
+        if let Some(t) = self.theme_settle_at {
+            if std::time::Instant::now() >= t {
+                self.theme_settle_at = None;
+                for tab in &mut self.tabs {
+                    if let Tab::Session(s) = tab {
+                        s.galley_cache.clear();
+                        s.caret_scan = None;
+                    }
+                }
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(
+                    t.saturating_duration_since(std::time::Instant::now()),
+                );
+            }
+        }
+
         // 动态基线刷新：任一会话最近 1s 内有输出 → 300ms 刷新（页签柱状动画以 300ms
         // 换帧）；否则空闲期降到 1s，大幅降低持续整屏重绘的 CPU 占用。
+        // 只看前台会话：后台流式输出不抬升基线，页签活动点由 1s 轮询更新即可。
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let animating = self.tabs.iter().any(|t| {
+        let animating = self.tabs.iter().enumerate().any(|(i, t)| {
             if let Tab::Session(s) = t {
+                if i != self.current {
+                    return false;
+                }
                 let count = s.output_count.load(Ordering::Relaxed);
                 let last_ms = s.last_output_ms.load(Ordering::Relaxed);
                 let silent = now_ms.saturating_sub(last_ms) > 500;

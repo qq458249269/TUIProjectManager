@@ -11,7 +11,8 @@ use std::os::windows::ffi::OsStrExt;
 use crate::term_gl::DirtyTracker;
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
@@ -42,6 +43,9 @@ pub struct Session {
     /// 是否应答过 OSC 10/11/4 颜色查询（一旦应答，说明该子进程能理解 OSC 颜色，
     /// 主题切换时的主动颜色广播才安全；shell 等从不查询，收到广播只会乱码）。
     pub osc_theme_aware: Arc<AtomicBool>,
+    /// 本会话是否为前台页签（UI 线程每帧同步 self.current）。后台会话的
+    /// 输出仍照常解析（管道不能停读），但不唤醒 UI 重绘。
+    pub foreground: Arc<AtomicBool>,
     /// 子进程是否已退出。
     pub exited: bool,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
@@ -71,6 +75,8 @@ pub struct Session {
     /// (解析代数, 行, 列)。代数没变就直接复用，
     /// 免去每帧 rows×cols 的全屏网格扫描。offset 恒为 0。
     pub caret_scan: Option<(u64, Line, Column)>,
+    /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
+    pub snapshot_scratch: Vec<(Point, Cell)>,
     /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
     /// 同一格式每帧只排版一次；上限 8192 条，超出整体清空防膨胀。
     pub galley_cache:
@@ -85,26 +91,38 @@ pub struct SessionListener {
     writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     redraw: std::sync::mpsc::SyncSender<()>,
     ctx: eframe::egui::Context,
+    /// 本会话是否为前台页签：后台会话的输出不唤醒 UI，刷新靠基线轮询。
+    foreground: std::sync::Arc<AtomicBool>,
 }
 
 impl EventListener for SessionListener {
     fn send_event(&self, event: Event) {
+        // Event::PtyWrite：仿真器对探测的自发应答默认丢弃（应答权归 reply_to_queries），
+        // 但主 DA 应答 \x1b[?6c 必须放行——新版 conpty 启动握手会等它，不给就不吐输出。
+        // （其余应答经 ConPTY 输入引擎时序错位时会被当键盘文本打进子进程。）
         if let Event::PtyWrite(text) = &event {
-            // 只投递到后台写入线程，绝不在解析线程里阻塞写
-            //（解析线程持有 term 锁时会回调这里）。
-            let _ = self.writer.try_send(text.as_bytes().to_vec());
+            if text == "\x1b[?6c" {
+                let _ = self.writer.try_send(text.as_bytes().to_vec());
+            }
         } else if let Event::ClipboardStore(_, text) = &event {
             // opencode 等 TUI 的 OSC 52 复制：直接写系统剪贴板。egui Context 线程安全。
             self.ctx.copy_text(text.clone());
         }
-        // try_send：通道容量 1，满则丢弃，刷新信号合并为一个。
+        // Event::PtyWrite（仿真器对 DA/DSR/DECRQM/键盘模式查询的自发应答）一律丢弃：
+        // 应答权统一归 reply_to_queries。否则双重应答，且这些应答经 ConPTY 输入
+        // 引擎时序错位时会被当键盘文本打进子进程（实测 cmd 提示符后多出 ?6c 尾巴）。
+        // 其余 PtyWrite 一律不投递。try_send：通道容量 1，满则丢弃，刷新信号合并为一个。
         // 必须非阻塞：解析线程持有 term 锁时回调这里，若 send 阻塞，
         // 会与 UI 线程的 term.lock() 渲染互相等待而死锁。
-        let _ = self.redraw.try_send(());
-        // 直接请求重绘（Context 线程安全）：空闲基线是 1s 轮询，若只靠
-        // logic() 里消费通道，PTY 输出刚错过一帧就要等最多 1s 才显示——
-        // 打字回显也是 PTY 输出，会明显发粘。这里即时唤醒下一帧。
-        self.ctx.request_repaint();
+        // 后台会话不唤醒 UI：画面反正不可见，切回该页签的那一帧自然会重绘；
+        // 页签标题/活动点由 1s 基线轮询更新。解析照常（管道不能停读）。
+        if self.foreground.load(Ordering::Relaxed) {
+            let _ = self.redraw.try_send(());
+            // 直接请求重绘（Context 线程安全）：空闲基线是 1s 轮询，若只靠
+            // logic() 里消费通道，PTY 输出刚错过一帧就要等最多 1s 才显示——
+            // 打字回显也是 PTY 输出，会明显发粘。这里即时唤醒下一帧。
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -123,6 +141,11 @@ impl EventListener for SessionListener {
 /// 不答主 DA 与 XTVERSION。返回 (应答字节, 是否应答了 OSC 颜色查询)。
 /// 查询序列可能跨块被截断，扫描单块即可——探测都发生在启动后的单次写入里。
 fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
+    // 高吞吐输出（AI 回答流）的绝大多数块根本没有转义序列：
+    // 先做一次快速扫描，无 ESC 字节直接返回，省掉逐字节状态扫描。
+    if !bytes.contains(&0x1b) {
+        return None;
+    }
     let mut out = Vec::new();
     let mut osc_color = false;
     let mut i = 0usize;
@@ -260,9 +283,12 @@ unsafe extern "system" {
 /// 首次启动会话时解包到临时目录并用 SetDllDirectoryW 加入 DLL 搜索路径——
 /// portable-pty 侧载逻辑按名字 LoadLibrary("conpty.dll") 就会命中它；解包失败
 /// 则回退系统内置 conpty（老系统上滚轮转发不可用，其余功能不受影响）。
+#[cfg(windows)]
 static CONPTY_DLL: &[u8] = include_bytes!("../assets/conpty/conpty.dll");
+#[cfg(windows)]
 static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe");
 
+#[cfg(windows)]
 fn ensure_bundled_conpty() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -308,6 +334,7 @@ pub fn spawn(
     redraw: std::sync::mpsc::SyncSender<()>,
     ctx: eframe::egui::Context,
 ) -> Result<Session, String> {
+    #[cfg(windows)]
     ensure_bundled_conpty();
     let pty_system = native_pty_system();
     let size = PtySize {
@@ -355,7 +382,12 @@ pub fn spawn(
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
     std::thread::spawn(move || {
         let mut writer = writer;
+        // ponytail: TUIPM_LOG_WRITES=1 时把所有写入 PTY 的字节打到 stderr，排查杂散输入用。
+        let log_writes = std::env::var("TUIPM_LOG_WRITES").is_ok();
         while let Ok(bytes) = writer_rx.recv() {
+            if log_writes {
+                eprintln!("[pty-write] {:?}", String::from_utf8_lossy(&bytes));
+            }
             if writer.write_all(&bytes).is_err() {
                 break;
             }
@@ -364,14 +396,25 @@ pub fn spawn(
     });
 
     let redraw_reader = redraw.clone();
+    // 前台标记：UI 线程每帧同步 self.current；后台会话输出不唤醒 UI。
+    let foreground = Arc::new(AtomicBool::new(false));
+    let listener_fg = foreground.clone();
     let listener = SessionListener {
         writer: writer_tx.clone(),
         redraw,
         ctx,
+        foreground: listener_fg,
     };
 
+    // 开启 kitty 键盘协议跟踪：应用推 CSI > flags u 时仿真器记下 DISAMBIGUATE 位，
+    // terminal.rs 据此决定组合回车是否发 CSI-u（协商过了才发，避免对端不认识
+    // 被当字面文本插进输入框）。
+    let term_config = Config {
+        kitty_keyboard: true,
+        ..Default::default()
+    };
     let term = Term::new(
-        Config::default(),
+        term_config,
         &TermSize::new(cols as usize, rows as usize),
         listener,
     );
@@ -404,6 +447,7 @@ pub fn spawn(
         let output_count = output_count.clone();
         let last_output_ms = last_output_ms.clone();
         let last_content_ms = last_content_ms.clone();
+        let reader_fg = foreground.clone();
         let parse_gen = parse_gen.clone();
         let mut reader = pair
             .master
@@ -490,6 +534,10 @@ pub fn spawn(
                             }
                             let _ = reply_tx.try_send(reply);
                         }
+                        // 前台才唤醒 UI 重绘（见 SessionListener::send_event 同款逻辑）。
+                        if reader_fg.load(Ordering::Relaxed) {
+                            let _ = redraw_reader.send(());
+                        }
                     }
                 }
             }
@@ -507,6 +555,7 @@ pub fn spawn(
         grid_size: (cols, rows),
         theme_dark,
         osc_theme_aware,
+        foreground,
         exited: false,
         last_clipboard_seq: None,
         output_count,
@@ -516,7 +565,9 @@ pub fn spawn(
         alt_screen: Arc::new(AtomicBool::new(false)),
         cursor_hidden: Arc::new(AtomicBool::new(true)),
         parse_gen,
-        caret_scan: None,        galley_cache: HashMap::new(),
+        caret_scan: None,
+        snapshot_scratch: Vec::new(),
+        galley_cache: HashMap::new(),
         dirty: DirtyTracker::new(),
     })
 }
@@ -534,6 +585,7 @@ mod tests {
             writer: std::sync::mpsc::sync_channel(1).0,
             redraw: std::sync::mpsc::sync_channel(1).0,
             ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
         // 主 DA 与 XTVERSION 有意不应答（会泄漏成键盘输入，见函数注释）；
@@ -561,6 +613,34 @@ mod tests {
         // DSR 应答不应标记 OSC 颜色（否则主题广播会误推给不响 OSC 的会话）。
         let (_, osc2) = reply_to_queries(&term, b"\x1b[6n", true).unwrap();
         assert!(!osc2, "DSR 应答不应标记 OSC 颜色");
+    }
+
+    /// 回归：仿真器自发 PtyWrite 应答只放行主 DA（\x1b[?6c，conpty 握手必需），
+    /// 其余（DSR/DECRQM/键盘模式等）必须丢弃——应答权归 reply_to_queries，
+    /// 否则经 ConPTY 输入引擎时序错位会被当键盘文本打进子进程。
+    #[test]
+    fn listener_drops_emulator_pty_writes() {
+        let (wtx, wrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+        let listener = SessionListener {
+            writer: wtx,
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        use alacritty_terminal::event::Event;
+        // 主 DA 应答：放行（conpty 启动握手等它，不给则不吐输出）。
+        listener.send_event(Event::PtyWrite("\x1b[?6c".to_string()));
+        assert!(
+            wrx.recv_timeout(std::time::Duration::from_millis(100)).is_ok(),
+            "主 DA 应答 \\x1b[?6c 必须放行"
+        );
+        // 其余应答：丢弃。
+        listener.send_event(Event::PtyWrite("\x1b[1;1R".to_string()));
+        listener.send_event(Event::PtyWrite("\x1b[?0u".to_string()));
+        assert!(
+            wrx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "DSR/键盘模式等仿真器自发应答应被丢弃，不应写入 PTY"
+        );
     }
 
     /// 宽字符由前导格+随空格两格组成；程序（如 nvim）把光标左移一格时光标会
@@ -655,6 +735,7 @@ mod tests {
             writer: std::sync::mpsc::sync_channel(1).0,
             redraw: std::sync::mpsc::sync_channel(1).0,
             ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
         let (reply, aware) =

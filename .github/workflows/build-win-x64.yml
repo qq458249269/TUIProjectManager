@@ -102,6 +102,27 @@ jobs:
           }
           exit 0
 
+      - name: 生成发布说明（最近更新自动取最近10条提交）
+        shell: pwsh
+        run: |
+          $lines = @(
+            'Windows x64 自动构建（pre-release）'
+            ''
+            "- 版本: $env:VERSION"
+            '- 运行: 直接运行 `tui-project-manager.exe`'
+            '- 签名: 已配置代码签名证书则用 signtool 签名（SHA256 + RFC3161 时间戳）；未配置时跳过签名'
+            '- 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）'
+            '- 会话页签: 可多开，关闭按钮立即销毁会话；退出时记录打开中的页签目录，下次启动自动恢复'
+            '- 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲，全屏 TUI 下转发真实滚动事件给应用（内置新版 ConPTY，运行时解包）；左键拖拽选择文本'
+            '- 界面: 右下角可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗'
+            '- 刷新: 空闲时每秒1次，进程有输出时300ms一帧动画'
+            '- 配置: 自动保存到 exe 同级的 `config/config.json`'
+            ''
+            '## 最近更新'
+          )
+          git log --pretty=format:'- %s' -10 | ForEach-Object { $lines += $_ }
+          Set-Content -Path release_notes.md -Value ($lines -join "`n") -Encoding utf8
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -114,30 +135,7 @@ jobs:
         with:
           tag_name: ${{ env.VERSION }}
           name: ${{ env.VERSION }}
-          body: |
-            Windows x64 自动构建（pre-release）
-
-            - 版本: `${{ env.VERSION }}`
-            - 运行: 直接运行 `tui-project-manager.exe`
-            - 签名: 已配置代码签名证书则用 signtool 签名（SHA256 + RFC3161 时间戳）；未配置时跳过签名
-            - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
-            - 会话页签: 可多开，关闭按钮立即销毁会话；退出时记录打开中的页签目录，下次启动自动恢复
-            - 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲，全屏 TUI 下转发真实滚动事件给应用（内置新版 ConPTY，运行时解包）；左键拖拽选择文本
-            - 界面: 右下角可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗
-            - 刷新: 空闲时每秒1次，进程有输出时300ms一帧动画
-            - 配置: 自动保存到 exe 同级的 `config/config.json`
-
-            ## 最近更新
-            - feat: 页签✏️等待输入图标 + 标题栏固定深色
-            - fix: 修复鼠标悬停激活窗口失效（refresh_titlebar 每帧重置 hover 跟踪）
-            - feat: 输入法优化+性能优化+等待输入提示+多行清空+滚轮减速
-            - perf: 简化光标绘制，去掉全屏反色搜索和字符重绘，Block改半透明覆盖
-            - fix: 清空输入改用 Ctrl+U+Ctrl+K，输出计数去抖防误触动画
-            - fix: 页签✅仅非前台显示 + 静默检测降至500ms + 修复编译警告
-            - fix: 用 Instant 精确判定连续输出，修复加载动画残留
-            - fix: 页签图标占位符防抖动 + 连续输出检测 + ✅替换√
-            - fix: 点击已选中的会话页签也能清除「输出结束」对号
-            - feat: 页签状态图标: 柱条等宽动画 + 退出必显对号, 动态刷新基线
+          body_path: release_notes.md
           files: target/release/tui-project-manager.exe
           draft: false
           prerelease: true

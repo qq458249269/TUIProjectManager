@@ -300,6 +300,18 @@ fn encode_char_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option
     None
 }
 
+/// 组合回车（Shift/Alt/Ctrl+Enter）编码。full=true 时按 CSI-u 发送
+/// （kitty 键盘协议 / modifyOtherKeys 同款格式），opencode 等全屏 TUI 靠它区分
+/// 「换行」与「提交」；full=false 回退普通 \r（普通 shell 收到转义串会当文本回显）。
+fn encode_modified_enter(shift: bool, alt: bool, ctrl: bool, full: bool) -> Vec<u8> {
+    if !full {
+        return vec![b'\r'];
+    }
+    // kitty 修饰符编码：1 + shift(1) + alt(2) + ctrl(4)；13 = Enter 的键值。
+    let m = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    format!("\x1b[13;{m}u").into_bytes()
+}
+
 /// 把 egui 按键编码为发送给 PTY 的字节序列。
 /// 纯可打印字符（无 ctrl/alt）返回 None，由 Event::Text 处理，避免重复输入。
 fn encode_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool, _repeat: bool) -> Option<Vec<u8>> {
@@ -524,10 +536,12 @@ pub fn show_terminal(
         }
         ui.ctx().request_repaint();
     } // end over_term
-    // ── 鼠标点击 / 移动 / 拖拽 → 按模式转发或本地处理 ──
+    // ── 鼠标点击 / 拖拽：按下/释放转发给子进程，拖拽与右键留给本地 ──
+    // 通用策略（对任何子进程一致，不区分是否 mouse reporting）：
+    // - 左/中键按下、释放照常转发 → TUI 内点击按钮/切换焦点仍可用；
+    // - 左键拖拽不转发 → 一律做本地文本选择（选中→复制是终端的通用刚需）；
+    // - 右键永不转发 → 固定弹本地菜单（复制/粘贴/清空输入）。
     if mouse_reporting {
-        // 子进程开了鼠标上报 → 把 egui 鼠标事件编码为 SGR 序列写入 PTY。
-        // 按下/释放/移动分别对应 SGR 的 M（按下）/m（释放）。
         let to_col_row = |pos: Pos2| -> (usize, usize) {
             let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
                 .clamp(1, cols);
@@ -536,13 +550,10 @@ pub fn show_terminal(
             (col, row)
         };
 
-        // --- 按下 / 释放 / 拖拽移动：直接从 egui 原始指针状态检测，
-        //    不依赖 resp.drag_started()/clicked()——后者在 Sense::click_and_drag()
-        //    下有时序问题（drag_started 同帧 clicked=false，导致纯点击漏发释放）。
-        let ptr_any_down = ui.input(|i| i.pointer.any_down());
+        // --- 按下/释放：直接从 egui 原始指针状态检测，不依赖 resp.clicked()——
+        //    Sense::click_and_drag() 下有时序问题（drag_started 同帧 clicked=false）。
         let ptr_pressed = ui.input(|i| {
             i.pointer.button_pressed(egui::PointerButton::Primary)
-                || i.pointer.button_pressed(egui::PointerButton::Secondary)
                 || i.pointer.button_pressed(egui::PointerButton::Middle)
         });
         let ptr_released = ui.input(|i| i.pointer.any_released());
@@ -554,25 +565,12 @@ pub fn show_terminal(
                 let btn = ui.input(|i| {
                     if i.pointer.button_pressed(egui::PointerButton::Primary) {
                         0
-                    } else if i.pointer.button_pressed(egui::PointerButton::Secondary) {
-                        2
-                    } else if i.pointer.button_pressed(egui::PointerButton::Middle) {
-                        1
                     } else {
-                        0
+                        1
                     }
                 });
                 send_mouse_event(&sess.writer, sgr_mouse, btn, col, row, false);
                 ui.ctx().request_repaint();
-            }
-        }
-
-        // --- 拖拽移动（按下期间指针移动） ---
-        if ptr_any_down {
-            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
-                let (col, row) = to_col_row(pos);
-                // motion 事件码 = 按键号 +32（SGR 参数与 X10 载荷同源）。
-                send_mouse_event(&sess.writer, sgr_mouse, 32, col, row, false);
             }
         }
 
@@ -584,8 +582,10 @@ pub fn show_terminal(
                 ui.ctx().request_repaint();
             }
         }
-    } else {
-        // 无鼠标上报 → egui 本地文本选择。
+    }
+
+    // 本地文本选择：两种模式都启用。左键拖拽选中文本，单击清除。
+    {
         if let Ok(mut t) = sess.term.lock() {
             let disp_off = t.grid().display_offset();
             let point_at = |pos: Pos2| -> Option<Point> {
@@ -618,9 +618,9 @@ pub fn show_terminal(
     }
 
     // 右键弹菜单：复制 / 粘贴 / 清空输入（不再右键直接粘贴，避免误触）。
-    // mouse reporting 模式下跳过——右键事件已作为 SGR 序列转发给子进程。
+    // 任何模式下都可用——右键不再转发给子进程。
     let mut menu_action: Option<TermAction> = None;
-    if !mouse_reporting {
+    {
     resp.context_menu(|ui| {
         let has_selection = sess
             .term
@@ -725,7 +725,7 @@ pub fn show_terminal(
         }
         None => {}
     }
-    } // end if !mouse_reporting
+    }
 
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
     let mut preedit = String::new();
@@ -817,7 +817,16 @@ pub fn show_terminal(
                             }
                         }
 
-                        if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
+                        // 组合回车：仅当应用真的推过 kitty 键盘协议（协商成功）
+                        // 才发 CSI-u（Shift+Enter = opencode 输入框换行）；否则退回 \r。
+                        // 不能拿备用屏当信号——ConPTY 会吞掉协议协商，对端不认识
+                        // CSI-u 时会把它当字面文本插进输入框（实测 opencode 出乱码）。
+                        if *key == egui::Key::Enter && (shift || alt || ctrl) {
+                            let full = term_mode_snapshot.map_or(false, |m| {
+                                m.intersects(TermMode::DISAMBIGUATE_ESC_CODES)
+                            });
+                            bytes_out.push(encode_modified_enter(shift, alt, ctrl, full));
+                        } else if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
                             bytes_out.push(bytes);
                         }
                     }
@@ -901,7 +910,11 @@ pub fn show_terminal(
         let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
         let show_cursor = term.mode().contains(TermMode::SHOW_CURSOR);
         // 快照可见区域格子：释放锁后渲染循环不再碰 term。
-        let mut snapshot_cells = Vec::with_capacity(rows * cols);
+        // 缓冲跨帧复用（从 Session 取出、渲染尾归还）：省掉每帧 rows×cols 的
+        // Vec 分配/回收，全屏 TUI 动画 60fps 时每秒少几万次分配。
+        let mut snapshot_cells = std::mem::take(&mut sess.snapshot_scratch);
+        snapshot_cells.clear();
+        snapshot_cells.reserve(rows * cols);
         for indexed in content.display_iter {
             let point = indexed.point;
             let vline = point.line.0 + offset as i32;
@@ -933,6 +946,18 @@ pub fn show_terminal(
     }
     let default_fg = color_for(dark, Color32::WHITE, Color32::BLACK);
     let default_bg = canvas_bg;
+
+    // ── 网格层绘制：背景矩形与字形分两列收集、背景在前拼接。
+    // 曾做过「静止帧形状缓存」（跨帧存 Shape 列表，内容未变直接重放），
+    // 但主题/页签切换后重放的旧字形引用失效，出现栅格化乱码，已删除；
+    // 保留的收益：同底色相邻槽合并成一个大矩形（TUI 状态栏/选中高亮从
+    // cols 个矩形降到 1 个）+ 背景层与字形层分离后的批量提交。
+            // 背景与字形分两列收集：同底色相邻槽先在 bg_run 里合并成一个大矩形，
+            // 合并跨格进行、只能循环结束后落笔——若与字形同列表会盖住字形。
+            // 格子矩形互不重叠，全局「背景层在下」与逐格交错绘制结果一致。
+            let mut bg_shapes: Vec<egui::Shape> = Vec::new();
+            let mut bg_run: Option<(Rect, Color32)> = None;
+            let mut fg_shapes: Vec<egui::Shape> = Vec::new();
 
     // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
     // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
@@ -1002,12 +1027,22 @@ pub fn show_terminal(
 
         // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景。宽字槽宽占满
         // 2 格（随空格已跳过，此处只画前导格），只靠字形背景（14pt）会露右半格。
+        // 同行相邻同底色槽并入当前 run（x 坐标由同一算式产生，相邻列精确相等）。
         if bg != canvas_bg {
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x_slot, y), Vec2::new(slot_w, cell_h)),
-                0.0,
-                bg,
-            );
+            let slot = Rect::from_min_size(Pos2::new(x_slot, y), Vec2::new(slot_w, cell_h));
+            match bg_run.as_mut() {
+                Some((run, run_bg)) if *run_bg == bg && run.right() == slot.left() && run.top() == slot.top() => {
+                    run.max.x = slot.max.x;
+                }
+                _ => {
+                    if let Some((run, c)) = bg_run.take() {
+                        bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
+                    }
+                    bg_run = Some((slot, bg));
+                }
+            }
+        } else if let Some((run, c)) = bg_run.take() {
+            bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
         }
 
         // Galley 缓存查找/回填。键里的“窄格下划线”只影响 TextFormat.underline；
@@ -1047,12 +1082,22 @@ pub fn show_terminal(
                 g
             }
         };
-        painter.galley(Pos2::new(x, y), galley, Color32::WHITE);
+        fg_shapes.push(egui::Shape::galley(Pos2::new(x, y), galley, Color32::WHITE));
 
         if wide && underlined {
-            painter.hline(x..=(x + slot_w), y + cell_h - 1.0, Stroke::new(1.0, fg));
+            fg_shapes.push(egui::Shape::line_segment(
+                [Pos2::new(x, y + cell_h - 1.0), Pos2::new(x + slot_w, y + cell_h - 1.0)],
+                Stroke::new(1.0, fg),
+            ));
         }
     }
+
+    // 收尾：冲掉最后一个背景 run，背景层拼在字形层前面，整层一次性提交。
+    if let Some((run, c)) = bg_run.take() {
+        bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
+    }
+    bg_shapes.extend(fg_shapes);
+    painter.add(egui::Shape::Vec(bg_shapes));
 
     // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
     // 定位策略分两种：
@@ -1066,9 +1111,15 @@ pub fn show_terminal(
     // 用 HashMap 做 O(1) 查找，替代旧版 snapshot_cells.iter().find() 的 O(n) 线性扫描，
     // 消除 rows×cols×snapshot_cells 的平方级开销。
     use std::collections::HashMap;
-    let cell_map: HashMap<(i32, usize), &Cell> = snapshot_cells.iter()
-        .map(|(p, c)| ((p.line.0, p.column.0), c))
-        .collect();
+    // 只有关闭光标（pi 等 TUI 自绘光标）才需要网格查找表；cmd/nvim 等
+    // SHOW_CURSOR 应用跳过构建，省去每帧 rows×cols 次 HashMap 插入。
+    let cell_map: Option<HashMap<(i32, usize), &Cell>> = if show_cursor {
+        None
+    } else {
+        Some(snapshot_cells.iter()
+            .map(|(p, c)| ((p.line.0, p.column.0), c))
+            .collect())
+    };
     let mut cursor_rect: Option<Rect> = None;
     {
         // 光标位置：
@@ -1105,7 +1156,7 @@ pub fn show_terminal(
                     let line = Line(r as i32 - disp_off as i32);
                     for col in 0..cols {
                         // O(1) HashMap 查找，替代 O(n) 线性扫描。
-                        if let Some(cell) = cell_map.get(&(line.0, col)) {
+                        if let Some(cell) = cell_map.as_ref().and_then(|m| m.get(&(line.0, col))) {
                             if is_caret(cell) {
                                 hit = Some(Point::new(line, Column(col)));
                                 break 'outer;
@@ -1168,7 +1219,7 @@ pub fn show_terminal(
                                 let ch = if on_spacer {
                                     // 从快照 HashMap O(1) 获取前导格字符。
                                     let prev = Column(cpoint.column.0.saturating_sub(1));
-                                    cell_map.get(&(cpoint.line.0, prev.0))
+                                    cell_map.as_ref().and_then(|m| m.get(&(cpoint.line.0, prev.0)))
                                         .map(|c| c.c)
                                         .unwrap_or(cursor_cell_char)
                                 } else {
@@ -1230,6 +1281,49 @@ pub fn show_terminal(
             }
         }
     }
+
+    // 主题调色诊断（TUIPM_THEME_DEBUG=1 时启用）：抽样打印前几行非空格格子的
+    // 原始 fg/bg 与适配后的最终色，用于定位切题后「黑底黑字」类问题出在
+    // 哪一环（原始解析错 or 适配错）。另附每帧缓存命中状态。
+    if std::env::var("TUIPM_THEME_DEBUG").as_deref() == Ok("1") {
+        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let f = FRAME.fetch_add(1, Ordering::Relaxed);
+        if f % 30 == 0 {
+            eprintln!(
+                "[frame] dark={dark} galleys={} gen={}",
+                sess.galley_cache.len(),
+                sess.parse_gen.load(Ordering::Relaxed),
+            );
+        }
+        let mut dumped = 0;
+        for (point, cell) in &snapshot_cells {
+            if cell.c == '\0' || cell.c == ' ' || dumped >= 12 {
+                continue;
+            }
+            dumped += 1;
+            eprintln!(
+                "[theme-debug] ({},{}) ch={:?} flags={:?} raw_fg={:?} raw_bg={:?} dark={}",
+                point.line.0,
+                point.column.0,
+                cell.c,
+                cell.flags,
+                cell.fg,
+                cell.bg,
+                dark
+            );
+        }
+        eprintln!(
+            "[theme-debug] palette[0..8]={:?} palette_fg={:?} palette_bg={:?} cursor={:?} show_cursor={}",
+            (0..8).map(|i| colors_vec[i]).collect::<Vec<_>>(),
+            colors_vec[256],
+            colors_vec[257],
+            cursor.shape,
+            show_cursor
+        );
+    }
+
+    // 归还快照缓冲供下一帧复用（见上方 take 处注释）。
+    sess.snapshot_scratch = snapshot_cells;
 
     // 记录终端状态标志，供 app 页签图标判定 TUI 运行状态。
     sess.alt_screen.store(alt_screen, Ordering::Relaxed);
@@ -1476,6 +1570,25 @@ mod tests {
         assert_eq!(key_bytes(egui::Key::Num5, false, true, false), Some(b"\x1b5".to_vec()));
         // alt+ctrl+a -> ESC + 0x01
         assert_eq!(key_bytes(egui::Key::A, true, true, false), Some(b"\x1b\x01".to_vec()));
+    }
+
+    #[test]
+    fn modified_enter() {
+        // 主屏 shell：组合回车回退普通 \r。
+        assert_eq!(encode_modified_enter(true, false, false, false), vec![b'\r']);
+        // 备屏/kitty：Shift/Alt/Ctrl+Enter 按 CSI-u，修饰符 = 1+s+2a+4c。
+        assert_eq!(
+            encode_modified_enter(true, false, false, true),
+            b"\x1b[13;2u".to_vec()
+        );
+        assert_eq!(
+            encode_modified_enter(false, true, false, true),
+            b"\x1b[13;3u".to_vec()
+        );
+        assert_eq!(
+            encode_modified_enter(true, false, true, true),
+            b"\x1b[13;6u".to_vec()
+        );
     }
 
     /// 相对路径转换：大小写不敏感、目录边界必须落分隔符、目录外保留绝对。
