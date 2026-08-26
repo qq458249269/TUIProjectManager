@@ -106,10 +106,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tui-project-manager-win-x64-${{ env.VERSION }}
-          path: |
-            target/release/tui-project-manager.exe
-            target/release/conpty.dll
-            target/release/OpenConsole.exe
+          path: target/release/tui-project-manager.exe
           if-no-files-found: error
 
       - name: 发布 pre-release
@@ -125,7 +122,7 @@ jobs:
             - 签名: 已配置代码签名证书则用 signtool 签名（SHA256 + RFC3161 时间戳）；未配置时跳过签名
             - 首页: 左侧项目列表点击选中 → 「启动 (内嵌页签)」在应用内终端页签运行；`＋ 添加` 添加项目（名称+路径），`重命名` / `改路径` / `删除` / `⚙ 设置`（可改 TUI 启动命令，如 nvim / lazygit / cmd）
             - 会话页签: 可多开，关闭按钮立即销毁会话；退出时记录打开中的页签目录，下次启动自动恢复
-            - 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲，全屏 TUI 下转发真实滚动事件给应用（依赖随包分发的 conpty.dll/OpenConsole.exe）；左键拖拽选择文本
+            - 终端交互: 右键有选区复制、无选区粘贴；Ctrl+C 有选区时复制、无选区发 SIGINT；Ctrl+V/多行粘贴（支持括号粘贴的应用按字面插入，shell 逐行执行）；滚轮查看滚动缓冲，全屏 TUI 下转发真实滚动事件给应用（内置新版 ConPTY，运行时解包）；左键拖拽选择文本
             - 界面: 右下角可切换深/浅色主题、`🔄 检查更新` 手动检查新版本；启动与新开页签时自动检查一次，提示只显示在窗口底部状态栏，不弹窗
             - 刷新: 空闲时每秒1次，进程有输出时300ms一帧动画
             - 配置: 自动保存到 exe 同级的 `config/config.json`
@@ -141,10 +138,7 @@ jobs:
             - fix: 页签图标占位符防抖动 + 连续输出检测 + ✅替换√
             - fix: 点击已选中的会话页签也能清除「输出结束」对号
             - feat: 页签状态图标: 柱条等宽动画 + 退出必显对号, 动态刷新基线
-          files: |
-            target/release/tui-project-manager.exe
-            target/release/conpty.dll
-            target/release/OpenConsole.exe
+          files: target/release/tui-project-manager.exe
           draft: false
           prerelease: true
           update_release: true

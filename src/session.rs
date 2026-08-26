@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 use crate::term_gl::DirtyTracker;
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -246,6 +249,55 @@ fn split_command(cmd: &str) -> Vec<String> {
     parts
 }
 
+#[cfg(windows)]
+unsafe extern "system" {
+    fn SetDllDirectoryW(lppathname: *const u16) -> i32;
+}
+
+/// 捆绑的新版 ConPTY（assets/conpty，取自 VS Code 内置 node-pty 同源构建，1.25 版）：
+/// Win10 内置老版 conpty 会吞掉备用屏/鼠标模式声明（?1049h/?1000h），并把宿主写入
+/// 的 SGR 滚轮序列改写成乱码，导致全屏 TUI（opencode 等）滚轮转发失效。
+/// 首次启动会话时解包到临时目录并用 SetDllDirectoryW 加入 DLL 搜索路径——
+/// portable-pty 侧载逻辑按名字 LoadLibrary("conpty.dll") 就会命中它；解包失败
+/// 则回退系统内置 conpty（老系统上滚轮转发不可用，其余功能不受影响）。
+static CONPTY_DLL: &[u8] = include_bytes!("../assets/conpty/conpty.dll");
+static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe");
+
+fn ensure_bundled_conpty() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // 按版本分目录：升级后旧文件不冲突。旧版本残留不清理（TEMP 会自清）。
+        let dir = std::env::temp_dir()
+            .join("tui-pm-conpty")
+            .join(crate::app_version());
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("解包内置 ConPTY 失败，回退系统内置 conpty");
+            return;
+        }
+        let put = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            // 已存在且大小一致就复用（同版本内容不变），否则重写；失败回退内置。
+            if std::fs::metadata(&p).map_or(true, |m| m.len() != bytes.len() as u64)
+                && std::fs::write(&p, bytes).is_err()
+            {
+                return None;
+            }
+            Some(p)
+        };
+        if put("conpty.dll", CONPTY_DLL).is_none()
+            || put("OpenConsole.exe", OPENCONSOLE_EXE).is_none()
+        {
+            eprintln!("解包内置 ConPTY 失败，回退系统内置 conpty");
+            return;
+        }
+        #[cfg(windows)]
+        unsafe {
+            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            SetDllDirectoryW(wide.as_ptr());
+        }
+    });
+}
+
 /// 在项目目录下启动一个会话，运行配置的 TUI 命令。
 pub fn spawn(
     title: &str,
@@ -256,6 +308,7 @@ pub fn spawn(
     redraw: std::sync::mpsc::SyncSender<()>,
     ctx: eframe::egui::Context,
 ) -> Result<Session, String> {
+    ensure_bundled_conpty();
     let pty_system = native_pty_system();
     let size = PtySize {
         rows,

@@ -27,25 +27,6 @@ fn main() {
     if let Err(e) = res.compile() {
         eprintln!("winres compile failed (continuing without resources): {e}");
     }
-
-    // 捆绑新版 ConPTY（取自 VS Code 内置的 node-pty 同源构建，1.25 版）：
-    // Win10 内置老版 conpty 会吞掉备用屏/鼠标模式声明（?1049h/?1000h），并把
-    // 宿主写入的 SGR 滚轮序列改写成乱码，导致全屏 TUI 滚轮转发失效。portable-pty
-    // 会优先侧载 exe 旁的 conpty.dll，找不到才回退系统内置。复制到目标目录与
-    // 测试目录（测试 exe 在 target/<profile>/deps，按应用目录搜索加载）。
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let profile_dir = out
-        .ancestors()
-        .nth(3)
-        .map(std::path::Path::to_path_buf)
-        .unwrap();
-    for f in ["conpty.dll", "OpenConsole.exe"] {
-        let src = manifest_dir.join("assets").join("conpty").join(f);
-        println!("cargo:rerun-if-changed=assets/conpty/{f}");
-        for dir in [profile_dir.clone(), profile_dir.join("deps")] {
-            if let Err(e) = std::fs::copy(&src, dir.join(f)) {
-                eprintln!("copy {f} to {:?} failed (continuing): {e}", dir);
-            }
-        }
-    }
 }
+// 注：新版 ConPTY（assets/conpty）已改为 include_bytes! 编进主程序、首次启动
+// 会话时解包到临时目录（见 session::ensure_bundled_conpty），发布仍是单文件。
