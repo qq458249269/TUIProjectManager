@@ -383,7 +383,7 @@ pub struct ClientApp {
     redraw_tx: std::sync::mpsc::SyncSender<()>,
     redraw_rx: Receiver<()>,
     /// 主题切换后的延迟全量重绘时刻：立即清缓存之外，等子进程重绘尘埃落定
-    /// 后（约 400ms）再清一遍所有会话缓存并强制整帧，兜住晚到的脏状态。
+    /// 后（约 100ms）再清一遍所有会话缓存并强制整帧，兜住晚到的脏状态。
     theme_settle_at: Option<std::time::Instant>,
     /// 页签拖动中记录的源索引；松手那帧消费掉并执行重排（None = 未在拖动）。
     drag_tab: Option<usize>,
@@ -1455,7 +1455,7 @@ impl ClientApp {
                     // 延迟全量重绘：子进程收到广播后重绘需要时间，晚到的输出可能
                     // 在清缓存之后才写入；定时再清一次并强制整帧，兜住这类脏状态。
                     self.theme_settle_at =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
                     ui.ctx().request_repaint();
                 }
             });

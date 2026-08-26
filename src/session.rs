@@ -8,7 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-use crate::term_gl::DirtyTracker;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::index::{Column, Line, Point};
@@ -81,8 +80,8 @@ pub struct Session {
     /// 同一格式每帧只排版一次；上限 8192 条，超出整体清空防膨胀。
     pub galley_cache:
         HashMap<(char, egui::Color32, bool, bool), std::sync::Arc<egui::epaint::Galley>>,
-    /// GPU 渲染器脏区跟踪：帧间逐格对比哈希，光标闪烁/打字只重绘变化格。
-    pub dirty: DirtyTracker,
+    /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
+    pub gpu: Option<crate::term_gl::TermGpu>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -568,7 +567,7 @@ pub fn spawn(
         caret_scan: None,
         snapshot_scratch: Vec::new(),
         galley_cache: HashMap::new(),
-        dirty: DirtyTracker::new(),
+        gpu: None,
     })
 }
 

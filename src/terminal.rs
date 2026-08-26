@@ -12,11 +12,18 @@ use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
 use crate::session::{Session, SessionListener};
+use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
 use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw};
 
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
+
+/// Color32 压成 u64 供哈希搅拌（sRGB 四字节）。
+#[inline]
+fn color_key(c: Color32) -> u64 {
+    ((c.r() as u64) << 24) | ((c.g() as u64) << 16) | ((c.b() as u64) << 8) | c.a() as u64
+}
 
 /// 深浅主题下的终端画布底色。
 const TERM_BG_DARK: Color32 = Color32::from_rgb(22, 22, 26);
@@ -443,9 +450,20 @@ pub fn show_terminal(
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
     }
+    // ── GPU 字形批渲染：首次帧初始化；DPI/字号变化时重建图集。失败则整格回落 galley。
+    let ppp = ui.ctx().pixels_per_point();
+    match sess.gpu.as_mut() {
+        Some(g) => g.ensure_params(TERM_FONT_SIZE, ppp),
+        None => sess.gpu = TermGpu::new(ui.ctx(), TERM_FONT_SIZE, ppp),
+    }
     let avail = ui.available_size();
     let cols = ((avail.x / cell_w).floor().max(1.0)) as usize;
     let rows = ((avail.y / cell_h).floor().max(1.0)) as usize;
+
+    // 哈希缓冲对齐可见区尺寸（rows×cols）。
+    if let Some(g) = sess.gpu.as_mut() {
+        g.begin_frame(rows, cols);
+    }
 
     if sess.grid_size != (cols as u16, rows as u16) {
         if let Ok(mut t) = sess.term.lock() {
@@ -1019,6 +1037,22 @@ pub fn show_terminal(
 
         let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
+        // 哈希先行：空白快速跳过的格子也要入表，保证 rows×cols 全覆盖可 diff。
+        // GPU 路径未启用时跳过，省下每格的哈希开销。
+        if sess.gpu.is_some() {
+            let g = sess.gpu.as_mut().unwrap();
+            let idx = vline as usize * cols + col;
+            let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (idx as u64);
+            hash_mix(&mut h, ch as u64);
+            hash_mix(&mut h, color_key(fg));
+            hash_mix(&mut h, color_key(bg));
+            hash_mix(
+                &mut h,
+                underlined as u64 | ((wide as u64) << 1) | ((selected as u64) << 2),
+            );
+            g.hash_scratch[idx] = h;
+        }
+
         // 空白格快速跳过：默认底色、未选中（否则底色已是高亮灰）、无下划线的
         // 空格无任何可见输出，连 LayoutJob 都不用建 —— 空屏帧的主要开销就在这。
         if ch == ' ' && bg == canvas_bg && !underlined {
@@ -1043,6 +1077,40 @@ pub fn show_terminal(
             }
         } else if let Some((run, c)) = bg_run.take() {
             bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
+        }
+
+        // GPU 批渲染优先：图集命中（含本次成功入库）直推 quad；空槽回落下方
+        // galley 路径（emoji 等缺字形格子逐格混合，不整屏切换）。
+        if let Some(g) = sess.gpu.as_mut() {
+            let slot = g.atlas.glyph(ch);
+            if slot.w > 0.0 {
+                let baseline = y + g.atlas.baseline_rel(cell_h);
+                let uv_solid = GlyphAtlas::solid_uv();
+                // 位图与显示 1:1，但落点若是小数设备像素，LINEAR 采样会混入
+                // 邻素发虚 —— 原点对齐设备像素网格保证锐利。
+                let snap = |v: f32| (v * ppp).round() / ppp;
+                g.quads.push(CellQuad {
+                    rect: Rect::from_min_size(
+                        Pos2::new(snap(x + slot.dx), snap(baseline + slot.dy)),
+                        Vec2::new(slot.w, slot.h),
+                    ),
+                    uv0: Pos2::new(slot.u0, slot.v0),
+                    uv1: Pos2::new(slot.u1, slot.v1),
+                    color: fg,
+                });
+                if underlined {
+                    g.quads.push(CellQuad {
+                        rect: Rect::from_min_size(
+                            Pos2::new(x_slot, y + g.atlas.underline_rel(cell_h)),
+                            Vec2::new(slot_w, 1.0),
+                        ),
+                        uv0: uv_solid,
+                        uv1: uv_solid,
+                        color: fg,
+                    });
+                }
+                continue;
+            }
         }
 
         // Galley 缓存查找/回填。键里的“窄格下划线”只影响 TextFormat.underline；
@@ -1095,6 +1163,13 @@ pub fn show_terminal(
     // 收尾：冲掉最后一个背景 run，背景层拼在字形层前面，整层一次性提交。
     if let Some((run, c)) = bg_run.take() {
         bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
+    }
+    // GPU 字形层：内容变化才重建网格；静止帧直接重放上一帧的同一 Arc<Mesh>，
+    // 跳过全部 quad 重建（egui 每帧仍会重画它，省的是 CPU 侧组装）。
+    if let Some(g) = sess.gpu.as_mut() {
+        if let Some(mesh) = g.end_frame(ui.ctx()) {
+            bg_shapes.push(egui::Shape::Mesh(mesh));
+        }
     }
     bg_shapes.extend(fg_shapes);
     painter.add(egui::Shape::Vec(bg_shapes));

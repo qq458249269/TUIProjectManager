@@ -10,6 +10,7 @@ clipboard-win = "5.4"
 # 关掉默认特性：去掉 wgpu/wayland/x11/accesskit/links，只用 glow 渲染器，
 # 体积和链接依赖都大幅缩减（links 会拉入 webbrowser，后者在 gnu 工具链下缺 shlwapi）。
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+fontdue = "0.9"
 portable-pty = "0.9"
 raw-window-handle = "0.6"
 rfd = "0.15"
@@ -40,3 +41,6 @@ strip = true
 
 [patch.crates-io]
 getrandom = { path = "vendor/getrandom-0.4.3" }
+
+[dev-dependencies]
+epaint_default_fonts = "0.36.1"
