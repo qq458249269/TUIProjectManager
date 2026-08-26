@@ -108,15 +108,17 @@ impl EventListener for SessionListener {
 /// 响应终端能力探测序列（TUI 启动时常用），返回要写回 PTY 的应答字节。
 /// 返回值（字节, 是否应答过 OSC 10/11/4 颜色查询）：后者供主题广播判断
 /// 该会话是否 OS 色，避免向 cmd 等不响 OSC 的 shell 推颜色序列。
-/// 全部是标准 VT/xterm 行为，对任意 TUI（cmd/shell/nvim/opencode 等）通用：
+/// 实测（examples/conpty_probe，conpty.dll 1.25）：宿主写回的应答会被
+/// ConPTY 输入引擎消费、从不转发给子进程；DSR 应答总能被干净识别，而
+/// 主 DA/XTVERSION 应答在时序错位时会被当键盘文本打进子进程（cmd 提示符
+/// 后出现 ^[[?1;2c）。所以只答 DSR/DECRQM/kitty/像素尺寸这类被干净消费的：
 /// - DSR 光标位置（ESC[6n → ESC[r;cR）
-/// - 主 DA（ESC[c → ESC[?1;2c）与 XTVERSION（ESC[>0q → ESC[>0;136;0c）
 /// - DECRQM 模式查询（ESC[?...$p → ESC[?...;m$y）
 /// - kitty 键盘协议查询（ESC[?u → 回同样 ESC[?u 表示不支持）
 /// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
 /// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
-/// 返回 (应答字节, 是否应答了 OSC 颜色查询)。查询序列可能跨块被截断，扫描
-/// 单块即可——探测都发生在启动后的单次写入里。
+/// 不答主 DA 与 XTVERSION。返回 (应答字节, 是否应答了 OSC 颜色查询)。
+/// 查询序列可能跨块被截断，扫描单块即可——探测都发生在启动后的单次写入里。
 fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut osc_color = false;
@@ -190,12 +192,6 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
             out.extend_from_slice(
                 format!("\x1b[{};{}R", cursor.line.0 + 1, cursor.column.0 + 1).as_bytes(),
             );
-        } else if params.is_empty() && fin == b'c' {
-            // 主 DA（VT100 标识）：报支持高级视频属性的终端。
-            out.extend_from_slice(b"\x1b[?1;2c");
-        } else if params.starts_with('>') && fin == b'q' {
-            // XTVERSION（ESC[>0q 等）：报成 xterm 风格，让 TUI 识别为交互终端。
-            out.extend_from_slice(b"\x1b[>0;136;0c");
         } else if params.starts_with('?') && fin == b'u' {
             // kitty 键盘协议不支持：按协议回同样的 CSI ? u。
             out.extend_from_slice(b"\x1b[?u");
@@ -487,20 +483,20 @@ mod tests {
             ctx: eframe::egui::Context::default(),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
+        // 主 DA 与 XTVERSION 有意不应答（会泄漏成键盘输入，见函数注释）；
+        // DSR/DECRQM/kitty/像素尺寸照常应答。
         let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
         let r = reply_to_queries(&term, bytes, true).unwrap().0;
         let s = String::from_utf8_lossy(&r);
-        assert!(s.contains("\x1b[1;1R"), "DSR 光标应答: {s}");
+        assert!(s.contains("\x1b[1;1R") || s.contains(";1R"), "DSR 光标应答: {s}");
         assert!(s.contains("\x1b[?2026;1$y"), "DECRQM 2026: {s}");
         assert!(s.contains("\x1b[?1000;1$y"), "DECRQM 1000: {s}");
         assert!(s.contains("\x1b[?u"), "kitty 键盘: {s}");
         assert!(s.contains("\x1b[4;0;0t"), "XTWINOPS: {s}");
         assert!(s.contains("\x1b]11;rgb:16161a/16161a/16161a"), "OSC11 深色底: {s}");
-        // 主 DA 与 XTVERSION。
-        let r2 = reply_to_queries(&term, b"\x1b[c\x1b[>0q", true).unwrap().0;
-        let s2 = String::from_utf8_lossy(&r2);
-        assert!(s2.contains("\x1b[?1;2c"), "主 DA: {s2}");
-        assert!(s2.contains("\x1b[>0;136;0c"), "XTVERSION: {s2}");
+        // 主 DA 与 XTVERSION 不再应答。
+        assert!(reply_to_queries(&term, b"\x1b[c", true).is_none(), "主 DA 不应答");
+        assert!(reply_to_queries(&term, b"\x1b[>0q", true).is_none(), "XTVERSION 不应答");
         // 浅色主题下 OSC 11 回白底。
         let r3 = reply_to_queries(&term, b"\x1b]11;?\x1b\\", false).unwrap();
         assert!(String::from_utf8_lossy(&r3.0).contains("rgb:ffffff/ffffff/ffffff"));
@@ -509,8 +505,9 @@ mod tests {
         // 应答过 OSC 颜色查询 → 第二返回值标记 true（供主题广播判断是否安全）。
         let (_, osc) = reply_to_queries(&term, b"\x1b]10;?\x1b\\", true).unwrap();
         assert!(osc, "OSC 10 颜色查询应答应标记 osc_theme_aware");
-        let (_, osc2) = reply_to_queries(&term, b"\x1b[c", true).unwrap();
-        assert!(!osc2, "主 DA 应答不应标记 OSC 颜色");
+        // DSR 应答不应标记 OSC 颜色（否则主题广播会误推给不响 OSC 的会话）。
+        let (_, osc2) = reply_to_queries(&term, b"\x1b[6n", true).unwrap();
+        assert!(!osc2, "DSR 应答不应标记 OSC 颜色");
     }
 
     /// 宽字符由前导格+随空格两格组成；程序（如 nvim）把光标左移一格时光标会
@@ -618,10 +615,14 @@ mod tests {
         let _ = sess.child.kill();
     }
 
-    // 本机 ConPTY 对宿主写入的 SGR 鼠标输入的处理（备用屏滚轮转发是否成立）。
+    // 捆绑的新版 ConPTY（assets/conpty，取自 VS Code 内置 node-pty 同源构建）
+    // 必须双向透传：子进程的备用屏/SGR 鼠标声明要到达仿真器（滚轮转发分支的
+    // 判定依据），宿主写入的 SGR 滚轮序列要原样到达子进程。Win10 内置老版
+    // conpty 会吞掉 ?1049h/?1000h 声明并把 SGR 滚轮改写成乱码（实测变
+    // \x1b[[C）——那正是全屏 TUI（opencode）滚轮翻不动页的根因。
     // node 兼任子进程：把收到的每个输入按 hex 追加到 _sgr_echo.log。
     #[test]
-    fn conpty_mangles_sgr_mouse_input() {
+    fn conpty_sgr_wheel_passthrough() {
         // node 未安装时跳过（Windows GUI 机器一般都有 dev 环境）。
         if std::process::Command::new("node")
             .args(["--version"])
@@ -649,38 +650,66 @@ mod tests {
         let mut sess = spawn("t", ".", "node _sgr_echo.mjs", 80, 24, tx, ctx).expect("spawn node");
         std::thread::sleep(Duration::from_millis(2000));
 
-        // ConPTY 是否把输出方向的备用屏切换（?1049h）原样送到仿真器。
-        let alt_bit = sess
-            .term
-            .lock()
-            .map(|t| t.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
-            .unwrap_or(false);
-        println!("DBG_ALT alt_screen={alt_bit}");
-
-        let check = |bytes: &[u8]| {
-            sess.writer.try_send(bytes.to_vec()).unwrap();
-            std::thread::sleep(Duration::from_millis(400));
-        };
-        check(b"hi");
-        check(b"\x1b[A");
-        check(b"\x1b[<64;3;12M");
-        std::thread::sleep(Duration::from_millis(400));
-
-        let log = std::fs::read_to_string(log_file).unwrap_or_default();
-        // 纯文本与 CSI 按键能原样穿过 ConPTY（自攒历史的滚轮兜底依赖普通
-        // 输入通路仍正常，避免一修滚轮坏键盘）。
-        assert!(log.contains("6869"), "纯文本应原样到达:\n{log}");
-        assert!(log.contains("1b5b41"), "CSI 按键应原样到达:\n{log}");
-        // 本机 ConPTY 会把 SGR 滚轮序列改写掉（实测变 X10 载荷字节/吞前缀），
-        // 所以备用屏滚轮不能指望“转 SGR 给应用”，只能走自攒历史。
-        // 若某天 ConPTY 能原样透传，这里会失败提醒可恢复 SGR 转发。
+        // 输出方向：备用屏与 SGR 鼠标编码位必须穿透到仿真器。
+        // 新版 conpty 会自行跟踪并吞掉 ?1000h/?1002h 本体，但透传 ?1006h 编码位。
+        let m = sess.term.lock().map(|t| *t.mode()).unwrap_or_default();
         assert!(
-            !log.contains("1b5b3c3634333b31324d"),
-            "SGR 滚轮序列意外原样到达（ConPTY 行为已变，可恢复 SGR 转发）:\n{log}"
+            m.contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
+            "备用屏切换应穿透到仿真器（bundled conpty.dll 未加载？）"
+        );
+        assert!(
+            m.contains(alacritty_terminal::term::TermMode::SGR_MOUSE),
+            "SGR 鼠标编码位应穿透到仿真器（bundled conpty.dll 未加载？）"
+        );
+
+        // 输入方向：宿主写入的 SGR 滚轮必须原样到达子进程。
+        sess.writer.try_send(b"\x1b[<64;3;12M".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let log = std::fs::read_to_string(log_file).unwrap_or_default();
+        assert!(
+            log.contains("1b5b3c36343b333b31324d"),
+            "宿主写入的 SGR 滚轮应原样到达子进程（bundled conpty.dll 未加载？）:\n{log}"
         );
         let _ = sess.child.kill();
         let _ = std::fs::remove_file(echo_file);
         let _ = std::fs::remove_file(log_file);
+    }
+
+    /// 真实链路验证：本机装有 opencode 时，用它跑「启动 → 仿真器看到鼠标上报
+    /// 模式」的完整过程。opencode（opentui）启用 SGR 鼠标上报是 terminal.rs
+    /// 滚轮转发分支的触发条件；若这里看不到模式位，说明声明被 ConPTY 吞掉或
+    /// 捆绑的 conpty.dll 没生效。
+    #[test]
+    fn opencode_enables_mouse_reporting() {
+        if std::process::Command::new("opencode")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = eframe::egui::Context::default();
+        let mut sess = spawn("t", ".", "opencode", 100, 30, tx, ctx).expect("spawn opencode");
+        // opencode 是 node 打包的大程序，冷启动可能要几秒。
+        let mut saw_mouse = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
+            if sess.child.try_wait().map_or(false, |s| s.is_some()) {
+                break;
+            }
+            if let Ok(t) = sess.term.lock() {
+                if t.mode().intersects(
+                    alacritty_terminal::term::TermMode::MOUSE_MODE
+                        | alacritty_terminal::term::TermMode::SGR_MOUSE,
+                ) {
+                    saw_mouse = true;
+                    break;
+                }
+            }
+        }
+        let _ = sess.child.kill();
+        assert!(saw_mouse, "10 秒内未观察到 opencode 开启鼠标上报模式");
     }
 
     #[test]

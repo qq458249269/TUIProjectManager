@@ -387,6 +387,34 @@ pub fn term_grid_size(ui: &egui::Ui) -> Option<(usize, usize)> {
     ))
 }
 
+/// 按子进程启用的鼠标编码（SGR ?1006 或默认 X10）把一次鼠标事件写入 PTY。
+/// 新版 ConPTY 对宿主写入的鼠标序列只透传、不重编码，所以编码必须与子进程
+/// 声明的一致；code 为 xterm 事件码：按键 0/1/2，移动 +32，滚轮上 64 下 65，
+/// 释放固定 0（X10 载荷里自动变 3）。col/row 已是 1-based。
+fn send_mouse_event(
+    writer: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    sgr: bool,
+    code: u16,
+    col: usize,
+    row: usize,
+    release: bool,
+) {
+    let bytes = if sgr {
+        format!("\x1b[<{code};{col};{row}{}", if release { 'm' } else { 'M' }).into_bytes()
+    } else {
+        // X10 三字节载荷：事件码+32、列+32、行+32；列/行上限 223 防 u8 回绕。
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            (code.min(191) as u8).wrapping_add(32),
+            (col.clamp(1, 223) as u8).wrapping_add(32),
+            (row.clamp(1, 223) as u8).wrapping_add(32),
+        ]
+    };
+    let _ = writer.try_send(bytes);
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
 pub fn show_terminal(
     ui: &mut egui::Ui,
@@ -437,56 +465,66 @@ pub fn show_terminal(
 
     // ── 读取终端鼠标模式（一次性锁，后续所有分支复用） ──
     let term_mode_snapshot = sess.term.lock().map(|t| *t.mode()).ok();
-    // 只检查实际启用的鼠标上报模式：MOUSE_REPORT_CLICK / MOUSE_MOTION。
-    // SGR_MOUSE 是编码格式修饰符，单独存在不代表子进程想要鼠标事件。
+    // 应用要鼠标事件 = 任一上报模式（?1000/?1002/?1003）。注意捆绑的新版
+    // conpty.dll 会自行跟踪并吞掉 ?1000h/?1002h，只向仿真器透传编码位 ?1006h，
+    // 所以 SGR_MOUSE 单独出现也代表子进程开了鼠标上报（实测 opencode 即此形态）。
     let mouse_reporting = term_mode_snapshot.map_or(false, |m| {
-        m.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION)
+        m.intersects(TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)
     });
+    // 转发用的编码开关：新版 ConPTY 对宿主写入的鼠标序列只透传不重编码，
+    // 必须与应用声明一致（SGR ?1006 vs 默认 X10）；老版 ConPTY 则把一切鼠标
+    // 序列改写成乱码，捆绑 conpty.dll 是全屏 TUI 滚轮可用的前提。
+    let sgr_mouse = term_mode_snapshot.map_or(false, |m| m.contains(TermMode::SGR_MOUSE));
     let alt_screen = term_mode_snapshot
         .unwrap_or(TermMode::empty())
         .contains(TermMode::ALT_SCREEN);
 
     // ── 鼠标滚轮 ──
-    if resp.hovered() {
-        let delta = ui.input(|i| i.smooth_scroll_delta.y);
-        if delta != 0.0 {
-            ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
-            let mut lines = (delta / cell_h).round() as i32;
-            if lines == 0 {
-                lines = if delta > 0.0 { 1 } else { -1 };
-            }
-            if mouse_reporting {
-                // 子进程开了鼠标上报 → SGR 鼠标滚轮事件。
-                let pos = ui
-                    .input(|i| i.pointer.latest_pos())
-                    .unwrap_or(rect.center());
-                let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
-                    .clamp(1, cols);
-                let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
-                    .clamp(1, rows);
-                let up = lines > 0;
-                for _ in 0..lines.abs().clamp(1, 32) {
-                    let b = if up { 64 } else { 65 };
-                    let _ = sess
-                        .writer
-                        .try_send(format!("\x1b[<{b};{col};{row}M").into_bytes());
-                }
-            } else if alt_screen {
-                // ALT_SCREEN 无鼠标上报（opencode 等）→ PgUp/PgDn。
-                let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
-                let key: &[u8] = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
-                for _ in 0..count {
-                    let _ = sess.writer.try_send(key.to_vec());
-                }
-            } else {
-                // 普通 shell / 主屏 TUI（pi 等）→ 滚仿真器缓冲。
-                if let Ok(mut t) = sess.term.lock() {
-                    t.scroll_display(Scroll::Delta(lines));
-                }
-            }
-            ui.ctx().request_repaint();
+    // 用 pointer_hover_pos() + latest_pos() 双重检测：
+    // hover_pos() 在 click_and_drag 感知下某些帧返回 None；
+    // latest_pos() 在纯滚轮操作（无鼠标移动）时也可能返回 None。
+    let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+    let over_term = scroll_delta != 0.0 && ui.input(|i| {
+        i.pointer.hover_pos().map_or(false, |p| rect.contains(p))
+            || i.pointer.latest_pos().map_or(false, |p| rect.contains(p))
+    });
+    if over_term {
+        let delta = scroll_delta;
+        ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+        let mut lines = (delta / cell_h).round() as i32;
+        if lines == 0 {
+            lines = if delta > 0.0 { 1 } else { -1 };
         }
-    }    // ── 鼠标点击 / 移动 / 拖拽 → 按模式转发或本地处理 ──
+        if mouse_reporting {
+            // 子进程开了鼠标上报（opencode/nvim 等）→ 滚轮作为真实滚轮事件转发，
+            // 编码与应用声明一致（SGR/X10）。优先于 alt_screen PgUp/PgDn 分支。
+            let pos = ui
+                .input(|i| i.pointer.latest_pos())
+                .unwrap_or(rect.center());
+            let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
+                .clamp(1, cols);
+            let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
+                .clamp(1, rows);
+            let b = if lines > 0 { 64u16 } else { 65 }; // xterm 滚轮上/下事件码
+            for _ in 0..lines.abs().clamp(1, 32) {
+                send_mouse_event(&sess.writer, sgr_mouse, b, col, row, false);
+            }
+        } else if alt_screen {
+            // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
+            let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
+            let key: &[u8] = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
+            for _ in 0..count {
+                let _ = sess.writer.try_send(key.to_vec());
+            }
+        } else {
+            // 普通 shell / 主屏 TUI（pi 等）→ 滚仿真器缓冲。
+            if let Ok(mut t) = sess.term.lock() {
+                t.scroll_display(Scroll::Delta(lines));
+            }
+        }
+        ui.ctx().request_repaint();
+    } // end over_term
+    // ── 鼠标点击 / 移动 / 拖拽 → 按模式转发或本地处理 ──
     if mouse_reporting {
         // 子进程开了鼠标上报 → 把 egui 鼠标事件编码为 SGR 序列写入 PTY。
         // 按下/释放/移动分别对应 SGR 的 M（按下）/m（释放）。
@@ -524,9 +562,7 @@ pub fn show_terminal(
                         0
                     }
                 });
-                let _ = sess.writer.try_send(
-                    format!("\x1b[<{btn};{col};{row}M").into_bytes(),
-                );
+                send_mouse_event(&sess.writer, sgr_mouse, btn, col, row, false);
                 ui.ctx().request_repaint();
             }
         }
@@ -535,10 +571,8 @@ pub fn show_terminal(
         if ptr_any_down {
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                 let (col, row) = to_col_row(pos);
-                let btn = 32; // motion flag
-                let _ = sess.writer.try_send(
-                    format!("\x1b[<{btn};{col};{row}M").into_bytes(),
-                );
+                // motion 事件码 = 按键号 +32（SGR 参数与 X10 载荷同源）。
+                send_mouse_event(&sess.writer, sgr_mouse, 32, col, row, false);
             }
         }
 
@@ -546,9 +580,7 @@ pub fn show_terminal(
         if ptr_released {
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                 let (col, row) = to_col_row(pos);
-                let _ = sess
-                    .writer
-                    .try_send(format!("\x1b[<0;{col};{row}m").into_bytes());
+                send_mouse_event(&sess.writer, sgr_mouse, 0, col, row, true);
                 ui.ctx().request_repaint();
             }
         }
@@ -844,26 +876,58 @@ pub fn show_terminal(
     }
 
     // ---- 渲染网格 ----
-    // 先克隆 Arc 再拿锁：渲染循环里要写 sess.galley_cache（缓存复用），
-    // 若守卫直接借自 sess.term，会与可变借用冲突。
+    // 快照终端状态后立即释放锁：渲染循环遍历全部格子（rows×cols）开销大，
+    // 期间解析线程被阻塞无法喂入新输出 → 打字回显延迟。快照后渲染纯读
+    // 快照数据，解析线程可在片间插空更新终端状态。
     let term_arc = sess.term.clone();
-    let term = match term_arc.lock() {
-        Ok(t) => t,
-        Err(_) => return,
+    let (
+        offset,
+        colors_vec,
+        cursor,
+        sel_range,
+        show_cursor,
+        snapshot_cells,
+        cursor_cell_char,
+        cursor_cell_flags,
+    ) = {
+        let term = match term_arc.lock() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let content = term.renderable_content();
+        let offset = content.display_offset;
+        let colors_vec = content.colors.clone();
+        let cursor = content.cursor;
+        let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
+        let show_cursor = term.mode().contains(TermMode::SHOW_CURSOR);
+        // 快照可见区域格子：释放锁后渲染循环不再碰 term。
+        let mut snapshot_cells = Vec::with_capacity(rows * cols);
+        for indexed in content.display_iter {
+            let point = indexed.point;
+            let vline = point.line.0 + offset as i32;
+            if vline >= 0 && vline < rows as i32 {
+                snapshot_cells.push((point, indexed.cell.clone()));
+            }
+        }
+        // 光标格快照：Block 光标反色重绘需要字符和标志。
+        let cpoint = cursor.point;
+        let (cursor_cell_char, cursor_cell_flags) = {
+            let cell = &term.grid()[cpoint];
+            (cell.c, cell.flags)
+        };
+        (
+            offset, colors_vec, cursor, sel_range, show_cursor,
+            snapshot_cells, cursor_cell_char, cursor_cell_flags,
+        )
+        // term 锁在此释放：解析线程可立即处理积压输出。
     };
-    let content = term.renderable_content();
-    let offset = content.display_offset;
-    let colors = &content.colors;
-    let cursor = content.cursor;
-    // 当前选区范围（供高亮与复制共用；alacritty 核心随内容滚动自动维护）。
-    let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
 
     // ── 预计算 ANSI 256 色查找表：把每格 resolve_color 的 match+from_rgb
     //    降为一次数组索引。colors 快照在帧首取一次，256 项遍历摊到整帧。
     let mut ansi_rgb: [Color32; 256] = [Color32::TRANSPARENT; 256];
     for i in 0..256usize {
-        if let Some(Rgb { r, g, b }) = colors[i] {
+        if let Some(Rgb { r, g, b }) = colors_vec[i] {
             ansi_rgb[i] = Color32::from_rgb(r, g, b);
         }
     }
@@ -875,13 +939,11 @@ pub fn show_terminal(
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
     // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
     //
-    for indexed in content.display_iter {
-        let point = indexed.point;
+    for (point, cell) in &snapshot_cells {
         let vline = point.line.0 + offset as i32;
         if vline < 0 || vline >= rows as i32 {
             continue;
         }
-        let cell = indexed.cell;
         // 随空格（宽字符占位格）直接跳过：它的 2 格槽矩形与前导格完全重叠，
         // 槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，选区盖住
         // 随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形画完后
@@ -902,7 +964,7 @@ pub fn show_terminal(
         let slot_w = slot_cells as f32 * cell_w;
 
         let underlined = cell.flags.contains(Flags::UNDERLINE);
-        let selected = sel_range.as_ref().is_some_and(|r| cell_selected(r, point, cell));
+        let selected = sel_range.as_ref().is_some_and(|r| cell_selected(r, *point, cell));
 
         // 用预计算查找表替换 resolve_color：Indexed/Named 走数组，Spec 直转。
         let resolve = |c: Color, default: Color32| -> Color32 {
@@ -1001,6 +1063,12 @@ pub fn show_terminal(
     //    方向键移动（实测 pi 停靠 (11,79)，输入在 (11,5)）。这类 TUI 会用
     //    “空白格 + 非默认前后景色”的单元格自绘真实输入光标（实测随方向键移动），
     //    所以先在该行找这种自绘光标格、画在那里；找不到才退回停靠位置。
+    // 用 HashMap 做 O(1) 查找，替代旧版 snapshot_cells.iter().find() 的 O(n) 线性扫描，
+    // 消除 rows×cols×snapshot_cells 的平方级开销。
+    use std::collections::HashMap;
+    let cell_map: HashMap<(i32, usize), &Cell> = snapshot_cells.iter()
+        .map(|(p, c)| ((p.line.0, p.column.0), c))
+        .collect();
     let mut cursor_rect: Option<Rect> = None;
     {
         // 光标位置：
@@ -1010,9 +1078,8 @@ pub fn show_terminal(
         //   (Black,White) 反色格画输入光标，格内是字符或空格，随方向键移动。
         //   自底向上整屏找反色格：输入行在 UI 最下方，必然优先命中；停靠行
         //   是灰色状态行时（启动瞬间）也不会误判。找不到才退回停靠位置。
-        let show = term.mode().contains(TermMode::SHOW_CURSOR);
         let mut cpoint = cursor.point;
-        if !show {
+        if !show_cursor {
             // 全屏扫描代价 rows×cols，每帧都扫不划算：内容只在解析线程变化，
             // 用解析代数做缓存键——没变就直接复用上次找到的自绘光标位置；
             // 任一变了才重扫并回填缓存。
@@ -1037,10 +1104,12 @@ pub fn show_terminal(
                 'outer: for r in (0..rows).rev() {
                     let line = Line(r as i32 - disp_off as i32);
                     for col in 0..cols {
-                        let cell = &term.grid()[Point::new(line, Column(col))];
-                        if is_caret(cell) {
-                            hit = Some(Point::new(line, Column(col)));
-                            break 'outer;
+                        // O(1) HashMap 查找，替代 O(n) 线性扫描。
+                        if let Some(cell) = cell_map.get(&(line.0, col)) {
+                            if is_caret(cell) {
+                                hit = Some(Point::new(line, Column(col)));
+                                break 'outer;
+                            }
                         }
                     }
                 }
@@ -1058,13 +1127,10 @@ pub fn show_terminal(
         if vline >= 0 && vline < rows as i32 {
             let col = p.column.0 as usize;
             if col < cols {
-                let cursor_cell = &term.grid()[cpoint];
-                // 宽字符光标：方块/下划线/空心块都按 2 格宽画，避免只盖住半个汉字。
-                // 光标本身停在宽字符的随空格（后一半）上也一样：若只按 1 格宽画，
-                // 白色方块会正好盖住汉字右半，看起来就是“只显示一半汉字”。
-                let on_spacer = cursor_cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                // 从快照获取光标格数据（不碰 term 锁）。
+                let on_spacer = cursor_cell_flags.contains(Flags::WIDE_CHAR_SPACER);
                 let cursor_wide =
-                    cursor_cell.flags.contains(Flags::WIDE_CHAR) || on_spacer;
+                    cursor_cell_flags.contains(Flags::WIDE_CHAR) || on_spacer;
                 let col0 = if on_spacer { col.saturating_sub(1) } else { col };
                 let x = rect.left() + col0 as f32 * cell_w;
                 let y = rect.top() + vline as f32 * cell_h;
@@ -1100,13 +1166,13 @@ pub fn show_terminal(
                                 // 反色重绘格内字符（宽字符居中画在整块内），保证光标内内容可读。
                                 // 光标停在随空格时自身无字形，取前导格的宽字符重绘。
                                 let ch = if on_spacer {
-                                    term.grid()[Point::new(
-                                        cpoint.line,
-                                        Column(cpoint.column.0.saturating_sub(1)),
-                                    )]
-                                    .c
+                                    // 从快照 HashMap O(1) 获取前导格字符。
+                                    let prev = Column(cpoint.column.0.saturating_sub(1));
+                                    cell_map.get(&(cpoint.line.0, prev.0))
+                                        .map(|c| c.c)
+                                        .unwrap_or(cursor_cell_char)
                                 } else {
-                                    cursor_cell.c
+                                    cursor_cell_char
                                 };
                                 if ch != '\0'
                                 {
