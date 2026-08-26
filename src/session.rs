@@ -18,6 +18,16 @@ use alacritty_terminal::vte::ansi::Processor;
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
+/// 回显延迟探针统计（TUIPM_LATENCY_DEBUG=1 启用）：总耗时/次数/峰值，全局共享。
+static ECHO_SUM_US: AtomicU64 = AtomicU64::new(0);
+static ECHO_CNT: AtomicU64 = AtomicU64::new(0);
+static ECHO_MAX_MS: AtomicU32 = AtomicU32::new(0);
+
+fn latency_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
+}
+
 /// 一个在应用内页签中运行的终端会话。
 pub struct Session {
     /// 页签标题（默认取项目名）。
@@ -74,6 +84,13 @@ pub struct Session {
     /// (解析代数, 行, 列)。代数没变就直接复用，
     /// 免去每帧 rows×cols 的全屏网格扫描。offset 恒为 0。
     pub caret_scan: Option<(u64, Line, Column)>,
+    /// 回显延迟探针：最近一次向 PTY 写入输入字节的毫秒时间戳。
+    /// 读取线程据此计算「按键 → 首块回显」延迟（TUIPM_LATENCY_DEBUG=1 打印）。
+    pub last_input_ms: Arc<AtomicU64>,
+    /// 主键按下时的位置（仅 UI 线程用）：快速拖选兜底判定用。
+    /// 低帧率下按下/拖动/释放全落在同一帧时，egui 既不判 click 也不判
+    /// drag，drag_started_by 永不触发 —— 这里自己记按下点。
+    pub drag_press_pos: Option<egui::Pos2>,
     /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
     pub snapshot_scratch: Vec<(Point, Cell)>,
     /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
@@ -436,6 +453,7 @@ pub fn spawn(
         .as_millis() as u64;
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_content_ms = Arc::new(AtomicU64::new(now_ts));
+    let last_input_ms = Arc::new(AtomicU64::new(0));
     // 读取子进程输出的线程。
     let term = Arc::new(Mutex::new(term));
     let parse_gen = Arc::new(AtomicU64::new(0));
@@ -446,6 +464,7 @@ pub fn spawn(
         let output_count = output_count.clone();
         let last_output_ms = last_output_ms.clone();
         let last_content_ms = last_content_ms.clone();
+        let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let parse_gen = parse_gen.clone();
         let mut reader = pair
@@ -472,6 +491,24 @@ pub fn spawn(
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
+                        // 回显延迟探针：输入后 500ms 内到来的输出视为回显，
+                        // 记录「按键→首块回显」耗时（TUIPM_LATENCY_DEBUG=1 打印）。
+                        if latency_debug() {
+                            let since = now_ms.saturating_sub(reader_input_ms.load(Ordering::Relaxed));
+                            if since > 0 && since <= 500 {
+                                ECHO_SUM_US.fetch_add(since * 1000, Ordering::Relaxed);
+                                ECHO_CNT.fetch_add(1, Ordering::Relaxed);
+                                ECHO_MAX_MS.fetch_max(since as u32, Ordering::Relaxed);
+                                let cnt = ECHO_CNT.load(Ordering::Relaxed);
+                                if cnt % 20 == 0 {
+                                    eprintln!(
+                                        "[latency] echo avg={}ms max={}ms n={cnt}",
+                                        ECHO_SUM_US.load(Ordering::Relaxed) / cnt / 1000,
+                                        ECHO_MAX_MS.load(Ordering::Relaxed),
+                                    );
+                                }
+                            }
+                        }
                         last_output_ms.store(now_ms, Ordering::Relaxed);
                         // 分析输出内容：区分 TUI 自带动画 vs 实际回答文本。
                         let chunk = &buf[..n];
@@ -568,6 +605,8 @@ pub fn spawn(
         snapshot_scratch: Vec::new(),
         galley_cache: HashMap::new(),
         gpu: None,
+        last_input_ms,
+        drag_press_pos: None,
     })
 }
 

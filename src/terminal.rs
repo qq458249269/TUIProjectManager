@@ -1,4 +1,5 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -23,6 +24,16 @@ pub const TERM_FONT_SIZE: f32 = 14.0;
 #[inline]
 fn color_key(c: Color32) -> u64 {
     ((c.r() as u64) << 24) | ((c.g() as u64) << 16) | ((c.b() as u64) << 8) | c.a() as u64
+}
+
+/// 渲染持锁段耗时统计（TUIPM_LATENCY_DEBUG=1 启用）。
+static SNAP_ACC_US: AtomicU64 = AtomicU64::new(0);
+static SNAP_MAX_US: AtomicU32 = AtomicU32::new(0);
+static SNAP_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+fn latency_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
 }
 
 /// 深浅主题下的终端画布底色。
@@ -574,7 +585,12 @@ pub fn show_terminal(
             i.pointer.button_pressed(egui::PointerButton::Primary)
                 || i.pointer.button_pressed(egui::PointerButton::Middle)
         });
-        let ptr_released = ui.input(|i| i.pointer.any_released());
+        // 仅过滤主/中键释放：右键释放不应转发给子进程（否则 TUI 收到
+        // 意外左键释放事件，回显杂字或清除选区）。
+        let ptr_released = ui.input(|i| {
+            i.pointer.button_released(egui::PointerButton::Primary)
+                || i.pointer.button_released(egui::PointerButton::Middle)
+        });
 
         if resp.hovered() && ptr_pressed {
             // 按下：检测哪个按钮
@@ -604,6 +620,8 @@ pub fn show_terminal(
 
     // 本地文本选择：两种模式都启用。左键拖拽选中文本，单击清除。
     {
+        let primary_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let latest_pos = ui.input(|i| i.pointer.latest_pos());
         if let Ok(mut t) = sess.term.lock() {
             let disp_off = t.grid().display_offset();
             let point_at = |pos: Pos2| -> Option<Point> {
@@ -632,6 +650,54 @@ pub fn show_terminal(
             if resp.clicked() {
                 t.selection = None;
             }
+            // 快速拖选兜底：低帧率（如 10fps 基线）下「按下→拖动→释放」全部
+            // 落在同一帧时，egui 判定既非 click（移动超阈值）也非 drag
+            // （release 清空 potential_drag_id），上面的 drag_started_by 分支
+            // 永远不触发，选区建不出来 → 右键菜单「复制」恒灰。这里用原始
+            // 指针状态自建：释放帧若按下/松开都在矩形内且位移明显、且常规
+            // 路径没建过选区，则补一次跨点选区。
+            // 注意同帧手势里指针状态已是帧末（latest_pos = 释放点），
+            // 按下点只能从原始事件里取。
+            if primary_released && sess.drag_press_pos.is_none() {
+                sess.drag_press_pos = ui.input(|i| {
+                    i.raw.events.iter().find_map(|e| match e {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            ..
+                        } => Some(*pos),
+                        _ => None,
+                    })
+                });
+            }
+            if primary_released {
+                if let (Some(p0), Some(p1)) = (sess.drag_press_pos.take(), latest_pos) {
+                    let moved = p0.distance(p1) > 4.0;
+                    if moved && rect.contains(p1) && t.selection.is_none() {
+                        let disp_off = t.grid().display_offset();
+                        let point_at = |pos: Pos2| -> Option<Point> {
+                            let col = ((pos.x - rect.left()) / cell_w).floor() as i64;
+                            let row = ((pos.y - rect.top()) / cell_h).floor() as i64;
+                            if row < 0 || col < 0 {
+                                return None;
+                            }
+                            Some(Point::new(
+                                Line(row as i32 - disp_off as i32),
+                                Column((col as usize).min(cols.saturating_sub(1))),
+                            ))
+                        };
+                        if let Some(start) = point_at(p0) {
+                            t.selection =
+                                Some(TermSelection::new(SelectionType::Simple, start, Side::Left));
+                            if let (Some(end), Some(sel)) = (point_at(p1), t.selection.as_mut()) {
+                                sel.update(end, Side::Left);
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -639,12 +705,15 @@ pub fn show_terminal(
     // 任何模式下都可用——右键不再转发给子进程。
     let mut menu_action: Option<TermAction> = None;
     {
+    // 选区状态在菜单闭包外检查：闭包内加锁时读者线程可能已在两段
+    // 锁之间处理了 PTY 输出（全屏 TUI 刷新帧大量输出），把选区清掉。
+    // 提前检查消除竞态窗口。
+    let has_selection = sess
+        .term
+        .lock()
+        .map(|t| t.selection.is_some())
+        .unwrap_or(false);
     resp.context_menu(|ui| {
-        let has_selection = sess
-            .term
-            .lock()
-            .map(|t| t.selection.is_some())
-            .unwrap_or(false);
         if ui
             .add_enabled(has_selection, egui::Button::new("📋 复制"))
             .on_hover_text("复制选中的文本到剪贴板")
@@ -850,6 +919,11 @@ pub fn show_terminal(
                     }
                     egui::Event::Copy => {
                         // 有选区时 Ctrl+C 复制选区；无选区才发 SIGINT（0x03）。
+                        // 注意：Ctrl+C 会同时触发 Event::Key(C,ctrl) 和 Event::Copy。
+                        // Key 处理器里 Ctrl+字母已经通过 encode_char_key 发了 0x03，
+                        // 这里只在「无选区且 Key 处理器未发过」时才补发，避免双发。
+                        let key_already_sent = !bytes_out.is_empty()
+                            && bytes_out.last().map_or(false, |b| b.as_slice() == [0x03]);
                         let mut copied = false;
                         if let Ok(mut t) = sess.term.lock() {
                             copied = copy_selection(&t, ui.ctx(), status);
@@ -857,7 +931,7 @@ pub fn show_terminal(
                                 t.selection = None;
                             }
                         }
-                        if !copied {
+                        if !copied && !key_already_sent {
                             bytes_out.push(vec![0x03]);
                         }
                     }
@@ -899,13 +973,25 @@ pub fn show_terminal(
         for b in &bytes_out {
             all.extend_from_slice(b);
         }
-        let _ = sess.writer.try_send(all);
+        let sent = sess.writer.try_send(all).is_ok();
+        // 回显延迟探针：记录输入时间戳（读取线程比对首块回显）。
+        if sent {
+            sess.last_input_ms.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     // ---- 渲染网格 ----
     // 快照终端状态后立即释放锁：渲染循环遍历全部格子（rows×cols）开销大，
     // 期间解析线程被阻塞无法喂入新输出 → 打字回显延迟。快照后渲染纯读
     // 快照数据，解析线程可在片间插空更新终端状态。
+    // 持锁段耗时打点（TUIPM_LATENCY_DEBUG=1 每 300 帧打印一次峰值/均值）。
+    let snap_started = std::time::Instant::now();
     let term_arc = sess.term.clone();
     let (
         offset,
@@ -952,6 +1038,19 @@ pub fn show_terminal(
         )
         // term 锁在此释放：解析线程可立即处理积压输出。
     };
+    if latency_debug() {
+        let us = snap_started.elapsed().as_micros() as u32;
+        SNAP_ACC_US.fetch_add(us as u64, Ordering::Relaxed);
+        SNAP_MAX_US.fetch_max(us, Ordering::Relaxed);
+        let n = SNAP_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 300 == 0 {
+            eprintln!(
+                "[latency] snapshot avg={}us max={}us frames={n}",
+                SNAP_ACC_US.load(Ordering::Relaxed) / n as u64,
+                SNAP_MAX_US.load(Ordering::Relaxed),
+            );
+        }
+    }
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
 
     // ── 预计算 ANSI 256 色查找表：把每格 resolve_color 的 match+from_rgb
