@@ -1402,50 +1402,58 @@ impl ClientApp {
             }
             // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录 / 检查更新）+ 深浅色切换（右侧第一个 = 最右）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("⋯ 更多", |ui| {
-                    ui.set_min_width(170.0);
-                    if ui
-                        .button("📂 打开用户目录")
-                        .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
-                        .clicked()
-                    {
-                        let dir = std::env::var("USERPROFILE")
-                            .or_else(|_| std::env::var("HOME"))
-                            .unwrap_or_else(|_| ".".to_string());
-                        self.open_explorer(dir);
-                        ui.close();
-                    }
-                    if ui
-                        .button("📂 打开软件目录")
-                        .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
-                        .clicked()
-                    {
-                        let dir = std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                            .unwrap_or_else(|| PathBuf::from("."));
-                        self.open_explorer(dir);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .button("🔄 检查更新")
-                        .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
-                        .clicked()
-                    {
-                        self.check_updates(false);
-                        ui.close();
-                    }
-                })
-                .response
-                .on_hover_text("打开用户目录 / 软件目录 / 检查更新");
+                // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
+                let more_id = egui::Id::new("status_more_menu");
+                let more_resp = ui.add(egui::Button::new("⋯ 更多"))
+                    .on_hover_text("打开用户目录 / 软件目录 / 检查更新");
+                if more_resp.clicked() && ui.input(|i| i.pointer.any_click()) {
+                    egui::Popup::toggle_id(ui.ctx(), more_id);
+                }
+                egui::Popup::from_response(&more_resp)
+                    .id(more_id)
+                    .open_memory(None)
+                    .show(|ui| {
+                        ui.set_width(110.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                            if ui.selectable_label(false, "📂 打开用户目录")
+                                .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
+                                .clicked()
+                            {
+                                let dir = std::env::var("USERPROFILE")
+                                    .or_else(|_| std::env::var("HOME"))
+                                    .unwrap_or_else(|_| ".".to_string());
+                                self.open_explorer(dir);
+                                ui.close();
+                            }
+                            if ui.selectable_label(false, "📂 打开软件目录")
+                                .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
+                                .clicked()
+                            {
+                                let dir = std::env::current_exe()
+                                    .ok()
+                                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                    .unwrap_or_else(|| PathBuf::from("."));
+                                self.open_explorer(dir);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.selectable_label(false, "🔄 检查更新")
+                                .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
+                                .clicked()
+                            {
+                                self.check_updates(false);
+                                ui.close();
+                            }
+                        });
+                    });
+                // 主题切换按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
                 let dark = self.config.settings.dark_mode;
                 let theme_btn = if dark {
                     ui.button("☀ 浅色").on_hover_text("切换到浅色主题，字体与颜色同步切换")
                 } else {
                     ui.button("🌙 深色").on_hover_text("切换到深色主题，字体与颜色同步切换")
                 };
-                if theme_btn.clicked() {
+                if theme_btn.clicked() && ui.input(|i| i.pointer.any_click()) {
                     self.config.settings.dark_mode = !dark;
                     apply_theme(ui.ctx(), self.config.settings.dark_mode);
                     self.save_config("已切换主题".to_string());
