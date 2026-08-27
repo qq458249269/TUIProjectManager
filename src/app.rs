@@ -404,6 +404,7 @@ pub struct ClientApp {
     titlebar_hwnd: isize,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
+
     /// 项目目录存在性缓存：path → (是否存在, 采样时间)。首页列表与详情页
     /// 每帧都要画“目录存在/不存在”，直接 is_dir() 是每帧每项目一次磁盘
     /// 调用（网络盘上明显拖帧），TTL 内复用结果。
@@ -754,7 +755,7 @@ impl ClientApp {
                 if !s.exited {
                     // 解析线程 panic（畸形逃逸序列等）后 term 锁变为 poisoned，
                     // 该会话已无法渲染，视同退出——避免黑屏页签占着不报。
-                    let poisoned = s.term.lock().is_err();
+                    let poisoned = s.term.read().is_err();
                     let exited = poisoned || matches!(s.child.try_wait(), Ok(Some(_)));
                     if exited {
                         s.exited = true;
@@ -960,7 +961,7 @@ impl ClientApp {
                         const BARS: &[&str] = &["▁", "▂", "▃", "▅", "▆", "▇"];
                         let idx = (now_ms / 300) as usize % BARS.len();
                         Some(BARS[idx])
-                    } else if is_tui && cursor_vis && content_silent && count > 0 && !viewed {
+                    } else if is_tui && cursor_vis && content_silent && count > 0 {
                         // TUI 空闲 + 光标可见 = 明确等待用户选择/输入
                         Some("✏️")
                     } else {
@@ -1305,6 +1306,9 @@ impl ClientApp {
                 // 光标块停在旧位置的残留。
                 s.galley_cache.clear();
                 s.caret_scan = None;
+                s.cached_render_shapes = None;
+                s.cached_ansi_rgb = None;
+                s.snapshot_gen = 0; // 强制下一帧全量重绘
                 // 只推给应答过 OSC 10/11/4 颜色查询的会话（opencode 等）。
                 // shell/cmd 从不查询这类序列，收到 `ESC]10;...ESC\` 会把 OSC 终止符
                 // 的 `\` 直接回显成“自动输入了反斜杠”，不能广播。
@@ -2202,6 +2206,9 @@ impl eframe::App for ClientApp {
                     if let Tab::Session(s) = tab {
                         s.galley_cache.clear();
                         s.caret_scan = None;
+                        s.cached_render_shapes = None;
+                        s.cached_ansi_rgb = None;
+                        s.snapshot_gen = 0;
                     }
                 }
                 ctx.request_repaint();
@@ -2212,27 +2219,38 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 动态基线刷新：任一会话最近 1s 内有输出 → 300ms 刷新（页签柱状动画以 300ms
-        // 换帧）；否则空闲期降到 1s，大幅降低持续整屏重绘的 CPU 占用。
+        // 动态基线刷新：打字/近期输出 → 16ms（60fps）；有活动但非打字 → 50ms；
+        // 空闲 → 1000ms。
         // 只看前台会话：后台流式输出不抬升基线，页签活动点由 1s 轮询更新即可。
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let animating = self.tabs.iter().enumerate().any(|(i, t)| {
-            if let Tab::Session(s) = t {
-                if i != self.current {
-                    return false;
+        let (has_output, has_recent_input) = self.tabs.iter().enumerate().fold(
+            (false, false),
+            |(out_acc, inp_acc), (i, t)| {
+                if let Tab::Session(s) = t {
+                    if i != self.current {
+                        return (out_acc, inp_acc);
+                    }
+                    let count = s.output_count.load(Ordering::Relaxed);
+                    let last_out = s.last_output_ms.load(Ordering::Relaxed);
+                    let last_in = s.last_input_ms.load(Ordering::Relaxed);
+                    let output_active = count > 0 && now_ms.saturating_sub(last_out) <= 500;
+                    let input_recent = now_ms.saturating_sub(last_in) <= 500;
+                    (out_acc || output_active, inp_acc || input_recent)
+                } else {
+                    (out_acc, inp_acc)
                 }
-                let count = s.output_count.load(Ordering::Relaxed);
-                let last_ms = s.last_output_ms.load(Ordering::Relaxed);
-                let silent = now_ms.saturating_sub(last_ms) > 500;
-                count > 0 && !silent
-            } else {
-                false
-            }
-        });
-        let base_ms = if animating { 300 } else { 1000 };
+            },
+        );
+        let base_ms = if has_recent_input {
+            16 // 打字时 60fps：按键回显延迟 <16ms
+        } else if has_output {
+            50 // 有近期输出（TUI动画等）：33fps，比旧版300ms流畅很多
+        } else {
+            1000 // 空闲：1fps
+        };
         ctx.request_repaint_after(std::time::Duration::from_millis(base_ms));
 
         // 更新检查结果回到状态栏。

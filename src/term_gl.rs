@@ -117,6 +117,11 @@ impl GlyphAtlas {
         self.rgba[0..4].copy_from_slice(&[255, 255, 255, 255]);
     }
 
+    /// 图集是否为空（尚未光栅化任何字形）。首帧懒预热据此判断。
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// 基线相对格子顶部的偏移（逻辑点）：内容行高在 cell_h 内垂直居中，
     /// 与 egui 强制 line_height 的排版结果一致。
     #[inline]

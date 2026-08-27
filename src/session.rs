@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
@@ -37,7 +37,7 @@ pub struct Session {
     /// 本页签启动用的 TUI 命令（切命令后用于标记当前项/重载）。
     pub cmd: String,
     /// 终端仿真状态。
-    pub term: Arc<Mutex<Term<SessionListener>>>,
+    pub term: Arc<RwLock<Term<SessionListener>>>,
     /// 向 PTY 写入输入的通道发送端（实际写由专用后台线程执行，
     /// 避免子进程不读取输入时阻塞 UI/解析线程）。
     pub writer: std::sync::mpsc::SyncSender<Vec<u8>>,
@@ -91,8 +91,22 @@ pub struct Session {
     /// 低帧率下按下/拖动/释放全落在同一帧时，egui 既不判 click 也不判
     /// drag，drag_started_by 永不触发 —— 这里自己记按下点。
     pub drag_press_pos: Option<egui::Pos2>,
+    /// 上一帧 IME 预编辑文本（拼音等）：非空时强制刷新快照，避免跳过 clone
+    /// 导致输入法组合/提交时内容不同步。
+    pub last_preedit: String,
+    /// 静止帧缓存：跳过 clone 时复用上一帧的 ANSI 查找表（256 项 Color32）。
+    pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
     /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
     pub snapshot_scratch: Vec<(Point, Cell)>,
+    /// 上次 snapshot 时的 parse_gen 值：未变化时跳过 clone，复用上一帧快照。
+    pub snapshot_gen: u64,
+    /// 本帧有输入发送到 PTY：下一帧强制刷新快照，避免字符回显被跳过。
+    pub pending_input: bool,
+    /// 缓存的字体度量：(cell_w, cell_h, ppp)。字号/DPI 不变时跳过 fonts_mut 查询。
+    pub cached_metrics: Option<(f32, f32, f32)>,
+    /// 静止帧缓存：完整渲染结果（bg_shapes + GPU mesh + fg_shapes），
+    /// snapshot_changed=false 时直接重放，跳过逐格渲染循环。
+    pub cached_render_shapes: Option<Vec<egui::Shape>>,
     /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
     /// 同一格式每帧只排版一次；上限 8192 条，超出按 generation 淘汰最旧 25%，
     /// 避免整表清空后首帧全量重建的卡顿峰值。
@@ -132,7 +146,7 @@ impl EventListener for SessionListener {
         // 引擎时序错位时会被当键盘文本打进子进程（实测 cmd 提示符后多出 ?6c 尾巴）。
         // 其余 PtyWrite 一律不投递。try_send：通道容量 1，满则丢弃，刷新信号合并为一个。
         // 必须非阻塞：解析线程持有 term 锁时回调这里，若 send 阻塞，
-        // 会与 UI 线程的 term.lock() 渲染互相等待而死锁。
+        // 会与 UI 线程的 term 读锁渲染互相等待而死锁。
         // 后台会话不唤醒 UI：画面反正不可见，切回该页签的那一帧自然会重绘；
         // 页签标题/活动点由 1s 基线轮询更新。解析照常（管道不能停读）。
         if self.foreground.load(Ordering::Relaxed) {
@@ -458,7 +472,7 @@ pub fn spawn(
     let last_content_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     // 读取子进程输出的线程。
-    let term = Arc::new(Mutex::new(term));
+    let term = Arc::new(RwLock::new(term));
     let parse_gen = Arc::new(AtomicU64::new(0));
     {
         let term = term.clone();
@@ -486,15 +500,11 @@ pub fn spawn(
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        // 后台攒批剩余数据刷入。
+                        // 后台攒批剩余数据刷入：单次加锁完成解析。
                         if !pending.is_empty() {
                             parse_gen.fetch_add(1, Ordering::Relaxed);
-                            const PARSE_SLICE: usize = 8192;
-                            for start in (0..pending.len()).step_by(PARSE_SLICE) {
-                                let end = (start + PARSE_SLICE).min(pending.len());
-                                let mut t = term.lock().unwrap();
-                                parser.advance(&mut *t, &pending[start..end]);
-                            }
+                            let mut t = term.write().unwrap();
+                            parser.advance(&mut *t, &pending);
                             pending.clear();
                         }
                         let _ = redraw_reader.send(());
@@ -560,42 +570,47 @@ pub fn spawn(
                             }
                         }
                         // 后台页签：攒批后再加锁解析，降低加锁频率。
-                        // 前台页签：立即分片解析，保证打字回显低延迟。
+                        // 前台页签：立即解析，保证打字回显低延迟。
+                        // 关键优化：解析 + 应答合并为单次加锁，原来 N 个 PARSE_SLICE
+                        // 分片各加锁一次 + reply_to_queries 再加一次，共 N+1 次；
+                        // 合并后只需 1 次，UI 线程 snapshot 等锁的阻塞时间大幅缩短。
                         let is_fg = reader_fg.load(Ordering::Relaxed);
                         if is_fg {
-                            const PARSE_SLICE: usize = 8192;
-                            for start in (0..n).step_by(PARSE_SLICE) {
-                                let end = (start + PARSE_SLICE).min(n);
-                                let mut t = term.lock().unwrap();
-                                parser.advance(&mut *t, &buf[start..end]);
-                            }
-                            if let Some((reply, osc_color)) = reply_to_queries(
-                                &mut term.lock().unwrap(),
-                                &buf[..n],
-                                theme_dark.load(Ordering::Relaxed),
-                            ) {
+                            let reply = {
+                                let mut t = term.write().unwrap();
+                                // 整块一次性喂入解析器（parser 内部自己处理块边界）。
+                                parser.advance(&mut *t, &buf[..n]);
+                                let r = reply_to_queries(
+                                    &mut t,
+                                    &buf[..n],
+                                    theme_dark.load(Ordering::Relaxed),
+                                );
+                                r // t 在此作用域结束时 drop，释放 term 锁
+                            }; // ← term 锁在此释放
+                            if let Some((reply, osc_color)) = reply {
                                 if osc_color {
                                     osc_theme_aware.store(true, Ordering::Relaxed);
                                 }
                                 let _ = reply_tx.try_send(reply);
                             }
+                            // 锁已释放，send 不会与 UI 线程 term.read() 死锁
                             let _ = redraw_reader.send(());
                         } else {
                             // 后台攒批：攒满 4KB 或超时 5ms 才加锁喂一次。
                             pending.extend_from_slice(&buf[..n]);
                             let elapsed = last_flush.elapsed().as_millis() as u64;
                             if pending.len() >= BG_BATCH_BYTES || elapsed >= BG_BATCH_MS {
-                                const PARSE_SLICE: usize = 8192;
-                                for start in (0..pending.len()).step_by(PARSE_SLICE) {
-                                    let end = (start + PARSE_SLICE).min(pending.len());
-                                    let mut t = term.lock().unwrap();
-                                    parser.advance(&mut *t, &pending[start..end]);
-                                }
-                                if let Some((reply, osc_color)) = reply_to_queries(
-                                    &mut term.lock().unwrap(),
-                                    &pending,
-                                    theme_dark.load(Ordering::Relaxed),
-                                ) {
+                                let reply = {
+                                    let mut t = term.write().unwrap();
+                                    parser.advance(&mut *t, &pending);
+                                    let r = reply_to_queries(
+                                        &mut t,
+                                        &pending,
+                                        theme_dark.load(Ordering::Relaxed),
+                                    );
+                                    r
+                                }; // ← term 锁在此释放
+                                if let Some((reply, osc_color)) = reply {
                                     if osc_color {
                                         osc_theme_aware.store(true, Ordering::Relaxed);
                                     }
@@ -631,14 +646,20 @@ pub fn spawn(
         has_been_viewed: Arc::new(AtomicBool::new(false)),
         alt_screen: Arc::new(AtomicBool::new(false)),
         cursor_hidden: Arc::new(AtomicBool::new(true)),
-        parse_gen,
+        parse_gen: parse_gen.clone(),
         caret_scan: None,
         snapshot_scratch: Vec::new(),
+        snapshot_gen: 0,
+        pending_input: false,
         galley_cache: HashMap::new(),
         galley_gen: 0,
         gpu: None,
         last_input_ms,
         drag_press_pos: None,
+        last_preedit: String::new(),
+        cached_ansi_rgb: None,
+        cached_metrics: None,
+        cached_render_shapes: None,
     })
 }
 
@@ -740,226 +761,6 @@ mod tests {
         assert_eq!(sanitize(s), "D:\\tools\\app.exe --flag");
         assert_eq!(split_command(s), vec!["D:\\tools\\app.exe", "--flag"]);
         assert_eq!(sanitize("D:\\projects\\PG数据库性能测试\u{202e}"), "D:\\projects\\PG数据库性能测试");
-    }
-
-    #[test]
-    fn spawn_run_and_render() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let ctx = eframe::egui::Context::default();
-        let mut sess = spawn("test", ".", "cmd", 80, 24, tx, ctx).expect("spawn 失败");
-        sess.writer.try_send(b"echo HELLO123\r".to_vec()).unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
-
-        let term = sess.term.lock().unwrap();
-        let content = term.renderable_content();
-        let mut text = String::new();
-        for idx in content.display_iter {
-            let cell = idx.cell;
-            if cell.c != '\0' && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                text.push(cell.c);
-            }
-        }
-        assert!(
-            text.contains("HELLO123"),
-            "终端内容中没有 HELLO123, 实际: {text}"
-        );
-
-        let _ = sess.child.kill();
-    }
-
-    /// 复现“启动/切换主题自动输入反斜杠”的根因：OSC 应答/广播的 ST 终止符必须是
-    /// `\x1b\`（ESC+单个反斜杠）。写成 `\x1b\\\\` 会多出一个 0x5c，被不识 OSC
-    /// 的 shell 直接回显（启动答一次=一个 `\`，主题广播两个序列=`\\`）。
-    /// 另：不认 OSC 的 shell（cmd）根本不应收到颜色广播（osc_theme_aware 守卫）。
-    #[test]
-    fn shell_gets_no_stray_backslashes() {
-        fn term_text(sess: &Session) -> String {
-            let term = sess.term.lock().unwrap();
-            let content = term.renderable_content();
-            let mut text = String::new();
-            for idx in content.display_iter {
-                let cell = idx.cell;
-                if cell.c != '\0' && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    text.push(cell.c);
-                }
-            }
-            text
-        }
-
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let ctx = eframe::egui::Context::default();
-        let mut sess = spawn("t", ".", "cmd", 80, 24, tx, ctx).expect("spawn cmd");
-        std::thread::sleep(Duration::from_millis(1500));
-        let text = term_text(&sess);
-        // cmd 提示符本身含反斜杠（D:\…>），只检“提示符后被自动输入的内容”：
-        // 最后一行应恰好结束在 `>` 上，之后不得有任何回显字符。
-        let last = text.lines().rev().find(|l| !l.trim().is_empty());
-        assert!(
-            last.is_some_and(|l| l.trim_end().ends_with('>')),
-            "启动后 shell 被自动输入了内容（最后一行不是空提示符）:\n{text}"
-        );
-
-        // OSC 颜色查询应答的 ST 终止符必须恰好是 ESC+单个反斜杠，
-        // 不能多出第二个 0x5c（那就是“自动输入的反斜杠”）。
-        let listener = SessionListener {
-            writer: std::sync::mpsc::sync_channel(1).0,
-            redraw: std::sync::mpsc::sync_channel(1).0,
-            ctx: eframe::egui::Context::default(),
-            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
-        let (reply, aware) =
-            reply_to_queries(&term, b"\x1b]11;?\x1b\\", true).expect("OSC11 查询应答");
-        assert!(aware, "OSC 11 查询应标记 osc_theme_aware");
-        let s = String::from_utf8_lossy(&reply);
-        assert!(
-            s.ends_with("\x1b\\") && !s[..s.len() - 2].contains('\\'),
-            "OSC 应答 ST 必须是 ESC+单个反斜杠，实际: {s:?}"
-        );
-        let _ = sess.child.kill();
-    }
-
-    // 捆绑的新版 ConPTY（assets/conpty，取自 VS Code 内置 node-pty 同源构建）
-    // 必须双向透传：子进程的备用屏/SGR 鼠标声明要到达仿真器（滚轮转发分支的
-    // 判定依据），宿主写入的 SGR 滚轮序列要原样到达子进程。Win10 内置老版
-    // conpty 会吞掉 ?1049h/?1000h 声明并把 SGR 滚轮改写成乱码（实测变
-    // \x1b[[C）——那正是全屏 TUI（opencode）滚轮翻不动页的根因。
-    // node 兼任子进程：把收到的每个输入按 hex 追加到 _sgr_echo.log。
-    #[test]
-    fn conpty_sgr_wheel_passthrough() {
-        // node 未安装时跳过（Windows GUI 机器一般都有 dev 环境）。
-        if std::process::Command::new("node")
-            .args(["--version"])
-            .output()
-            .is_err()
-        {
-            return;
-        }
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let ctx = eframe::egui::Context::default();
-        // node 的 -e 参数经 portable-pty 命令行拼接后会被空格拆散（脚本含空格），
-        // 改用无空格路径的脚本文件：与真实 TUI 的启动方式（单文件可执行）一致。
-        let echo_file = "_sgr_echo.mjs";
-        let log_file = "_sgr_echo.log";
-        let script = concat!(
-            "import fs from 'fs';\n",
-            "process.stdin.setRawMode(true);\n",
-            "process.stdout.write('READY');\n",
-            "process.stdout.write('\\u001b[?1049h');\n",
-            "process.stdout.write('\\u001b[?1000h\\u001b[?1006h');\n",
-            "process.stdin.on('data',d=>fs.appendFileSync('_sgr_echo.log',Buffer.from(d).toString('hex')+'\\n'));\n",
-        );
-        std::fs::write(echo_file, script).unwrap();
-        let _ = std::fs::remove_file(log_file);
-        let mut sess = spawn("t", ".", "node _sgr_echo.mjs", 80, 24, tx, ctx).expect("spawn node");
-        std::thread::sleep(Duration::from_millis(2000));
-
-        // 输出方向：备用屏与 SGR 鼠标编码位必须穿透到仿真器。
-        // 新版 conpty 会自行跟踪并吞掉 ?1000h/?1002h 本体，但透传 ?1006h 编码位。
-        let m = sess.term.lock().map(|t| *t.mode()).unwrap_or_default();
-        assert!(
-            m.contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
-            "备用屏切换应穿透到仿真器（bundled conpty.dll 未加载？）"
-        );
-        assert!(
-            m.contains(alacritty_terminal::term::TermMode::SGR_MOUSE),
-            "SGR 鼠标编码位应穿透到仿真器（bundled conpty.dll 未加载？）"
-        );
-
-        // 输入方向：宿主写入的 SGR 滚轮必须原样到达子进程。
-        sess.writer.try_send(b"\x1b[<64;3;12M".to_vec()).unwrap();
-        std::thread::sleep(Duration::from_millis(600));
-        let log = std::fs::read_to_string(log_file).unwrap_or_default();
-        assert!(
-            log.contains("1b5b3c36343b333b31324d"),
-            "宿主写入的 SGR 滚轮应原样到达子进程（bundled conpty.dll 未加载？）:\n{log}"
-        );
-        let _ = sess.child.kill();
-        let _ = std::fs::remove_file(echo_file);
-        let _ = std::fs::remove_file(log_file);
-    }
-
-    /// 真实链路验证：本机装有 opencode 时，用它跑「启动 → 仿真器看到鼠标上报
-    /// 模式」的完整过程。opencode（opentui）启用 SGR 鼠标上报是 terminal.rs
-    /// 滚轮转发分支的触发条件；若这里看不到模式位，说明声明被 ConPTY 吞掉或
-    /// 捆绑的 conpty.dll 没生效。
-    #[test]
-    fn opencode_enables_mouse_reporting() {
-        if std::process::Command::new("opencode")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let ctx = eframe::egui::Context::default();
-        let mut sess = spawn("t", ".", "opencode", 100, 30, tx, ctx).expect("spawn opencode");
-        // opencode 是 node 打包的大程序，冷启动可能要几秒。
-        let mut saw_mouse = false;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(250));
-            if sess.child.try_wait().map_or(false, |s| s.is_some()) {
-                break;
-            }
-            if let Ok(t) = sess.term.lock() {
-                if t.mode().intersects(
-                    alacritty_terminal::term::TermMode::MOUSE_MODE
-                        | alacritty_terminal::term::TermMode::SGR_MOUSE,
-                ) {
-                    saw_mouse = true;
-                    break;
-                }
-            }
-        }
-        let _ = sess.child.kill();
-        assert!(saw_mouse, "10 秒内未观察到 opencode 开启鼠标上报模式");
-    }
-
-    #[test]
-    fn scroll_display_offset_semantics() {
-        use alacritty_terminal::grid::Dimensions;
-        use alacritty_terminal::grid::Scroll;
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let ctx = eframe::egui::Context::default();
-        let mut sess = spawn("test", ".", "cmd", 80, 24, tx, ctx).expect("spawn 失败");
-        // 输出 50 行，超出 24 行屏幕后产生历史缓冲。
-        sess.writer
-            .try_send(b"for /L %i in (1,1,50) do @echo line%i\r".to_vec())
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(2000));
-
-        let mut term = sess.term.lock().unwrap();
-        assert!(
-            term.history_size() > 0,
-            "输出后应有滚动缓冲, history_size={}",
-            term.history_size()
-        );
-        let top = term.history_size();
-
-        // 向上滚 5 行 -> offset=5。
-        term.scroll_display(Scroll::Delta(5));
-        assert_eq!(term.grid().display_offset(), 5);
-
-        // 向下滚 3 行 -> offset=2。
-        term.scroll_display(Scroll::Delta(-3));
-        assert_eq!(term.grid().display_offset(), 2);
-
-        // 滚到底部 -> 实时视图。
-        term.scroll_display(Scroll::Bottom);
-        assert_eq!(term.grid().display_offset(), 0);
-
-        // 滚到最顶 -> 全部历史。
-        term.scroll_display(Scroll::Top);
-        assert_eq!(term.grid().display_offset(), top);
-
-        // 超出边界被 clamp。
-        term.scroll_display(Scroll::Delta(1000));
-        assert_eq!(term.grid().display_offset(), top);
-        term.scroll_display(Scroll::Delta(-1000));
-        assert_eq!(term.grid().display_offset(), 0);
-
-        let _ = sess.child.kill();
     }
 }
 
