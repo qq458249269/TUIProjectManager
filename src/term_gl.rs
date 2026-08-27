@@ -102,11 +102,18 @@ impl GlyphAtlas {
             descent_px,
             w: ATLAS_SIZE,
             h: ATLAS_SIZE,
-            rgba: vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+            rgba: {
+                let sz = (ATLAS_SIZE * ATLAS_SIZE * 4) as usize;
+                // 安全：rgba 是 u8 数组，任意位模式都合法；
+                // paint_white_texel 紧接着覆盖前 4 字节。
+                let mut v: Vec<u8> = Vec::with_capacity(sz);
+                unsafe { v.set_len(sz); }
+                v
+            },
             cx: 1, // (0,0) 保留为纯白素：实心 quad（下划线）取色用
             cy: 0,
             rh: 0,
-            map: HashMap::new(),
+            map: HashMap::with_capacity(256),
             version: 0,
         };
         atlas.paint_white_texel();
@@ -341,8 +348,15 @@ impl TermGpu {
 
     /// 帧首准备：哈希缓冲对齐 rows×cols。返回 true 表示几何参数变了需全量重绘。
     pub fn begin_frame(&mut self, rows: usize, cols: usize) {
-        self.hash_scratch.clear();
-        self.hash_scratch.resize(rows * cols, 0);
+        let needed = rows * cols;
+        if self.hash_scratch.len() >= needed {
+            // 已有足够容量 → fill(0) 重置，无重分配。
+            self.hash_scratch[..needed].fill(0);
+            self.hash_scratch.truncate(needed);
+        } else {
+            self.hash_scratch.clear();
+            self.hash_scratch.resize(needed, 0);
+        }
         self.quads.clear();
     }
 

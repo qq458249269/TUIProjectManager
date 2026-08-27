@@ -1248,43 +1248,97 @@ pub fn show_terminal(
             }
         }
 
-        // Galley 缓存查找/回填。键里的“窄格下划线”只影响 TextFormat.underline；
-        // 宽字符下划线是事后手画的横线，不进排版，故宽字该位恒 false。
-        let key = (ch, fg, underlined && !wide, wide);
-        let galley = match sess.galley_cache.get(&key) {
-            Some((g, _)) => g.clone(),
-            None => {
-                // LRU 淘汰：超限时按 generation 淘汰最旧 25%，
-                // 避免整表清空后首帧全量重建的卡顿峰值。
-                if sess.galley_cache.len() >= 8192 {
-                    let cutoff = sess.galley_gen.saturating_sub(sess.galley_gen / 4);
-                    sess.galley_cache.retain(|_, (_, g)| *g > cutoff);
-                    sess.galley_gen += 1;
+        // Galley 缓存查找/回填。
+        // ASCII 快速路径（32..=126）：固定数组 O(1) 查找，跳过 HashMap。
+        // 颜色量化到 8 桶（RGB 高位组合），下划线 2 种 → 95×8×2=1520 槽。
+        // 宽字符下划线是事后手画的横线，不进排版，故宽字恒 false。
+        let galley = if !wide && ch.is_ascii() && (32..=126).contains(&(ch as u8)) {
+            let ci = ch as u8 - 32;
+            let color_q = ((fg.r() as usize >> 5) * 4 + (fg.g() as usize >> 6) * 2
+                + (fg.b() as usize >> 6)) & 7;
+            let slot_idx = ci as usize * 16 + color_q * 2 + (underlined && !wide) as usize;
+            let slots = sess.ascii_galley_slots.get_or_insert_with(|| {
+                // 初始化：1520 个 (version, Option<Galley>) 槽位，零成本空槽。
+                const INIT: (u64, Option<std::sync::Arc<egui::epaint::Galley>>) =
+                    (0, None);
+                [INIT; 1520]
+            });
+            if let Some((ver, Some(g))) = slots.get(slot_idx) {
+                if *ver == sess.galley_gen {
+                    g.clone()
+                } else {
+                    // generation 过期 → 重建 galley 并更新槽位。
+                    let mut format = egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: fg,
+                        underline: Stroke::NONE,
+                        line_height: Some(cell_h),
+                        ..Default::default()
+                    };
+                    if underlined {
+                        format.underline = Stroke::new(1.0, fg);
+                    }
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(&ch.to_string(), 0.0, format);
+                    let g = painter.layout_job(job);
+                    if let Some(slot) = slots.get_mut(slot_idx) {
+                        *slot = (sess.galley_gen, Some(g.clone()));
+                    }
+                    g
                 }
+            } else {
+                // 空槽 → 首次光栅化并填入。
                 let mut format = egui::TextFormat {
                     font_id: font_id.clone(),
                     color: fg,
                     underline: Stroke::NONE,
-                    // 强制统一行高：CJK fallback 字体（msyh 等）行高与默认等宽字体不同，
-                    // 不指定会让含中文的行变高，导致整块内容逐行漂移、与光标/选区错位。
                     line_height: Some(cell_h),
                     ..Default::default()
                 };
-                if key.2 {
+                if underlined {
                     format.underline = Stroke::new(1.0, fg);
                 }
                 let mut job = egui::text::LayoutJob::default();
-                if wide {
-                    // 宽字左对齐画在 2 格位起点（与终端惯例一致：字身贴槽左沿，
-                    // 槽宽仍按 2 格，选区/光标块/下划线盖满整槽；若居中则每个汉字
-                    // 左右各内缩 1.43px，字与相邻 ASCII、行首字都显出偏移）。
-                    job.wrap.max_width = slot_w;
-                }
-                let text = ch.to_string();
-                job.append(&text, 0.0, format);
+                job.append(&ch.to_string(), 0.0, format);
                 let g = painter.layout_job(job);
-                sess.galley_cache.insert(key, (g.clone(), sess.galley_gen));
+                if let Some(slot) = slots.get_mut(slot_idx) {
+                    *slot = (sess.galley_gen, Some(g.clone()));
+                }
                 g
+            }
+        } else {
+            // 非 ASCII（CJK 等）→ HashMap 回落。
+            let key = (ch, fg, underlined && !wide, wide);
+            match sess.galley_cache.get(&key) {
+                Some((g, _)) => g.clone(),
+                None => {
+                    // LRU 淘汰：超限时按 generation 淘汰最旧 25%，
+                    // 避免整表清空后首帧全量重建的卡顿峰值。
+                    if sess.galley_cache.len() >= 8192 {
+                        let cutoff = sess.galley_gen.saturating_sub(sess.galley_gen / 4);
+                        sess.galley_cache.retain(|_, (_, g)| *g > cutoff);
+                        sess.galley_gen += 1;
+                    }
+                    let mut format = egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: fg,
+                        underline: Stroke::NONE,
+                        line_height: Some(cell_h),
+                        ..Default::default()
+                    };
+                    if underlined && !wide {
+                        format.underline = Stroke::new(1.0, fg);
+                    }
+                    let mut job = egui::text::LayoutJob::default();
+                    if wide {
+                        job.wrap.max_width = slot_w;
+                    }
+                    let text = ch.to_string();
+                    job.append(&text, 0.0, format);
+                    let g = painter.layout_job(job);
+                    sess.galley_cache.insert(key, (g.clone(), sess.galley_gen));
+                    g
+                }
             }
         };
         fg_shapes.push(egui::Shape::galley(Pos2::new(x, y), galley, Color32::WHITE));

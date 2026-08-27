@@ -116,6 +116,14 @@ pub struct Session {
     pub galley_gen: u64,
     /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
     pub gpu: Option<crate::term_gl::TermGpu>,
+    /// 会话是否仍在启动中（首次有实际输出后置 false）。
+    /// UI 线程据此显示旋转 ⚙️ 加载动画。
+    pub loading: Arc<AtomicBool>,
+    /// galley_cache ASCII 快速路径：键 = (char as u8, fg_key, underline)。
+    /// 95 个可打印 ASCII × 8 种颜色量化 × 2 种下划线 = 最多 1520 条，
+    /// 固定数组 O(1) 查找，跳过 HashMap 的哈希+比较开销。
+    pub ascii_galley_slots:
+        Option<[(u64, Option<std::sync::Arc<egui::epaint::Galley>>); 1520]>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -230,13 +238,20 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
             continue;
         }
         let mut j = i + 2;
-        let mut params = String::new();
+        // 栈上缓冲替代 String::new() + push：CSI 参数通常 <20 字节，
+        // 避免每次转义序列触发一次堆分配。
+        let mut params_buf = [0u8; 32];
+        let mut params_len = 0usize;
         while j < bytes.len()
             && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b'?' || bytes[j] == b'>')
         {
-            params.push(bytes[j] as char);
+            if params_len < params_buf.len() {
+                params_buf[params_len] = bytes[j];
+            }
+            params_len += 1;
             j += 1;
         }
+        let params = &params_buf[..params_len.min(params_buf.len())];
         if j < bytes.len() && bytes[j] == b'$' {
             j += 1; // DECRQM 的中间字节：\x1b[?N$p
         }
@@ -245,26 +260,29 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
         }
         let fin = bytes[j];
         i = j + 1;
-        if params == "6" && fin == b'n' {
+        if params == b"6" && fin == b'n' {
             // DSR 光标位置：汇报视口内光标行列（1-based）。
             let cursor = term.renderable_content().cursor.point;
             out.extend_from_slice(
                 format!("\x1b[{};{}R", cursor.line.0 + 1, cursor.column.0 + 1).as_bytes(),
             );
-        } else if params.starts_with('?') && fin == b'u' {
+        } else if params.starts_with(b"?") && fin == b'u' {
             // kitty 键盘协议不支持：按协议回同样的 CSI ? u。
             out.extend_from_slice(b"\x1b[?u");
-        } else if params.starts_with('?') && fin == b'p' {
+        } else if params.starts_with(b"?") && fin == b'p' {
             // DECRQM：1 = 支持且处于该模式，0 = 不识别。
             // 我们能转发 SGR 滚轮（1000/1006）；括号粘贴、同步输出、断字簇按启用答复；
             // 像素鼠标（1016）我们根本不发像素数据，回不识别以免 app 改用像素坐标。
-            let n: i64 = params[1..].parse().unwrap_or(-1);
+            let n: i64 = std::str::from_utf8(&params[1..])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
             let state = match n {
                 1000 | 1006 | 2004 | 2026 | 2027 => 1,
                 _ => 0,
             };
             out.extend_from_slice(format!("\x1b[?{};{}$y", n, state).as_bytes());
-        } else if params == "14" && fin == b't' {
+        } else if params == b"14" && fin == b't' {
             // XTWINOPS 14：像素尺寸未知，回 0 表示知道但无数据。
             out.extend_from_slice(b"\x1b[4;0;0t");
         }
@@ -464,6 +482,7 @@ pub fn spawn(
     let osc_theme_aware = Arc::new(AtomicBool::new(false));
 
     let output_count = Arc::new(AtomicU32::new(0));
+    let loading = Arc::new(AtomicBool::new(true));
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -483,6 +502,7 @@ pub fn spawn(
         let last_content_ms = last_content_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
+        let reader_loading = loading.clone();
         let parse_gen = parse_gen.clone();
         let mut reader = pair
             .master
@@ -564,6 +584,10 @@ pub fn spawn(
                             || esc_ratio > 0.8;
                         if !is_animation {
                             last_content_ms.store(now_ms, Ordering::Relaxed);
+                            // 首次有实际内容输出 → 标记加载完成，停止旋转动画。
+                            if reader_loading.load(Ordering::Relaxed) {
+                                reader_loading.store(false, Ordering::Relaxed);
+                            }
                             if now_ms.saturating_sub(last_counted_ms) > 300 || printable >= 20 {
                                 output_count.fetch_add(1, Ordering::Relaxed);
                                 last_counted_ms = now_ms;
@@ -660,6 +684,8 @@ pub fn spawn(
         cached_ansi_rgb: None,
         cached_metrics: None,
         cached_render_shapes: None,
+        loading,
+        ascii_galley_slots: None,
     })
 }
 

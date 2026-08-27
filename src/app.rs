@@ -25,6 +25,8 @@ pub enum Tab {
     Session(Session),
 }
 
+
+
 /// 待下一帧在会话页签布局里启动的会话。
 /// 点击「启动」时若立刻 spawn，窗口还停在首页布局，拿不到终端真实可用面积，
 /// 只能估算（窗口减左栏/状态栏余量），与会话页签全宽实际面积恒差一截；TUI
@@ -755,6 +757,8 @@ impl ClientApp {
                 if !s.exited {
                     // 解析线程 panic（畸形逃逸序列等）后 term 锁变为 poisoned，
                     // 该会话已无法渲染，视同退出——避免黑屏页签占着不报。
+                    // 注意：不能用 try_read().is_err()，因为 WouldBlock（锁被占用）
+                    // 也会返回 Err，导致正在输出的会话被误判为退出。
                     let poisoned = s.term.read().is_err();
                     let exited = poisoned || matches!(s.child.try_wait(), Ok(Some(_)));
                     if exited {
@@ -936,7 +940,6 @@ impl ClientApp {
                 if let Tab::Session(s) = tab {
                     ui.add_space(4.0);
                     // 状态图标：固定宽度单字符。
-                    let count = s.output_count.load(Ordering::Relaxed);
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -947,31 +950,31 @@ impl ClientApp {
                     let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
                     let last_content = s.last_content_ms.load(Ordering::Relaxed);
                     let content_silent = now_ms.saturating_sub(last_content) > 500;
-                    let last_any = s.last_output_ms.load(Ordering::Relaxed);
-                    let any_silent = now_ms.saturating_sub(last_any) > 500;
+                    let count = s.output_count.load(Ordering::Relaxed);
+                    let last_out = s.last_output_ms.load(Ordering::Relaxed);
+                    let any_silent = now_ms.saturating_sub(last_out) > 500;
                     // 图标逻辑：
-                    //   ✅ 已退出未查看
-                    //   ▁▂▃▅▆▇ 有近期输出（活跃）
-                    //   ✏️ TUI 明确等待用户选择/输入：光标可见 + 空闲 + 有历史输出
-                    //      （光标隐藏 = TUI 在动画/输出中，不算等待输入）
+                    //   ❌ 已退出
+                    //   🔄 会话启动中 / 正在输出
+                    //   ✏️ TUI 空闲等待用户输入
+                    //   ✅ 输出结束（本轮对话完成，点击页签后消失）
                     let icon: Option<&str> = if s.exited {
-                        if viewed { None } else { Some("✅") }
+                        Some("❌")
+                    } else if s.loading.load(Ordering::Relaxed) {
+                        Some("🔄")
                     } else if !any_silent && count > 0 {
-                        // 有近期输出 → 活跃动画柱条（TUI 和普通应用通用）
-                        const BARS: &[&str] = &["▁", "▂", "▃", "▅", "▆", "▇"];
-                        let idx = (now_ms / 300) as usize % BARS.len();
-                        Some(BARS[idx])
+                        // 正在输出 → 🔄
+                        Some("🔄")
                     } else if is_tui && cursor_vis && content_silent && count > 0 {
-                        // TUI 空闲 + 光标可见 = 明确等待用户选择/输入
+                        // TUI 空闲 + 光标可见 = 等待用户输入
                         Some("✏️")
+                    } else if count > 0 && !viewed {
+                        // 输出已结束 + 未查看 → ✅
+                        Some("✅")
                     } else {
                         None
                     };
-                    let title = if s.exited {
-                        format!("{} (已退出)", s.title)
-                    } else {
-                        s.title.clone()
-                    };
+                    let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
                     // 本页签当前启动命令（切换菜单里勾选当前项）。
