@@ -129,7 +129,6 @@ pub struct Session {
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
 #[derive(Clone)]
 pub struct SessionListener {
-    writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     redraw: std::sync::mpsc::SyncSender<()>,
     ctx: eframe::egui::Context,
     /// 本会话是否为前台页签：后台会话的输出不唤醒 UI，刷新靠基线轮询。
@@ -138,14 +137,12 @@ pub struct SessionListener {
 
 impl EventListener for SessionListener {
     fn send_event(&self, event: Event) {
-        // Event::PtyWrite：仿真器对探测的自发应答默认丢弃（应答权归 reply_to_queries），
-        // 但主 DA 应答 \x1b[?6c 必须放行——新版 conpty 启动握手会等它，不给就不吐输出。
-        // （其余应答经 ConPTY 输入引擎时序错位时会被当键盘文本打进子进程。）
-        if let Event::PtyWrite(text) = &event {
-            if text == "\x1b[?6c" {
-                let _ = self.writer.try_send(text.as_bytes().to_vec());
-            }
-        } else if let Event::ClipboardStore(_, text) = &event {
+        // Event::PtyWrite：仿真器对探测的自发应答一律丢弃。
+        // 旧版曾放行主 DA 应答 \x1b[?6c（认为 conpty 握手需要），
+        // 但实测 ConPTY 输入引擎处理 DA 时会把 'c' 字符回显到 PTY 输出，
+        // 导致 pi/vim 等启动时光标位置多出一个 'C'。ConPTY 自身已能
+        // 处理 DA 握手，宿主无需代答。应答权统一归 reply_to_queries。
+        if let Event::ClipboardStore(_, text) = &event {
             // opencode 等 TUI 的 OSC 52 复制：直接写系统剪贴板。egui Context 线程安全。
             self.ctx.copy_text(text.clone());
         }
@@ -451,7 +448,6 @@ pub fn spawn(
     let foreground = Arc::new(AtomicBool::new(false));
     let listener_fg = foreground.clone();
     let listener = SessionListener {
-        writer: writer_tx.clone(),
         redraw,
         ctx,
         foreground: listener_fg,
@@ -699,13 +695,12 @@ mod tests {
     #[test]
     fn reply_to_queries_standard() {
         let listener = SessionListener {
-            writer: std::sync::mpsc::sync_channel(1).0,
             redraw: std::sync::mpsc::sync_channel(1).0,
             ctx: eframe::egui::Context::default(),
             foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
-        // 主 DA 与 XTVERSION 有意不应答（会泄漏成键盘输入，见函数注释）；
+        // 主 DA 与 XTVERSION 有意不应答（泄漏为键盘输入，见函数注释）；
         // DSR/DECRQM/kitty/像素尺寸照常应答。
         let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
         let r = reply_to_queries(&term, bytes, true).unwrap().0;
@@ -736,28 +731,20 @@ mod tests {
     /// 其余（DSR/DECRQM/键盘模式等）必须丢弃——应答权归 reply_to_queries，
     /// 否则经 ConPTY 输入引擎时序错位会被当键盘文本打进子进程。
     #[test]
-    fn listener_drops_emulator_pty_writes() {
-        let (wtx, wrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+    fn listener_drops_all_pty_writes() {
         let listener = SessionListener {
-            writer: wtx,
             redraw: std::sync::mpsc::sync_channel(1).0,
             ctx: eframe::egui::Context::default(),
             foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         use alacritty_terminal::event::Event;
-        // 主 DA 应答：放行（conpty 启动握手等它，不给则不吐输出）。
+        // 所有 PtyWrite 一律丢弃：主 DA、DSR、键盘模式等。
+        // ConPTY 自身处理 DA 握手，宿主代答会导致 'c' 字符回显泄漏。
         listener.send_event(Event::PtyWrite("\x1b[?6c".to_string()));
-        assert!(
-            wrx.recv_timeout(std::time::Duration::from_millis(100)).is_ok(),
-            "主 DA 应答 \\x1b[?6c 必须放行"
-        );
-        // 其余应答：丢弃。
         listener.send_event(Event::PtyWrite("\x1b[1;1R".to_string()));
         listener.send_event(Event::PtyWrite("\x1b[?0u".to_string()));
-        assert!(
-            wrx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
-            "DSR/键盘模式等仿真器自发应答应被丢弃，不应写入 PTY"
-        );
+        // 没有 writer 通道，PtyWrite 事件不应触发任何写入。
+        // 此处验证不 panic 即可（无 writer 字段，事件被完全忽略）。
     }
 
     /// 宽字符由前导格+随空格两格组成；程序（如 nvim）把光标左移一格时光标会
