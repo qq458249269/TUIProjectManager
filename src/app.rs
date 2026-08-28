@@ -2586,7 +2586,7 @@ impl eframe::App for ClientApp {
             },
         );
         let base_ms = if has_recent_input {
-            16 // 打字时 60fps：按键回显延迟 <16ms
+            33 // 打字时 30fps：前台激活页签上限，节省资源
         } else if has_output {
             50 // 有近期输出（TUI动画等）：33fps，比旧版300ms流畅很多
         } else {
