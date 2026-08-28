@@ -395,6 +395,10 @@ pub struct ClientApp {
     drag_command: Option<usize>,
     /// 点击「启动」待 spawn 的会话（下一帧会话页签布局里按精确尺寸启动）。
     pending_launch: Vec<PendingLaunch>,
+    /// 后台线程正在 spawn 的会话：(title, is_restore)。每帧轮询通道收结果。
+    spawning: Vec<(String, bool)>,
+    /// 后台 spawn 完成的结果通道。
+    spawn_rx: Option<Receiver<(Result<Session, String>, bool)>>,
     /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
     pending_restore: Vec<PendingLaunch>,
     /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
@@ -404,6 +408,8 @@ pub struct ClientApp {
     last_term_size: (u16, u16),
     /// 原生窗口句柄：每帧轮询确保标题栏始终深色（防御 WM_SETTINGCHANGE 重置）。
     titlebar_hwnd: isize,
+    /// 上一次实际生效的主题深浅：跟随系统时每帧对比，系统主题变化即重应用。
+    last_theme_dark: bool,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
 
@@ -414,13 +420,27 @@ pub struct ClientApp {
     /// 页签标题排版宽度缓存：title → 宽度。标题几乎不变，避免每页签每帧
     /// 一次全量 layout_no_wrap 测宽。
     title_width_cache: HashMap<String, f32>,
+    /// pi 模型配置（编辑态）。
+    pi_models: config::ModelsConfig,
+    /// oh-my-pi 模型配置（编辑态）。
+    omp_models: config::ModelsConfig,
+    /// 模型设置是否展开编辑。
+    model_settings_open: bool,
 }
 
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
         let config = config::load();
-        apply_theme(&cc.egui_ctx, config.settings.dark_mode);
+        let initial_dark = config.settings.dark_mode;
+        apply_theme(
+            &cc.egui_ctx,
+            if config.settings.follow_system {
+                matches!(cc.egui_ctx.system_theme(), None | Some(egui::Theme::Dark))
+            } else {
+                config.settings.dark_mode
+            },
+        );
         let titlebar_hwnd = hwnd_of(cc);
         // 手动设一次保证首帧即黑。再发一次 SetTheme(Dark)：winit 0.30 的 set_theme
         // 不更新内部 preferred_theme（build 时为 None），WM_SETTINGCHANGE 时它会把
@@ -464,13 +484,19 @@ impl ClientApp {
             drag_command: None,
             pending_launch: Vec::new(),
             pending_restore: Vec::new(),
+            spawning: Vec::new(),
+            spawn_rx: None,
             restore_active: None,
             last_term_size: (80, 24),
             titlebar_hwnd,
+            last_theme_dark: initial_dark,
 
             ctx,
             dir_exists_cache: HashMap::new(),
             title_width_cache: HashMap::new(),
+            pi_models: config::load_pi_models(),
+            omp_models: config::load_omp_models(),
+            model_settings_open: false,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -558,7 +584,7 @@ impl ClientApp {
         }
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
-                if s.dir == project.path && !s.exited {
+                if s.dir == project.path && !s.exited.load(Ordering::Relaxed) {
                     self.current = i;
                     self.term_focused = true;
                     self.status = Some(format!("已切换到会话: {}", s.title));
@@ -652,7 +678,7 @@ impl ClientApp {
         ) {
             Ok(sess) => {
                 sess.theme_dark
-                    .store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
+                    .store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
                 self.tabs.push(Tab::Session(sess));
                 self.current = self.tabs.len() - 1;
                 self.term_focused = true;
@@ -754,15 +780,14 @@ impl ClientApp {
         let mut changed = false;
         for tab in self.tabs.iter_mut() {
             if let Tab::Session(s) = tab {
-                if !s.exited {
-                    // 解析线程 panic（畸形逃逸序列等）后 term 锁变为 poisoned，
-                    // 该会话已无法渲染，视同退出——避免黑屏页签占着不报。
-                    // 注意：不能用 try_read().is_err()，因为 WouldBlock（锁被占用）
-                    // 也会返回 Err，导致正在输出的会话被误判为退出。
-                    let poisoned = s.term.read().is_err();
-                    let exited = poisoned || matches!(s.child.try_wait(), Ok(Some(_)));
-                    if exited {
-                        s.exited = true;
+                if !s.exited.load(Ordering::Relaxed) {
+                    // reader 线程退出时设置 exited 标志（无需 term 锁）。
+                    // 兜底：子进程也已退出时同样标记。
+                    let child_exited = matches!(s.child.try_wait(), Ok(Some(_)));
+                    if child_exited {
+                        s.exited.store(true, Ordering::Relaxed);
+                    }
+                    if s.exited.load(Ordering::Relaxed) {
                         changed = true;
                     }
                 }
@@ -950,6 +975,8 @@ impl ClientApp {
                     let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
                     let last_content = s.last_content_ms.load(Ordering::Relaxed);
                     let content_silent = now_ms.saturating_sub(last_content) > 500;
+                    // 内容新鲜度：最近 3 秒内有过可打印内容输出 → TUI 活跃。
+                    let content_fresh = now_ms.saturating_sub(last_content) < 3000;
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let any_silent = now_ms.saturating_sub(last_out) > 500;
@@ -958,15 +985,16 @@ impl ClientApp {
                     //   🔄 会话启动中 / 正在输出
                     //   ✏️ TUI 空闲等待用户输入
                     //   ✅ 输出结束（本轮对话完成，点击页签后消失）
-                    let icon: Option<&str> = if s.exited {
+                    let icon: Option<&str> = if s.exited.load(Ordering::Relaxed) {
                         Some("❌")
                     } else if s.loading.load(Ordering::Relaxed) {
                         Some("🔄")
                     } else if !any_silent && count > 0 {
                         // 正在输出 → 🔄
                         Some("🔄")
-                    } else if is_tui && cursor_vis && content_silent && count > 0 {
-                        // TUI 空闲 + 光标可见 = 等待用户输入
+                    } else if is_tui && cursor_vis && content_silent && content_fresh && count > 0 {
+                        // TUI 空闲 + 光标可见 + 近期有内容输出 = 等待用户输入
+                        // （排除会话结束后 shell 空闲停在提示符的情况）
                         Some("✏️")
                     } else if count > 0 && !viewed {
                         // 输出已结束 + 未查看 → ✅
@@ -1255,7 +1283,7 @@ impl ClientApp {
         let dir = s.dir.clone();
         let title = s.title.clone();
         let cmd = s.cmd.clone();
-        if !s.exited {
+        if !s.exited.load(Ordering::Relaxed) {
             let _ = s.child.kill();
         }
         self.tabs.remove(idx);
@@ -1270,7 +1298,7 @@ impl ClientApp {
             self.ctx.clone(),
         ) {
             Ok(sess) => {
-                sess.theme_dark.store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
+                sess.theme_dark.store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
                 self.tabs.insert(idx, Tab::Session(sess));
                 self.current = idx;
                 self.term_focused = true;
@@ -1292,8 +1320,17 @@ impl ClientApp {
 
     /// 通知所有会话当前主题：更新应答器用的标志，并主动广播 OSC 10/11 颜色
     /// （opencode 等 TUI 启动时会查询终端颜色来匹配自己的配色）。
+    /// 当前实际生效的主题深浅：跟随系统时取系统偏好，否则取用户设置。
+    fn effective_dark(&self) -> bool {
+        if self.config.settings.follow_system {
+            matches!(self.ctx.system_theme(), None | Some(egui::Theme::Dark))
+        } else {
+            self.config.settings.dark_mode
+        }
+    }
+
     fn broadcast_theme(&mut self) {
-        let dark = self.config.settings.dark_mode;
+        let dark = self.effective_dark();
         // rgb 分量必须是 1~4 位十六进制（X 约定，表示 16 位值）：之前发 6 位
         // （"rgb:ffffff/…"）是非法格式，opencode 解析出错值后用坏调色板重绘，
         // 表现为字体颜色错、文字残缺、栅格乱，且切回主题也不恢复。
@@ -1311,11 +1348,10 @@ impl ClientApp {
                 s.caret_scan = None;
                 s.cached_render_shapes = None;
                 s.cached_ansi_rgb = None;
-                s.snapshot_gen = 0; // 强制下一帧全量重绘
                 // 只推给应答过 OSC 10/11/4 颜色查询的会话（opencode 等）。
                 // shell/cmd 从不查询这类序列，收到 `ESC]10;...ESC\` 会把 OSC 终止符
                 // 的 `\` 直接回显成“自动输入了反斜杠”，不能广播。
-                if !s.exited
+                if !s.exited.load(Ordering::Relaxed)
                     && s.osc_theme_aware
                         .load(std::sync::atomic::Ordering::Relaxed)
                 {
@@ -1335,7 +1371,7 @@ impl ClientApp {
         }
         let dir = s.dir.clone();
         let title = s.title.clone();
-        if !s.exited {
+        if !s.exited.load(Ordering::Relaxed) {
             let _ = s.child.kill();
         }
         self.tabs.remove(idx);
@@ -1352,7 +1388,7 @@ impl ClientApp {
         ) {
             Ok(sess) => {
                 sess.theme_dark
-                    .store(self.config.settings.dark_mode, std::sync::atomic::Ordering::Relaxed);
+                    .store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
                 self.tabs.insert(idx, Tab::Session(sess));
                 self.current = idx;
                 self.term_focused = true;
@@ -1453,16 +1489,35 @@ impl ClientApp {
                             }
                         });
                     });
-                // 主题切换按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
-                let dark = self.config.settings.dark_mode;
-                let theme_btn = if dark {
-                    ui.button("☀ 浅色").on_hover_text("切换到浅色主题，字体与颜色同步切换")
+                // 主题切换按钮：深色 → 浅色 → 跟随系统 → 深色 轮转。
+                // 只响应鼠标点击，防止键盘方向键选中后回车误触发。
+                let (fs, dark) = (
+                    self.config.settings.follow_system,
+                    self.effective_dark(),
+                );
+                let label = if fs {
+                    "🎨 跟随系统"
+                } else if dark {
+                    "🌙 深色"
                 } else {
-                    ui.button("🌙 深色").on_hover_text("切换到深色主题，字体与颜色同步切换")
+                    "☀ 浅色"
                 };
+                let theme_btn = ui
+                    .button(label)
+                    .on_hover_text("点击切换：深色 → 浅色 → 跟随系统（随 Windows 深浅自动切换）");
                 if theme_btn.clicked() && ui.input(|i| i.pointer.any_click()) {
-                    self.config.settings.dark_mode = !dark;
-                    apply_theme(ui.ctx(), self.config.settings.dark_mode);
+                    if fs {
+                        // 跟随系统 → 切回固定深色。
+                        self.config.settings.follow_system = false;
+                        self.config.settings.dark_mode = true;
+                    } else if dark {
+                        // 深色 → 浅色。
+                        self.config.settings.dark_mode = false;
+                    } else {
+                        // 浅色 → 跟随系统。
+                        self.config.settings.follow_system = true;
+                    }
+                    apply_theme(ui.ctx(), self.effective_dark());
                     self.save_config("已切换主题".to_string());
                     // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色（
                     // opencode 等 TUI 会据此匹配自己的配色）。
@@ -1986,12 +2041,265 @@ impl ClientApp {
             self.save_config("设置已自动保存".to_string());
         }
         ui.add_space(12.0);
-        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n✏️ = TUI 等待选择，✅ = 输出结束待查看，点击页签后消失。").weak());
+        ui.separator();
+        ui.add_space(6.0);
+        // ── 模型配置 ──
+        ui.horizontal(|ui| {
+            let arrow = if self.model_settings_open { "▼" } else { "▶" };
+            if ui
+                .button(format!("{arrow} 模型配置"))
+                .on_hover_text("配置 pi / oh-my-pi 的模型参数")
+                .clicked()
+            {
+                self.model_settings_open = !self.model_settings_open;
+            }
+        });
+        if self.model_settings_open {
+            self.model_settings_ui(ui);
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
         ui.add_space(12.0);
         if ui.button("← 返回项目列表").clicked() {
             self.screen = Screen::Main;
+        }
+    }
+
+    fn model_settings_ui(&mut self, ui: &mut egui::Ui) {
+        // ── pi 配置 ──
+        ui.label(RichText::new("pi 模型配置").strong());
+        ui.label(
+            RichText::new(format!("路径: {}", config::pi_models_path().display()))
+                .weak()
+                .small(),
+        );
+        let mut pi_dirty = false;
+        // providers 列表
+        let pi_keys: Vec<String> = self.pi_models.providers.keys().cloned().collect();
+        for key in &pi_keys {
+            if let Some(provider) = self.pi_models.providers.get_mut(key) {
+                ui.indent(key, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Provider:");
+                        ui.label(RichText::new(key).strong());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("baseUrl:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut provider.base_url)
+                                    .desired_width(320.0),
+                            )
+                            .changed()
+                        {
+                            pi_dirty = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("apiKey:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut provider.api_key)
+                                    .desired_width(320.0),
+                            )
+                            .changed()
+                        {
+                            pi_dirty = true;
+                        }
+                    });
+                    // models 列表
+                    let mut model_remove: Option<usize> = None;
+                    for (mi, model) in provider.models.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Model[{}]:", mi));
+                            ui.label("id:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut model.id).desired_width(60.0),
+                                )
+                                .changed()
+                            {
+                                pi_dirty = true;
+                            }
+                            ui.label("name:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut model.name)
+                                        .desired_width(100.0),
+                                )
+                                .changed()
+                            {
+                                pi_dirty = true;
+                            }
+                            ui.label("context:");
+                            let mut ctx_str = model.context_window.to_string();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut ctx_str)
+                                        .desired_width(80.0),
+                                )
+                                .changed()
+                            {
+                                if let Ok(v) = ctx_str.parse() {
+                                    model.context_window = v;
+                                    pi_dirty = true;
+                                }
+                            }
+                            ui.label("max:");
+                            let mut max_str = model.max_tokens.to_string();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut max_str)
+                                        .desired_width(80.0),
+                                )
+                                .changed()
+                            {
+                                if let Ok(v) = max_str.parse() {
+                                    model.max_tokens = v;
+                                    pi_dirty = true;
+                                }
+                            }
+                            if ui.small_button("×").clicked() {
+                                model_remove = Some(mi);
+                            }
+                        });
+                    }
+                    if let Some(mi) = model_remove {
+                        provider.models.remove(mi);
+                        pi_dirty = true;
+                    }
+                    if ui.button("+ 添加模型").clicked() {
+                        provider
+                            .models
+                            .push(config::ModelEntry::default());
+                        pi_dirty = true;
+                    }
+                });
+            }
+        }
+        ui.add_space(4.0);
+        ui.separator();
+        // ── oh-my-pi 配置 ──
+        ui.label(RichText::new("oh-my-pi 模型配置").strong());
+        ui.label(
+            RichText::new(format!("路径: {}", config::omp_models_path().display()))
+                .weak()
+                .small(),
+        );
+        let mut omp_dirty = false;
+        let omp_keys: Vec<String> = self.omp_models.providers.keys().cloned().collect();
+        for key in &omp_keys {
+            if let Some(provider) = self.omp_models.providers.get_mut(key) {
+                ui.indent(key, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Provider:");
+                        ui.label(RichText::new(key).strong());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("baseUrl:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut provider.base_url)
+                                    .desired_width(320.0),
+                            )
+                            .changed()
+                        {
+                            omp_dirty = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("apiKey:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut provider.api_key)
+                                    .desired_width(320.0),
+                            )
+                            .changed()
+                        {
+                            omp_dirty = true;
+                        }
+                    });
+                    let mut model_remove: Option<usize> = None;
+                    for (mi, model) in provider.models.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Model[{}]:", mi));
+                            ui.label("id:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut model.id).desired_width(60.0),
+                                )
+                                .changed()
+                            {
+                                omp_dirty = true;
+                            }
+                            ui.label("name:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut model.name)
+                                        .desired_width(100.0),
+                                )
+                                .changed()
+                            {
+                                omp_dirty = true;
+                            }
+                            ui.label("context:");
+                            let mut ctx_str = model.context_window.to_string();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut ctx_str)
+                                        .desired_width(80.0),
+                                )
+                                .changed()
+                            {
+                                if let Ok(v) = ctx_str.parse() {
+                                    model.context_window = v;
+                                    omp_dirty = true;
+                                }
+                            }
+                            ui.label("max:");
+                            let mut max_str = model.max_tokens.to_string();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut max_str)
+                                        .desired_width(80.0),
+                                )
+                                .changed()
+                            {
+                                if let Ok(v) = max_str.parse() {
+                                    model.max_tokens = v;
+                                    omp_dirty = true;
+                                }
+                            }
+                            if ui.small_button("×").clicked() {
+                                model_remove = Some(mi);
+                            }
+                        });
+                    }
+                    if let Some(mi) = model_remove {
+                        provider.models.remove(mi);
+                        omp_dirty = true;
+                    }
+                    if ui.button("+ 添加模型").clicked() {
+                        provider
+                            .models
+                            .push(config::ModelEntry::default());
+                        omp_dirty = true;
+                    }
+                });
+            }
+        }
+        // 自动保存
+        if pi_dirty {
+            if let Err(e) = config::save_pi_models(&self.pi_models) {
+                self.status = Some(format!("pi 配置保存失败: {e}"));
+            }
+        }
+        if omp_dirty {
+            if let Err(e) = config::save_omp_models(&self.omp_models) {
+                self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
+            }
         }
     }
 
@@ -2177,7 +2485,7 @@ impl eframe::App for ClientApp {
                 .iter()
                 .skip(1)
                 .filter_map(|t| match t {
-                    Tab::Session(s) if !s.exited => Some(s.dir.clone()),
+                    Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.dir.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -2192,6 +2500,17 @@ impl eframe::App for ClientApp {
         // 只调 DwmSetWindowAttribute（不调 refresh_titlebar），不干扰 hover 跟踪。
         if !is_titlebar_dark(self.titlebar_hwnd) {
             set_dwm_dark(self.titlebar_hwnd);
+        }
+
+        // 跟随系统：系统深浅变化时重应用主题并广播到所有会话。
+        let cur_dark = self.effective_dark();
+        if cur_dark != self.last_theme_dark {
+            self.last_theme_dark = cur_dark;
+            apply_theme(ctx, cur_dark);
+            self.broadcast_theme();
+            self.theme_settle_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+            ctx.request_repaint();
         }
 
         // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
@@ -2211,7 +2530,6 @@ impl eframe::App for ClientApp {
                         s.caret_scan = None;
                         s.cached_render_shapes = None;
                         s.cached_ansi_rgb = None;
-                        s.snapshot_gen = 0;
                     }
                 }
                 ctx.request_repaint();
@@ -2255,6 +2573,11 @@ impl eframe::App for ClientApp {
             1000 // 空闲：1fps
         };
         ctx.request_repaint_after(std::time::Duration::from_millis(base_ms));
+        // 前台有终端会话时，强制每秒至少重绘一次：
+        // 即使 reader 线程偶尔长时间持锁，UI 也不会完全冻结。
+        if self.tabs.iter().any(|t| matches!(t, Tab::Session(s) if !s.exited.load(Ordering::Relaxed))) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
@@ -2299,73 +2622,97 @@ impl eframe::App for ClientApp {
         egui::CentralPanel::default().show(ui, |ui| {
             // 待启动会话在此 spawn：中央面板布局已定，ui.available_size() 即终端真实
             // 面积，按它算行列数启动，TUI 首帧即按最终尺寸画整屏页，无需 resize 纠正。
+            // spawn 移到后台线程：ConPTY 初始化 + 子进程创建会阻塞 UI 数百毫秒，
+            // 导致首帧卡死、点击/键盘事件全部丢失。
             let pending = std::mem::take(&mut self.pending_launch);
             if !pending.is_empty() {
                 let geom = terminal::term_grid_size(ui);
+                let (cols, rows) = geom.unwrap_or((80, 24));
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.spawn_rx = Some(rx);
                 for p in pending {
-                    let (cols, rows) = geom.unwrap_or((80, 24));
-                    match session::spawn(
-                        &p.title,
-                        &p.dir,
-                        &p.cmd,
-                        cols as u16,
-                        rows as u16,
-                        self.redraw_tx.clone(),
-                        self.ctx.clone(),
-                    ) {
+                    let title = p.title.clone();
+                    let redraw = self.redraw_tx.clone();
+                    let ctx = self.ctx.clone();
+                    let tx = tx.clone();
+                    self.spawning.push((title, false));
+                    std::thread::spawn(move || {
+                        let result = session::spawn(
+                            &p.title, &p.dir, &p.cmd,
+                            cols as u16, rows as u16,
+                            redraw, ctx,
+                        );
+                        let _ = tx.send((result, false));
+                    });
+                }
+                self.screen = Screen::Main;
+                self.check_updates(true);
+            }
+            // 轮询后台 spawn 结果。
+            if let Some(rx) = &self.spawn_rx {
+                let mut restored = 0usize;
+                while let Ok((result, is_restore)) = rx.try_recv() {
+                    self.spawning.pop();
+                    match result {
                         Ok(sess) => {
                             sess.theme_dark.store(
-                                self.config.settings.dark_mode,
+                                self.effective_dark(),
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                             self.tabs.push(Tab::Session(sess));
-                            self.current = self.tabs.len() - 1;
-                            self.term_focused = true;
-                            self.screen = Screen::Main;
-                            self.status = Some(format!("已启动: {}", p.title));
+                            if is_restore {
+                                restored += 1;
+                            } else {
+                                self.current = self.tabs.len() - 1;
+                                self.term_focused = true;
+                                self.screen = Screen::Main;
+                                self.status = Some("已启动".to_string());
+                            }
                         }
                         Err(e) => {
                             self.status = Some(format!("启动失败: {e}"));
                         }
                     }
                 }
-                self.check_updates(true);
+                // 恢复完成后应用上次激活页签。
+                if restored > 0 {
+                    if let Some(active) = self.restore_active.take() {
+                        self.current = active.min(self.tabs.len() - 1);
+                        self.term_focused = self.current != 0;
+                    }
+                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+                }
+                if self.spawning.is_empty() {
+                    self.spawn_rx = None;
+                }
             }
 
-            // 启动时恢复上次的会话：同样等首帧会话页签布局按精确尺寸启动。
+            // 启动时恢复上次的会话：后台线程 spawn，避免阻塞首帧。
             let pending = std::mem::take(&mut self.pending_restore);
             if !pending.is_empty() {
                 let geom = terminal::term_grid_size(ui);
-                let mut restored = 0usize;
+                let (cols, rows) = geom.unwrap_or((80, 24));
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.spawn_rx = Some(rx);
+                let restore_count = pending.len();
                 for p in pending {
-                    let (cols, rows) = geom.unwrap_or((80, 24));
-                    match session::spawn(
-                        &p.title,
-                        &p.dir,
-                        &p.cmd,
-                        cols as u16,
-                        rows as u16,
-                        self.redraw_tx.clone(),
-                        self.ctx.clone(),
-                    ) {
-                        Ok(sess) => {
-                            sess.theme_dark.store(
-                                self.config.settings.dark_mode,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            self.tabs.push(Tab::Session(sess));
-                            restored += 1;
-                        }
-                        Err(_) => {}
-                    }
+                    let title = p.title.clone();
+                    let redraw = self.redraw_tx.clone();
+                    let ctx = self.ctx.clone();
+                    let tx = tx.clone();
+                    self.spawning.push((title, true));
+                    std::thread::spawn(move || {
+                        let result = session::spawn(
+                            &p.title, &p.dir, &p.cmd,
+                            cols as u16, rows as u16,
+                            redraw, ctx,
+                        );
+                        let _ = tx.send((result, true));
+                    });
                 }
-                if let Some(active) = self.restore_active.take() {
-                    self.current = active.min(self.tabs.len() - 1);
-                    self.term_focused = self.current != 0;
-                }
-                if restored > 0 {
-                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
-                }
+                // 恢复的会话数已知，等后台线程完成后一次性应用 restore_active。
+                // 先记下待恢复数，spawn_rx 轮询时消费。
+                let _ = restore_count;
             }
 
             if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
@@ -2376,7 +2723,7 @@ impl eframe::App for ClientApp {
                 // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
                 // catch_unwind 捕获后关闭该页签，整个软件继续运行。
                 let (dark, status, term_focused) = (
-                    self.config.settings.dark_mode,
+                    self.effective_dark(),
                     &mut self.status,
                     &mut self.term_focused,
                 );

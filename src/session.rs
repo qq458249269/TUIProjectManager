@@ -10,13 +10,57 @@ use std::os::windows::ffi::OsStrExt;
 
 
 use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange};
 use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::sync::atomic::AtomicPtr;
+
+// ── 无锁快照：reader 线程生成，UI 线程通过 AtomicPtr 加载，零锁竞争 ──
+
+/// 终端渲染快照：包含 UI 渲染一帧所需的全部数据。
+#[allow(dead_code)]
+/// reader 线程在处理完 PTY 输出后生成，通过 AtomicPtr 原子交换给 UI 线程。
+pub struct TermSnapshot {
+    /// 可见格子 (point, cell)。
+    pub cells: Vec<(Point, Cell)>,
+    /// 显示偏移。
+    pub offset: usize,
+    /// 光标位置。
+    pub cursor_point: Point,
+    /// 光标形状。
+    pub cursor_shape: CursorShape,
+    /// 选区（用于复制和渲染）。
+    pub selection: Option<TermSelection>,
+    /// 选区范围（用于渲染高亮）。
+    pub sel_range: Option<SelectionRange>,
+    /// 选中的文本（用于复制）。
+    pub selected_text: Option<String>,
+    /// 光标是否可见。
+    pub show_cursor: bool,
+    /// 调色盘。
+    pub colors: Colors,
+    /// 终端模式标志。
+    pub mode: TermMode,
+    /// 光标格的字符和标志（Block 光标反色重绘用）。
+    pub cursor_cell_char: char,
+    pub cursor_cell_flags: alacritty_terminal::term::cell::Flags,
+}
+
+#[allow(dead_code)]
+/// UI → reader 线程的命令：滚动、调整大小、选区更新。
+/// reader 线程在处理 PTY 输出的间隙消费这些命令。
+pub enum TermCommand {
+    Scroll(Scroll),
+    Resize { cols: usize, rows: usize },
+    UpdateSelection(Option<TermSelection>),
+}
 
 /// 回显延迟探针统计（TUIPM_LATENCY_DEBUG=1 启用）：总耗时/次数/峰值，全局共享。
 static ECHO_SUM_US: AtomicU64 = AtomicU64::new(0);
@@ -36,8 +80,13 @@ pub struct Session {
     pub dir: String,
     /// 本页签启动用的 TUI 命令（切命令后用于标记当前项/重载）。
     pub cmd: String,
-    /// 终端仿真状态。
+    /// 终端仿真状态（仅 reader 线程写入）。
     pub term: Arc<RwLock<Term<SessionListener>>>,
+    /// 无锁渲染快照：reader 线程生成，UI 线程通过 load() 零锁读取。
+    pub snapshot: Arc<AtomicPtr<TermSnapshot>>,
+    /// UI → reader 命令通道：滚动/调整大小/选区更新。
+    #[allow(dead_code)]
+    pub cmd_tx: std::sync::mpsc::Sender<TermCommand>,
     /// 向 PTY 写入输入的通道发送端（实际写由专用后台线程执行，
     /// 避免子进程不读取输入时阻塞 UI/解析线程）。
     pub writer: std::sync::mpsc::SyncSender<Vec<u8>>,
@@ -47,6 +96,10 @@ pub struct Session {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
     /// 上次渲染的网格尺寸，用于检测是否需要 resize。
     pub grid_size: (u16, u16),
+    /// 新会话首次帧需要强制 resize：解决 ConPTY 初始化时序问题。
+    /// spawn 后 ConPTY 管道可能未就绪，子进程输出被阻塞；
+    /// 自动 resize 强制 ConPTY 重新同步，无需用户手动调整窗口。
+    pub needs_resize: bool,
     /// 当前深浅主题（应答 OSC 10/11 颜色查询用，由 UI 线程更新）。
     pub theme_dark: Arc<AtomicBool>,
     /// 是否应答过 OSC 10/11/4 颜色查询（一旦应答，说明该子进程能理解 OSC 颜色，
@@ -55,8 +108,8 @@ pub struct Session {
     /// 本会话是否为前台页签（UI 线程每帧同步 self.current）。后台会话的
     /// 输出仍照常解析（管道不能停读），但不唤醒 UI 重绘。
     pub foreground: Arc<AtomicBool>,
-    /// 子进程是否已退出。
-    pub exited: bool,
+    /// 子进程是否已退出（reader 线程写、UI 线程读，无需 term 锁）。
+    pub exited: Arc<AtomicBool>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
@@ -98,10 +151,6 @@ pub struct Session {
     pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
     /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
     pub snapshot_scratch: Vec<(Point, Cell)>,
-    /// 上次 snapshot 时的 parse_gen 值：未变化时跳过 clone，复用上一帧快照。
-    pub snapshot_gen: u64,
-    /// 本帧有输入发送到 PTY：下一帧强制刷新快照，避免字符回显被跳过。
-    pub pending_input: bool,
     /// 缓存的字体度量：(cell_w, cell_h, ppp)。字号/DPI 不变时跳过 fonts_mut 查询。
     pub cached_metrics: Option<(f32, f32, f32)>,
     /// 静止帧缓存：完整渲染结果（bg_shapes + GPU mesh + fg_shapes），
@@ -119,11 +168,13 @@ pub struct Session {
     /// 会话是否仍在启动中（首次有实际输出后置 false）。
     /// UI 线程据此显示旋转 ⚙️ 加载动画。
     pub loading: Arc<AtomicBool>,
-    /// galley_cache ASCII 快速路径：键 = (char as u8, fg_key, underline)。
+    /// loading 结束后是否已做过 ConPTY 重新同步：首次检测到 loading→false 时触发 resize，
+    /// 强制 ConPTY 重新同步输入管道。解决 OMP 等 TUI 加载完成后输入无响应的问题。
     /// 95 个可打印 ASCII × 8 种颜色量化 × 2 种下划线 = 最多 1520 条，
     /// 固定数组 O(1) 查找，跳过 HashMap 的哈希+比较开销。
     pub ascii_galley_slots:
         Option<[(u64, Option<std::sync::Arc<egui::epaint::Galley>>); 1520]>,
+
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -176,8 +227,12 @@ impl EventListener for SessionListener {
 /// - kitty 键盘协议查询（ESC[?u → 回同样 ESC[?u 表示不支持）
 /// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
 /// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
-/// 不答主 DA 与 XTVERSION。返回 (应答字节, 是否应答了 OSC 颜色查询)。
-/// 查询序列可能跨块被截断，扫描单块即可——探测都发生在启动后的单次写入里。
+/// 主 DA/XTVERSION 不应答（ConPTY 时序错位时泄漏为键盘输入杂字）；
+/// OMP 通过 TERM_PROGRAM 环境变量跳过 DA 查询。
+/// 返回 (应答字节, 是否应答了 OSC 颜色查询)。
+/// 查询序列可能跨块被截断：OMP 等程序的查询序列可能被 read() 切分到
+/// 相邻块中，扫描单块可能漏掉。调用方在外层已做跨块拼接（leftover 缓冲），
+/// 因此此函数只需处理完整/不完整序列即可。
 fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
     // 高吞吐输出（AI 回答流）的绝大多数块根本没有转义序列：
     // 先做一次快速扫描，无 ESC 字节直接返回，省掉逐字节状态扫描。
@@ -257,7 +312,13 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
         }
         let fin = bytes[j];
         i = j + 1;
-        if params == b"6" && fin == b'n' {
+        if (params.is_empty() || params == b"0") && fin == b'c' {
+            // Primary Device Attributes (DA)：不应答。
+            // ConPTY 对 DA 应答的消费时序不稳定——快速启动时响应到达时
+            // ConPTY 输入引擎已过匹配窗口，会把 ESC[?1;2c 泄漏为键盘输入
+            //（表现为终端杂字 C）。改为通过 TERM_PROGRAM 环境变量让 OMP
+            // 识别终端身份、跳过 DA 查询（见 spawn 函数）。
+        } else if params == b"6" && fin == b'n' {
             // DSR 光标位置：汇报视口内光标行列（1-based）。
             let cursor = term.renderable_content().cursor.point;
             out.extend_from_slice(
@@ -266,6 +327,12 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
         } else if params.starts_with(b"?") && fin == b'u' {
             // kitty 键盘协议不支持：按协议回同样的 CSI ? u。
             out.extend_from_slice(b"\x1b[?u");
+        } else if params.starts_with(b"?") && fin == b'S' {
+            // 主键增强查询（OMP/ink 启动时发 \x1b[?2;1;0S）：
+            // 应答"不支持主键增强"(\x1b[?0u)，强制宿主回退传统按键编码。
+            // 若不答，OMP 判定键盘协议未确认，可能丢弃未按协议编码的裸字符 `1`
+            //（深色下不回显、浅色 OSC 后才恢复即为该态）。
+            out.extend_from_slice(b"\x1b[?0u");
         } else if params.starts_with(b"?") && fin == b'p' {
             // DECRQM：1 = 支持且处于该模式，0 = 不识别。
             // 我们能转发 SGR 滚轮（1000/1006）；括号粘贴、同步输出、断字簇按启用答复；
@@ -407,6 +474,10 @@ pub fn spawn(
     // 不设的话会退化成无彩色渲染。
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // TERM_PROGRAM 让 oh-my-posh 等工具识别终端身份，跳过 DA 查询。
+    // 不答 DA（ConPTY 时序错位时响应会泄漏为键盘输入，出现杂字 C）。
+    cmd.env("TERM_PROGRAM", "mintty");
+    cmd.env("TERM_PROGRAM_VERSION", "3.7.5");
     let dir = sanitize(dir);
     if !dir.is_empty() {
         cmd.cwd(Path::new(&dir));
@@ -428,18 +499,33 @@ pub fn spawn(
     // 这个后台线程，不会拖死 UI 线程或持有 term 锁的解析线程。
     // 通道有界，写满时 try_send 丢弃新输入（比阻塞整个程序好）。
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+    let writer_alive = Arc::new(AtomicBool::new(true));
+    let writer_alive_clone = writer_alive.clone();
     std::thread::spawn(move || {
         let mut writer = writer;
+        let mut write_count: u64 = 0;
         // ponytail: TUIPM_LOG_WRITES=1 时把所有写入 PTY 的字节打到 stderr，排查杂散输入用。
         let log_writes = std::env::var("TUIPM_LOG_WRITES").is_ok();
         while let Ok(bytes) = writer_rx.recv() {
             if log_writes {
                 eprintln!("[pty-write] {:?}", String::from_utf8_lossy(&bytes));
             }
-            if writer.write_all(&bytes).is_err() {
-                break;
+            match writer.write_all(&bytes) {
+                Ok(()) => {
+                    let _ = writer.flush();
+                    write_count += 1;
+                }
+                Err(e) => {
+                    // ── writer 线程死亡诊断 ──
+                    // write_all 失败 = PTY 写入管道断裂（子进程退出或管道异常），
+                    // 此后所有 try_send 仍成功但数据永远不会到达 PTY。
+                    writer_alive_clone.store(false, Ordering::Relaxed);
+                    let _ = std::fs::write("writer_died.log",
+                        format!("[WRITER-DIED] write_all failed: {e} (after {write_count} writes, {} bytes)\nlast_bytes: {:?}\n",
+                            bytes.len(), String::from_utf8_lossy(&bytes)));
+                    break;
+                }
             }
-            let _ = writer.flush();
         }
     });
 
@@ -464,10 +550,12 @@ pub fn spawn(
         term_config,
         &TermSize::new(cols as usize, rows as usize),
         listener,
-    );
-
-    // 通知子进程终端尺寸（部分程序需要）。
-    let _ = pair.master.resize(size);
+    );    // 注意：不在 spawn 里调 pair.master.resize(size)。
+    // 子进程已通过 pair.slave.spawn_command() 拿到正确尺寸；
+    // ConPTY 内部会把该尺寸同步给子进程。
+    // 若此处再 resize，会与 show_terminal() 首帧 resize 竞争，
+    // 导致 ConPTY 管道状态不一致（输入卡死）。
+    // 首帧 resize 由 Session.needs_resize 标记触发，保证只发生一次。
 
     // 终端能力查询应答（opencode/opentui 启动时会探测终端交互能力：DSR、
     // DECRQM、XTWINOPS 等）。不回会导致 app 判定“非交互终端”，从而不启用
@@ -476,6 +564,34 @@ pub fn spawn(
     let reply_tx = writer_tx.clone();
     let theme_dark = Arc::new(AtomicBool::new(true));
     let osc_theme_aware = Arc::new(AtomicBool::new(false));
+
+    // OMP/opencode 等 TUI 启动后若不收到一次外部写入，其输入事件循环
+    // 不进入就绪态：按键字节已写入 ConPTY 但 OMP 不回显、不消费，一直
+    // 到切主题（发 OSC10/11）后才恢复。此处 spawn 后立即推一次同款 OSC，
+    // 让输入从一开始就正常。经验证有效（alt-screen 触发点更晚反而失灵，
+    // 必须赶在 OMP 首次渲染前送达）。
+    {
+        let d = theme_dark.load(Ordering::Relaxed);
+        let (fg, bg) = if d { ("ffff", "1616/1616/1a1a") } else { ("0000", "ffff/ffff/ffff") };
+        let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\x1b]11;rgb:{bg}\x1b\\").into_bytes();
+        let _ = writer_tx.try_send(msg);
+    }
+    // 无锁快照 + 命令通道
+    let snapshot = Arc::new(AtomicPtr::new(Box::into_raw(Box::new(TermSnapshot {
+        cells: Vec::new(),
+        offset: 0,
+        cursor_point: Point::new(Line(0), Column(0)),
+        cursor_shape: CursorShape::Block,
+        selection: None,
+        sel_range: None,
+        selected_text: None,
+        show_cursor: true,
+        colors: Colors::default(),
+        mode: TermMode::empty(),
+        cursor_cell_char: ' ',
+        cursor_cell_flags: alacritty_terminal::term::cell::Flags::empty(),
+    }))));
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<TermCommand>();
 
     let output_count = Arc::new(AtomicU32::new(0));
     let loading = Arc::new(AtomicBool::new(true));
@@ -486,12 +602,14 @@ pub fn spawn(
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_content_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
+    let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
     let term = Arc::new(RwLock::new(term));
     let parse_gen = Arc::new(AtomicU64::new(0));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
+        let reader_exited = exited.clone();
         let osc_theme_aware = osc_theme_aware.clone();
         let output_count = output_count.clone();
         let last_output_ms = last_output_ms.clone();
@@ -500,6 +618,8 @@ pub fn spawn(
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
         let parse_gen = parse_gen.clone();
+        let reader_snapshot = snapshot.clone();
+        let reader_cmd_rx = cmd_rx;
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -508,21 +628,27 @@ pub fn spawn(
             let mut parser: Processor = Processor::default();
             let mut buf = [0u8; 0x10_000];
             let mut last_counted_ms: u64 = 0;
-            // 后台页签攒批缓冲：降低加锁频率，减少对前台的锁竞争。
-            let mut pending: Vec<u8> = Vec::new();
-            let mut last_flush = std::time::Instant::now();
-            const BG_BATCH_BYTES: usize = 4096;
-            const BG_BATCH_MS: u64 = 5;
+            // 跨块拼接缓冲：OMP 等程序的终端查询序列可能被 read() 切分到相邻块，
+            // reply_to_queries 逐块扫描会漏掉。保留尾部未完成的转义序列，
+            // 下一块拼接后重扫。
+            let mut query_leftover: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        // 后台攒批剩余数据刷入：单次加锁完成解析。
-                        if !pending.is_empty() {
+                        // 跨块残留一并刷入。
+                        if !query_leftover.is_empty() {
                             parse_gen.fetch_add(1, Ordering::Relaxed);
                             let mut t = term.write().unwrap();
-                            parser.advance(&mut *t, &pending);
-                            pending.clear();
+                            parser.advance(&mut *t, &query_leftover);
+                            let r = reply_to_queries(&mut t, &query_leftover, theme_dark.load(Ordering::Relaxed));
+                            drop(t);
+                            if let Some((reply, osc_color)) = r {
+                                if osc_color { osc_theme_aware.store(true, Ordering::Relaxed); }
+                                let _ = reply_tx.try_send(reply);
+                            }
+                            query_leftover.clear();
                         }
+                        reader_exited.store(true, Ordering::Relaxed);
                         let _ = redraw_reader.send(());
                         break;
                     },
@@ -595,17 +721,52 @@ pub fn spawn(
                         // 分片各加锁一次 + reply_to_queries 再加一次，共 N+1 次；
                         // 合并后只需 1 次，UI 线程 snapshot 等锁的阻塞时间大幅缩短。
                         let is_fg = reader_fg.load(Ordering::Relaxed);
-                        if is_fg {
+                        // 跨块拼接：把上次残留的未完成转义序列拼到本次块前面，
+                        // 保证 reply_to_queries 能识别被 read() 切断的查询。
+                        let merged: Vec<u8> = if query_leftover.is_empty() {
+                            buf[..n].to_vec()
+                        } else {
+                            query_leftover.extend_from_slice(&buf[..n]);
+                            std::mem::take(&mut query_leftover)
+                        };
+                        // 提取尾部未完成的转义序列：从最后一个 ESC 开始到块尾
+                        // 若该段不含 CSI/OSC 终结字节，则是不完整的，保留到下块。
+                        query_leftover.clear();
+                        if let Some(last_esc) = merged.iter().rposition(|&b| b == 0x1b) {
+                            let tail = &merged[last_esc..];
+                            let complete = if tail.len() >= 2 && tail[1] == b'[' {
+                                tail[2..].iter().any(|&b| (0x40..=0x7e).contains(&b))
+                            } else if tail.len() >= 2 && tail[1] == b']' {
+                                tail[2..].iter().any(|&b| b == 0x07)
+                                    || tail.windows(2).any(|w| w[0] == 0x1b && w[1] == b'\\')
+                            } else {
+                                tail.len() >= 2
+                            };
+                            if !complete {
+                                query_leftover.extend_from_slice(tail);
+                            }
+                        }
+                        // ── 分块处理：每次最多 CHUNK_SIZE 字节后释放 term 锁，
+                        //    让 UI 线程有机会获取读锁做渲染/响应输入。
+                        //    VT parser 内部状态（部分序列缓冲）独立于 term 锁，
+                        //    分块不会破坏解析连续性。
+                        //    块大小 1KB：解析耗时 <0.1ms，释放锁间隙足够 UI 拿读锁，
+                        //    无需 sleep 让步（消除 CPU 空转）。
+                        const CHUNK_SIZE: usize = 1024;
+                        let data: &[u8] = if is_fg { &merged } else { &buf[..n] };
+                        let mut offset = 0usize;
+                        while offset < data.len() {
+                            let end = (offset + CHUNK_SIZE).min(data.len());
+                            let chunk = &data[offset..end];
                             let reply = {
                                 let mut t = term.write().unwrap();
-                                // 整块一次性喂入解析器（parser 内部自己处理块边界）。
-                                parser.advance(&mut *t, &buf[..n]);
+                                parser.advance(&mut *t, chunk);
                                 let r = reply_to_queries(
                                     &mut t,
-                                    &buf[..n],
+                                    chunk,
                                     theme_dark.load(Ordering::Relaxed),
                                 );
-                                r // t 在此作用域结束时 drop，释放 term 锁
+                                r
                             }; // ← term 锁在此释放
                             if let Some((reply, osc_color)) = reply {
                                 if osc_color {
@@ -613,32 +774,79 @@ pub fn spawn(
                                 }
                                 let _ = reply_tx.try_send(reply);
                             }
-                            // 锁已释放，send 不会与 UI 线程 term.read() 死锁
+                            offset = end;
+                        }
+                        // ── 处理 UI 命令（滚动/调整大小/选区）──
+                        while let Ok(cmd) = reader_cmd_rx.try_recv() {
+                            if let Ok(mut t) = term.write() {
+                                match cmd {
+                                    TermCommand::Scroll(s) => t.scroll_display(s),
+                                    TermCommand::Resize { cols, rows } => {
+                                        t.resize(TermSize::new(cols, rows));
+                                    }
+                                    TermCommand::UpdateSelection(sel) => {
+                                        t.selection = sel;
+                                    }
+                                }
+                            }
+                        }
+                        // ── 生成无锁快照：短暂加锁克隆可见格子 + 元数据，
+                        //    然后通过 AtomicPtr 原子交换给 UI 线程。UI 线程
+                        //    load() 时零锁竞争，彻底消除渲染卡顿。
+                        {
+                            if let Ok(t) = term.read() {
+                                let content = t.renderable_content();
+                                let offset_val = content.display_offset;
+                                let colors = content.colors.clone();
+                                let cursor = content.cursor;
+                                let selection = t.selection.clone();
+                                let sel = selection.as_ref().and_then(|s| s.to_range(&t));
+                                let selected_text = t.selection_to_string();
+                                let show = t.mode().contains(TermMode::SHOW_CURSOR);
+                                let mode = *t.mode();
+                                let cpoint = cursor.point;
+                                let (cc, cf) = {
+                                    let cell = &t.grid()[cpoint];
+                                    (cell.c, cell.flags)
+                                };
+                                // 只克隆可见行的格子
+                                let mut cells = Vec::new();
+                                for indexed in content.display_iter {
+                                    let p = indexed.point;
+                                    let vline = p.line.0 + offset_val as i32;
+                                    if vline >= 0 {
+                                        cells.push((p, indexed.cell.clone()));
+                                    }
+                                }
+                                let new_snap = Box::into_raw(Box::new(TermSnapshot {
+                                    cells,
+                                    offset: offset_val,
+                                    cursor_point: cursor.point,
+                                    cursor_shape: cursor.shape,
+                                    selection,
+                                    sel_range: sel,
+                                    selected_text,
+                                    show_cursor: show,
+                                    colors,
+                                    mode,
+                                    cursor_cell_char: cc,
+                                    cursor_cell_flags: cf,
+                                }));
+                                // 原子交换：UI 线程下一帧 load() 即可拿到最新快照
+                                let old = reader_snapshot.swap(new_snap, Ordering::AcqRel);
+                                if !old.is_null() {
+                                    unsafe { drop(Box::from_raw(old)); }
+                                }
+                            }
+                        }
+                        if is_fg {
                             let _ = redraw_reader.send(());
                         } else {
-                            // 后台攒批：攒满 4KB 或超时 5ms 才加锁喂一次。
-                            pending.extend_from_slice(&buf[..n]);
-                            let elapsed = last_flush.elapsed().as_millis() as u64;
-                            if pending.len() >= BG_BATCH_BYTES || elapsed >= BG_BATCH_MS {
-                                let reply = {
-                                    let mut t = term.write().unwrap();
-                                    parser.advance(&mut *t, &pending);
-                                    let r = reply_to_queries(
-                                        &mut t,
-                                        &pending,
-                                        theme_dark.load(Ordering::Relaxed),
-                                    );
-                                    r
-                                }; // ← term 锁在此释放
-                                if let Some((reply, osc_color)) = reply {
-                                    if osc_color {
-                                        osc_theme_aware.store(true, Ordering::Relaxed);
-                                    }
-                                    let _ = reply_tx.try_send(reply);
-                                }
-                                pending.clear();
-                                last_flush = std::time::Instant::now();
-                            }
+                            // 后台页签攒批：攒满阈值或超时才处理，降低加锁频率。
+                            // 分块已在上方完成，此处仅控制处理时机。
+                            // （后台路径上面的 while 循环已直接处理完 data，
+                            //    这里不再额外 batch——后台输出量通常较小，
+                            //    分块本身就足够轻量。）
                         }
                     }
                 }
@@ -651,14 +859,17 @@ pub fn spawn(
         dir: dir.to_string(),
         cmd: tui_command.to_string(),
         term,
-         writer: writer_tx,
+        snapshot: snapshot.clone(),
+        cmd_tx: cmd_tx.clone(),
+        writer: writer_tx,
         master: pair.master,
         child,
         grid_size: (cols, rows),
+        needs_resize: true,
         theme_dark,
         osc_theme_aware,
         foreground,
-        exited: false,
+        exited: exited.clone(),
         last_clipboard_seq: None,
         output_count,
         last_output_ms,
@@ -669,8 +880,6 @@ pub fn spawn(
         parse_gen: parse_gen.clone(),
         caret_scan: None,
         snapshot_scratch: Vec::new(),
-        snapshot_gen: 0,
-        pending_input: false,
         galley_cache: HashMap::new(),
         galley_gen: 0,
         gpu: None,
@@ -682,7 +891,60 @@ pub fn spawn(
         cached_render_shapes: None,
         loading,
         ascii_galley_slots: None,
+
     })
+}
+
+/// UI 线程滚动后立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
+/// 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
+pub fn refresh_snapshot(
+    term: &Arc<RwLock<Term<SessionListener>>>,
+    snapshot: &Arc<AtomicPtr<TermSnapshot>>,
+) {
+    if let Ok(t) = term.read() {
+        let content = t.renderable_content();
+        let offset_val = content.display_offset;
+        let colors = content.colors.clone();
+        let cursor = content.cursor;
+        let selection = t.selection.clone();
+        let sel = selection.as_ref().and_then(|s| s.to_range(&t));
+        let selected_text = t.selection_to_string();
+        let show = t.mode().contains(TermMode::SHOW_CURSOR);
+        let mode = *t.mode();
+        let cpoint = cursor.point;
+        let (cc, cf) = {
+            let cell = &t.grid()[cpoint];
+            (cell.c, cell.flags)
+        };
+        let mut cells = Vec::new();
+        for indexed in content.display_iter {
+            let p = indexed.point;
+            let vline = p.line.0 + offset_val as i32;
+            if vline >= 0 {
+                cells.push((p, indexed.cell.clone()));
+            }
+        }
+        let new_snap = Box::into_raw(Box::new(TermSnapshot {
+            cells,
+            offset: offset_val,
+            cursor_point: cursor.point,
+            cursor_shape: cursor.shape,
+            selection,
+            sel_range: sel,
+            selected_text,
+            show_cursor: show,
+            colors,
+            mode,
+            cursor_cell_char: cc,
+            cursor_cell_flags: cf,
+        }));
+        let old = snapshot.swap(new_snap, Ordering::AcqRel);
+        if !old.is_null() {
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -690,7 +952,7 @@ mod tests {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
 
-    /// 终端能力应答器：标准 VT 序列的应答都要对（opencode 等 TUI 靠它判定
+    /// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
     /// 终端是否交互）。
     #[test]
     fn reply_to_queries_standard() {
@@ -700,8 +962,8 @@ mod tests {
             foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
-        // 主 DA 与 XTVERSION 有意不应答（泄漏为键盘输入，见函数注释）；
-        // DSR/DECRQM/kitty/像素尺寸照常应答。
+        // DA 不应答（ConPTY 时序错位会泄漏为键盘输入 C）；通过 TERM_PROGRAM 环境变量
+        // 让 OMP 跳过 DA 查询；DSR/DECRQM/kitty/像素尺寸/OSC 颜色照常应答。
         let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
         let r = reply_to_queries(&term, bytes, true).unwrap().0;
         let s = String::from_utf8_lossy(&r);
@@ -711,8 +973,9 @@ mod tests {
         assert!(s.contains("\x1b[?u"), "kitty 键盘: {s}");
         assert!(s.contains("\x1b[4;0;0t"), "XTWINOPS: {s}");
         assert!(s.contains("\x1b]11;rgb:16161a/16161a/16161a"), "OSC11 深色底: {s}");
-        // 主 DA 与 XTVERSION 不再应答。
+        // DA 与 XTVERSION 不应答（泄漏为键盘输入）。
         assert!(reply_to_queries(&term, b"\x1b[c", true).is_none(), "主 DA 不应答");
+        assert!(reply_to_queries(&term, b"\x1b[0c", true).is_none(), "DA 0c 不应答");
         assert!(reply_to_queries(&term, b"\x1b[>0q", true).is_none(), "XTVERSION 不应答");
         // 浅色主题下 OSC 11 回白底。
         let r3 = reply_to_queries(&term, b"\x1b]11;?\x1b\\", false).unwrap();

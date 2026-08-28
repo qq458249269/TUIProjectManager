@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::grid::Scroll;
@@ -25,17 +25,6 @@ pub const TERM_FONT_SIZE: f32 = 14.0;
 fn color_key(c: Color32) -> u64 {
     ((c.r() as u64) << 24) | ((c.g() as u64) << 16) | ((c.b() as u64) << 8) | c.a() as u64
 }
-
-/// 渲染持锁段耗时统计（TUIPM_LATENCY_DEBUG=1 启用）。
-static SNAP_ACC_US: AtomicU64 = AtomicU64::new(0);
-static SNAP_MAX_US: AtomicU32 = AtomicU32::new(0);
-static SNAP_FRAMES: AtomicU32 = AtomicU32::new(0);
-
-fn latency_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
-}
-
 /// 深浅主题下的终端画布底色。
 const TERM_BG_DARK: Color32 = Color32::from_rgb(22, 22, 26);
 const TERM_BG_LIGHT: Color32 = Color32::WHITE;
@@ -492,7 +481,9 @@ pub fn show_terminal(
         g.begin_frame(rows, cols);
     }
 
-    if sess.grid_size != (cols as u16, rows as u16) {
+    let needs_resize = sess.needs_resize;
+    let resized = sess.grid_size != (cols as u16, rows as u16) || needs_resize;
+    if resized {
         if let Ok(mut t) = sess.term.write() {
             t.resize(TermSize::new(cols, rows));
         }
@@ -503,6 +494,7 @@ pub fn show_terminal(
             pixel_height: 0,
         });
         sess.grid_size = (cols as u16, rows as u16);
+        sess.needs_resize = false;
     }
 
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
@@ -521,7 +513,7 @@ pub fn show_terminal(
     painter.rect_filled(rect, 0.0, color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT));
 
     // ── 读取终端鼠标模式（一次性锁，后续所有分支复用） ──
-    let term_mode_snapshot = sess.term.read().map(|t| *t.mode()).ok();
+    let term_mode_snapshot = sess.term.try_read().map(|t| *t.mode()).ok();
     // 应用要鼠标事件 = 任一上报模式（?1000/?1002/?1003）。注意捆绑的新版
     // conpty.dll 会自行跟踪并吞掉 ?1000h/?1002h，只向仿真器透传编码位 ?1006h，
     // 所以 SGR_MOUSE 单独出现也代表子进程开了鼠标上报（实测 opencode 即此形态）。
@@ -582,6 +574,9 @@ pub fn show_terminal(
             if let Ok(mut t) = sess.term.write() {
                 t.scroll_display(Scroll::Delta(lines));
             }
+            // 立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
+            // 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
+            crate::session::refresh_snapshot(&sess.term, &sess.snapshot);
         }
         ui.ctx().request_repaint();
     } // end over_term
@@ -933,10 +928,19 @@ pub fn show_terminal(
                                 .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
                                 .unwrap_or(false);
                             if bracketed {
-                                let mut v = b"\x1b[200~".to_vec();
-                                v.extend_from_slice(text.as_bytes());
-                                v.extend_from_slice(b"\x1b[201~");
-                                bytes_out.push(v);
+                                // 括号粘贴也统一把换行替换为空格：
+                                // 多行粘贴不应创建真正的换行（清空输入只能清当前行，
+                                // 会遗留前几行的残余内容）。
+                                let cleaned: String = text
+                                    .replace("\r\n", " ")
+                                    .replace('\r', " ")
+                                    .replace('\n', " ");
+                                if !cleaned.is_empty() {
+                                    let mut v = b"\x1b[200~".to_vec();
+                                    v.extend_from_slice(cleaned.as_bytes());
+                                    v.extend_from_slice(b"\x1b[201~");
+                                    bytes_out.push(v);
+                                }
                             } else {
                                 // 换行替换为空格：多行粘贴保留词间距，
                                 // 不让 shell 把每行当独立命令执行。
@@ -972,10 +976,6 @@ pub fn show_terminal(
                     .as_millis() as u64,
                 Ordering::Relaxed,
             );
-            // 标记下一帧需要强制刷新快照：PTY 回显会在下一帧的 parse_gen 里体现，
-            // 但输入发送和 parse_gen 更新之间有 1 帧窗口期，不标记会导致
-            // 回显字符被跳过（快照复用旧数据、parse_gen 还没变）。
-            sess.pending_input = true;
         }
     }
 
@@ -986,89 +986,29 @@ pub fn show_terminal(
     // 静止帧优化：parse_gen 未变时跳过 cell clone（最大开销），复用上一帧快照；
     // 光标/选区/颜色等元数据仍每帧读取（它们可能独立变化）。
     // 注意：IME 活跃时不跳过，因为输入法组合/提交会改变终端内容。
-    let snap_started = std::time::Instant::now();
-    let term_arc = sess.term.clone();
-    let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
-    let snapshot_changed = cur_gen != sess.snapshot_gen
-        || !sess.last_preedit.is_empty()
-        || std::mem::replace(&mut sess.pending_input, false);
-    let (
-        offset,
-        colors_vec,
-        cursor,
-        sel_range,
-        show_cursor,
-        snapshot_cells,
-        cursor_cell_char,
-        cursor_cell_flags,
-    ) = {
-        let term = match term_arc.read() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        let content = term.renderable_content();
-        let offset = content.display_offset;
-        let colors_vec = content.colors.clone();
-        let cursor = content.cursor;
-        let sel_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
-        let show_cursor = term.mode().contains(TermMode::SHOW_CURSOR);
-        // 光标格快照：Block 光标反色重绘需要字符和标志。
-        let cpoint = cursor.point;
-        let (cursor_cell_char, cursor_cell_flags) = {
-            let cell = &term.grid()[cpoint];
-            (cell.c, cell.flags)
-        };
-        if snapshot_changed {
-            // 内容变化或 IME 活跃：重新克隆所有可见格子。
-            // 缓冲跨帧复用（从 Session 取出、渲染尾归还）：省掉每帧 rows×cols 的
-            // Vec 分配/回收，全屏 TUI 动画 60fps 时每秒少几万次分配。
-            let mut snapshot_cells = std::mem::take(&mut sess.snapshot_scratch);
-            snapshot_cells.clear();
-            snapshot_cells.reserve(rows * cols);
-            for indexed in content.display_iter {
-                let point = indexed.point;
-                let vline = point.line.0 + offset as i32;
-                if vline >= 0 && vline < rows as i32 {
-                    snapshot_cells.push((point, indexed.cell.clone()));
-                }
-            }
-            (
-                offset, colors_vec, cursor, sel_range, show_cursor,
-                snapshot_cells, cursor_cell_char, cursor_cell_flags,
-            )
-        } else {
-            // 静止帧：复用上一帧快照，跳过 rows×cols 次 cell clone。
-            // term 锁仍需获取（读 cursor/selection/colors），但不再遍历 display_iter。
-            let snapshot_cells = std::mem::take(&mut sess.snapshot_scratch);
-            (
-                offset, colors_vec, cursor, sel_range, show_cursor,
-                snapshot_cells, cursor_cell_char, cursor_cell_flags,
-            )
-        }
-        // term 锁在此释放：解析线程可立即处理积压输出。
-    };
-    if latency_debug() {
-        let us = snap_started.elapsed().as_micros() as u32;
-        SNAP_ACC_US.fetch_add(us as u64, Ordering::Relaxed);
-        SNAP_MAX_US.fetch_max(us, Ordering::Relaxed);
-        let n = SNAP_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 300 == 0 {
-            eprintln!(
-                "[latency] snapshot avg={}us max={}us frames={n}",
-                SNAP_ACC_US.load(Ordering::Relaxed) / n as u64,
-                SNAP_MAX_US.load(Ordering::Relaxed),
-            );
-        }
+    // ── 从原子快照加载渲染数据：零锁竞争 ──
+    // reader 线程处理 PTY 输出后生成快照并通过 AtomicPtr 原子交换。
+    // UI 线程 load() 时无需获取任何锁，彻底消除渲染卡顿。
+    let snap_ptr = sess.snapshot.load(Ordering::Acquire);
+    if snap_ptr.is_null() {
+        return; // 首帧快照尚未生成
     }
-    // 记录本次 snapshot 对应的 parse_gen，下帧比对决定是否跳过 clone。
-    if snapshot_changed {
-        sess.snapshot_gen = sess.parse_gen.load(Ordering::Relaxed);
-    }
+    let snap = unsafe { &*snap_ptr };
+    let offset = snap.offset;
+    let colors_vec = snap.colors.clone();
+    let cursor_point = snap.cursor_point;
+    let cursor_shape = snap.cursor_shape;
+    let sel_range = snap.sel_range;
+    let show_cursor = snap.show_cursor;
+    let cursor_cell_char = snap.cursor_cell_char;
+    let cursor_cell_flags = snap.cursor_cell_flags;
+    let snapshot_cells: Vec<(Point, Cell)> = snap.cells.iter().cloned().collect();
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
 
     // ── 预计算 ANSI 256 色查找表：把每格 resolve_color 的 match+from_rgb
     //    降为一次数组索引。静止帧复用上一帧的查找表，跳过 256 次循环。
-    let ansi_rgb = if snapshot_changed {
+    // 快照来自原子指针，每帧都是最新的，始终重建
+    let ansi_rgb = if true {
         let mut rgb: [Color32; 256] = [Color32::TRANSPARENT; 256];
         for i in 0..256usize {
             if let Some(Rgb { r, g, b }) = colors_vec[i] {
@@ -1097,14 +1037,8 @@ pub fn show_terminal(
 
     // ── 静止帧快速路径：渲染结果未变时直接重放缓存，跳过逐格循环。
     //    缓存形状不含光标，光标在函数末尾统一绘制（两种路径共享）。
-    let skip_render = !snapshot_changed && sess.cached_render_shapes.is_some();
-    if skip_render {
-        if let Some(cached) = sess.cached_render_shapes.take() {
-            painter.add(egui::Shape::Vec(cached));
-        }
-    }
-
-    if !skip_render {
+    // 无锁快照架构下始终重建渲染形状
+    {
     // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
     // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
@@ -1174,7 +1108,7 @@ pub fn show_terminal(
 
         // 哈希先行：空白快速跳过的格子也要入表，保证 rows×cols 全覆盖可 diff。
         // GPU 路径未启用时跳过，省下每格的哈希开销。
-        if sess.gpu.is_some() {
+        if sess.gpu.is_some() && col < cols {
             let g = sess.gpu.as_mut().unwrap();
             let idx = vline as usize * cols + col;
             let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (idx as u64);
@@ -1398,7 +1332,7 @@ pub fn show_terminal(
         //   (Black,White) 反色格画输入光标，格内是字符或空格，随方向键移动。
         //   自底向上整屏找反色格：输入行在 UI 最下方，必然优先命中；停靠行
         //   是灰色状态行时（启动瞬间）也不会误判。找不到才退回停靠位置。
-        let mut cpoint = cursor.point;
+        let mut cpoint = cursor_point;
         if !show_cursor {
             // 全屏扫描代价 rows×cols，每帧都扫不划算：内容只在解析线程变化，
             // 用解析代数做缓存键——没变就直接复用上次找到的自绘光标位置；
@@ -1468,10 +1402,10 @@ pub fn show_terminal(
                 };
                 let border = fill;
                 // Hidden 形状兜底成 Block：隐藏 = 不画，那就强制画个方块。
-                let shape = if cursor.shape == CursorShape::Hidden {
+                let shape = if cursor_shape == CursorShape::Hidden {
                     CursorShape::Block
                 } else {
-                    cursor.shape
+                    cursor_shape
                 };
                 if *term_focused {
                         match shape {
@@ -1586,7 +1520,7 @@ pub fn show_terminal(
             (0..8).map(|i| colors_vec[i]).collect::<Vec<_>>(),
             colors_vec[256],
             colors_vec[257],
-            cursor.shape,
+            cursor_shape,
             show_cursor
         );
     }
@@ -1597,7 +1531,7 @@ pub fn show_terminal(
     // 记录终端状态标志，供 app 页签图标判定 TUI 运行状态。
     sess.alt_screen.store(alt_screen, Ordering::Relaxed);
     sess.cursor_hidden
-        .store(cursor.shape == CursorShape::Hidden, Ordering::Relaxed);
+        .store(cursor_shape == CursorShape::Hidden, Ordering::Relaxed);
 
     // 启用系统输入法：egui 只有在有控件写入 PlatformOutput::ime 时才会调用
     // winit 的 set_ime_allowed（目前只有 TextEdit 走这条路径），否则 Windows
