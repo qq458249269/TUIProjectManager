@@ -12,7 +12,7 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
-use crate::session::{Session, SessionListener};
+use crate::session::{Session, SessionListener, TermCommand};
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
 use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw};
@@ -576,7 +576,7 @@ pub fn show_terminal(
             }
             // 立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
             // 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
-            crate::session::refresh_snapshot(&sess.term, &sess.snapshot);
+            crate::session::refresh_snapshot(sess);
         }
         ui.ctx().request_repaint();
     } // end over_term
@@ -764,10 +764,9 @@ pub fn show_terminal(
         Some(TermAction::Paste) => {
             // 剪贴板里是文件（复制过文件）→ 直接粘贴相对路径；
             // 否则清掉选区触发系统文本粘贴，下一帧 egui 投递 Event::Paste。
+            // 通过命令通道异步清除选区，避免 UI 线程获取 term 写锁。
             let files = clipboard_files();
-            if let Ok(mut t) = sess.term.write() {
-                t.selection = None;
-            }
+            let _ = sess.cmd_tx.send(TermCommand::UpdateSelection(None));
             if !paste_file_paths(sess, &files, status) {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
@@ -874,10 +873,9 @@ pub fn show_terminal(
                         let shift = modifiers.shift;
 
                         // Esc 清除文本选择（按键仍转发给终端，兼容 vim 等应用）。
+                        // 通过命令通道异步清除，避免 UI 线程获取 term 写锁。
                         if *key == egui::Key::Escape {
-                            if let Ok(mut t) = sess.term.write() {
-                                t.selection = None;
-                            }
+                            let _ = sess.cmd_tx.send(TermCommand::UpdateSelection(None));
                         }
 
                         // 组合回车：仅当应用真的推过 kitty 键盘协议（协商成功）
@@ -995,20 +993,29 @@ pub fn show_terminal(
     }
     let snap = unsafe { &*snap_ptr };
     let offset = snap.offset;
-    let colors_vec = snap.colors.clone();
     let cursor_point = snap.cursor_point;
     let cursor_shape = snap.cursor_shape;
     let sel_range = snap.sel_range;
     let show_cursor = snap.show_cursor;
     let cursor_cell_char = snap.cursor_cell_char;
     let cursor_cell_flags = snap.cursor_cell_flags;
-    let snapshot_cells: Vec<(Point, Cell)> = snap.cells.iter().cloned().collect();
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
 
-    // ── 预计算 ANSI 256 色查找表：把每格 resolve_color 的 match+from_rgb
-    //    降为一次数组索引。静止帧复用上一帧的查找表，跳过 256 次循环。
-    // 快照来自原子指针，每帧都是最新的，始终重建
-    let ansi_rgb = if true {
+    // ── parse_gen 驱动的静止帧优化：内容未变时跳过 cells clone 和颜色重建 ──
+    let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
+    let gen_changed = cur_gen != sess.last_snapshot_gen;
+    let snapshot_cells: Vec<(Point, Cell)> = if gen_changed {
+        // 快照有新内容：全量 clone cells（O(rows×cols)）
+        snap.cells.iter().cloned().collect()
+    } else {
+        // 内容未变（纯滚动/空闲帧）：复用上一帧缓存的 cells，零 clone
+        // snapshot_scratch 已在上帧末尾填充，此处直接 take 复用
+        std::mem::take(&mut sess.snapshot_scratch)
+    };
+
+    // ── 预计算 ANSI 256 色查找表：parse_gen 未变时复用缓存，跳过 256 次循环 ──
+    let ansi_rgb = if gen_changed {
+        let colors_vec = &snap.colors;
         let mut rgb: [Color32; 256] = [Color32::TRANSPARENT; 256];
         for i in 0..256usize {
             if let Some(Rgb { r, g, b }) = colors_vec[i] {
@@ -1031,14 +1038,20 @@ pub fn show_terminal(
             // 背景与字形分两列收集：同底色相邻槽先在 bg_run 里合并成一个大矩形，
             // 合并跨格进行、只能循环结束后落笔——若与字形同列表会盖住字形。
             // 格子矩形互不重叠，全局「背景层在下」与逐格交错绘制结果一致。
+    // ── 静止帧快速路径：parse_gen 未变且缓存有效时，
+    //    跳过逐格渲染循环和 GPU mesh 重建，直接提交缓存的 Shape 列表。
+    //    CPU 省掉 rows×cols 次迭代，GPU 省掉 mesh 重新提交。
+    let mut skip_render_loop = false;
+    if !gen_changed {
+        if let Some(cached) = &sess.cached_render_shapes {
+            painter.add(egui::Shape::Vec(cached.clone()));
+            skip_render_loop = true;
+        }
+    }
+    if !skip_render_loop {
             let mut bg_shapes: Vec<egui::Shape> = Vec::new();
             let mut bg_run: Option<(Rect, Color32)> = None;
             let mut fg_shapes: Vec<egui::Shape> = Vec::new();
-
-    // ── 静止帧快速路径：渲染结果未变时直接重放缓存，跳过逐格循环。
-    //    缓存形状不含光标，光标在函数末尾统一绘制（两种路径共享）。
-    // 无锁快照架构下始终重建渲染形状
-    {
     // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
     // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
@@ -1297,10 +1310,11 @@ pub fn show_terminal(
         }
     }
     bg_shapes.extend(fg_shapes);
-    // 缓存完整渲染结果供静止帧重放。
+    // 缓存完整渲染结果供静止帧重放：下帧 gen_changed=false 时直接提交，
+    // 跳过逐格渲染循环和 GPU mesh 重建。
     sess.cached_render_shapes = Some(bg_shapes.clone());
     painter.add(egui::Shape::Vec(bg_shapes));
-    } // end if !skip_render
+    } // end if !skip_render_loop
 
     // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
     // 定位策略分两种：
@@ -1517,9 +1531,9 @@ pub fn show_terminal(
         }
         eprintln!(
             "[theme-debug] palette[0..8]={:?} palette_fg={:?} palette_bg={:?} cursor={:?} show_cursor={}",
-            (0..8).map(|i| colors_vec[i]).collect::<Vec<_>>(),
-            colors_vec[256],
-            colors_vec[257],
+            (0..8).map(|i| snap.colors[i]).collect::<Vec<_>>(),
+            snap.colors[256],
+            snap.colors[257],
             cursor_shape,
             show_cursor
         );

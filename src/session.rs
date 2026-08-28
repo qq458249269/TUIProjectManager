@@ -151,6 +151,11 @@ pub struct Session {
     pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
     /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
     pub snapshot_scratch: Vec<(Point, Cell)>,
+    /// 上一帧快照对应的 parse_gen：用于检测 snapshot 是否有新内容，跳过无变化帧的 clone。
+    pub last_snapshot_gen: u64,
+    /// 上一帧快照偏移：仅 offset 变化时做 O(rows) 的 point.line 平移，
+    /// 避免 O(rows×cols) 的全量 clone。
+    pub last_snapshot_offset: usize,
     /// 缓存的字体度量：(cell_w, cell_h, ppp)。字号/DPI 不变时跳过 fonts_mut 查询。
     pub cached_metrics: Option<(f32, f32, f32)>,
     /// 静止帧缓存：完整渲染结果（bg_shapes + GPU mesh + fg_shapes），
@@ -750,23 +755,45 @@ pub fn spawn(
                         //    让 UI 线程有机会获取读锁做渲染/响应输入。
                         //    VT parser 内部状态（部分序列缓冲）独立于 term 锁，
                         //    分块不会破坏解析连续性。
-                        //    块大小 1KB：解析耗时 <0.1ms，释放锁间隙足够 UI 拿读锁，
-                        //    无需 sleep 让步（消除 CPU 空转）。
-                        const CHUNK_SIZE: usize = 1024;
-                        let data: &[u8] = if is_fg { &merged } else { &buf[..n] };
-                        let mut offset = 0usize;
-                        while offset < data.len() {
-                            let end = (offset + CHUNK_SIZE).min(data.len());
-                            let chunk = &data[offset..end];
+                        // ── 分块处理：前台 4KB 块保证回显低延迟，
+                        //    后台一次性解析整块数据，降低锁竞争频率。
+                        //    前台：4KB 块间隙足够 UI 拿读锁渲染/响应输入。
+                        //    后台：不可见，无需频繁释放锁给 UI，一次加锁解析整块。
+                        if is_fg {
+                            const CHUNK_SIZE: usize = 4096;
+                            let mut offset = 0usize;
+                            while offset < merged.len() {
+                                let end = (offset + CHUNK_SIZE).min(merged.len());
+                                let chunk = &merged[offset..end];
+                                let reply = {
+                                    let mut t = term.write().unwrap();
+                                    parser.advance(&mut *t, chunk);
+                                    let r = reply_to_queries(
+                                        &mut t,
+                                        chunk,
+                                        theme_dark.load(Ordering::Relaxed),
+                                    );
+                                    r
+                                }; // ← term 锁在此释放
+                                if let Some((reply, osc_color)) = reply {
+                                    if osc_color {
+                                        osc_theme_aware.store(true, Ordering::Relaxed);
+                                    }
+                                    let _ = reply_tx.try_send(reply);
+                                }
+                                offset = end;
+                            }
+                        } else {
+                            // 后台会话：一次加锁解析整块数据（不可见，
+                            // 无需频繁释放锁给 UI，降低锁竞争频率）。
                             let reply = {
                                 let mut t = term.write().unwrap();
-                                parser.advance(&mut *t, chunk);
-                                let r = reply_to_queries(
+                                parser.advance(&mut *t, &merged);
+                                reply_to_queries(
                                     &mut t,
-                                    chunk,
+                                    &merged,
                                     theme_dark.load(Ordering::Relaxed),
-                                );
-                                r
+                                )
                             }; // ← term 锁在此释放
                             if let Some((reply, osc_color)) = reply {
                                 if osc_color {
@@ -774,7 +801,6 @@ pub fn spawn(
                                 }
                                 let _ = reply_tx.try_send(reply);
                             }
-                            offset = end;
                         }
                         // ── 处理 UI 命令（滚动/调整大小/选区）──
                         while let Ok(cmd) = reader_cmd_rx.try_recv() {
@@ -889,6 +915,8 @@ pub fn spawn(
         cached_ansi_rgb: None,
         cached_metrics: None,
         cached_render_shapes: None,
+        last_snapshot_gen: 0,
+        last_snapshot_offset: 0,
         loading,
         ascii_galley_slots: None,
 
@@ -897,10 +925,36 @@ pub fn spawn(
 
 /// UI 线程滚动后立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
 /// 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
-pub fn refresh_snapshot(
-    term: &Arc<RwLock<Term<SessionListener>>>,
-    snapshot: &Arc<AtomicPtr<TermSnapshot>>,
-) {
+/// 优化：若 parse_gen 未变（仅 offset 变化），只做 O(rows) 的 point.line 平移，
+/// 跳过 O(rows×cols) 的全量 Cell clone。
+pub fn refresh_snapshot(sess: &mut Session) {
+    let snapshot = &sess.snapshot;
+    let term = &sess.term;
+    let cur_ptr = snapshot.load(Ordering::Acquire);
+    if cur_ptr.is_null() {
+        return;
+    }
+    let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
+    let cur_offset = unsafe { (*cur_ptr).offset };
+    let gen_changed = cur_gen != sess.last_snapshot_gen;
+    let offset_changed = cur_offset != sess.last_snapshot_offset;
+
+    if !gen_changed && !offset_changed {
+        return;
+    }
+
+    if !gen_changed && offset_changed {
+        // 仅偏移变化（滚动，无新 PTY 输出）：平移已有 cells 的 point.line，不 clone
+        let delta = cur_offset as i32 - sess.last_snapshot_offset as i32;
+        for (p, _) in sess.snapshot_scratch.iter_mut() {
+            p.line.0 += delta;
+        }
+        sess.last_snapshot_gen = cur_gen;
+        sess.last_snapshot_offset = cur_offset;
+        return;
+    }
+
+    // parse_gen 变了：reader 线程有新输出，全量 clone
     if let Ok(t) = term.read() {
         let content = t.renderable_content();
         let offset_val = content.display_offset;
@@ -944,6 +998,8 @@ pub fn refresh_snapshot(
                 drop(Box::from_raw(old));
             }
         }
+        sess.last_snapshot_gen = cur_gen;
+        sess.last_snapshot_offset = offset_val;
     }
 }
 

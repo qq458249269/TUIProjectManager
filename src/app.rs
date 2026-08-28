@@ -783,9 +783,13 @@ impl ClientApp {
                 if !s.exited.load(Ordering::Relaxed) {
                     // reader 线程退出时设置 exited 标志（无需 term 锁）。
                     // 兜底：子进程也已退出时同样标记。
-                    let child_exited = matches!(s.child.try_wait(), Ok(Some(_)));
-                    if child_exited {
-                        s.exited.store(true, Ordering::Relaxed);
+                    // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
+                    // reader 线程会在 PTY 管道断裂时设置 exited 标志。
+                    if s.foreground.load(Ordering::Relaxed) {
+                        let child_exited = matches!(s.child.try_wait(), Ok(Some(_)));
+                        if child_exited {
+                            s.exited.store(true, Ordering::Relaxed);
+                        }
                     }
                     if s.exited.load(Ordering::Relaxed) {
                         changed = true;
@@ -893,18 +897,34 @@ impl ClientApp {
 
     // ---- 渲染 ----
 
-    /// 页签块底色：选中 → 实底高亮（蓝），悬停 → 半透明浅染，否则透明。
-    fn tab_bg(sel_fill: Color32, selected: bool, hovered: bool) -> Color32 {
-        if selected {
-            sel_fill
-        } else if hovered {
-            Color32::from_rgba_unmultiplied(sel_fill.r(), sel_fill.g(), sel_fill.b(), 60)
+    /// 页签块底色：选中 → 实底高亮，悬停 → 半透明浅染，否则透明。
+    /// 深色模式下使用深灰底色 + 微弱蓝色点缀，与面板背景区分但不刺眼；
+    /// 浅色模式沿用 egui 选中蓝。
+    fn tab_bg(sel_fill: Color32, selected: bool, hovered: bool, dark: bool) -> Color32 {
+        if dark {
+            // 深色模式：深灰底色（比面板背景 #1e1e22 稍亮），带微弱蓝色调
+            let accent = Color32::from_rgb(42, 44, 52);   // 深灰偏冷
+            let hover = Color32::from_rgb(52, 54, 64);    // 悬停稍亮
+            if selected {
+                accent
+            } else if hovered {
+                hover
+            } else {
+                Color32::TRANSPARENT
+            }
         } else {
-            Color32::TRANSPARENT
+            if selected {
+                sel_fill
+            } else if hovered {
+                Color32::from_rgba_unmultiplied(sel_fill.r(), sel_fill.g(), sel_fill.b(), 60)
+            } else {
+                Color32::TRANSPARENT
+            }
         }
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let dark = self.effective_dark();
         let mut actions: Vec<TabAction> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
         // 布局内边距保持紧凑（页签间距小）；背景色块比布局框大：左右各 5px、
@@ -957,7 +977,7 @@ impl ClientApp {
                 }
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-                let bg = Self::tab_bg(sel_fill, selected, hovering);
+                let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                 ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
             }
 
@@ -1173,7 +1193,7 @@ impl ClientApp {
                     let hovering = !selected
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-                    let bg = Self::tab_bg(sel_fill, selected, hovering);
+                    let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                     ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
                     tab_rects.push((i, rect));
                 }
