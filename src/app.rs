@@ -257,6 +257,69 @@ fn ui_warn(ui: &egui::Ui) -> Color32 {
     }
 }
 
+/// 查询 Windows 注册表获取系统 AppsUseLightTheme 值：
+/// 0 = 深色，1 = 浅色。egui 的 system_theme() 依赖 WM_SETTINGCHANGE 消息，
+/// 窗口未激活/消息丢失时返回 None，导致跟随系统主题检测失效。
+/// 直接读注册表更可靠。
+#[cfg(target_os = "windows")]
+fn query_windows_dark_mode() -> bool {
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            hkey: isize,
+            lp_subkey: *const u16,
+            ul_options: u32,
+            sam_desired: u32,
+            phk_result: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: isize,
+            lp_value_name: *const u16,
+            lp_reserved: *mut u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hkey: isize) -> i32;
+    }
+    const HKEY_CURRENT_USER: isize = 0x80000001;
+    const KEY_READ: u32 = 0x20019;
+    // Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme
+    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = "AppsUseLightTheme"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut hkey: isize = 0;
+    let hr = unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, key_path.as_ptr(), 0, KEY_READ, &mut hkey)
+    };
+    if hr != 0 {
+        return true; // 打不开默认深色
+    }
+    let mut data_type: u32 = 0;
+    let mut data: u32 = 0;
+    let mut data_size: u32 = 4;
+    let hr = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut data_type,
+            &mut data as *mut u32 as *mut u8,
+            &mut data_size,
+        )
+    };
+    unsafe { RegCloseKey(hkey); }
+    if hr != 0 {
+        return true; // 读取失败默认深色
+    }
+    data == 0 // AppsUseLightTheme=0 → 深色
+}
+
 fn ui_ok(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
         Color32::from_rgb(90, 200, 90)
@@ -414,7 +477,7 @@ pub struct ClientApp {
     ctx: egui::Context,
 
     /// 项目目录存在性缓存：path → (是否存在, 采样时间)。首页列表与详情页
-    /// 每帧都要画“目录存在/不存在”，直接 is_dir() 是每帧每项目一次磁盘
+    /// 每帧都要画"目录存在/不存在"，直接 is_dir() 是每帧每项目一次磁盘
     /// 调用（网络盘上明显拖帧），TTL 内复用结果。
     dir_exists_cache: HashMap<String, (bool, Instant)>,
     /// 页签标题排版宽度缓存：title → 宽度。标题几乎不变，避免每页签每帧
@@ -426,6 +489,8 @@ pub struct ClientApp {
     omp_models: config::ModelsConfig,
     /// 模型设置是否展开编辑。
     model_settings_open: bool,
+    /// 后台重绘跳帧计数器：后台页签收到 redraw 信号时累计，达到跳帧阈值才真正重绘。
+    bg_frame: u64,
 }
 
 impl ClientApp {
@@ -436,7 +501,10 @@ impl ClientApp {
         apply_theme(
             &cc.egui_ctx,
             if config.settings.follow_system {
-                matches!(cc.egui_ctx.system_theme(), None | Some(egui::Theme::Dark))
+                #[cfg(target_os = "windows")]
+                { query_windows_dark_mode() }
+                #[cfg(not(target_os = "windows"))]
+                { matches!(cc.egui_ctx.system_theme(), None | Some(egui::Theme::Dark)) }
             } else {
                 config.settings.dark_mode
             },
@@ -497,6 +565,7 @@ impl ClientApp {
             pi_models: config::load_pi_models(),
             omp_models: config::load_omp_models(),
             model_settings_open: false,
+            bg_frame: 0,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -1343,7 +1412,12 @@ impl ClientApp {
     /// 当前实际生效的主题深浅：跟随系统时取系统偏好，否则取用户设置。
     fn effective_dark(&self) -> bool {
         if self.config.settings.follow_system {
-            matches!(self.ctx.system_theme(), None | Some(egui::Theme::Dark))
+            // 直接读注册表：egui system_theme() 依赖 WM_SETTINGCHANGE，
+            // 窗口未激活/消息丢失时返回 None 导致跟随系统失效。
+            #[cfg(target_os = "windows")]
+            { return query_windows_dark_mode(); }
+            #[cfg(not(target_os = "windows"))]
+            { matches!(self.ctx.system_theme(), None | Some(egui::Theme::Dark)) }
         } else {
             self.config.settings.dark_mode
         }
@@ -2499,18 +2573,20 @@ impl eframe::App for ClientApp {
             }
         }
         // 记录打开中的终端页签（退出后下次启动自动重新拉起）。
-        self.config.tabs = config::TabsState {
-            dirs: self
-                .tabs
-                .iter()
-                .skip(1)
-                .filter_map(|t| match t {
-                    Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.dir.clone()),
-                    _ => None,
-                })
-                .collect(),
-            active: self.current,
-        };
+        // active 指向 dirs 数组中的页签（0=Home, 1=dirs[0], …）。
+        // 必须按 dirs 实际过滤后的顺序计算索引，不能直接用 self.current：
+        // self.current 是 tabs 全数组含 Home/已退出页签的索引，与 dirs 不对应。
+        let dirs: Vec<String> = self
+            .tabs
+            .iter()
+            .skip(1)
+            .filter_map(|t| match t {
+                Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.dir.clone()),
+                _ => None,
+            })
+            .collect();
+        let active = self.current;
+        self.config.tabs = config::TabsState { dirs, active };
         // 窗口状态已在每帧 logic 中记录，退出时落盘。
         let _ = config::save(&self.config);
     }
@@ -2560,44 +2636,15 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 动态基线刷新：打字/近期输出 → 16ms（60fps）；有活动但非打字 → 50ms；
-        // 空闲 → 1000ms。
-        // 只看前台会话：后台流式输出不抬升基线，页签活动点由 1s 轮询更新即可。
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let (has_output, has_recent_input) = self.tabs.iter().enumerate().fold(
-            (false, false),
-            |(out_acc, inp_acc), (i, t)| {
-                if let Tab::Session(s) = t {
-                    if i != self.current {
-                        return (out_acc, inp_acc);
-                    }
-                    let count = s.output_count.load(Ordering::Relaxed);
-                    let last_out = s.last_output_ms.load(Ordering::Relaxed);
-                    let last_in = s.last_input_ms.load(Ordering::Relaxed);
-                    let output_active = count > 0 && now_ms.saturating_sub(last_out) <= 500;
-                    let input_recent = now_ms.saturating_sub(last_in) <= 500;
-                    (out_acc || output_active, inp_acc || input_recent)
-                } else {
-                    (out_acc, inp_acc)
-                }
-            },
-        );
-        let base_ms = if has_recent_input {
-            33 // 打字时 30fps：前台激活页签上限，节省资源
-        } else if has_output {
-            50 // 有近期输出（TUI动画等）：33fps，比旧版300ms流畅很多
+        // 帧率控制：前台终端页签用 refresh_fps（默认 10fps），后台/首页 1fps。
+        let is_foreground_term = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
+        if is_foreground_term {
+            let fps = self.config.settings.refresh_fps.clamp(10, 60);
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
         } else {
-            1000 // 空闲：1fps
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(base_ms));
-        // 前台有终端会话时，强制每秒至少重绘一次：
-        // 即使 reader 线程偶尔长时间持锁，UI 也不会完全冻结。
-        if self.tabs.iter().any(|t| matches!(t, Tab::Session(s) if !s.exited.load(Ordering::Relaxed))) {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        self.bg_frame = self.bg_frame.wrapping_add(1);
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
@@ -2606,12 +2653,11 @@ impl eframe::App for ClientApp {
             ctx.request_repaint();
         }
 
-        let redraw = self.redraw_rx.try_iter().next().is_some();
+        // 后台页签：完全不消费 redraw，不触发重绘。
+        let _ = self.redraw_rx.try_iter().next();
         let exited = self.update_exited();
         if exited {
             self.status = Some("有会话已退出".to_string());
-        }
-        if redraw || exited {
             ctx.request_repaint();
         }
 

@@ -17,7 +17,62 @@ fn default_refresh_fps() -> u64 {
 }
 
 fn default_dark_mode() -> bool {
-    true
+    // 首次运行（无配置文件）时检测 Windows 系统主题偏好。
+    // 注册表 AppsUseLightTheme：1=浅色（false），0=深色（true），读取失败兜底深色。
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn RegOpenKeyExW(
+                hkey: isize,
+                lp_subkey: *const u16,
+                ul_options: u32,
+                sam_desired: u32,
+                phk_result: *mut isize,
+            ) -> i32;
+            fn RegQueryValueExW(
+                hkey: isize,
+                lp_value_name: *const u16,
+                lp_reserved: *mut u32,
+                lp_type: *mut u32,
+                lp_data: *mut u8,
+                lpcb_data: *mut u32,
+            ) -> i32;
+            fn RegCloseKey(hkey: isize) -> i32;
+        }
+        const HKEY_CURRENT_USER: isize = 0x8000_0001;
+        const KEY_READ: u32 = 0x0002_0019;
+        const REG_DWORD: u32 = 4;
+        let key_path: Vec<u16> = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let val_name: Vec<u16> = "AppsUseLightTheme"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut hkey: isize = 0;
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key_path.as_ptr(), 0, KEY_READ, &mut hkey) } == 0 {
+            let mut dtype: u32 = 0;
+            let mut data: u32 = 0;
+            let mut size: u32 = std::mem::size_of::<u32>() as u32;
+            let hr = unsafe {
+                RegQueryValueExW(
+                    hkey,
+                    val_name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut dtype,
+                    &mut data as *mut u32 as *mut u8,
+                    &mut size,
+                )
+            };
+            unsafe { RegCloseKey(hkey); }
+            if hr == 0 && dtype == REG_DWORD {
+                return data == 0; // AppsUseLightTheme=0 → 深色
+            }
+        }
+    }
+    true // 读取失败兜底深色
 }
 
 fn default_follow_system() -> bool {

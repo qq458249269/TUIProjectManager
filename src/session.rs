@@ -935,7 +935,9 @@ pub fn refresh_snapshot(sess: &mut Session) {
         return;
     }
     let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
-    let cur_offset = unsafe { (*cur_ptr).offset };
+    // 从终端 grid 直接读 display_offset：旧 snapshot 的 offset 未随滚动更新，
+    // 用它检测不到纯滚动变化。
+    let cur_offset = term.read().map(|t| t.grid().display_offset()).unwrap_or(0);
     let gen_changed = cur_gen != sess.last_snapshot_gen;
     let offset_changed = cur_offset != sess.last_snapshot_offset;
 
@@ -943,18 +945,10 @@ pub fn refresh_snapshot(sess: &mut Session) {
         return;
     }
 
-    if !gen_changed && offset_changed {
-        // 仅偏移变化（滚动，无新 PTY 输出）：平移已有 cells 的 point.line，不 clone
-        let delta = cur_offset as i32 - sess.last_snapshot_offset as i32;
-        for (p, _) in sess.snapshot_scratch.iter_mut() {
-            p.line.0 += delta;
-        }
-        sess.last_snapshot_gen = cur_gen;
-        sess.last_snapshot_offset = cur_offset;
-        return;
-    }
-
-    // parse_gen 变了：reader 线程有新输出，全量 clone
+    // 任何变化（gen 或 offset）都需重新 clone cells：
+    // - gen 变化：新 PTY 输出改变了内容
+    // - offset 变化：滚动改变了可见区域
+    // 合并为统一路径，避免 offset-only 分支的陈旧 snapshot 问题。
     if let Ok(t) = term.read() {
         let content = t.renderable_content();
         let offset_val = content.display_offset;
@@ -978,8 +972,11 @@ pub fn refresh_snapshot(sess: &mut Session) {
                 cells.push((p, indexed.cell.clone()));
             }
         }
+        // cells 先存 snapshot_scratch，再 clone 一份给 snapshot：
+        // render_cells 在 gen_changed=false 时 take scratch，避免再 clone。
+        sess.snapshot_scratch = cells;
         let new_snap = Box::into_raw(Box::new(TermSnapshot {
-            cells,
+            cells: sess.snapshot_scratch.clone(),
             offset: offset_val,
             cursor_point: cursor.point,
             cursor_shape: cursor.shape,
@@ -1000,6 +997,7 @@ pub fn refresh_snapshot(sess: &mut Session) {
         }
         sess.last_snapshot_gen = cur_gen;
         sess.last_snapshot_offset = offset_val;
+        sess.cached_render_shapes = None;
     }
 }
 
