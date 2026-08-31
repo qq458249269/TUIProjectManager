@@ -144,6 +144,9 @@ pub struct Session {
     /// 低帧率下按下/拖动/释放全落在同一帧时，egui 既不判 click 也不判
     /// drag，drag_started_by 永不触发 —— 这里自己记按下点。
     pub drag_press_pos: Option<egui::Pos2>,
+    /// 鼠标按下时的位置（纯点击判定用）：press_origin() 在释放帧返回 None，
+    /// 自己从 raw events 捕获按下坐标，用于区分点击与拖动。
+    pub click_press_pos: Option<egui::Pos2>,
     /// 上一帧 IME 预编辑文本（拼音等）：非空时强制刷新快照，避免跳过 clone
     /// 导致输入法组合/提交时内容不同步。
     pub last_preedit: String,
@@ -911,6 +914,7 @@ pub fn spawn(
         gpu: None,
         last_input_ms,
         drag_press_pos: None,
+        click_press_pos: None,
         last_preedit: String::new(),
         cached_ansi_rgb: None,
         cached_metrics: None,

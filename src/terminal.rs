@@ -640,6 +640,16 @@ pub fn show_terminal(
     {
         let primary_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         let latest_pos = ui.input(|i| i.pointer.latest_pos());
+        // 跟踪按下位置：press_origin() 在释放帧返回 None（egui 事后清除），
+        // 改为自己从 raw events 捕获按下坐标。
+        let primary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        if primary_pressed {
+            sess.click_press_pos = ui.input(|i| i.pointer.latest_pos());
+        }
+        // 判断是否为纯点击（无拖动位移）：按下与释放位置距离 < 4px。
+        let is_true_click = primary_released && sess.click_press_pos.map_or(false, |p0| {
+            latest_pos.map_or(false, |p1| p1.distance(p0) < 4.0)
+        });
         if let Ok(mut t) = sess.term.write() {
             let disp_off = t.grid().display_offset();
             let point_at = |pos: Pos2| -> Option<Point> {
@@ -657,16 +667,19 @@ pub fn show_terminal(
                 if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
                     t.selection =
                         Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
+                    ui.ctx().request_repaint();
                 }
             } else if resp.dragged_by(egui::PointerButton::Primary) {
                 if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
                     if let Some(sel) = t.selection.as_mut() {
                         sel.update(pos, Side::Left);
                     }
+                    ui.ctx().request_repaint();
                 }
             }
-            if resp.clicked() {
+            if resp.clicked() && is_true_click {
                 t.selection = None;
+                ui.ctx().request_repaint();
             }
             if primary_released && sess.drag_press_pos.is_none() {
                 sess.drag_press_pos = ui.input(|i| {
@@ -773,10 +786,11 @@ pub fn show_terminal(
             *term_focused = true;
         }
         Some(TermAction::ClearInput) => {
-            // 清空当前输入行：End（光标到行尾）+ Ctrl+U（清除到行首）。
-            // Ctrl+U（0x15）是 bash/zsh/cmd 通用的「清空行」快捷键，
-            // 单次发送即可清空整行，无需发送大量退格。
-            let _ = sess.writer.try_send(b"\x1b[F\x15".to_vec());
+            // 清空输入：Ctrl+C 取消整个输入（多行模式下取消全部行），
+            // 再 Ctrl+U 清行刷新提示符。
+            // Ctrl+U 单独只清当前显示行，多行输入（\\n 分隔）时前面的行残留；
+            // Ctrl+C 在 bash/zsh 多行模式下会取消整个多行输入。
+            let _ = sess.writer.try_send(b"\x03\x15".to_vec());
             *status = Some("已清空输入".to_string());
         }
         None => {}
@@ -995,11 +1009,19 @@ pub fn show_terminal(
     let offset = snap.offset;
     let cursor_point = snap.cursor_point;
     let cursor_shape = snap.cursor_shape;
-    let sel_range = snap.sel_range;
     let show_cursor = snap.show_cursor;
     let cursor_cell_char = snap.cursor_cell_char;
     let cursor_cell_flags = snap.cursor_cell_flags;
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
+    // 选区范围从终端实时读取，不依赖快照（快照的 sel_range 只有 reader 线程刷新，
+    // 用户拖动选区不会更新快照，导致渲染用旧选区高亮）。
+    let sel_range = sess.term.try_read().ok().and_then(|t| {
+        t.selection.as_ref().and_then(|s| s.to_range(&t))
+    });
+    // 选区变化时清缓存：即使快照未变（gen_changed=false），选区高亮也必须重绘。
+    if sel_range != snap.sel_range {
+        sess.cached_render_shapes = None;
+    }
 
     // ── parse_gen 驱动的静止帧优化：内容未变时跳过 cells clone 和颜色重建 ──
     let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
@@ -1593,6 +1615,13 @@ pub fn show_terminal(
 
     // 会话活跃时由 SessionListener 的后台解析线程通过 redraw 信号触发重绘；
     // 这里不需要无条件 request_repaint，避免空闲时满帧空转。
+
+    // 鼠标操作时恢复帧率：选区拖动或鼠标按住时必须刷新画面。
+    // logic() 在 ui() 之前执行，ctx.input() 可能读不到当前帧的指针状态，
+    // 所以在 show_terminal 内部（ui 可用时）检测并触发重绘。
+    if ui.input(|i| i.pointer.any_down()) || has_selection {
+        ui.ctx().request_repaint();
+    }
 }
 
 /// 浅色主题颜色映射：亮黄等亮饱和色白底上必须被压暗到可读、色相保留；
