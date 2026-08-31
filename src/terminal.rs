@@ -827,11 +827,15 @@ pub fn show_terminal(
             *term_focused = true;
         }
         Some(TermAction::ClearInput) => {
-            // 清空输入：先 Ctrl+C 取消多行输入，再 Home + Ctrl+U 确保当前行也被清除。
+            // 清空输入：先 Ctrl+C 取消多行输入，再多次 Ctrl+U 确保所有行都被清除。
             // \x03 Ctrl+C：bash/zsh 多行模式下取消全部行，cmd/PowerShell 取消当前行。
-            // \x01 Home：光标移到行首（确保 Ctrl+U 从行首开始删）。
-            // \x15 Ctrl+U：从光标删到行首。
-            let _ = sess.writer.try_send(b"\x03\x01\x15".to_vec());
+            // \x15 Ctrl+U：从光标删到行首（重复多次以清除残留的多行内容）。
+            let mut clear_seq = Vec::with_capacity(202);
+            clear_seq.extend_from_slice(b"\x03");
+            for _ in 0..100 {
+                clear_seq.extend_from_slice(b"\x15");
+            }
+            let _ = sess.writer.try_send(clear_seq);
             *status = Some("已清空输入".to_string());
         }
         None => {}
