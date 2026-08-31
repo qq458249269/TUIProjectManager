@@ -30,6 +30,6 @@
 
 ## 帧率控制
 
-- 前台终端页签：`refresh_fps`（默认 10fps）→ `request_repaint_after(1000/fps ms)`
+- 前台终端页签：`refresh_fps`（默认 30fps）→ `request_repaint_after(1000/fps ms)`
 - 后台页签：不消费 redraw 信号（`let _ = self.redraw_rx.try_iter().next()`），不触发 repaint
 - 后台页签 `show_terminal` 不被调用（只渲染当前页签）

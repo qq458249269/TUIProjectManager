@@ -16,13 +16,13 @@ use crate::terminal;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Main,
-    Settings,
 }
 
 /// 顶部页签：第一个永远是首页，后面每个对应一个终端会话。
 pub enum Tab {
     Home,
     Session(Session),
+    Settings,
 }
 
 
@@ -460,12 +460,16 @@ pub struct ClientApp {
     pending_launch: Vec<PendingLaunch>,
     /// 后台线程正在 spawn 的会话：(title, is_restore)。每帧轮询通道收结果。
     spawning: Vec<(String, bool)>,
-    /// 后台 spawn 完成的结果通道。
-    spawn_rx: Option<Receiver<(Result<Session, String>, bool)>>,
+    /// 后台 spawn 完成的结果通道：(result, is_restore, saved_index)。
+    /// saved_index 仅恢复时有效（保存时的 dirs 索引），用于按原序插入页签。
+    spawn_rx: Option<Receiver<(Result<Session, String>, bool, usize)>>,
     /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
     pending_restore: Vec<PendingLaunch>,
     /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
     restore_active: Option<usize>,
+    /// 启动恢复的会话按保存序暂存于此（save_i 槽位），全部完成后按序插入页签。
+    /// 后台 spawn 完成顺序随机，逐条插入会因先到的高索引越界 panic，故先攒槽。
+    restore_slots: Vec<Option<Result<Session, String>>>,
     /// 终端上次渲染的真实网格尺寸：重开崩溃页签/切启动命令时按它 spawn，
     /// 避免再走 80x24 → 首帧 resize 的错尺寸启动路径。
     last_term_size: (u16, u16),
@@ -551,6 +555,7 @@ impl ClientApp {
             drag_project: None,
             drag_command: None,
             pending_launch: Vec::new(),
+            restore_slots: Vec::new(),
             pending_restore: Vec::new(),
             spawning: Vec::new(),
             spawn_rx: None,
@@ -615,12 +620,18 @@ impl ClientApp {
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
         self.settings_refresh_fps = self.config.settings.refresh_fps.to_string();
-        self.screen = Screen::Settings;
+        // 如果已有一个设置页签，跳转过去而不是重复添加。
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
+            self.current = idx;
+        } else {
+            self.tabs.push(Tab::Settings);
+            self.current = self.tabs.len() - 1;
+        }
         self.term_focused = false;
     }
 
     fn refresh_focus(&mut self) {
-        self.term_focused = !matches!(self.tabs.get(self.current), Some(Tab::Home));
+        self.term_focused = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
         if !self.term_focused {
             self.screen = Screen::Main;
         }
@@ -639,6 +650,15 @@ impl ClientApp {
             // try_send：通道满说明已有待处理重绘，本次唤醒请求可安全丢弃。
             let _ = redraw_tx.try_send(());
         });
+    }
+
+    /// 后台 spawn 完成的应用注册：给会话同步深浅主题后原样返回，供插入页签。
+    fn apply_theme_to(&self, result: Result<Session, String>) -> Result<Session, String> {
+        if let Ok(sess) = &result {
+            sess.theme_dark
+                .store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     fn launch_selected(&mut self) {
@@ -1265,6 +1285,87 @@ impl ClientApp {
                     let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                     ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
                     tab_rects.push((i, rect));
+                } else if let Tab::Settings = tab {
+                    // ── 设置页签 ──
+                    ui.add_space(4.0);
+                    let title = "⚙ 设置";
+                    let selected = self.current == i;
+                    let bg_idx = ui.painter().add(egui::Shape::Noop);
+                    let (close_rect, frame_resp) = egui::Frame::new()
+                        .corner_radius(4.0)
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(tab_margin)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let min_width =
+                                ui.text_style_height(&egui::TextStyle::Body) * 4.0;
+                            let title_w = *self.title_width_cache.entry(title.to_string()).or_insert_with(|| {
+                                ui.ctx().fonts_mut(|f| {
+                                    f.layout_no_wrap(title.to_string(), tab_font.clone(), Color32::TRANSPARENT)
+                                        .size()
+                                        .x
+                                })
+                            });
+                            let s = ui.spacing().item_spacing.x;
+                            let icon_title_w = slot_w + s + title_w;
+                            let slack = (min_width - icon_title_w - s - close_w).max(0.0);
+                            let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
+                                ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
+                            } else if slack > 0.0 {
+                                (slack, 0.0)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            if pad_l > 0.0 {
+                                ui.add_space(pad_l);
+                            }
+                            let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                            ui.add_sized(
+                                egui::vec2(slot_w, row_h),
+                                egui::Label::new(" ").selectable(false),
+                            );
+                            ui.add(
+                                if selected {
+                                    egui::Label::new(RichText::new(title).strong())
+                                } else {
+                                    egui::Label::new(RichText::new(title))
+                                }
+                                .selectable(false),
+                            );
+                            if pad_m > 0.0 {
+                                ui.add_space(pad_m);
+                            }
+                            (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
+                        })
+                        .inner;
+                    let rect = frame_resp.rect;
+                    let resp = ui.interact(
+                        rect,
+                        egui::Id::new(("settings_tab", i)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if resp.clicked() {
+                        let pos = ui.ctx().pointer_interact_pos();
+                        if pos.is_some_and(|p| close_rect.contains(p)) {
+                            actions.push(TabAction::Close(i));
+                        } else {
+                            actions.push(TabAction::Activate(i));
+                        }
+                    }
+                    if resp.hovered()
+                        && ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .is_some_and(|p| close_rect.contains(p))
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let hovering = !selected
+                        && drag_index.is_none()
+                        && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
+                    let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
+                    tab_rects.push((i, rect));
                 }
             }
         });
@@ -1876,11 +1977,7 @@ impl ClientApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.screen == Screen::Settings {
-                self.settings_ui(ui);
-            } else {
-                self.project_detail_ui(ui);
-            }
+            self.project_detail_ui(ui);
         });
     }
 
@@ -2152,13 +2249,51 @@ impl ClientApp {
             self.model_settings_ui(ui);
         }
         ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        // ── 帧率预设 ──
+        ui.label(RichText::new("前台终端页签帧率（后台页签始终不渲染，不影响 CPU）").strong());
+        ui.add_space(4.0);
+        let presets = [10u64, 30, 60];
+        let cur_fps = self.config.settings.refresh_fps;
+        ui.horizontal(|ui| {
+            for &preset in &presets {
+                let label = format!("{preset} FPS");
+                let selected = cur_fps == preset;
+                if ui
+                    .add(egui::Button::selectable(selected, &label))
+                    .clicked()
+                {
+                    self.config.settings.refresh_fps = preset;
+                    self.settings_refresh_fps = preset.to_string();
+                    self.save_config(format!("帧率已设为 {preset} FPS"));
+                }
+            }
+            ui.separator();
+            ui.label("自定义:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.settings_refresh_fps)
+                    .desired_width(50.0)
+                    .hint_text("10-60"),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Ok(v) = self.settings_refresh_fps.parse::<u64>() {
+                    let clamped = v.clamp(10, 60);
+                    self.config.settings.refresh_fps = clamped;
+                    self.settings_refresh_fps = clamped.to_string();
+                    self.save_config(format!("帧率已设为 {clamped} FPS"));
+                }
+            }
+        });
+        ui.label(
+            RichText::new("默认 30 FPS，10 省电 / 30 均衡 / 60 流畅")
+                .weak()
+                .small(),
+        );
+        ui.add_space(12.0);
         ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
-        ui.add_space(12.0);
-        if ui.button("← 返回项目列表").clicked() {
-            self.screen = Screen::Main;
-        }
     }
 
     fn model_settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -2636,7 +2771,7 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 帧率控制：前台终端页签用 refresh_fps（默认 10fps），后台/首页 1fps。
+        // 帧率控制：前台终端页签用 refresh_fps（默认 30fps），后台/首页 1fps。
         let is_foreground_term = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
         if is_foreground_term {
             let fps = self.config.settings.refresh_fps.clamp(10, 60);
@@ -2708,7 +2843,8 @@ impl eframe::App for ClientApp {
                             cols as u16, rows as u16,
                             redraw, ctx,
                         );
-                        let _ = tx.send((result, false));
+                        // 非恢复：saved_index 用 0，实际不会用到。
+                        let _ = tx.send((result, false, 0));
                     });
                 }
                 self.screen = Screen::Main;
@@ -2716,37 +2852,55 @@ impl eframe::App for ClientApp {
             }
             // 轮询后台 spawn 结果。
             if let Some(rx) = &self.spawn_rx {
-                let mut restored = 0usize;
-                while let Ok((result, is_restore)) = rx.try_recv() {
+                while let Ok((result, is_restore, saved_index)) = rx.try_recv() {
                     self.spawning.pop();
-                    match result {
-                        Ok(sess) => {
-                            sess.theme_dark.store(
-                                self.effective_dark(),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            self.tabs.push(Tab::Session(sess));
-                            if is_restore {
-                                restored += 1;
-                            } else {
+                    if is_restore {
+                        // 攒进按保存序的槽位：后台 spawn 完成顺序随机，直接按索引插入
+                        // 会因先到的高索引越界（tabs 尚未补齐前索引）而闪退。
+                        // 先算主题（借用 self 不可变），再写槽位（可变借用），避免重叠。
+                        let themed = self.apply_theme_to(result);
+                        if let Some(slot) = self.restore_slots.get_mut(saved_index) {
+                            *slot = Some(themed);
+                        }
+                    } else {
+                        match self.apply_theme_to(result) {
+                            Ok(sess) => {
+                                self.tabs.push(Tab::Session(sess));
                                 self.current = self.tabs.len() - 1;
                                 self.term_focused = true;
                                 self.screen = Screen::Main;
                                 self.status = Some("已启动".to_string());
                             }
-                        }
-                        Err(e) => {
-                            self.status = Some(format!("启动失败: {e}"));
+                            Err(e) => {
+                                self.status = Some(format!("启动失败: {e}"));
+                            }
                         }
                     }
                 }
-                // 恢复完成后应用上次激活页签。
-                if restored > 0 {
-                    if let Some(active) = self.restore_active.take() {
-                        self.current = active.min(self.tabs.len() - 1);
-                        self.term_focused = self.current != 0;
+                // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
+                // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
+                if self.spawning.is_empty() && !self.restore_slots.is_empty() {
+                    let slots = std::mem::take(&mut self.restore_slots);
+                    let mut restored = 0usize;
+                    for slot in slots {
+                        match slot {
+                            Some(Ok(sess)) => {
+                                self.tabs.push(Tab::Session(sess));
+                                restored += 1;
+                            }
+                            Some(Err(e)) => {
+                                self.status = Some(format!("启动失败: {e}"));
+                            }
+                            None => {}
+                        }
                     }
-                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+                    if restored > 0 {
+                        if let Some(active) = self.restore_active.take() {
+                            self.current = active.min(self.tabs.len() - 1);
+                            self.term_focused = self.current != 0;
+                        }
+                        self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+                    }
                 }
                 if self.spawning.is_empty() {
                     self.spawn_rx = None;
@@ -2761,19 +2915,24 @@ impl eframe::App for ClientApp {
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.spawn_rx = Some(rx);
                 let restore_count = pending.len();
-                for p in pending {
-                    let title = p.title.clone();
+                self.restore_slots = (0..restore_count).map(|_| None).collect();
+                for (save_i, p) in pending.into_iter().enumerate() {
+                    let title = p.title;
+                    let dir = p.dir;
+                    let cmd = p.cmd;
                     let redraw = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let tx = tx.clone();
-                    self.spawning.push((title, true));
+                    self.spawning.push((title.clone(), true));
                     std::thread::spawn(move || {
                         let result = session::spawn(
-                            &p.title, &p.dir, &p.cmd,
+                            &title, &dir, &cmd,
                             cols as u16, rows as u16,
                             redraw, ctx,
                         );
-                        let _ = tx.send((result, true));
+                        // saved_index：恢复时按保存时的原序插入，保证页签顺序不因
+                        // 后台 spawn 完成先后而打乱。
+                        let _ = tx.send((result, true, save_i));
                     });
                 }
                 // 恢复的会话数已知，等后台线程完成后一次性应用 restore_active。
@@ -2781,49 +2940,61 @@ impl eframe::App for ClientApp {
                 let _ = restore_count;
             }
 
-            if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
-                // 记录本次终端真实网格尺寸（show_terminal 每帧同步进 grid_size，
-                // 直接读，省去再查一次字体度量）：重开崩溃页签/切换启动命令时按它
-                // spawn，避免 80x24 起步等首帧 resize 的错尺寸启动路径。
-                self.last_term_size = s.grid_size;
-                // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
-                // catch_unwind 捕获后关闭该页签，整个软件继续运行。
-                let (dark, status, term_focused) = (
-                    self.effective_dark(),
-                    &mut self.status,
-                    &mut self.term_focused,
-                );
-                let sess = match self.tabs.get_mut(self.current) {
-                    Some(Tab::Session(s)) => s,
-                    _ => unreachable!(),
-                };
-                let crashed = match std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| {
-                        terminal::show_terminal(ui, sess, dark, status, term_focused);
-                    }),
-                ) {
-                    Ok(()) => None,
-                    Err(payload) => Some(
-                        payload
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "未知错误".to_string()),
-                    ),
-                };
-                if let Some(reason) = crashed {
-                    let idx = self.current;
-                    let (dir, title) = match self.tabs.get(idx) {
-                        Some(Tab::Session(s)) => (s.dir.clone(), s.title.clone()),
-                        _ => (String::new(), String::new()),
+            match self.tabs.get(self.current) {
+                Some(Tab::Session(_)) => {
+                    // 记录本次终端真实网格尺寸（show_terminal 每帧同步进 grid_size，
+                    // 直接读，省去再查一次字体度量）：重开崩溃页签/切换启动命令时按它
+                    // spawn，避免 80x24 起步等首帧 resize 的错尺寸启动路径。
+                    self.last_term_size = {
+                        if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
+                            s.grid_size
+                        } else {
+                            unreachable!()
+                        }
                     };
-                    self.close_session(idx);
-                    self.confirm = Some(ConfirmDialog::RelaunchSession { dir, title, reason });
-                    self.status =
-                        Some("该终端页签发生崩溃，已隔离并关闭（其他页签不受影响）。".to_string());
+                    // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
+                    // catch_unwind 捕获后关闭该页签，整个软件继续运行。
+                    let (dark, status, term_focused) = (
+                        self.effective_dark(),
+                        &mut self.status,
+                        &mut self.term_focused,
+                    );
+                    let sess = match self.tabs.get_mut(self.current) {
+                        Some(Tab::Session(s)) => s,
+                        _ => unreachable!(),
+                    };
+                    let crashed = match std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            terminal::show_terminal(ui, sess, dark, status, term_focused);
+                        }),
+                    ) {
+                        Ok(()) => None,
+                        Err(payload) => Some(
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "未知错误".to_string()),
+                        ),
+                    };
+                    if let Some(reason) = crashed {
+                        let idx = self.current;
+                        let (dir, title) = match self.tabs.get(idx) {
+                            Some(Tab::Session(s)) => (s.dir.clone(), s.title.clone()),
+                            _ => (String::new(), String::new()),
+                        };
+                        self.close_session(idx);
+                        self.confirm = Some(ConfirmDialog::RelaunchSession { dir, title, reason });
+                        self.status =
+                            Some("该终端页签发生崩溃，已隔离并关闭（其他页签不受影响）。".to_string());
+                    }
                 }
-            } else {
-                self.home_ui(ui);
+                Some(Tab::Settings) => {
+                    self.settings_ui(ui);
+                }
+                _ => {
+                    self.home_ui(ui);
+                }
             }
         });
 

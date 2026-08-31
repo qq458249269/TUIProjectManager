@@ -52,6 +52,28 @@ fn unlock_exe() {
 }
 
 fn main() -> eframe::Result {
+    // 全进程 panic 钩子：任何线程 panic（页签 reader/渲染/解析线程）都记到崩溃日志，
+    // 不静默吞掉。日志写在 exe 同级 crash.log，供事后定位到底哪个页签/线程崩了。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        eprintln!("[PANIC] {msg} (thread {:?})", std::thread::current().name());
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("crash.log"))
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "[{:?}] {msg} (thread {:?})",
+                            std::time::SystemTime::now(),
+                            std::thread::current().name())
+                    });
+            }
+        }
+        default_hook(info);
+    }));
     unlock_exe();
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()

@@ -9,8 +9,8 @@ pub struct Project {
     pub path: String,
 }
 
-/// 界面基线刷新帧率的默认值（帧/秒），对应默认 10 帧/秒。
-pub(crate) const DEFAULT_REFRESH_FPS: u64 = 10;
+/// 界面基线刷新帧率的默认值（帧/秒），对应默认 30 帧/秒。
+pub(crate) const DEFAULT_REFRESH_FPS: u64 = 30;
 
 fn default_refresh_fps() -> u64 {
     DEFAULT_REFRESH_FPS
@@ -87,7 +87,7 @@ pub struct Settings {
     pub tui_commands: Vec<String>,
     /// 当前选中的 TUI 命令（启动项目时使用）。
     pub tui_command: String,
-    /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 10。
+    /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 30。
     #[serde(default = "default_refresh_fps")]
     pub refresh_fps: u64,
     /// 深浅主题：true=深色（默认），false=浅色。
