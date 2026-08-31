@@ -2771,21 +2771,19 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 帧率控制：消费 redraw 信号判断活动状态，仅在有变化时调度下一帧。
-        // 空闲时不调 request_repaint_after → egui 停止唤醒 → GPU 零开销。
-        // SessionListener.send_event() 在前台 PTY 有输出时已调 ctx.request_repaint()，
-        // 足以唤醒空闲渲染；用户键盘/鼠标输入也会触发 egui 自身唤醒。
-        // 帧率控制：仅在有终端输出时调度下一帧，空闲时停帧降 GPU。
-        // 鼠标操作（选区拖动）的帧率恢复由 show_terminal 内部负责。
+        // 帧率控制：前台页签有输出时按配置 FPS，空闲时 1 FPS 基线（保持光标闪烁、
+        // 页签图标更新），后台页签/首页/设置页不调度。
         let is_foreground_term = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
         let redraw_count = self.redraw_rx.try_iter().count();
         if is_foreground_term {
             if redraw_count > 0 {
-                // 有终端输出活动 → 按配置帧率调度下一帧（保持回显流畅）。
+                // 有 PTY 输出 → 按配置帧率持续刷新（打字回显、TUI 动画）。
                 let fps = self.config.settings.refresh_fps.clamp(10, 60);
                 ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
+            } else {
+                // 空闲 → 10 FPS 基线：保持光标闪烁、页签状态图标更新流畅。
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
-            // 无活动时不调度：SessionListener 会在下次 PTY 输出时唤醒渲染。
         }
         // 首页/设置页不调度轮询：egui 输入处理会自动唤醒渲染循环。
         // 更新检查结果在用户交互时自然被消费。

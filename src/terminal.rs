@@ -135,6 +135,47 @@ fn copy_selection(
     }
 }
 
+/// 去掉文本中的 ANSI 转义序列（CSI/OSC/ESC 等），防止粘贴时把终端控制码当字面文本插入。
+/// 过滤模式：ESC 后跟 [ 或 ] 或单个字符的序列（如 ESCc、ESC(M 等）。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // ESC 后跟 [ → CSI 序列：参数字节 + 中间字节 + 终止字节
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // 跳过参数字节（0x30..=0x3F）和中间字节（0x20..=0x2F）
+                while chars.peek().map_or(false, |&b| matches!(b, '\x20'..='\x2f' | '\x30'..='\x3f')) {
+                    chars.next();
+                }
+                // 终止字节（0x40..=0x7E）
+                if chars.peek().map_or(false, |&b| matches!(b, '\x40'..='\x7e')) {
+                    chars.next();
+                }
+            } else if chars.peek() == Some(&']') {
+                // OSC 序列：ESC ] ... BEL 或 ESC \
+                chars.next();
+                while let Some(c2) = chars.next() {
+                    if c2 == '\x07' { break; }
+                    if c2 == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else if let Some(&next) = chars.peek() {
+                // 其他 ESC 序列（如 ESC c、ESC(M）：跳过下一个字符
+                if next != '[' && next != ']' {
+                    chars.next();
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// 从剪贴板读文件绝对路径列表（CF_HDROP，资源管理器 Ctrl+C 复制/剪切的文件）。
 /// 剪贴板被占用或无文件时返回空。
 fn clipboard_files() -> Vec<String> {
@@ -786,11 +827,11 @@ pub fn show_terminal(
             *term_focused = true;
         }
         Some(TermAction::ClearInput) => {
-            // 清空输入：Ctrl+C 取消整个输入（多行模式下取消全部行），
-            // 再 Ctrl+U 清行刷新提示符。
-            // Ctrl+U 单独只清当前显示行，多行输入（\\n 分隔）时前面的行残留；
-            // Ctrl+C 在 bash/zsh 多行模式下会取消整个多行输入。
-            let _ = sess.writer.try_send(b"\x03\x15".to_vec());
+            // 清空输入：先 Ctrl+C 取消多行输入，再 Home + Ctrl+U 确保当前行也被清除。
+            // \x03 Ctrl+C：bash/zsh 多行模式下取消全部行，cmd/PowerShell 取消当前行。
+            // \x01 Home：光标移到行首（确保 Ctrl+U 从行首开始删）。
+            // \x15 Ctrl+U：从光标删到行首。
+            let _ = sess.writer.try_send(b"\x03\x01\x15".to_vec());
             *status = Some("已清空输入".to_string());
         }
         None => {}
@@ -932,37 +973,22 @@ pub fn show_terminal(
                             continue;
                         }
                         if !text.is_empty() {
-                            // 多行粘贴：支持括号粘贴的应用（nvim 等）按字面插入，
-                            // 否则把换行转成 \r，让 shell 逐行执行。
+                            // 过滤 ANSI 转义序列：防止终端控制码（kitty 协议响应等）
+                            // 被当字面文本插入输入行。
+                            let cleaned = strip_ansi(text);
+                            if cleaned.is_empty() { continue; }
                             let bracketed = sess
                                 .term
                                 .read()
                                 .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
                                 .unwrap_or(false);
                             if bracketed {
-                                // 括号粘贴也统一把换行替换为空格：
-                                // 多行粘贴不应创建真正的换行（清空输入只能清当前行，
-                                // 会遗留前几行的残余内容）。
-                                let cleaned: String = text
-                                    .replace("\r\n", " ")
-                                    .replace('\r', " ")
-                                    .replace('\n', " ");
-                                if !cleaned.is_empty() {
-                                    let mut v = b"\x1b[200~".to_vec();
-                                    v.extend_from_slice(cleaned.as_bytes());
-                                    v.extend_from_slice(b"\x1b[201~");
-                                    bytes_out.push(v);
-                                }
+                                let mut v = b"\x1b[200~".to_vec();
+                                v.extend_from_slice(cleaned.as_bytes());
+                                v.extend_from_slice(b"\x1b[201~");
+                                bytes_out.push(v);
                             } else {
-                                // 换行替换为空格：多行粘贴保留词间距，
-                                // 不让 shell 把每行当独立命令执行。
-                                let cleaned: String = text
-                                    .replace("\r\n", " ")
-                                    .replace('\r', " ")
-                                    .replace('\n', " ");
-                                if !cleaned.is_empty() {
-                                    bytes_out.push(cleaned.into_bytes());
-                                }
+                                bytes_out.push(cleaned.into_bytes());
                             }
                         }
                     }
