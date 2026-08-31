@@ -2771,13 +2771,22 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 帧率控制：前台终端页签用 refresh_fps（默认 30fps），后台/首页 1fps。
+        // 帧率控制：消费 redraw 信号判断活动状态，仅在有变化时调度下一帧。
+        // 空闲时不调 request_repaint_after → egui 停止唤醒 → GPU 零开销。
+        // SessionListener.send_event() 在前台 PTY 有输出时已调 ctx.request_repaint()，
+        // 足以唤醒空闲渲染；用户键盘/鼠标输入也会触发 egui 自身唤醒。
         let is_foreground_term = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
+        let redraw_count = self.redraw_rx.try_iter().count();
         if is_foreground_term {
-            let fps = self.config.settings.refresh_fps.clamp(10, 60);
-            ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
+            if redraw_count > 0 {
+                // 有终端输出活动 → 按配置帧率调度下一帧（保持回显流畅）。
+                let fps = self.config.settings.refresh_fps.clamp(10, 60);
+                ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
+            }
+            // 无活动时不调度：SessionListener 会在下次 PTY 输出时唤醒渲染。
         } else {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            // 首页/设置页无 redraw 通道，维持极低频轮询。
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
         }
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
@@ -2787,9 +2796,6 @@ impl eframe::App for ClientApp {
             self.update_latest = latest;
             ctx.request_repaint();
         }
-
-        // 后台页签：完全不消费 redraw，不触发重绘。
-        let _ = self.redraw_rx.try_iter().next();
         let exited = self.update_exited();
         if exited {
             self.status = Some("有会话已退出".to_string());
