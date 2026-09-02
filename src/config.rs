@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct Project {
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// 界面基线刷新帧率的默认值（帧/秒），对应默认 30 帧/秒。

@@ -25,6 +25,14 @@ pub enum Tab {
     Settings,
 }
 
+/// 待下一帧在会话页签布局里重新启动/切换命令的会话（异步，不阻塞 UI）。
+pub struct PendingRelaunch {
+    pub tab_index: usize,
+    pub title: String,
+    pub dir: String,
+    pub cmd: String,
+}
+
 
 
 /// 待下一帧在会话页签布局里启动的会话。
@@ -81,6 +89,7 @@ enum ProjectAction {
     Rename(usize),
     EditPath(usize),
     Delete(usize),
+    ToggleHide(usize),
 }
 
 /// 加载中文字体作为 Proportional 与 Monospace 的 fallback。
@@ -458,11 +467,11 @@ pub struct ClientApp {
     drag_command: Option<usize>,
     /// 点击「启动」待 spawn 的会话（下一帧会话页签布局里按精确尺寸启动）。
     pending_launch: Vec<PendingLaunch>,
-    /// 后台线程正在 spawn 的会话：(title, is_restore)。每帧轮询通道收结果。
-    spawning: Vec<(String, bool)>,
+    /// 后台线程正在 spawn 的会话：(title, is_restore, relaunch_tab_index)。
+    spawning: Vec<(String, bool, Option<usize>)>,
     /// 后台 spawn 完成的结果通道：(result, is_restore, saved_index)。
     /// saved_index 仅恢复时有效（保存时的 dirs 索引），用于按原序插入页签。
-    spawn_rx: Option<Receiver<(Result<Session, String>, bool, usize)>>,
+    spawn_rx: Option<Receiver<(Result<Session, String>, bool, Option<usize>)>>,
     /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
     pending_restore: Vec<PendingLaunch>,
     /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
@@ -495,6 +504,12 @@ pub struct ClientApp {
     model_settings_open: bool,
     /// 后台重绘跳帧计数器：后台页签收到 redraw 信号时累计，达到跳帧阈值才真正重绘。
     bg_frame: u64,
+    /// 首页项目列表搜索过滤文本。
+    search_query: String,
+    /// 首页是否显示已隐藏的项目。
+    show_hidden: bool,
+    /// 待异步重新启动/切换命令的页签。
+    pending_relaunch: Vec<PendingRelaunch>,
 }
 
 impl ClientApp {
@@ -571,6 +586,9 @@ impl ClientApp {
             omp_models: config::load_omp_models(),
             model_settings_open: false,
             bg_frame: 0,
+            search_query: String::new(),
+            show_hidden: false,
+            pending_relaunch: Vec::new(),
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -727,19 +745,29 @@ impl ClientApp {
         #[cfg(windows)]
         let result = {
             use std::os::windows::process::CommandExt;
-            // cmd /c 按 PATHEXT 解析 code → code.cmd。目录必须作为独立参数传入：
-            // 若拼成 "code \"{dir}\"" 一个字符串，Rust 会把内嵌引号转义成 \"，
-            // cmd 不认该转义，含空格路径会被拆成多个参数。目录含空格时 cmd 的引号
-            // 自然保护 & | < > () 等字符，无需转义；不含空格时不加引号，需用 ^
-            // 转义这些字符，防止 cmd 把它们当命令分隔符。
-            // --new-window：已运行实例接手时会把当前窗口切到新目录，出现标题是
-            // 新目录但资源管理器仍显示旧目录的半切换状态（看起来像“把目录当页签
-            // 打开”）；显式开新窗口避免污染已有窗口。
-            std::process::Command::new("cmd")
-                .args(["/c", "code", "--new-window"])
-                .arg(Self::cmd_arg(dir))
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW，避免闪黑窗
-                .output()
+            use std::io::Write;
+            // cmd /c 通过系统代码页（GBK）转码命令行，中文路径会乱码。
+            // 写临时 .cmd 文件：先 chcp 65001 切 UTF-8，再 code --new-window。
+            // .cmd 本身用 UTF-8 写入，chcp 65001 让 cmd 按 UTF-8 解析后续行。
+            let bat = std::env::temp_dir().join("codebuff_open.cmd");
+            let content = format!("@chcp 65001 >nul\r\n@code --new-window \"{}\"\r\n", dir);
+            if let Ok(mut f) = std::fs::File::create(&bat) {
+                let _ = f.write_all(content.as_bytes());
+                drop(f);
+                let r = std::process::Command::new("cmd")
+                    .args(["/c", bat.to_str().unwrap_or("")])
+                    .creation_flags(0x0800_0000)
+                    .output();
+                let _ = std::fs::remove_file(&bat);
+                r
+            } else {
+                // 降级：直接调用 code（路径可能乱码但不至于崩溃）
+                std::process::Command::new("code")
+                    .args(["--new-window"])
+                    .arg(dir)
+                    .creation_flags(0x0800_0000)
+                    .output()
+            }
         };
         #[cfg(not(windows))]
         let result = std::process::Command::new("code").arg(dir).output();
@@ -753,28 +781,12 @@ impl ClientApp {
     }
 
     fn relaunch_session(&mut self, dir: String, title: String) {
-        // 按实际渲染尺寸 spawn：会话页签仍是当前视图，last_term_size 即真实尺寸，
-        // 避免固定 80x24 → 首帧 resize 的错尺寸启动路径（同新开页签竞态）。
-        let (cols, rows) = self.last_term_size;
-        match session::spawn(
-            &title,
-            &dir,
-            &self.config.settings.tui_command,
-            cols,
-            rows,
-            self.redraw_tx.clone(),
-            self.ctx.clone(),
-        ) {
-            Ok(sess) => {
-                sess.theme_dark
-                    .store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
-                self.tabs.push(Tab::Session(sess));
-                self.current = self.tabs.len() - 1;
-                self.term_focused = true;
-                self.status = Some(format!("已重新打开会话: {title}"));
-            }
-            Err(e) => self.status = Some(format!("重新打开会话失败: {e}")),
-        }
+        self.pending_relaunch.push(PendingRelaunch {
+            tab_index: self.tabs.len(),
+            title,
+            dir,
+            cmd: self.config.settings.tui_command.clone(),
+        });
     }
 
     fn close_session(&mut self, idx: usize) {
@@ -911,7 +923,7 @@ impl ClientApp {
                         .unwrap_or_else(|| path.clone());
                     name = fallback;
                 }
-                self.config.projects.push(config::Project { name, path });
+                self.config.projects.push(config::Project { name, path, hidden: false });
                 self.selected_project = self.config.projects.len() - 1;
                 self.input = None;
                 self.save_config("已添加项目".to_string());
@@ -1344,6 +1356,9 @@ impl ClientApp {
                         egui::Id::new(("settings_tab", i)),
                         egui::Sense::click_and_drag(),
                     );
+                    if resp.dragged() {
+                        drag_index = Some(i);
+                    }
                     if resp.clicked() {
                         let pos = ui.ctx().pointer_interact_pos();
                         if pos.is_some_and(|p| close_rect.contains(p)) {
@@ -1477,35 +1492,20 @@ impl ClientApp {
             let _ = s.child.kill();
         }
         self.tabs.remove(idx);
-        let (cols, rows) = self.last_term_size;
-        match session::spawn(
-            &title,
-            &dir,
-            &cmd,
-            cols,
-            rows,
-            self.redraw_tx.clone(),
-            self.ctx.clone(),
-        ) {
-            Ok(sess) => {
-                sess.theme_dark.store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
-                self.tabs.insert(idx, Tab::Session(sess));
-                self.current = idx;
-                self.term_focused = true;
-                self.refresh_focus();
-                self.status = Some(format!("已重新启动: {title}"));
-            }
-            Err(e) => {
-                self.status = Some(format!("重新启动失败: {e}"));
-                if self.current >= self.tabs.len() {
-                    self.current = self.tabs.len().saturating_sub(1);
-                }
-                if self.current == 0 {
-                    self.screen = Screen::Main;
-                }
-                self.refresh_focus();
-            }
+        if self.current >= self.tabs.len() {
+            self.current = self.tabs.len().saturating_sub(1);
         }
+        if self.current == 0 {
+            self.screen = Screen::Main;
+        }
+        self.refresh_focus();
+        self.pending_relaunch.push(PendingRelaunch {
+            tab_index: idx,
+            title,
+            dir,
+            cmd,
+        });
+        self.status = Some("正在重新启动...".to_string());
     }
 
     /// 通知所有会话当前主题：更新应答器用的标志，并主动广播 OSC 10/11 颜色
@@ -1570,37 +1570,20 @@ impl ClientApp {
             let _ = s.child.kill();
         }
         self.tabs.remove(idx);
-        // 按实际渲染尺寸 spawn：会话页签仍是当前视图，last_term_size 即真实尺寸。
-        let (cols, rows) = self.last_term_size;
-        match session::spawn(
-            &title,
-            &dir,
-            &cmd,
-            cols,
-            rows,
-            self.redraw_tx.clone(),
-            self.ctx.clone(),
-        ) {
-            Ok(sess) => {
-                sess.theme_dark
-                    .store(self.effective_dark(), std::sync::atomic::Ordering::Relaxed);
-                self.tabs.insert(idx, Tab::Session(sess));
-                self.current = idx;
-                self.term_focused = true;
-                self.refresh_focus();
-                self.status = Some(format!("已切换到命令: {cmd}"));
-            }
-            Err(e) => {
-                self.status = Some(format!("切换命令失败: {e}"));
-                if self.current >= self.tabs.len() {
-                    self.current = self.tabs.len().saturating_sub(1);
-                }
-                if self.current == 0 {
-                    self.screen = Screen::Main;
-                }
-                self.refresh_focus();
-            }
+        if self.current >= self.tabs.len() {
+            self.current = self.tabs.len().saturating_sub(1);
         }
+        if self.current == 0 {
+            self.screen = Screen::Main;
+        }
+        self.refresh_focus();
+        self.pending_relaunch.push(PendingRelaunch {
+            tab_index: idx,
+            title,
+            dir,
+            cmd,
+        });
+        self.status = Some("正在切换命令...".to_string());
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1746,10 +1729,43 @@ impl ClientApp {
                         self.open_settings();
                     }
                 });
+                // 搜索框
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .desired_width(ui.available_width())
+                        .hint_text("搜索项目名/目录..."),
+                );
+                // 隐藏项目切换
+                let hidden_count = self.config.projects.iter().filter(|p| p.hidden).count();
+                if hidden_count > 0 {
+                    let label = if self.show_hidden {
+                        format!("隐藏项目 ({hidden_count}) - 点击隐藏")
+                    } else {
+                        format!("显示隐藏项目 ({hidden_count})")
+                    };
+                    if ui.button(label).clicked() {
+                        self.show_hidden = !self.show_hidden;
+                    }
+                }
                 ui.separator();
                 if self.config.projects.is_empty() {
                     ui.label(RichText::new("暂无项目，点击「＋ 添加」创建一个。").weak());
                 }
+                // 过滤项目列表
+                let query = self.search_query.trim().to_lowercase();
+                let filtered_indices: Vec<usize> = self.config
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        if !self.show_hidden && p.hidden { return false; }
+                        if query.is_empty() { return true; }
+                        p.name.to_lowercase().contains(&query)
+                            || p.path.to_lowercase().contains(&query)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
                 let sel = self.selected_project;
                 let sel_fill = ui.visuals().selection.bg_fill;
                 let mut actions: Vec<ProjectAction> = Vec::new();
@@ -1768,12 +1784,14 @@ impl ClientApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (i, p) in self.config.projects.iter().enumerate() {
+                        for &i in &filtered_indices {
+                            let p = &self.config.projects[i];
                             let exists = exists_list[i];
+                            let hidden_mark = if p.hidden { " [隐藏]" } else { "" };
                             let label = if exists {
-                                format!("● {}", p.name)
+                                format!("● {}{}", p.name, hidden_mark)
                             } else {
-                                format!("○ {}  (目录不存在)", p.name)
+                                format!("○ {}{}  (目录不存在)", p.name, hidden_mark)
                             };
                             let color = if exists {
                                 ui.visuals().text_color()
@@ -1822,6 +1840,11 @@ impl ClientApp {
                                     ui.close();
                                 }
                                 ui.separator();
+                                let hide_label = if p.hidden { "取消隐藏" } else { "隐藏项目" };
+                                if ui.button(hide_label).clicked() {
+                                    actions.push(ProjectAction::ToggleHide(i));
+                                    ui.close();
+                                }
                                 if ui.button("重命名").clicked() {
                                     actions.push(ProjectAction::Rename(i));
                                     ui.close();
@@ -1971,6 +1994,18 @@ impl ClientApp {
                         ProjectAction::Delete(i) => {
                             self.selected_project = i;
                             self.request_delete();
+                        }
+                        ProjectAction::ToggleHide(i) => {
+                            if let Some(p) = self.config.projects.get_mut(i) {
+                                p.hidden = !p.hidden;
+                                let msg = if p.hidden {
+                                    format!("已隐藏: {}", p.name)
+                                } else {
+                                    format!("已取消隐藏: {}", p.name)
+                                };
+                                self.selected_project = i;
+                                self.save_config(msg);
+                            }
                         }
                     }
                 }
@@ -2831,7 +2866,9 @@ impl eframe::App for ClientApp {
             // spawn 移到后台线程：ConPTY 初始化 + 子进程创建会阻塞 UI 数百毫秒，
             // 导致首帧卡死、点击/键盘事件全部丢失。
             let pending = std::mem::take(&mut self.pending_launch);
-            if !pending.is_empty() {
+            let pending_rel = std::mem::take(&mut self.pending_relaunch);
+            let has_new_spawns = !pending.is_empty() || !pending_rel.is_empty();
+            if has_new_spawns {
                 let geom = terminal::term_grid_size(ui);
                 let (cols, rows) = geom.unwrap_or((80, 24));
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -2841,75 +2878,109 @@ impl eframe::App for ClientApp {
                     let redraw = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let tx = tx.clone();
-                    self.spawning.push((title, false));
+                    self.spawning.push((title, false, None));
                     std::thread::spawn(move || {
                         let result = session::spawn(
                             &p.title, &p.dir, &p.cmd,
                             cols as u16, rows as u16,
                             redraw, ctx,
                         );
-                        // 非恢复：saved_index 用 0，实际不会用到。
-                        let _ = tx.send((result, false, 0));
+                        let _ = tx.send((result, false, None));
+                    });
+                }
+                for p in pending_rel {
+                    let title = p.title.clone();
+                    let tab_idx = p.tab_index;
+                    let redraw = self.redraw_tx.clone();
+                    let ctx = self.ctx.clone();
+                    let tx = tx.clone();
+                    self.spawning.push((title, false, Some(tab_idx)));
+                    std::thread::spawn(move || {
+                        let result = session::spawn(
+                            &p.title, &p.dir, &p.cmd,
+                            cols as u16, rows as u16,
+                            redraw, ctx,
+                        );
+                        let _ = tx.send((result, false, Some(tab_idx)));
                     });
                 }
                 self.screen = Screen::Main;
                 self.check_updates(true);
             }
-            // 轮询后台 spawn 结果。
+            // 轮询后台 spawn 结果：先收进临时列表，再逐条处理，避免 &rx 与 &mut self 借用冲突。
+            let mut spawn_results: Vec<(Result<Session, String>, bool, Option<usize>)> = Vec::new();
             if let Some(rx) = &self.spawn_rx {
-                while let Ok((result, is_restore, saved_index)) = rx.try_recv() {
+                while let Ok(item) = rx.try_recv() {
                     self.spawning.pop();
-                    if is_restore {
-                        // 攒进按保存序的槽位：后台 spawn 完成顺序随机，直接按索引插入
-                        // 会因先到的高索引越界（tabs 尚未补齐前索引）而闪退。
-                        // 先算主题（借用 self 不可变），再写槽位（可变借用），避免重叠。
-                        let themed = self.apply_theme_to(result);
-                        if let Some(slot) = self.restore_slots.get_mut(saved_index) {
+                    spawn_results.push(item);
+                }
+            }
+            for (result, is_restore, saved_index) in spawn_results {
+                if is_restore {
+                    let themed = self.apply_theme_to(result);
+                    if let Some(idx) = saved_index {
+                        if let Some(slot) = self.restore_slots.get_mut(idx) {
                             *slot = Some(themed);
                         }
-                    } else {
-                        match self.apply_theme_to(result) {
-                            Ok(sess) => {
-                                self.tabs.push(Tab::Session(sess));
-                                self.current = self.tabs.len() - 1;
-                                self.term_focused = true;
-                                self.screen = Screen::Main;
-                                self.status = Some("已启动".to_string());
-                            }
-                            Err(e) => {
-                                self.status = Some(format!("启动失败: {e}"));
-                            }
+                    }
+                } else if let Some(relaunch_idx) = saved_index {
+                    match self.apply_theme_to(result) {
+                        Ok(sess) => {
+                            let idx = relaunch_idx.min(self.tabs.len());
+                            self.tabs.insert(idx, Tab::Session(sess));
+                            self.current = idx;
+                            self.term_focused = true;
+                            self.screen = Screen::Main;
+                            self.refresh_focus();
+                            self.status = Some("已启动".to_string());
+                        }
+                        Err(e) => {
+                            self.status = Some(format!("启动失败: {e}"));
+                            self.refresh_focus();
+                        }
+                    }
+                } else {
+                    match self.apply_theme_to(result) {
+                        Ok(sess) => {
+                            self.tabs.push(Tab::Session(sess));
+                            self.current = self.tabs.len() - 1;
+                            self.term_focused = true;
+                            self.screen = Screen::Main;
+                            self.status = Some("已启动".to_string());
+                        }
+                        Err(e) => {
+                            self.status = Some(format!("启动失败: {e}"));
                         }
                     }
                 }
-                // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
-                // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
-                if self.spawning.is_empty() && !self.restore_slots.is_empty() {
-                    let slots = std::mem::take(&mut self.restore_slots);
-                    let mut restored = 0usize;
-                    for slot in slots {
-                        match slot {
-                            Some(Ok(sess)) => {
-                                self.tabs.push(Tab::Session(sess));
-                                restored += 1;
-                            }
-                            Some(Err(e)) => {
-                                self.status = Some(format!("启动失败: {e}"));
-                            }
-                            None => {}
+            }
+            // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
+            // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
+            if self.spawning.is_empty() && !self.restore_slots.is_empty() {
+                let slots = std::mem::take(&mut self.restore_slots);
+                let mut restored = 0usize;
+                for slot in slots {
+                    match slot {
+                        Some(Ok(sess)) => {
+                            self.tabs.push(Tab::Session(sess));
+                            restored += 1;
                         }
-                    }
-                    if restored > 0 {
-                        if let Some(active) = self.restore_active.take() {
-                            self.current = active.min(self.tabs.len() - 1);
-                            self.term_focused = self.current != 0;
+                        Some(Err(e)) => {
+                            self.status = Some(format!("启动失败: {e}"));
                         }
-                        self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+                        None => {}
                     }
                 }
-                if self.spawning.is_empty() {
-                    self.spawn_rx = None;
+                if restored > 0 {
+                    if let Some(active) = self.restore_active.take() {
+                        self.current = active.min(self.tabs.len() - 1);
+                        self.term_focused = self.current != 0;
+                    }
+                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
                 }
+            }
+            if self.spawning.is_empty() {
+                self.spawn_rx = None;
             }
 
             // 启动时恢复上次的会话：后台线程 spawn，避免阻塞首帧。
@@ -2928,7 +2999,7 @@ impl eframe::App for ClientApp {
                     let redraw = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let tx = tx.clone();
-                    self.spawning.push((title.clone(), true));
+                    self.spawning.push((title.clone(), true, Some(save_i)));
                     std::thread::spawn(move || {
                         let result = session::spawn(
                             &title, &dir, &cmd,
@@ -2937,7 +3008,7 @@ impl eframe::App for ClientApp {
                         );
                         // saved_index：恢复时按保存时的原序插入，保证页签顺序不因
                         // 后台 spawn 完成先后而打乱。
-                        let _ = tx.send((result, true, save_i));
+                        let _ = tx.send((result, true, Some(save_i)));
                     });
                 }
                 // 恢复的会话数已知，等后台线程完成后一次性应用 restore_active。

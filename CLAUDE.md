@@ -130,3 +130,61 @@ if resp.clicked() && is_true_click {
 - 不消费 redraw 信号，不触发 repaint
 - `show_terminal` 不被调用（只渲染当前页签）
 - 后台会话输出照常解析（管道不能停读），但不唤醒 UI
+
+## 会话异步启动（关键架构约束）
+
+### pending_launch / pending_relaunch
+- `PendingLaunch`：新页签启动（从首页点击「启动」）
+- `PendingRelaunch`：重新启动/切换命令（重启页签、切换启动命令、崩溃后重新打开）
+- 两者在 `ui()` 的 `CentralPanel` 闭包里统一 spawn：`pending_launch` 创建通道 + 发送，`pending_relaunch` 复用同一通道
+- `spawning` 元组类型：`(title, is_restore, relaunch_tab_index: Option<usize>)`
+  - `relaunch_tab_index = None`：新页签，push 到末尾
+  - `relaunch_tab_index = Some(idx)`：替换 idx 处页签
+- `spawn_rx` 通道类型：`Receiver<(Result<Session, String>, bool, Option<usize>)>`
+- **禁止**在 `relaunch_session` / `restart_tab` / `switch_tab_command` 里同步调 `session::spawn`：会阻塞 UI 数百毫秒
+
+### spawn 结果处理
+- 先 `try_recv` 收进临时 `Vec`，再逐条处理（避免 `&rx` 与 `&mut self` 借用冲突）
+- restore 模式：攒进 `restore_slots` 按保存序一次性追加
+- relaunch 模式：`self.tabs.insert(idx, Tab::Session(sess))`
+- 新启动模式：`self.tabs.push(Tab::Session(sess))`
+
+## 首页项目列表搜索与隐藏
+
+### 搜索过滤
+- `ClientApp.search_query: String`：搜索文本
+- 在 `home_ui` 中构建 `filtered_indices: Vec<usize>`，模糊匹配项目名或目录路径（`to_lowercase().contains()`）
+- 列表循环用 `for &i in &filtered_indices` 迭代
+
+### 隐藏项目
+- `Project.hidden: bool`（`#[serde(default)]`，向后兼容）
+- `ClientApp.show_hidden: bool`：控制是否显示已隐藏项目
+- 右键菜单「隐藏项目」/「取消隐藏」→ `ProjectAction::ToggleHide`
+- 有隐藏项目时显示切换按钮「显示隐藏项目 (N)」/「隐藏项目 (N) - 点击隐藏」
+- 过滤优先级：先 hidden 过滤，再 search 过滤
+
+## VS Code 中文路径编码修复
+
+### 问题
+- `cmd /c code --new-window "中文路径"` 通过系统代码页（GBK）转码，中文路径乱码
+
+### 修复
+- 写临时 `.cmd` 文件：第一行 `@chcp 65001 >nul` 切 UTF-8 代码页，第二行 `@code --new-window "path"`
+- `.cmd` 文件用 UTF-8 写入，chcp 65001 让 cmd 按 UTF-8 解析后续行
+- 执行后删除临时文件
+- 降级路径：File::create 失败时直接调 `Command::new("code")`
+
+## 页签拖拽重排
+
+### 关键约束
+- Session 页签和 Settings 页签都必须设置 `Sense::click_and_drag()` 并检查 `resp.dragged()` 记录 `drag_index`
+- Home 页签固定最左，不可拖动
+- `drag_tab` 跨帧保存源索引，松手帧消费并执行 `move_tab`
+- `move_tab` 拒绝 `from == 0`（Home 固定）
+
+## 项目列表拖拽重排
+
+### 过滤状态下的拖拽
+- 搜索或显示隐藏项目时（`is_filtered = true`），禁用拖拽重排（fi 无法映射到原始索引）
+- `row_rects` 和 `drag_index` 使用过滤后索引（fi），`move_project` 使用原始索引
+- 非过滤状态下 fi == 原始索引，拖拽正常工作
