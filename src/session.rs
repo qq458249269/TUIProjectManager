@@ -92,8 +92,8 @@ pub struct Session {
     pub writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     /// PTY 主句柄（用于 resize）。
     pub master: Box<dyn portable_pty::MasterPty + Send>,
-    /// 子进程。
-    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// 子进程（Option 包装：take() 后移入后台线程异步 kill，避免 Child::drop 在 UI 线程阻塞）。
+    pub child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// 上次渲染的网格尺寸，用于检测是否需要 resize。
     pub grid_size: (u16, u16),
     /// 新会话首次帧需要强制 resize：解决 ConPTY 初始化时序问题。
@@ -892,7 +892,7 @@ pub fn spawn(
         cmd_tx: cmd_tx.clone(),
         writer: writer_tx,
         master: pair.master,
-        child,
+        child: Some(child),
         grid_size: (cols, rows),
         needs_resize: true,
         theme_dark,

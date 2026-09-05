@@ -793,8 +793,16 @@ impl ClientApp {
         if idx == 0 || idx >= self.tabs.len() {
             return;
         }
+        // 将 child 移到后台线程异步清理：Child::drop 在 Windows 上调用
+        // WaitForSingleObject 等待进程退出，会阻塞 UI 线程 100-500ms。
+        // take() 后 tabs.remove() 触发的 Session::Drop 不再包含 child，
+        // UI 线程立即返回，进程终止在后台完成。
         if let Some(Tab::Session(s)) = self.tabs.get_mut(idx) {
-            let _ = s.child.kill();
+            if let Some(mut child) = s.child.take() {
+                std::thread::spawn(move || {
+                    let _ = child.kill();
+                });
+            }
         }
         self.tabs.remove(idx);
         if self.current >= self.tabs.len() {
@@ -887,7 +895,9 @@ impl ClientApp {
                     // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
                     // reader 线程会在 PTY 管道断裂时设置 exited 标志。
                     if s.foreground.load(Ordering::Relaxed) {
-                        let child_exited = matches!(s.child.try_wait(), Ok(Some(_)));
+                        let child_exited = s.child
+                            .as_deref_mut()
+                            .map_or(false, |c| matches!(c.try_wait(), Ok(Some(_))));
                         if child_exited {
                             s.exited.store(true, Ordering::Relaxed);
                         }
@@ -991,7 +1001,9 @@ impl ClientApp {
     fn shutdown(&mut self) {
         for tab in self.tabs.iter_mut() {
             if let Tab::Session(s) = tab {
-                let _ = s.child.kill();
+                if let Some(mut child) = s.child.take() {
+                    let _ = child.kill();
+                }
             }
         }
     }
@@ -1488,8 +1500,13 @@ impl ClientApp {
         let dir = s.dir.clone();
         let title = s.title.clone();
         let cmd = s.cmd.clone();
+        // 将 child 移到后台线程异步清理，避免 Child::drop 阻塞 UI 线程。
         if !s.exited.load(Ordering::Relaxed) {
-            let _ = s.child.kill();
+            if let Some(mut child) = s.child.take() {
+                std::thread::spawn(move || {
+                    let _ = child.kill();
+                });
+            }
         }
         self.tabs.remove(idx);
         if self.current >= self.tabs.len() {
@@ -1566,8 +1583,13 @@ impl ClientApp {
         }
         let dir = s.dir.clone();
         let title = s.title.clone();
+        // 将 child 移到后台线程异步清理，避免 Child::drop 阻塞 UI 线程。
         if !s.exited.load(Ordering::Relaxed) {
-            let _ = s.child.kill();
+            if let Some(mut child) = s.child.take() {
+                std::thread::spawn(move || {
+                    let _ = child.kill();
+                });
+            }
         }
         self.tabs.remove(idx);
         if self.current >= self.tabs.len() {
