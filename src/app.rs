@@ -398,7 +398,7 @@ fn fetch_latest_release() -> (String, Option<String>, Option<String>) {
     }
 }
 
-/// 下载新版本 exe 到应用目录 tmp/ 下，完成后写 bat 替换脚本并关闭应用。
+/// 下载新版本 exe 到应用目录，完成后替换运行中的 exe（不退出、不重启）。
 /// 在后台线程执行，通过 channel 回报进度。
 fn download_and_replace(
     url: &str,
@@ -410,7 +410,7 @@ fn download_and_replace(
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
     let new_exe = app_dir.join(format!("{exe_name}.new"));
 
-    // 用 curl 下载，-# 显示进度条，-o 指定输出文件
+    // 用 curl 下载，--progress-bar 把进度写到 stderr，-o 指定输出文件
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-L",
@@ -421,17 +421,48 @@ fn download_and_replace(
         "-o",
         new_exe.to_str().unwrap_or(""),
         url,
-    ]);
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
-    let _ = progress_tx.send(DownloadEvent::Downloading("正在下载...".to_string()));
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = progress_tx.send(DownloadEvent::Failed(format!("下载失败: {e}")));
+            return;
+        }
+    };
 
-    match cmd.output() {
-        Ok(o) if o.status.success() => {
+    // 逐行读 stderr，解析 curl 进度条首列百分比，实时上报
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            use std::io::BufRead;
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Some(pct) = line
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        let _ = progress_tx.send(DownloadEvent::Progress(pct));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    match child.wait() {
+        Ok(status) if status.success() => {
             // 验证下载的文件非空
             match std::fs::metadata(&new_exe) {
                 Ok(m) if m.len() > 1024 => {
@@ -443,9 +474,8 @@ fn download_and_replace(
                 }
             }
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let _ = progress_tx.send(DownloadEvent::Failed(format!("下载失败: {stderr}")));
+        Ok(_) => {
+            let _ = progress_tx.send(DownloadEvent::Failed("下载失败：curl 返回非零状态".to_string()));
         }
         Err(e) => {
             let _ = progress_tx.send(DownloadEvent::Failed(format!("下载失败: {e}")));
@@ -455,7 +485,8 @@ fn download_and_replace(
 
 /// 下载完成后的事件。
 enum DownloadEvent {
-    Downloading(String),
+    /// 下载进度百分比（0.0 ~ 100.0）。
+    Progress(f64),
     Downloaded(PathBuf),
     Failed(String),
 }
@@ -1741,7 +1772,7 @@ impl ClientApp {
                 if self.download_progress.is_some() {
                     // 正在下载，显示进度
                     let progress = self.download_progress.clone().unwrap_or_default();
-                    ui.label(RichText::new(format!("⬇ {progress}")).color(ui_warn(ui)));
+                    ui.label(RichText::new(format!("⬇ 下载中 {progress}")).color(ui_warn(ui)));
                 } else if let Some(download_url) = &self.update_download_url {
                     // 有下载链接，点击直接下载替换
                     if ui
@@ -1751,7 +1782,7 @@ impl ClientApp {
                     {
                         let url = download_url.clone();
                         let (dl_tx, dl_rx) = std::sync::mpsc::channel();
-                        self.download_progress = Some("正在准备下载...".to_string());
+                        self.download_progress = Some("0.00%".to_string());
                         self.download_rx = Some(dl_rx);
                         std::thread::spawn(move || {
                             download_and_replace(&url, dl_tx);
@@ -2986,8 +3017,8 @@ impl eframe::App for ClientApp {
             let mut keep_rx = true;
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    DownloadEvent::Downloading(msg) => {
-                        self.status = Some(msg);
+                    DownloadEvent::Progress(pct) => {
+                        self.download_progress = Some(format!("{pct:.2}%"));
                         ctx.request_repaint();
                     }
                     DownloadEvent::Downloaded(new_exe) => {
