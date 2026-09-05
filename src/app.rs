@@ -68,6 +68,8 @@ pub enum ConfirmDialog {
     DeleteProject { index: usize, name: String },
     /// 会话页签崩溃后的处理选择：重新打开 / 关闭。
     RelaunchSession { dir: String, title: String, reason: String },
+    /// 更新下载完成，替换脚本已就绪，询问是否立即重启应用。
+    RestartApp { bat: PathBuf },
 }
 
 /// 页签栏点击/右键菜单产生的动作。
@@ -2843,6 +2845,13 @@ impl ClientApp {
                     0,
                 )
             }
+            ConfirmDialog::RestartApp { .. } => {
+                confirm_label = "立即重启";
+                (
+                    "新版本已下载完成，重启应用后生效。现在重启吗？（取消则继续使用当前版本）".to_string(),
+                    0,
+                )
+            }
         };
         let mut yes = false;
         let mut no = false;
@@ -2873,6 +2882,19 @@ impl ClientApp {
                 ConfirmDialog::DeleteProject { index, .. } => self.confirm_delete(index),
                 ConfirmDialog::RelaunchSession { dir, title, .. } => {
                     self.relaunch_session(dir, title)
+                }
+                ConfirmDialog::RestartApp { bat } => {
+                    // 启动 bat 脚本（内部 taskkill /F + 替换 + 重启），然后关闭应用
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/c", bat.to_str().unwrap_or("")])
+                            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                            .spawn();
+                    }
+                    self.status = Some("正在替换并重启...".to_string());
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         } else if !no {
@@ -2994,24 +3016,15 @@ impl eframe::App for ClientApp {
                         ctx.request_repaint();
                     }
                     DownloadEvent::Downloaded(new_exe) => {
-                        // 下载完成，写 bat 替换脚本并关闭应用
+                        // 下载完成，写 bat 替换脚本，弹窗询问是否立即重启
                         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
                         let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
                         let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
                         if let Some(bat) = schedule_replace(&new_exe, &app_dir, &exe_name) {
-                            self.status = Some("下载完成，正在替换...".to_string());
+                            self.status = Some("新版本已下载完成，重启应用后生效".to_string());
                             self.download_progress = None;
+                            self.confirm = Some(ConfirmDialog::RestartApp { bat });
                             ctx.request_repaint();
-                            // 启动 bat 脚本（detached），然后关闭应用
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                let _ = std::process::Command::new("cmd")
-                                    .args(["/c", bat.to_str().unwrap_or("")])
-                                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                                    .spawn();
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         } else {
                             self.status = Some("替换脚本创建失败".to_string());
                             self.download_progress = None;
