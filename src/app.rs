@@ -410,14 +410,14 @@ fn download_and_replace(
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
     let new_exe = app_dir.join(format!("{exe_name}.new"));
 
-    // 用 curl 下载，--progress-bar 把进度写到 stderr，-o 指定输出文件
+    // 用 curl 下载，--progress-meter 把表格进度写到 stderr，-o 指定输出文件
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-L",
         "--connect-timeout",
         "15",
         "--ssl-no-revoke",
-        "--progress-bar",
+        "--progress-meter",
         "-o",
         new_exe.to_str().unwrap_or(""),
         url,
@@ -438,22 +438,25 @@ fn download_and_replace(
         }
     };
 
-    // 逐行读 stderr，解析 curl 进度条首列百分比，实时上报
+    // 逐段读 stderr：curl 每次进度更新以 \r 覆盖，段内按 \r 切分，取每段首列数字（百分比）
     if let Some(stderr) = child.stderr.take() {
+        use std::io::BufRead;
         let mut reader = std::io::BufReader::new(stderr);
-        let mut line = String::new();
+        let mut buf = Vec::new();
         loop {
-            line.clear();
-            use std::io::BufRead;
-            match reader.read_line(&mut line) {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if let Some(pct) = line
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| s.parse::<f64>().ok())
-                    {
-                        let _ = progress_tx.send(DownloadEvent::Progress(pct));
+                    for part in buf.split(|&b| b == b'\r') {
+                        let text = String::from_utf8_lossy(part);
+                        if let Some(pct) = text
+                            .split_whitespace()
+                            .next()
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            let _ = progress_tx.send(DownloadEvent::Progress(pct));
+                        }
                     }
                 }
                 Err(_) => break,
