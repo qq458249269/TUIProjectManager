@@ -1,5 +1,9 @@
 # 项目开发注意事项
 
+## 编码后必须编译 debug
+- 每次改动代码后必须执行 `cargo build` 编译 debug 版本（仅 `cargo check` 不够）
+- 编译通过且无新增 warning 后才可提交/推送
+
 ## 终端滚动渲染（关键架构约束）
 
 ### snapshot 机制

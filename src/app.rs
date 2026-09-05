@@ -345,8 +345,8 @@ fn ui_gray(ui: &egui::Ui) -> Color32 {
     }
 }
 
-/// 从 GitHub Release 拉取最新版本号，返回（状态栏消息, tag, 下载 URL）。
-fn fetch_latest_release() -> (String, Option<String>, Option<String>) {
+/// 从 GitHub Release 拉取最新版本号，返回（状态栏消息, 有新版本时的 tag）。
+fn fetch_latest_release() -> (String, Option<String>) {
     const URL: &str =
         "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
     let mut cmd = std::process::Command::new("curl");
@@ -374,238 +374,17 @@ fn fetch_latest_release() -> (String, Option<String>, Option<String>) {
                     let tag = v["tag_name"].as_str().unwrap_or("?").to_string();
                     let latest = tag.trim_start_matches('v');
                     if version_newer(latest, crate::app_version()) {
-                        // 从 release assets 中查找 exe 下载链接
-                        let download_url = v["assets"].as_array().and_then(|assets| {
-                            assets.iter().find_map(|a| {
-                                let name = a["name"].as_str().unwrap_or("");
-                                if name.ends_with(".exe") {
-                                    a["browser_download_url"].as_str().map(String::from)
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                        (format!("发现新版本 {tag}，点击下方按钮下载"), Some(tag), download_url)
+                        (format!("发现新版本 {tag}，点击下方按钮下载"), Some(tag))
                     } else {
-                        (format!("已是最新版本 ({tag})"), None, None)
+                        (format!("已是最新版本 ({tag})"), None)
                     }
                 }
-                Err(_) => ("检查更新失败：无法解析 GitHub 响应".to_string(), None, None),
+                Err(_) => ("检查更新失败：无法解析 GitHub 响应".to_string(), None),
             }
         }
-        Ok(_) => ("检查更新失败：网络错误".to_string(), None, None),
-        Err(e) => (format!("检查更新失败：{e}"), None, None),
+        Ok(_) => ("检查更新失败：网络错误".to_string(), None),
+        Err(e) => (format!("检查更新失败：{e}"), None),
     }
-}
-
-/// 探测可用的系统代理：读注册表 ProxyServer（如 127.0.0.1:10808），端口可达才返回。
-/// 代理软件没运行时端口连不通，返回 None 让 curl 直连。
-fn system_proxy() -> Option<String> {
-    let mut out = std::process::Command::new("reg");
-    out.args([
-            "query",
-            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-            "/v",
-            "ProxyServer",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // GUI 程序 spawn 控制台程序（reg.exe）会闪黑窗，CREATE_NO_WINDOW 消除
-        out.creation_flags(0x08000000);
-    }
-    let out = out.output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // 输出形如： ProxyServer    REG_SZ    127.0.0.1:10808
-    let hp = text.lines().find_map(|l| {
-        let l = l.trim();
-        if !l.contains("REG_SZ") {
-            return None;
-        }
-        let v = l["REG_SZ".len()..].trim();
-        v.split([';', '=', ',']).find_map(|seg| {
-            let seg = seg.trim();
-            if seg.split(':').count() == 2 {
-                Some(seg.to_string())
-            } else {
-                None
-            }
-        })
-    })?;
-    // 探测端口是否活着
-    use std::net::{TcpStream, ToSocketAddrs};
-    let addr = hp.to_socket_addrs().ok()?.next()?;
-    if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).is_err() {
-        return None;
-    }
-    Some(format!("http://{hp}"))
-}
-
-/// 用 curl 下载单个 URL 到 new_exe，实时上报进度。成功（文件有效）返回 true。
-/// 错误文本收集到 last_err 供外层汇总显示。
-fn run_curl(
-    url: &str,
-    new_exe: &Path,
-    progress_tx: &std::sync::mpsc::Sender<DownloadEvent>,
-    last_err: &mut String,
-) -> bool {
-    // 自动使用系统代理（端口可达才用）
-    let proxy = system_proxy();
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args([
-        "-L",
-        "--connect-timeout",
-        "8",
-        "--ssl-no-revoke",
-        "--progress-meter",
-        "-o",
-        new_exe.to_str().unwrap_or(""),
-        url,
-    ])
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::piped());
-    if let Some(p) = &proxy {
-        cmd.args(["--proxy", p]);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            *last_err = e.to_string();
-            return false;
-        }
-    };
-    let _ = progress_tx.send(DownloadEvent::Started(child.id()));
-
-    // 逐段读 stderr：curl 每次进度更新以 \r 覆盖，段内按 \r 切分，取每段首列数字（百分比）
-    // 非数字段收集末尾文本（curl 错误行），失败时带给用户
-    if let Some(stderr) = child.stderr.take() {
-        use std::io::BufRead;
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    for part in buf.split(|&b| b == b'\r') {
-                        let text = String::from_utf8_lossy(part);
-                        if let Some(pct) = text
-                            .split_whitespace()
-                            .next()
-                            .and_then(|s| s.parse::<f64>().ok())
-                        {
-                            let _ = progress_tx.send(DownloadEvent::Progress(pct));
-                        } else if text.starts_with("curl:") {
-                            *last_err = text.trim().to_string();
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-
-    match child.wait() {
-        Ok(status) if status.success() => {
-            // 验证下载的文件非空
-            match std::fs::metadata(new_exe) {
-                Ok(m) if m.len() > 1024 => true,
-                _ => {
-                    let _ = std::fs::remove_file(new_exe).ok();
-                    *last_err = "下载文件异常（可能不完整）".to_string();
-                    false
-                }
-            }
-        }
-        Ok(_) => {
-            if last_err.is_empty() {
-                *last_err = "curl 返回非零状态".to_string();
-            }
-            false
-        }
-        Err(e) => {
-            *last_err = e.to_string();
-            false
-        }
-    }
-}
-
-/// 下载新版本 exe 到应用目录，完成后替换运行中的 exe（不退出、不重启）。
-/// 在后台线程执行，通过 channel 回报进度。
-/// 多源重试：直连 github 被墙时自动切换 ghproxy 镜像。
-fn download_and_replace(
-    url: &str,
-    progress_tx: std::sync::mpsc::Sender<DownloadEvent>,
-) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-
-    let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let new_exe = app_dir.join(format!("{exe_name}.new"));
-
-    // 候选源：原始 URL + 常见 ghproxy 镜像（github 主域在国内常被 SNI 阻断）
-    let mut attempts = vec![url.to_string()];
-    attempts.push(format!("https://mirror.ghproxy.com/{url}"));
-    attempts.push(format!("https://ghproxy.net/{url}"));
-    let mut last_err = String::new();
-    for (i, u) in attempts.iter().enumerate() {
-        if i > 0 {
-            // 换源提示（进度归零，用户可见切换发生）
-            let _ = progress_tx.send(DownloadEvent::Progress(0.0));
-            last_err.clear();
-        }
-        if run_curl(u, &new_exe, &progress_tx, &mut last_err) {
-            let _ = progress_tx.send(DownloadEvent::Downloaded(new_exe));
-            return;
-        }
-    }
-    let _ = progress_tx.send(DownloadEvent::Failed(format!(
-        "下载失败（已尝试直连与镜像源）：{last_err}"
-    )));
-}
-
-/// 下载完成后的事件。
-enum DownloadEvent {
-    /// curl 下载进程已启动，携带 pid（供退出时强制清理）。
-    Started(u32),
-    /// 下载进度百分比（0.0 ~ 100.0）。
-    Progress(f64),
-    Downloaded(PathBuf),
-    Failed(String),
-}
-
-/// 热替换运行中的 exe（不退出、不重启）：旧 exe 改名 → 新 exe 移入原名。
-/// 必须由外部 PowerShell 进程执行：主进程自己 rename 到自己 exe 原名会被拒绝访问（os error 5）。
-/// 旧文件 exe.old 因运行中句柄暂时删不掉，残留到下次替换时再清。
-fn schedule_replace(new_exe: &Path, app_dir: &Path, exe_name: &str) -> bool {
-    let exe = app_dir.join(exe_name);
-    let old = app_dir.join(format!("{exe_name}.old"));
-    // 单引号包路径；路径含单引号极罕见，忽略。
-    let ps = format!(
-        "Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue; Rename-Item -LiteralPath '{}' '{}' -Force; Move-Item -LiteralPath '{}' '{}' -Force",
-        old.display(),
-        exe.display(),
-        format!("{exe_name}.old"),
-        new_exe.display(),
-        exe.display(),
-    );
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    cmd.spawn().is_ok()
 }
 
 /// 用系统默认浏览器打开 URL。
@@ -671,15 +450,8 @@ pub struct ClientApp {
     pub config_path: PathBuf,
     pub term_focused: bool,
     update_latest: Option<String>,
-    update_download_url: Option<String>,
-    check_tx: Sender<(String, Option<String>, Option<String>)>,
-    update_rx: Receiver<(String, Option<String>, Option<String>)>,
-    /// 下载进度（Some = 正在下载）。
-    download_progress: Option<String>,
-    /// 下载进程 pid（应用退出时强制结束，避免残留 curl）。
-    download_pid: Option<u32>,
-    /// 下载事件接收通道。
-    download_rx: Option<std::sync::mpsc::Receiver<DownloadEvent>>,
+    check_tx: Sender<(String, Option<String>)>,
+    update_rx: Receiver<(String, Option<String>)>,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
@@ -787,16 +559,12 @@ impl ClientApp {
             config_path,
             term_focused: false,
             update_latest: None,
-            update_download_url: None,
             input: None,
             confirm: None,
             check_tx,
             update_rx,
             redraw_tx,
             redraw_rx,
-            download_progress: None,
-            download_pid: None,
-            download_rx: None,
             theme_settle_at: None,
             drag_tab: None,
             drag_project: None,
@@ -1237,19 +1005,6 @@ impl ClientApp {
                     let _ = child.kill();
                 }
             }
-        }
-        // 结束残留的下载进程（curl）
-        if let Some(pid) = self.download_pid.take() {
-            let mut kill = std::process::Command::new("taskkill");
-            kill.args(["/PID", &pid.to_string(), "/F"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                kill.creation_flags(0x08000000); // CREATE_NO_WINDOW，避免闪黑窗
-            }
-            let _ = kill.status();
         }
     }
 
@@ -1877,37 +1632,16 @@ impl ClientApp {
             ui.label(RichText::new(text).color(color));
             if let Some(tag) = &self.update_latest {
                 ui.separator();
-                if self.download_progress.is_some() {
-                    // 正在下载，显示进度
-                    let progress = self.download_progress.clone().unwrap_or_default();
-                    ui.label(RichText::new(format!("⬇ 下载中 {progress}")).color(ui_warn(ui)));
-                } else if let Some(download_url) = &self.update_download_url {
-                    // 有下载链接，点击直接下载替换
-                    if ui
-                        .button(format!("⬇ 下载 {tag}"))
-                        .on_hover_text("下载新版本并自动替换（需重启应用）")
-                        .clicked()
-                    {
-                        let url = download_url.clone();
-                        let (dl_tx, dl_rx) = std::sync::mpsc::channel();
-                        self.download_progress = Some("0.00%".to_string());
-                        self.download_rx = Some(dl_rx);
-                        std::thread::spawn(move || {
-                            download_and_replace(&url, dl_tx);
-                        });
-                    }
-                } else {
-                    // 无下载链接，降级到浏览器打开
-                    let url = format!(
-                        "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
-                    );
-                    if ui
-                        .button(format!("⬇ 下载 {tag}"))
-                        .on_hover_text("用系统默认浏览器打开 GitHub Release 下载页")
-                        .clicked()
-                    {
-                        open_url(&url);
-                    }
+                // 用系统浏览器打开 GitHub Release 下载页
+                let url = format!(
+                    "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
+                );
+                if ui
+                    .button(format!("⬇ 下载 {tag}"))
+                    .on_hover_text("用系统默认浏览器打开 GitHub Release 下载页")
+                    .clicked()
+                {
+                    open_url(&url);
                 }
             }
             // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录 / 检查更新）+ 深浅色切换（右侧第一个 = 最右）。
@@ -3114,55 +2848,10 @@ impl eframe::App for ClientApp {
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
         // 更新检查结果回到状态栏。
-        if let Ok((msg, latest, download_url)) = self.update_rx.try_recv() {
+        if let Ok((msg, latest)) = self.update_rx.try_recv() {
             self.status = Some(msg);
             self.update_latest = latest;
-            self.update_download_url = download_url;
             ctx.request_repaint();
-        }
-        // 处理下载进度事件：先 take() 取出 rx，处理完再决定是否放回。
-        if let Some(rx) = self.download_rx.take() {
-            let mut keep_rx = true;
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    DownloadEvent::Started(pid) => {
-                        self.download_pid = Some(pid);
-                        ctx.request_repaint();
-                    }
-                    DownloadEvent::Progress(pct) => {
-                        self.download_progress = Some(format!("{pct:.2}%"));
-                        ctx.request_repaint();
-                    }
-                    DownloadEvent::Downloaded(new_exe) => {
-                        // 下载完成，写 bat 替换脚本，应用运行中直接热替换（不退出、不重启）
-                        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-                        let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-                        let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        if schedule_replace(&new_exe, &app_dir, &exe_name) {
-                            self.status = Some("正在替换为新版本，重启应用后生效".to_string());
-                            self.download_progress = None;
-                            self.download_pid = None;
-                            ctx.request_repaint();
-                        } else {
-                            self.status = Some("替换进程启动失败".to_string());
-                            self.download_progress = None;
-                            self.download_pid = None;
-                            ctx.request_repaint();
-                        }
-                        keep_rx = false;
-                    }
-                    DownloadEvent::Failed(msg) => {
-                        self.status = Some(msg);
-                        self.download_progress = None;
-                        self.download_pid = None;
-                        ctx.request_repaint();
-                        keep_rx = false;
-                    }
-                }
-            }
-            if keep_rx {
-                self.download_rx = Some(rx);
-            }
         }
         let exited = self.update_exited();
         if exited {
