@@ -401,15 +401,23 @@ fn fetch_latest_release() -> (String, Option<String>, Option<String>) {
 /// 探测可用的系统代理：读注册表 ProxyServer（如 127.0.0.1:10808），端口可达才返回。
 /// 代理软件没运行时端口连不通，返回 None 让 curl 直连。
 fn system_proxy() -> Option<String> {
-    let out = std::process::Command::new("reg")
-        .args([
+    let mut out = std::process::Command::new("reg");
+    out.args([
             "query",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
             "/v",
             "ProxyServer",
         ])
-        .output()
-        .ok()?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // GUI 程序 spawn 控制台程序（reg.exe）会闪黑窗，CREATE_NO_WINDOW 消除
+        out.creation_flags(0x08000000);
+    }
+    let out = out.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     // 输出形如： ProxyServer    REG_SZ    127.0.0.1:10808
     let hp = text.lines().find_map(|l| {
@@ -1232,11 +1240,16 @@ impl ClientApp {
         }
         // 结束残留的下载进程（curl）
         if let Some(pid) = self.download_pid.take() {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
+            let mut kill = std::process::Command::new("taskkill");
+            kill.args(["/PID", &pid.to_string(), "/F"])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                kill.creation_flags(0x08000000); // CREATE_NO_WINDOW，避免闪黑窗
+            }
+            let _ = kill.status();
         }
     }
 
