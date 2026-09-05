@@ -436,25 +436,21 @@ fn system_proxy() -> Option<String> {
     Some(format!("http://{hp}"))
 }
 
-/// 下载新版本 exe 到应用目录，完成后替换运行中的 exe（不退出、不重启）。
-/// 在后台线程执行，通过 channel 回报进度。
-fn download_and_replace(
+/// 用 curl 下载单个 URL 到 new_exe，实时上报进度。成功（文件有效）返回 true。
+/// 错误文本收集到 last_err 供外层汇总显示。
+fn run_curl(
     url: &str,
-    progress_tx: std::sync::mpsc::Sender<DownloadEvent>,
-) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-
-    let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let new_exe = app_dir.join(format!("{exe_name}.new"));
-
-    // 用 curl 下载，--progress-meter 把表格进度写到 stderr，-o 指定输出文件；自动使用可用系统代理
+    new_exe: &Path,
+    progress_tx: &std::sync::mpsc::Sender<DownloadEvent>,
+    last_err: &mut String,
+) -> bool {
+    // 自动使用系统代理（端口可达才用）
     let proxy = system_proxy();
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-L",
         "--connect-timeout",
-        "15",
+        "8",
         "--ssl-no-revoke",
         "--progress-meter",
         "-o",
@@ -475,15 +471,14 @@ fn download_and_replace(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = progress_tx.send(DownloadEvent::Failed(format!("下载失败: {e}")));
-            return;
+            *last_err = e.to_string();
+            return false;
         }
     };
     let _ = progress_tx.send(DownloadEvent::Started(child.id()));
 
     // 逐段读 stderr：curl 每次进度更新以 \r 覆盖，段内按 \r 切分，取每段首列数字（百分比）
     // 非数字段收集末尾文本（curl 错误行），失败时带给用户
-    let mut last_err = String::new();
     if let Some(stderr) = child.stderr.take() {
         use std::io::BufRead;
         let mut reader = std::io::BufReader::new(stderr);
@@ -502,7 +497,7 @@ fn download_and_replace(
                         {
                             let _ = progress_tx.send(DownloadEvent::Progress(pct));
                         } else if text.starts_with("curl:") {
-                            last_err = text.trim().to_string();
+                            *last_err = text.trim().to_string();
                         }
                     }
                 }
@@ -514,28 +509,60 @@ fn download_and_replace(
     match child.wait() {
         Ok(status) if status.success() => {
             // 验证下载的文件非空
-            match std::fs::metadata(&new_exe) {
-                Ok(m) if m.len() > 1024 => {
-                    let _ = progress_tx.send(DownloadEvent::Downloaded(new_exe));
-                }
+            match std::fs::metadata(new_exe) {
+                Ok(m) if m.len() > 1024 => true,
                 _ => {
-                    let _ = std::fs::remove_file(&new_exe).ok();
-                    let _ = progress_tx.send(DownloadEvent::Failed("下载文件异常（可能不完整）".to_string()));
+                    let _ = std::fs::remove_file(new_exe).ok();
+                    *last_err = "下载文件异常（可能不完整）".to_string();
+                    false
                 }
             }
         }
         Ok(_) => {
-            let msg = if last_err.is_empty() {
-                "下载失败：curl 返回非零状态".to_string()
-            } else {
-                format!("下载失败：{last_err}")
-            };
-            let _ = progress_tx.send(DownloadEvent::Failed(msg));
+            if last_err.is_empty() {
+                *last_err = "curl 返回非零状态".to_string();
+            }
+            false
         }
         Err(e) => {
-            let _ = progress_tx.send(DownloadEvent::Failed(format!("下载失败: {e}")));
+            *last_err = e.to_string();
+            false
         }
     }
+}
+
+/// 下载新版本 exe 到应用目录，完成后替换运行中的 exe（不退出、不重启）。
+/// 在后台线程执行，通过 channel 回报进度。
+/// 多源重试：直连 github 被墙时自动切换 ghproxy 镜像。
+fn download_and_replace(
+    url: &str,
+    progress_tx: std::sync::mpsc::Sender<DownloadEvent>,
+) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+
+    let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let new_exe = app_dir.join(format!("{exe_name}.new"));
+
+    // 候选源：原始 URL + 常见 ghproxy 镜像（github 主域在国内常被 SNI 阻断）
+    let mut attempts = vec![url.to_string()];
+    attempts.push(format!("https://mirror.ghproxy.com/{url}"));
+    attempts.push(format!("https://ghproxy.net/{url}"));
+    let mut last_err = String::new();
+    for (i, u) in attempts.iter().enumerate() {
+        if i > 0 {
+            // 换源提示（进度归零，用户可见切换发生）
+            let _ = progress_tx.send(DownloadEvent::Progress(0.0));
+            last_err.clear();
+        }
+        if run_curl(u, &new_exe, &progress_tx, &mut last_err) {
+            let _ = progress_tx.send(DownloadEvent::Downloaded(new_exe));
+            return;
+        }
+    }
+    let _ = progress_tx.send(DownloadEvent::Failed(format!(
+        "下载失败（已尝试直连与镜像源）：{last_err}"
+    )));
 }
 
 /// 下载完成后的事件。
