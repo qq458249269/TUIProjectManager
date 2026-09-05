@@ -406,16 +406,9 @@ fn download_and_replace(
 ) {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-    let tmp_dir = app_dir.join("tmp");
-
-    // 创建 tmp 目录
-    if std::fs::create_dir_all(&tmp_dir).is_err() {
-        let _ = progress_tx.send(DownloadEvent::Failed("无法创建 tmp 目录".to_string()));
-        return;
-    }
 
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let new_exe = tmp_dir.join(format!("{exe_name}.new"));
+    let new_exe = app_dir.join(format!("{exe_name}.new"));
 
     // 用 curl 下载，-# 显示进度条，-o 指定输出文件
     let mut cmd = std::process::Command::new("curl");
