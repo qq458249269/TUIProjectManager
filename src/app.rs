@@ -398,6 +398,44 @@ fn fetch_latest_release() -> (String, Option<String>, Option<String>) {
     }
 }
 
+/// 探测可用的系统代理：读注册表 ProxyServer（如 127.0.0.1:10808），端口可达才返回。
+/// 代理软件没运行时端口连不通，返回 None 让 curl 直连。
+fn system_proxy() -> Option<String> {
+    let out = std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            "/v",
+            "ProxyServer",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // 输出形如： ProxyServer    REG_SZ    127.0.0.1:10808
+    let hp = text.lines().find_map(|l| {
+        let l = l.trim();
+        if !l.contains("REG_SZ") {
+            return None;
+        }
+        let v = l["REG_SZ".len()..].trim();
+        v.split([';', '=', ',']).find_map(|seg| {
+            let seg = seg.trim();
+            if seg.split(':').count() == 2 {
+                Some(seg.to_string())
+            } else {
+                None
+            }
+        })
+    })?;
+    // 探测端口是否活着
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addr = hp.to_socket_addrs().ok()?.next()?;
+    if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).is_err() {
+        return None;
+    }
+    Some(format!("http://{hp}"))
+}
+
 /// 下载新版本 exe 到应用目录，完成后替换运行中的 exe（不退出、不重启）。
 /// 在后台线程执行，通过 channel 回报进度。
 fn download_and_replace(
@@ -410,7 +448,8 @@ fn download_and_replace(
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
     let new_exe = app_dir.join(format!("{exe_name}.new"));
 
-    // 用 curl 下载，--progress-meter 把表格进度写到 stderr，-o 指定输出文件
+    // 用 curl 下载，--progress-meter 把表格进度写到 stderr，-o 指定输出文件；自动使用可用系统代理
+    let proxy = system_proxy();
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-L",
@@ -424,6 +463,9 @@ fn download_and_replace(
     ])
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::piped());
+    if let Some(p) = &proxy {
+        cmd.args(["--proxy", p]);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -437,8 +479,11 @@ fn download_and_replace(
             return;
         }
     };
+    let _ = progress_tx.send(DownloadEvent::Started(child.id()));
 
     // 逐段读 stderr：curl 每次进度更新以 \r 覆盖，段内按 \r 切分，取每段首列数字（百分比）
+    // 非数字段收集末尾文本（curl 错误行），失败时带给用户
+    let mut last_err = String::new();
     if let Some(stderr) = child.stderr.take() {
         use std::io::BufRead;
         let mut reader = std::io::BufReader::new(stderr);
@@ -456,6 +501,8 @@ fn download_and_replace(
                             .and_then(|s| s.parse::<f64>().ok())
                         {
                             let _ = progress_tx.send(DownloadEvent::Progress(pct));
+                        } else if text.starts_with("curl:") {
+                            last_err = text.trim().to_string();
                         }
                     }
                 }
@@ -478,7 +525,12 @@ fn download_and_replace(
             }
         }
         Ok(_) => {
-            let _ = progress_tx.send(DownloadEvent::Failed("下载失败：curl 返回非零状态".to_string()));
+            let msg = if last_err.is_empty() {
+                "下载失败：curl 返回非零状态".to_string()
+            } else {
+                format!("下载失败：{last_err}")
+            };
+            let _ = progress_tx.send(DownloadEvent::Failed(msg));
         }
         Err(e) => {
             let _ = progress_tx.send(DownloadEvent::Failed(format!("下载失败: {e}")));
@@ -488,6 +540,8 @@ fn download_and_replace(
 
 /// 下载完成后的事件。
 enum DownloadEvent {
+    /// curl 下载进程已启动，携带 pid（供退出时强制清理）。
+    Started(u32),
     /// 下载进度百分比（0.0 ~ 100.0）。
     Progress(f64),
     Downloaded(PathBuf),
@@ -587,6 +641,8 @@ pub struct ClientApp {
     update_rx: Receiver<(String, Option<String>, Option<String>)>,
     /// 下载进度（Some = 正在下载）。
     download_progress: Option<String>,
+    /// 下载进程 pid（应用退出时强制结束，避免残留 curl）。
+    download_pid: Option<u32>,
     /// 下载事件接收通道。
     download_rx: Option<std::sync::mpsc::Receiver<DownloadEvent>>,
     pub input: Option<InputDialog>,
@@ -704,6 +760,7 @@ impl ClientApp {
             redraw_tx,
             redraw_rx,
             download_progress: None,
+            download_pid: None,
             download_rx: None,
             theme_settle_at: None,
             drag_tab: None,
@@ -1145,6 +1202,14 @@ impl ClientApp {
                     let _ = child.kill();
                 }
             }
+        }
+        // 结束残留的下载进程（curl）
+        if let Some(pid) = self.download_pid.take() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
 
@@ -3020,6 +3085,10 @@ impl eframe::App for ClientApp {
             let mut keep_rx = true;
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    DownloadEvent::Started(pid) => {
+                        self.download_pid = Some(pid);
+                        ctx.request_repaint();
+                    }
                     DownloadEvent::Progress(pct) => {
                         self.download_progress = Some(format!("{pct:.2}%"));
                         ctx.request_repaint();
@@ -3032,10 +3101,12 @@ impl eframe::App for ClientApp {
                         if schedule_replace(&new_exe, &app_dir, &exe_name) {
                             self.status = Some("正在替换为新版本，重启应用后生效".to_string());
                             self.download_progress = None;
+                            self.download_pid = None;
                             ctx.request_repaint();
                         } else {
                             self.status = Some("替换进程启动失败".to_string());
                             self.download_progress = None;
+                            self.download_pid = None;
                             ctx.request_repaint();
                         }
                         keep_rx = false;
@@ -3043,6 +3114,7 @@ impl eframe::App for ClientApp {
                     DownloadEvent::Failed(msg) => {
                         self.status = Some(msg);
                         self.download_progress = None;
+                        self.download_pid = None;
                         ctx.request_repaint();
                         keep_rx = false;
                     }
