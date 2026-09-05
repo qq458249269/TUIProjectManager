@@ -467,24 +467,29 @@ enum DownloadEvent {
     Failed(String),
 }
 
-/// 写 bat 替换脚本并返回其路径：应用退出后由 bat 完成替换（不自动重启，由用户手动启动）。
-fn schedule_replace(_new_exe: &Path, app_dir: &Path, exe_name: &str) -> Option<PathBuf> {
-    let bat = app_dir.join("tmp").join("update.bat");
-    // bat 内容：等待进程退出 → 替换 → 结束（不重启）
-    // %~dp0 = bat 所在目录（即 tmp/），上一级就是 app_dir
-    let content = format!(
-        "@echo off\r\n\
-         title \"{e} 正在更新...\"\r\n\
-         timeout /t 2 /nobreak >nul\r\n\
-         taskkill /IM \"{e}\" /F >nul 2>&1\r\n\
-         timeout /t 1 /nobreak >nul\r\n\
-         del \"%~dp0\\..\\{e}\" >nul 2>&1\r\n\
-         move /Y \"%~dp0\\{e}.new\" \"%~dp0\\..\\{e}\" >nul 2>&1\r\n\
-         del \"%~dp0\\update.bat\" >nul 2>&1\r\n",
-        e = exe_name
+/// 热替换运行中的 exe（不退出、不重启）：旧 exe 改名 → 新 exe 移入原名。
+/// 必须由外部 PowerShell 进程执行：主进程自己 rename 到自己 exe 原名会被拒绝访问（os error 5）。
+/// 旧文件 exe.old 因运行中句柄暂时删不掉，残留到下次替换时再清。
+fn schedule_replace(new_exe: &Path, app_dir: &Path, exe_name: &str) -> bool {
+    let exe = app_dir.join(exe_name);
+    let old = app_dir.join(format!("{exe_name}.old"));
+    // 单引号包路径；路径含单引号极罕见，忽略。
+    let ps = format!(
+        "Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue; Rename-Item -LiteralPath '{}' '{}' -Force; Move-Item -LiteralPath '{}' '{}' -Force",
+        old.display(),
+        exe.display(),
+        format!("{exe_name}.old"),
+        new_exe.display(),
+        exe.display(),
     );
-    std::fs::write(&bat, content.as_bytes()).ok()?;
-    Some(bat)
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn().is_ok()
 }
 
 /// 用系统默认浏览器打开 URL。
@@ -2993,26 +2998,16 @@ impl eframe::App for ClientApp {
                         ctx.request_repaint();
                     }
                     DownloadEvent::Downloaded(new_exe) => {
-                        // 下载完成，写 bat 替换脚本，自动执行替换并退出应用（不重启）
+                        // 下载完成，写 bat 替换脚本，应用运行中直接热替换（不退出、不重启）
                         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
                         let app_dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
                         let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        if let Some(bat) = schedule_replace(&new_exe, &app_dir, &exe_name) {
-                            self.status = Some("正在替换新版本，应用即将退出，完成后请手动启动".to_string());
+                        if schedule_replace(&new_exe, &app_dir, &exe_name) {
+                            self.status = Some("正在替换为新版本，重启应用后生效".to_string());
                             self.download_progress = None;
                             ctx.request_repaint();
-                            // 启动 bat 脚本（detached，内部等进程退出后替换），然后关闭应用
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                let _ = std::process::Command::new("cmd")
-                                    .args(["/c", bat.to_str().unwrap_or("")])
-                                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                                    .spawn();
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         } else {
-                            self.status = Some("替换脚本创建失败".to_string());
+                            self.status = Some("替换进程启动失败".to_string());
                             self.download_progress = None;
                             ctx.request_repaint();
                         }
