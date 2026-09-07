@@ -435,6 +435,18 @@ fn dir_exists(cache: &mut HashMap<String, (bool, Instant)>, path: &str) -> bool 
     cache.insert(path.to_string(), (ok, now));
     ok
 }
+/// 首页项目列表排序模式。升/降序仅作用于显示层（按名称首字），
+/// 不修改 config 里的原始数据；「默认顺序」展示原始数据顺序，
+/// 自定义排序通过拖拽重排完成（会持久化修改原始数据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectSort {
+    /// 原始数据顺序（可拖拽自定义重排）。
+    Default,
+    /// 按名称首字升序，仅显示层排序。
+    NameAsc,
+    /// 按名称首字降序，仅显示层排序。
+    NameDesc,
+}
 
 pub struct ClientApp {
     pub config: config::Config,
@@ -508,6 +520,8 @@ pub struct ClientApp {
     search_query: String,
     /// 首页是否显示已隐藏的项目。
     show_hidden: bool,
+    /// 首页项目列表排序模式（显示层排序，不修改原始数据）。
+    project_sort: ProjectSort,
     /// 待异步重新启动/切换命令的页签。
     pending_relaunch: Vec<PendingRelaunch>,
 }
@@ -588,6 +602,7 @@ impl ClientApp {
             bg_frame: 0,
             search_query: String::new(),
             show_hidden: false,
+            project_sort: ProjectSort::Default,
             pending_relaunch: Vec::new(),
         };
 
@@ -1752,13 +1767,27 @@ impl ClientApp {
                         self.open_settings();
                     }
                 });
-                // 搜索框
+                // 搜索框 + 排序文本按钮（点击循环切换：默认 → 升序 → 降序 → 默认）
                 ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search_query)
-                        .desired_width(ui.available_width())
-                        .hint_text("搜索项目名/目录..."),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .desired_width(ui.available_width() - 70.0)
+                            .hint_text("搜索项目名/目录..."),
+                    );
+                    let label = match self.project_sort {
+                        ProjectSort::Default => "默认顺序",
+                        ProjectSort::NameAsc => "名称升序",
+                        ProjectSort::NameDesc => "名称降序",
+                    };
+                    if ui.button(label).clicked() {
+                        self.project_sort = match self.project_sort {
+                            ProjectSort::Default => ProjectSort::NameAsc,
+                            ProjectSort::NameAsc => ProjectSort::NameDesc,
+                            ProjectSort::NameDesc => ProjectSort::Default,
+                        };
+                    }
+                });
                 // 隐藏项目切换
                 let hidden_count = self.config.projects.iter().filter(|p| p.hidden).count();
                 if hidden_count > 0 {
@@ -1789,6 +1818,26 @@ impl ClientApp {
                     })
                     .map(|(i, _)| i)
                     .collect();
+                // 升/降序仅作用于显示层：按名称首字排序 filtered_indices（原始索引），
+                // 无论何种排序都不改动 config.projects —— 自定义顺序仍由拖拽重排单独完成。
+                let mut display_indices = filtered_indices;
+                match self.project_sort {
+                    ProjectSort::Default => {}
+                    ProjectSort::NameAsc => display_indices.sort_by(|&a, &b| {
+                        self.config.projects[a]
+                            .name
+                            .chars()
+                            .next()
+                            .cmp(&self.config.projects[b].name.chars().next())
+                    }),
+                    ProjectSort::NameDesc => display_indices.sort_by(|&a, &b| {
+                        self.config.projects[b]
+                            .name
+                            .chars()
+                            .next()
+                            .cmp(&self.config.projects[a].name.chars().next())
+                    }),
+                }
                 let sel = self.selected_project;
                 let sel_fill = ui.visuals().selection.bg_fill;
                 let mut actions: Vec<ProjectAction> = Vec::new();
@@ -1807,7 +1856,7 @@ impl ClientApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for &i in &filtered_indices {
+                        for &i in &display_indices {
                             let p = &self.config.projects[i];
                             let exists = exists_list[i];
                             let hidden_mark = if p.hidden { " [隐藏]" } else { "" };
@@ -1886,7 +1935,8 @@ impl ClientApp {
                                 }
                             });
                             // 拖动悬浮帧：记录源索引；行矩形供落位定位。
-                            if resp.dragged() {
+                            // 升/降序视图下显示顺序与原始数据不一致，禁用拖拽重排。
+                            if resp.dragged() && self.project_sort == ProjectSort::Default {
                                 drag_index = Some(i);
                             }
                             row_rects.push((i, resp.rect));
@@ -1912,10 +1962,15 @@ impl ClientApp {
                     });
                 // 拖动状态跨帧保存在 self.drag_project：拖动中的每一帧刷新源索引，
                 // 松手帧（dragged() 已变 false）靠它仍拿得到 from。
+                // 升/降序视图下显示顺序与原始数据不一致，禁用拖拽重排。
+                if self.project_sort != ProjectSort::Default {
+                    drag_index = None;
+                }
                 if let Some(i) = drag_index {
                     self.drag_project = Some(i);
                 }
-                if let Some(from) = self.drag_project {
+                if self.project_sort == ProjectSort::Default {
+                    if let Some(from) = self.drag_project {
                     let pointer = ui.ctx().pointer_interact_pos();
                     // 悬停目标：指针所在行的上半 → 插到它前面，下半 → 后面；
                     // 落在最后一行下方 → 末尾，第一行上方 → 开头。
@@ -1975,6 +2030,7 @@ impl ClientApp {
                             self.save_config("已调整项目顺序".to_string());
                         }
                     }
+                }
                 }
                 for action in actions {
                     match action {
