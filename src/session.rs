@@ -90,8 +90,9 @@ pub struct Session {
     /// 向 PTY 写入输入的通道发送端（实际写由专用后台线程执行，
     /// 避免子进程不读取输入时阻塞 UI/解析线程）。
     pub writer: std::sync::mpsc::SyncSender<Vec<u8>>,
-    /// PTY 主句柄（用于 resize）。
-    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    /// PTY 主句柄（用于 resize）。Option 包装：kill_in_background() 后取走，
+    /// 避免 MasterPty::drop 在 UI 线程阻塞（Windows 上 ClosePseudoConsole 可能卡住）。
+    pub master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// 子进程（Option 包装：take() 后移入后台线程异步 kill，避免 Child::drop 在 UI 线程阻塞）。
     pub child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// 上次渲染的网格尺寸，用于检测是否需要 resize。
@@ -891,7 +892,7 @@ pub fn spawn(
         snapshot: snapshot.clone(),
         cmd_tx: cmd_tx.clone(),
         writer: writer_tx,
-        master: pair.master,
+        master: Some(pair.master),
         child: Some(child),
         grid_size: (cols, rows),
         needs_resize: true,
@@ -925,6 +926,28 @@ pub fn spawn(
         ascii_galley_slots: None,
 
     })
+}
+
+impl Session {
+    /// 将 child 和 master 都移到后台线程异步清理，避免 Child::drop / MasterPty::drop
+    /// 在 UI 线程阻塞（Windows 上调用 WaitForSingleObject 等待进程退出，
+    /// 100-500ms 冻结 UI）。
+    /// 调用方在 tabs.remove() 之前调用：Session::drop 时 child=None + master=None，
+    /// 零阻塞。
+    pub fn kill_in_background(&mut self) {
+        let child = self.child.take();
+        let master = self.master.take();
+        if child.is_some() || master.is_some() {
+            std::thread::spawn(move || {
+                if let Some(mut c) = child {
+                    let _ = c.kill();
+                }
+                // master 在此 drop：PTY 伪控制台在此释放，
+                // reader 线程感知到管道断裂后自然退出。
+                drop(master);
+            });
+        }
+    }
 }
 
 /// UI 线程滚动后立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，

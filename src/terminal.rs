@@ -528,12 +528,14 @@ pub fn show_terminal(
         if let Ok(mut t) = sess.term.write() {
             t.resize(TermSize::new(cols, rows));
         }
-        let _ = sess.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(m) = sess.master.as_ref() {
+            let _ = m.resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
         sess.grid_size = (cols as u16, rows as u16);
         sess.needs_resize = false;
     }
@@ -1053,15 +1055,17 @@ pub fn show_terminal(
         sess.cached_render_shapes = None;
     }
 
-    // ── parse_gen 驱动的静止帧优化：内容未变时跳过 cells clone 和颜色重建 ──
+    // ── parse_gen 驱动的静止帧优化：内容未变时跳过颜色重建 ──
     let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
     let gen_changed = cur_gen != sess.last_snapshot_gen;
     let snapshot_cells: Vec<(Point, Cell)> = if gen_changed {
-        // 快照有新内容：全量 clone cells（O(rows×cols)）
-        snap.cells.iter().cloned().collect()
+        // 快照有新内容：复用 scratch buffer 的容量做 clone_from，
+        // 避免 collect() 的独立分配（切换页签首帧的主要卡顿源）。
+        sess.snapshot_scratch.clone_from(&snap.cells);
+        std::mem::take(&mut sess.snapshot_scratch)
     } else {
-        // 内容未变（纯滚动/空闲帧）：复用上一帧缓存的 cells，零 clone
-        // snapshot_scratch 已在上帧末尾填充，此处直接 take 复用
+        // 内容未变（纯滚动/空闲帧）：上帧 render_cells 已归还 scratch，
+        // 直接 take 复用，零 clone。
         std::mem::take(&mut sess.snapshot_scratch)
     };
 
