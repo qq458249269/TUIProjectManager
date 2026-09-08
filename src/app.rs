@@ -387,21 +387,79 @@ fn fetch_latest_release() -> (String, Option<String>) {
     }
 }
 
-/// 用系统默认浏览器打开 URL。
-/// egui 的 Hyperlink 依赖 eframe 的 links 特性（webbrowser crate），本项目为减
-/// 体积禁用了该特性，OpenUrl 命令是空操作——所以自己调 cmd start 交给浏览器。
-fn open_url(url: &str) {
+/// 下载 GitHub Release 最新版本的 exe 到指定目录，实时报告进度。
+/// 返回 Ok(下载文件路径) 或 Err(错误信息)。
+fn download_update(
+    tag: &str,
+    dest_dir: &Path,
+    progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
+) -> Result<String, String> {
+    // 从 GitHub Release assets 里找 exe 文件名。
+    let api_url = format!(
+        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
+    );
+    let mut api_cmd = std::process::Command::new("curl");
+    api_cmd.args([
+        "-s", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-H", "User-Agent: TUIProjectManager",
+        &api_url,
+    ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW，避免闪黑窗
-            .spawn();
+        api_cmd.creation_flags(0x08000000);
     }
-    #[cfg(not(windows))]
+    let api_out = api_cmd.output().map_err(|e| format!("获取版本信息失败: {e}"))?;
+    let api_json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&api_out.stdout))
+        .map_err(|_| "解析版本信息失败".to_string())?;
+    let assets = api_json["assets"].as_array().ok_or("无可用下载文件")?;
+    let exe_asset = assets.iter().find(|a| {
+        a["name"].as_str().map_or(false, |n| n.ends_with(".exe"))
+    }).ok_or("未找到 exe 下载文件")?;
+    let download_url = exe_asset["browser_download_url"].as_str()
+        .ok_or("下载链接无效")?;
+    let asset_name = exe_asset["name"].as_str().unwrap_or("update.exe");
+    // 下载到 .new 文件，完成后由调用方替换旧 exe。
+    let new_name = format!("{asset_name}.new");
+    let dest_path = dest_dir.join(&new_name);
+
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-L", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-H", "User-Agent: TUIProjectManager",
+        "-o", dest_path.to_str().unwrap_or("update.exe.new"),
+        download_url,
+    ]);
+    #[cfg(windows)]
     {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("启动下载失败: {e}"))?;
+
+    let total = exe_asset["size"].as_u64().unwrap_or(0);
+    // 轮询文件大小报告进度：每 200ms 检查一次。
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let downloaded = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+        let _ = progress_tx.send((downloaded, total));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let final_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+                    let _ = progress_tx.send((final_size, total));
+                    return Ok(dest_path.to_string_lossy().into_owned());
+                } else {
+                    let _ = std::fs::remove_file(&dest_path);
+                    return Err(format!("下载失败: curl 退出码 {}", status.code().unwrap_or(-1)));
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest_path);
+                return Err(format!("下载失败: {e}"));
+            }
+        }
     }
 }
 
@@ -464,6 +522,11 @@ pub struct ClientApp {
     update_latest: Option<String>,
     check_tx: Sender<(String, Option<String>)>,
     update_rx: Receiver<(String, Option<String>)>,
+    /// 下载进度：后台线程通过通道报告 (bytes_downloaded, total_bytes)。
+    download_progress_tx: Option<std::sync::mpsc::Sender<(u64, u64)>>,
+    download_progress_rx: Option<Receiver<(u64, u64)>>,
+    /// 当前正在下载更新（显示进度条，禁用下载按钮）。
+    downloading: bool,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
@@ -573,6 +636,9 @@ impl ClientApp {
             config_path,
             term_focused: false,
             update_latest: None,
+            download_progress_tx: None,
+            download_progress_rx: None,
+            downloading: false,
             input: None,
             confirm: None,
             check_tx,
@@ -681,6 +747,52 @@ impl ClientApp {
         std::thread::spawn(move || {
             let _ = tx.send(fetch_latest_release());
             // try_send：通道满说明已有待处理重绘，本次唤醒请求可安全丢弃。
+            let _ = redraw_tx.try_send(());
+        });
+    }
+
+    /// 后台下载更新：下载到 .new 文件，完成后替换旧 exe。
+    fn start_download(&mut self, tag: &str) {
+        if self.downloading {
+            return;
+        }
+        self.downloading = true;
+        self.status = Some(format!("正在下载 {tag}…"));
+        let tag = tag.to_string();
+        let (ptx, prx) = std::sync::mpsc::channel();
+        self.download_progress_tx = Some(ptx.clone());
+        self.download_progress_rx = Some(prx);
+        let redraw_tx = self.redraw_tx.clone();
+        let status_tx = self.check_tx.clone();
+        std::thread::spawn(move || {
+            let exe_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let result = download_update(&tag, &exe_path, ptx);
+            match result {
+                Ok(new_path) => {
+                    let new_file = PathBuf::from(&new_path);
+                    // 旧 exe 复制为 .old
+                    if let Ok(exe) = std::env::current_exe() {
+                        let old_path = exe.with_extension("exe.old");
+                        let _ = std::fs::copy(&exe, &old_path);
+                    }
+                    // .new 文件改为 .exe（去掉文件名末尾的 .new）
+                    let final_name = new_file.file_name()
+                        .map(|n| n.to_string_lossy().replacen(".new", "", 1))
+                        .unwrap_or_else(|| "TUIProjectManager.exe".into());
+                    let final_path = exe_path.join(final_name);
+                    let _ = std::fs::rename(&new_file, &final_path);
+                    let _ = status_tx.send((
+                        format!("下载完成！请手动重启应用以使用新版本 {tag}"),
+                        None,
+                    ));
+                }
+                Err(e) => {
+                    let _ = status_tx.send((format!("下载失败: {e}"), None));
+                }
+            }
             let _ = redraw_tx.try_send(());
         });
     }
@@ -1531,6 +1643,17 @@ impl ClientApp {
         self.status = Some("正在重新启动...".to_string());
     }
 
+    /// 格式化字节数为人类可读字符串（KB/MB）。
+    fn format_bytes(bytes: u64) -> String {
+        if bytes < 1024 {
+            format!("{bytes} B")
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    }
+
     /// 通知所有会话当前主题：更新应答器用的标志，并主动广播 OSC 10/11 颜色
     /// （opencode 等 TUI 启动时会查询终端颜色来匹配自己的配色）。
     /// 当前实际生效的主题深浅：跟随系统时取系统偏好，否则取用户设置。
@@ -1631,18 +1754,20 @@ impl ClientApp {
                 },
             };
             ui.label(RichText::new(text).color(color));
-            if let Some(tag) = &self.update_latest {
+            if let Some(tag) = self.update_latest.clone() {
                 ui.separator();
-                // 用系统浏览器打开 GitHub Release 下载页
-                let url = format!(
-                    "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
-                );
-                if ui
-                    .button(format!("⬇ 下载 {tag}"))
-                    .on_hover_text("用系统默认浏览器打开 GitHub Release 下载页")
-                    .clicked()
-                {
-                    open_url(&url);
+                if self.downloading {
+                    // 下载中：显示进度文本，按钮禁用
+                    ui.add_enabled(false,
+                        egui::Button::new(format!("⬇ 下载中… {tag}")));
+                } else {
+                    if ui
+                        .button(format!("⬇ 下载 {tag}"))
+                        .on_hover_text("自动下载新版本到当前目录，完成后替换旧版本")
+                        .clicked()
+                    {
+                        self.start_download(&tag);
+                    }
                 }
             }
             // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录 / 检查更新）+ 深浅色切换（右侧第一个 = 最右）。
@@ -2893,6 +3018,30 @@ impl eframe::App for ClientApp {
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
             self.status = Some(msg);
             self.update_latest = latest;
+            ctx.request_repaint();
+        }
+        // 下载进度实时更新状态栏。
+        if let Some(rx) = &self.download_progress_rx {
+            if let Ok((downloaded, total)) = rx.try_recv() {
+                if total > 0 {
+                    let pct = downloaded as f64 / total as f64 * 100.0;
+                    self.status = Some(format!("下载中… {pct:.2}% ({}/{})",
+                        Self::format_bytes(downloaded),
+                        Self::format_bytes(total)));
+                } else {
+                    self.status = Some(format!("下载中… {}",
+                        Self::format_bytes(downloaded)));
+                }
+                ctx.request_repaint();
+            }
+        }
+        // 下载线程结束后清理通道。
+        if self.downloading && self.download_progress_rx.as_ref()
+            .map_or(false, |rx| rx.try_recv().is_err())
+        {
+            self.downloading = false;
+            self.download_progress_tx = None;
+            self.download_progress_rx = None;
             ctx.request_repaint();
         }
         let exited = self.update_exited();
