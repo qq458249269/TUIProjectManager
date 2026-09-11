@@ -146,11 +146,11 @@ fn strip_ansi(s: &str) -> String {
             if chars.peek() == Some(&'[') {
                 chars.next(); // consume '['
                 // 跳过参数字节（0x30..=0x3F）和中间字节（0x20..=0x2F）
-                while chars.peek().map_or(false, |&b| matches!(b, '\x20'..='\x2f' | '\x30'..='\x3f')) {
+                while chars.peek().is_some_and(|&b| matches!(b, '\x20'..='\x2f' | '\x30'..='\x3f')) {
                     chars.next();
                 }
                 // 终止字节（0x40..=0x7E）
-                if chars.peek().map_or(false, |&b| matches!(b, '\x40'..='\x7e')) {
+                if chars.peek().is_some_and(|&b| matches!(b, '\x40'..='\x7e')) {
                     chars.next();
                 }
             } else if chars.peek() == Some(&']') {
@@ -179,10 +179,7 @@ fn strip_ansi(s: &str) -> String {
 /// 从剪贴板读文件绝对路径列表（CF_HDROP，资源管理器 Ctrl+C 复制/剪切的文件）。
 /// 剪贴板被占用或无文件时返回空。
 fn clipboard_files() -> Vec<String> {
-    match get_clipboard(FileList) {
-        Ok(files) => files,
-        Err(_) => Vec::new(),
-    }
+    get_clipboard(FileList).unwrap_or_default()
 }
 
 /// 把绝对路径转成相对会话启动目录的路径（Windows 路径不区分大小写）：
@@ -318,7 +315,7 @@ fn encode_char_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option
             return Some(vec![0]);
         }
         let lc = b.to_ascii_lowercase();
-        if lc.is_ascii() && (b'a'..=b'z').contains(&lc) {
+        if lc.is_ascii_lowercase() {
             return Some(vec![lc - b'a' + 1]);
         }
         return Some(match lc {
@@ -338,7 +335,7 @@ fn encode_char_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option
     if ctrl && alt {
         let mut v = vec![0x1b];
         let lc = b.to_ascii_lowercase();
-        if lc.is_ascii() && (b'a'..=b'z').contains(&lc) {
+        if lc.is_ascii_lowercase() {
             v.push(lc - b'a' + 1);
         } else {
             v.push(b);
@@ -506,11 +503,11 @@ pub fn show_terminal(
     }
     // 首帧懒预热：图集为空时一次性光栅化 ASCII 可打印字符，
     // 避免首帧逐字光栅化的卡顿峰值。只在 map 为空时执行（首次或 DPI 变化后）。
-    if let Some(g) = sess.gpu.as_mut() {
-        if g.atlas.is_empty() {
-            for ch in (32u8..=126).map(|b| b as char) {
-                g.atlas.glyph(ch);
-            }
+    if let Some(g) = sess.gpu.as_mut()
+        && g.atlas.is_empty()
+    {
+        for ch in (32u8..=126).map(|b| b as char) {
+            g.atlas.glyph(ch);
         }
     }
     let avail = ui.available_size();
@@ -550,7 +547,7 @@ pub fn show_terminal(
     // IME 归属：终端聚焦，且没有其他 egui 控件（如输入弹窗里的 TextEdit）
     // 持有键盘焦点时，才把系统输入法交给终端。
     let owns_ime = *term_focused
-        && ui.memory(|m| m.focused().map_or(true, |id| id == term_id));
+        && ui.memory(|m| m.focused().is_none_or(|id| id == term_id));
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT));
@@ -560,13 +557,13 @@ pub fn show_terminal(
     // 应用要鼠标事件 = 任一上报模式（?1000/?1002/?1003）。注意捆绑的新版
     // conpty.dll 会自行跟踪并吞掉 ?1000h/?1002h，只向仿真器透传编码位 ?1006h，
     // 所以 SGR_MOUSE 单独出现也代表子进程开了鼠标上报（实测 opencode 即此形态）。
-    let mouse_reporting = term_mode_snapshot.map_or(false, |m| {
+    let mouse_reporting = term_mode_snapshot.is_some_and(|m| {
         m.intersects(TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)
     });
     // 转发用的编码开关：新版 ConPTY 对宿主写入的鼠标序列只透传不重编码，
     // 必须与应用声明一致（SGR ?1006 vs 默认 X10）；老版 ConPTY 则把一切鼠标
     // 序列改写成乱码，捆绑 conpty.dll 是全屏 TUI 滚轮可用的前提。
-    let sgr_mouse = term_mode_snapshot.map_or(false, |m| m.contains(TermMode::SGR_MOUSE));
+    let sgr_mouse = term_mode_snapshot.is_some_and(|m| m.contains(TermMode::SGR_MOUSE));
     let alt_screen = term_mode_snapshot
         .unwrap_or(TermMode::empty())
         .contains(TermMode::ALT_SCREEN);
@@ -579,8 +576,8 @@ pub fn show_terminal(
     let (scroll_delta, over_term) = ui.input(|i| {
         let sd = i.smooth_scroll_delta.y;
         let over = sd != 0.0 && (
-            i.pointer.hover_pos().map_or(false, |p| rect.contains(p))
-                || i.pointer.latest_pos().map_or(false, |p| rect.contains(p))
+            i.pointer.hover_pos().is_some_and(|p| rect.contains(p))
+                || i.pointer.latest_pos().is_some_and(|p| rect.contains(p))
         );
         (sd, over)
     });
@@ -607,7 +604,7 @@ pub fn show_terminal(
             }
         } else if alt_screen {
             // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
-            let count = (lines.abs() as usize).div_ceil(3).clamp(1, 8);
+            let count = lines.unsigned_abs().div_ceil(3).clamp(1, 8);
             let key: &[u8] = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
             for _ in 0..count {
                 let _ = sess.writer.try_send(key.to_vec());
@@ -667,12 +664,12 @@ pub fn show_terminal(
         }
 
         // --- 释放 ---
-        if ptr_released {
-            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
-                let (col, row) = to_col_row(pos);
-                send_mouse_event(&sess.writer, sgr_mouse, 0, col, row, true);
-                ui.ctx().request_repaint();
-            }
+        if ptr_released
+            && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+        {
+            let (col, row) = to_col_row(pos);
+            send_mouse_event(&sess.writer, sgr_mouse, 0, col, row, true);
+            ui.ctx().request_repaint();
         }
     }
 
@@ -690,8 +687,8 @@ pub fn show_terminal(
             sess.click_press_pos = ui.input(|i| i.pointer.latest_pos());
         }
         // 判断是否为纯点击（无拖动位移）：按下与释放位置距离 < 4px。
-        let is_true_click = primary_released && sess.click_press_pos.map_or(false, |p0| {
-            latest_pos.map_or(false, |p1| p1.distance(p0) < 4.0)
+        let is_true_click = primary_released && sess.click_press_pos.is_some_and(|p0| {
+            latest_pos.is_some_and(|p1| p1.distance(p0) < 4.0)
         });
         if let Ok(mut t) = sess.term.write() {
             let disp_off = t.grid().display_offset();
@@ -712,13 +709,13 @@ pub fn show_terminal(
                         Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
                     ui.ctx().request_repaint();
                 }
-            } else if resp.dragged_by(egui::PointerButton::Primary) {
-                if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
-                    if let Some(sel) = t.selection.as_mut() {
-                        sel.update(pos, Side::Left);
-                    }
-                    ui.ctx().request_repaint();
+            } else if resp.dragged_by(egui::PointerButton::Primary)
+                && let Some(pos) = resp.interact_pointer_pos().and_then(point_at)
+            {
+                if let Some(sel) = t.selection.as_mut() {
+                    sel.update(pos, Side::Left);
                 }
+                ui.ctx().request_repaint();
             }
             if resp.clicked() && is_true_click {
                 t.selection = None;
@@ -737,9 +734,10 @@ pub fn show_terminal(
                     })
                 });
             }
-            if primary_released {
-                if let (Some(p0), Some(p1)) = (sess.drag_press_pos.take(), latest_pos) {
-                    let moved = p0.distance(p1) > 4.0;
+            if primary_released
+                && let (Some(p0), Some(p1)) = (sess.drag_press_pos.take(), latest_pos)
+            {
+                let moved = p0.distance(p1) > 4.0;
                     if moved && rect.contains(p1) && t.selection.is_none() {
                         let disp_off = t.grid().display_offset();
                         let point_at = |pos: Pos2| -> Option<Point> {
@@ -763,7 +761,6 @@ pub fn show_terminal(
                         }
                     }
                 }
-            }
             // 在同一次加锁内完成选区状态读取，消除与右键菜单之间的竞态窗口。
             has_selection = t.selection.is_some();
         }
@@ -864,10 +861,10 @@ pub fn show_terminal(
                 .iter()
                 .map(|f| f.path().to_string_lossy().into_owned())
                 .collect();
-            if paste_file_paths(sess, &files, status) {
-                if let Ok(mut t) = sess.term.write() {
-                    t.selection = None;
-                }
+            if paste_file_paths(sess, &files, status)
+                && let Ok(mut t) = sess.term.write()
+            {
+                t.selection = None;
             }
         }
     } else if has_hovered {
@@ -893,7 +890,7 @@ pub fn show_terminal(
                     .map(|t| t.selection.is_some())
                     .unwrap_or(false);
                 let over_term = ui
-                    .input(|i| i.pointer.latest_pos().map_or(false, |p| rect.contains(p)));
+                    .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
                 if !has_sel && over_term {
                     paste_file_paths(sess, &clipboard_files(), status);
                 }
@@ -913,10 +910,8 @@ pub fn show_terminal(
                         bytes_out.push(text.as_bytes().to_vec());
                     }
                     egui::Event::Ime(ime) if owns_ime => match ime {
-                        egui::ImeEvent::Commit(text) => {
-                            if !alt_down && !text.is_empty() {
-                                bytes_out.push(text.as_bytes().to_vec());
-                            }
+                        egui::ImeEvent::Commit(text) if !alt_down && !text.is_empty() => {
+                            bytes_out.push(text.as_bytes().to_vec());
                         }
                         egui::ImeEvent::Preedit { text, .. } => {
                             preedit.clone_from(text);
@@ -944,7 +939,7 @@ pub fn show_terminal(
                         // 不能拿备用屏当信号——ConPTY 会吞掉协议协商，对端不认识
                         // CSI-u 时会把它当字面文本插进输入框（实测 opencode 出乱码）。
                         if *key == egui::Key::Enter && (shift || alt || ctrl) {
-                            let full = term_mode_snapshot.map_or(false, |m| {
+                            let full = term_mode_snapshot.is_some_and(|m| {
                                 m.intersects(TermMode::DISAMBIGUATE_ESC_CODES)
                             });
                             bytes_out.push(encode_modified_enter(shift, alt, ctrl, full));
@@ -958,7 +953,7 @@ pub fn show_terminal(
                         // Key 处理器里 Ctrl+字母已经通过 encode_char_key 发了 0x03，
                         // 这里只在「无选区且 Key 处理器未发过」时才补发，避免双发。
                         let key_already_sent = !bytes_out.is_empty()
-                            && bytes_out.last().map_or(false, |b| b.as_slice() == [0x03]);
+                            && bytes_out.last().is_some_and(|b| b.as_slice() == [0x03]);
                         let mut copied = false;
                         if let Ok(mut t) = sess.term.write() {
                             copied = copy_selection(&t, ui.ctx(), status);
@@ -1021,6 +1016,28 @@ pub fn show_terminal(
                 Ordering::Relaxed,
             );
         }
+    }
+
+    // ── 阻止 egui 用方向键在控件间导航焦点 ──
+    // egui Focus::begin_pass 在每帧开头读取 focused_widget 的 EventFilter：
+    // 若 horizontal_arrows / vertical_arrows 为 false（默认），方向键会设置
+    // focus_direction → end_pass 把焦点移到相邻控件（"更多"按钮等）。
+    // 两步修复：
+    // 1. set_focus_lock_filter 声明方向键归终端（从第二帧起生效，需 had_focus_last_frame）。
+    // 2. move_focus(None) 清除本帧已被 begin_pass 设下的方向（兜底第一帧）。
+    if *term_focused {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                term_id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    tab: false,
+                    escape: true,
+                },
+            );
+            m.move_focus(egui::FocusDirection::None);
+        });
     }
 
     // ---- 渲染网格 ----
@@ -1098,11 +1115,11 @@ pub fn show_terminal(
     //    跳过逐格渲染循环和 GPU mesh 重建，直接提交缓存的 Shape 列表。
     //    CPU 省掉 rows×cols 次迭代，GPU 省掉 mesh 重新提交。
     let mut skip_render_loop = false;
-    if !gen_changed {
-        if let Some(cached) = &sess.cached_render_shapes {
-            painter.add(egui::Shape::Vec(cached.clone()));
-            skip_render_loop = true;
-        }
+    if !gen_changed
+        && let Some(cached) = &sess.cached_render_shapes
+    {
+        painter.add(egui::Shape::Vec(cached.clone()));
+        skip_render_loop = true;
     }
     if !skip_render_loop {
             let mut bg_shapes: Vec<egui::Shape> = Vec::new();
@@ -1125,7 +1142,7 @@ pub fn show_terminal(
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
-        let col = point.column.0 as usize;
+        let col = point.column.0;
         let x = rect.left() + col as f32 * cell_w;
         let y = rect.top() + vline as f32 * cell_h;
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
@@ -1177,8 +1194,9 @@ pub fn show_terminal(
 
         // 哈希先行：空白快速跳过的格子也要入表，保证 rows×cols 全覆盖可 diff。
         // GPU 路径未启用时跳过，省下每格的哈希开销。
-        if sess.gpu.is_some() && col < cols {
-            let g = sess.gpu.as_mut().unwrap();
+        if let Some(g) = sess.gpu.as_mut()
+            && col < cols
+        {
             let idx = vline as usize * cols + col;
             let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (idx as u64);
             hash_mix(&mut h, ch as u64);
@@ -1360,10 +1378,10 @@ pub fn show_terminal(
     }
     // GPU 字形层：内容变化才重建网格；静止帧直接重放上一帧的同一 Arc<Mesh>，
     // 跳过全部 quad 重建（egui 每帧仍会重画它，省的是 CPU 侧组装）。
-    if let Some(g) = sess.gpu.as_mut() {
-        if let Some(mesh) = g.end_frame(ui.ctx()) {
-            bg_shapes.push(egui::Shape::Mesh(mesh));
-        }
+    if let Some(g) = sess.gpu.as_mut()
+        && let Some(mesh) = g.end_frame(ui.ctx())
+    {
+        bg_shapes.push(egui::Shape::Mesh(mesh));
     }
     bg_shapes.extend(fg_shapes);
     // 缓存完整渲染结果供静止帧重放：下帧 gen_changed=false 时直接提交，
@@ -1429,11 +1447,11 @@ pub fn show_terminal(
                     let line = Line(r as i32 - disp_off as i32);
                     for col in 0..cols {
                         // O(1) HashMap 查找，替代 O(n) 线性扫描。
-                        if let Some(cell) = cell_map.as_ref().and_then(|m| m.get(&(line.0, col))) {
-                            if is_caret(cell) {
-                                hit = Some(Point::new(line, Column(col)));
-                                break 'outer;
-                            }
+                        if let Some(cell) = cell_map.as_ref().and_then(|m| m.get(&(line.0, col)))
+                            && is_caret(cell)
+                        {
+                            hit = Some(Point::new(line, Column(col)));
+                            break 'outer;
                         }
                     }
                 }
@@ -1449,7 +1467,7 @@ pub fn show_terminal(
         let p = cpoint;
         let vline = p.line.0 + offset as i32;
         if vline >= 0 && vline < rows as i32 {
-            let col = p.column.0 as usize;
+            let col = p.column.0;
             if col < cols {
                 // 从快照获取光标格数据（不碰 term 锁）。
                 let on_spacer = cursor_cell_flags.contains(Flags::WIDE_CHAR_SPACER);
@@ -1561,7 +1579,7 @@ pub fn show_terminal(
     if std::env::var("TUIPM_THEME_DEBUG").as_deref() == Ok("1") {
         static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let f = FRAME.fetch_add(1, Ordering::Relaxed);
-        if f % 30 == 0 {
+        if f.is_multiple_of(30) {
             eprintln!(
                 "[frame] dark={dark} galleys={} gen={}",
                 sess.galley_cache.len(),

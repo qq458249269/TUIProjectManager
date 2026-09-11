@@ -8,6 +8,7 @@
 //! 跳过 quad 重建；内容一变即整帧重建（不做局部更新——重建本身已是微秒级）。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui;
 use egui::{Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureOptions};
@@ -17,6 +18,50 @@ use egui::{Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureOptions}
 const ATLAS_SIZE: u32 = 1024;
 /// 字形位图之间的间隔像素：LINEAR 采样时防止相邻字形边缘渗色。
 const GLYPH_PAD: u32 = 1;
+
+// ── 进程级 fontdue 解析缓存 ──
+// fontdue::Font::from_bytes 解析 msyh.ttc（约 20MB）需要 ~400ms；
+// 每个 Session 首帧都会重建 TermGpu，重启/新开页签都在 UI 线程重复解析
+// → 重启卡顿。fontdue::Font 不可变，解析结果可跨会话共享（Arc 引用）。
+// key = 原始字节序列（会话间恒定，进程内只解析一次）。
+/// 原始字体源：(文件字节, ttc 子索引)。
+type FontSource = (Vec<u8>, u32);
+/// 缓存条目：源列表（字节级全等判定命中）+ 物理字号档（px 取整）+ 解析结果。
+type FontCacheEntry = (Vec<FontSource>, u32, Vec<Arc<fontdue::Font>>);
+static FONT_CACHE: OnceLock<Mutex<Vec<FontCacheEntry>>> = OnceLock::new();
+/// 缓存条目上限：按物理字号（px 取整）分档，DPI 不变时只有一档；
+/// 防止用户来回切换显示器 DPI 时无限膨胀。每档持有原始字体字节（~20MB）。
+const FONT_CACHE_MAX: usize = 4;
+
+/// 从进程级缓存取（或解析后缓存）fontdue 解析结果。
+/// 命中条件：字体列表字节级全等 + 物理字号一致。
+fn cached_fonts(sources: &[FontSource], px: f32) -> Vec<Arc<fontdue::Font>> {
+    let cache = FONT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some((_, _, fonts)) = guard
+        .iter()
+        .find(|(sources2, px2, _)| *px2 == px as u32 && sources2 == sources)
+    {
+        return fonts.clone();
+    }
+    // 未命中：解析并缓存。持锁解析：首个会话启动时一次性代价，后续全部命中。
+    let mut fonts: Vec<Arc<fontdue::Font>> = Vec::new();
+    for (data, index) in sources {
+        let settings = fontdue::FontSettings {
+            collection_index: *index,
+            scale: px,
+            load_substitutions: false,
+        };
+        if let Ok(f) = fontdue::Font::from_bytes(data.as_slice(), settings) {
+            fonts.push(Arc::new(f));
+        }
+    }
+    guard.push((sources.to_vec(), px as u32, fonts.clone()));
+    if guard.len() > FONT_CACHE_MAX {
+        guard.remove(0);
+    }
+    fonts
+}
 
 /// 单个字形的图集记录。UV 指向图集内的位图矩形；
 /// dx 相对格子左缘、dy 相对基线的位图左上角偏移（逻辑点，dy 恒 ≤ 0）。
@@ -50,7 +95,8 @@ impl GlyphSlot {
 /// 字形纹理图集：动态 shelf 打包，按需光栅化。
 pub struct GlyphAtlas {
     /// Monospace 家族字体链（主字体在前，CJK fallback 在后），按序试到命中。
-    fonts: Vec<fontdue::Font>,
+    /// Arc：跨会话共享进程级解析缓存，避免每次重建重复解析。
+    fonts: Vec<Arc<fontdue::Font>>,
     /// 光栅化字号（物理像素）= 字号 pt × ppp。
     px: f32,
     ppp: f32,
@@ -72,27 +118,16 @@ impl GlyphAtlas {
     /// `font_data`：(字体文件字节, ttc 子索引)。解析失败的字体跳过。
     pub fn new(font_data: &[(Vec<u8>, u32)], font_size_pt: f32, ppp: f32) -> Self {
         let px = font_size_pt * ppp;
-        let mut fonts = Vec::new();
+        // 进程级缓存：跨会话共享 fontdue 解析结果（msyh.ttc 20MB 解析 ~400ms，
+        // 每 Session 首帧都重建 TermGpu 的话重启/新开页签必卡）。
+        let fonts = cached_fonts(font_data, px);
         let mut ascent_px = px * 0.8;
         let mut descent_px = -px * 0.2;
-        for (data, index) in font_data {
-            let settings = fontdue::FontSettings {
-                collection_index: *index,
-                scale: px,
-                load_substitutions: false,
-            };
-            match fontdue::Font::from_bytes(data.as_slice(), settings) {
-                Ok(f) => {
-                    if fonts.is_empty() {
-                        if let Some(lm) = f.horizontal_line_metrics(px) {
-                            ascent_px = lm.ascent;
-                            descent_px = lm.descent;
-                        }
-                    }
-                    fonts.push(f);
-                }
-                Err(_) => continue,
-            }
+        if let Some(f) = fonts.first()
+            && let Some(lm) = f.horizontal_line_metrics(px)
+        {
+            ascent_px = lm.ascent;
+            descent_px = lm.descent;
         }
         let mut atlas = Self {
             fonts,
@@ -106,9 +141,7 @@ impl GlyphAtlas {
                 let sz = (ATLAS_SIZE * ATLAS_SIZE * 4) as usize;
                 // 安全：rgba 是 u8 数组，任意位模式都合法；
                 // paint_white_texel 紧接着覆盖前 4 字节。
-                let mut v: Vec<u8> = Vec::with_capacity(sz);
-                unsafe { v.set_len(sz); }
-                v
+                vec![0u8; sz]
             },
             cx: 1, // (0,0) 保留为纯白素：实心 quad（下划线）取色用
             cy: 0,

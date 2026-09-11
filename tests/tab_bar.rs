@@ -293,18 +293,18 @@ fn click_close_drag_cursor() {
 
     // 2) 悬停页签正文 → 普通光标（无 Grab）；悬停 × → 小手
     // 注意：hovered 标志在 headless 里滞后一帧，同位置的 move 各发两次。
-    let cur = frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut a);
+    frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut a);
     let cur = frame(&ctx, vec![Event::PointerMoved(t1.center())], &mut a);
     assert_eq!(cur, egui::CursorIcon::Default, "页签正文悬停为普通箭头");
     let xp_hover = egui::pos2(t1.right() - 3.5, t1.center().y);
-    let cur = frame(&ctx, vec![Event::PointerMoved(xp_hover)], &mut a);
+    frame(&ctx, vec![Event::PointerMoved(xp_hover)], &mut a);
     let cur = frame(&ctx, vec![Event::PointerMoved(xp_hover)], &mut a);
     assert_eq!(
         cur,
         egui::CursorIcon::PointingHand,
         "悬停 × 上应显示小手"
     );
-    let cur = frame(&ctx, vec![Event::PointerMoved(t3.center())], &mut a);
+    frame(&ctx, vec![Event::PointerMoved(t3.center())], &mut a);
     let cur = frame(&ctx, vec![Event::PointerMoved(t3.center())], &mut a);
     assert_eq!(cur, egui::CursorIcon::Default, "其他页签正文仍为普通箭头");
 

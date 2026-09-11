@@ -113,7 +113,7 @@ impl Default for Settings {
 }
 
 /// 应用配置，保存到与程序同级目录下的 config/config.json。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub projects: Vec<Project>,
     pub settings: Settings,
@@ -126,7 +126,7 @@ pub struct Config {
 }
 
 /// 上次的窗口状态。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct WindowState {
     pub pos: Option<[f32; 2]>,
@@ -134,18 +134,8 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
-impl Default for WindowState {
-    fn default() -> Self {
-        Self {
-            pos: None,
-            size: None,
-            maximized: false,
-        }
-    }
-}
-
 /// 上次退出时打开中的终端页签（启动时重新拉起）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct TabsState {
     /// 打开的会话目录，按页签顺序。
@@ -154,32 +144,12 @@ pub struct TabsState {
     pub active: usize,
 }
 
-impl Default for TabsState {
-    fn default() -> Self {
-        Self {
-            dirs: Vec::new(),
-            active: 0,
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            projects: Vec::new(),
-            settings: Settings::default(),
-            window: WindowState::default(),
-            tabs: TabsState::default(),
-        }
-    }
-}
-
 /// 与程序可执行文件同级的 config 目录。
 pub fn config_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.join("config");
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        return dir.join("config");
     }
     PathBuf::from("config")
 }

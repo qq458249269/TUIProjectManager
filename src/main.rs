@@ -30,9 +30,10 @@ const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 
 fn unlock_exe() {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
-            if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(name) = exe.file_name().and_then(|n| n.to_str())
+    {
+        if let Some(parent) = exe.parent() {
                 let _ = std::fs::remove_file(parent.join(format!("{name}.running")));
             }
             let running = exe.with_file_name(format!("{name}.running"));
@@ -49,8 +50,7 @@ fn unlock_exe() {
             }
         }
     }
-}
-
+ 
 fn main() -> eframe::Result {
     // 全进程 panic 钩子：任何线程 panic（页签 reader/渲染/解析线程）都记到崩溃日志，
     // 不静默吞掉。日志写在 exe 同级 crash.log，供事后定位到底哪个页签/线程崩了。
@@ -58,9 +58,10 @@ fn main() -> eframe::Result {
     std::panic::set_hook(Box::new(move |info| {
         let msg = info.to_string();
         eprintln!("[PANIC] {msg} (thread {:?})", std::thread::current().name());
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let _ = std::fs::OpenOptions::new()
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let _ = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(dir.join("crash.log"))
@@ -70,7 +71,6 @@ fn main() -> eframe::Result {
                             std::time::SystemTime::now(),
                             std::thread::current().name())
                     });
-            }
         }
         default_hook(info);
     }));

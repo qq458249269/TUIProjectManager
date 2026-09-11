@@ -72,6 +72,13 @@ fn latency_debug() -> bool {
     *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
 }
 
+/// 逐格渲染的 Galley 缓存类型：键 = (字符, 前景色, 窄格下划线, 宽字符)，
+/// 值 = (galley, 淘汰代数)。
+type GalleyCache = std::collections::HashMap<
+    (char, egui::Color32, bool, bool),
+    (std::sync::Arc<egui::epaint::Galley>, u64),
+>;
+
 /// 一个在应用内页签中运行的终端会话。
 pub struct Session {
     /// 页签标题（默认取项目名）。
@@ -168,8 +175,7 @@ pub struct Session {
     /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
     /// 同一格式每帧只排版一次；上限 8192 条，超出按 generation 淘汰最旧 25%，
     /// 避免整表清空后首帧全量重建的卡顿峰值。
-    pub galley_cache:
-        HashMap<(char, egui::Color32, bool, bool), (std::sync::Arc<egui::epaint::Galley>, u64)>,
+    pub galley_cache: GalleyCache,
     /// galley_cache 淘汰代数：每次淘汰 +1，新插入继承当前代数。
     pub galley_gen: u64,
     /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
@@ -236,6 +242,7 @@ impl EventListener for SessionListener {
 /// - kitty 键盘协议查询（ESC[?u → 回同样 ESC[?u 表示不支持）
 /// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
 /// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
+///
 /// 主 DA/XTVERSION 不应答（ConPTY 时序错位时泄漏为键盘输入杂字）；
 /// OMP 通过 TERM_PROGRAM 环境变量跳过 DA 查询。
 /// 返回 (应答字节, 是否应答了 OSC 颜色查询)。
@@ -280,17 +287,15 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
                 out.extend_from_slice(
                     format!("\x1b]{osc_num};rgb:{c}/{c}/{c}\x1b\\").as_bytes(),
                 );
-            } else if osc_num == 4 {
-                if let Some(rest) = body.strip_suffix(b";?") {
-                    if let Ok(idx) = String::from_utf8_lossy(rest).parse::<u32>() {
-                        if idx <= 15 {
-                            osc_color = true;
-                            out.extend_from_slice(
-                                format!("\x1b]4;{idx};rgb:000000/000000/000000\x1b\\").as_bytes(),
-                            );
-                        }
-                    }
-                }
+            } else if osc_num == 4
+                && let Some(rest) = body.strip_suffix(b";?")
+                && let Ok(idx) = String::from_utf8_lossy(rest).parse::<u32>()
+                && idx <= 15
+            {
+                osc_color = true;
+                out.extend_from_slice(
+                    format!("\x1b]4;{idx};rgb:000000/000000/000000\x1b\\").as_bytes(),
+                );
             }
             continue;
         }
@@ -649,7 +654,7 @@ pub fn spawn(
                             parse_gen.fetch_add(1, Ordering::Relaxed);
                             let mut t = term.write().unwrap();
                             parser.advance(&mut *t, &query_leftover);
-                            let r = reply_to_queries(&mut t, &query_leftover, theme_dark.load(Ordering::Relaxed));
+                            let r = reply_to_queries(&t, &query_leftover, theme_dark.load(Ordering::Relaxed));
                             drop(t);
                             if let Some((reply, osc_color)) = r {
                                 if osc_color { osc_theme_aware.store(true, Ordering::Relaxed); }
@@ -674,7 +679,7 @@ pub fn spawn(
                                 ECHO_CNT.fetch_add(1, Ordering::Relaxed);
                                 ECHO_MAX_MS.fetch_max(since as u32, Ordering::Relaxed);
                                 let cnt = ECHO_CNT.load(Ordering::Relaxed);
-                                if cnt % 20 == 0 {
+                                if cnt.is_multiple_of(20) {
                                     eprintln!(
                                         "[latency] echo avg={}ms max={}ms n={cnt}",
                                         ECHO_SUM_US.load(Ordering::Relaxed) / cnt / 1000,
@@ -746,7 +751,7 @@ pub fn spawn(
                             let complete = if tail.len() >= 2 && tail[1] == b'[' {
                                 tail[2..].iter().any(|&b| (0x40..=0x7e).contains(&b))
                             } else if tail.len() >= 2 && tail[1] == b']' {
-                                tail[2..].iter().any(|&b| b == 0x07)
+                                tail[2..].contains(&0x07)
                                     || tail.windows(2).any(|w| w[0] == 0x1b && w[1] == b'\\')
                             } else {
                                 tail.len() >= 2
@@ -772,12 +777,11 @@ pub fn spawn(
                                 let reply = {
                                     let mut t = term.write().unwrap();
                                     parser.advance(&mut *t, chunk);
-                                    let r = reply_to_queries(
-                                        &mut t,
+                                    reply_to_queries(
+                                        &t,
                                         chunk,
                                         theme_dark.load(Ordering::Relaxed),
-                                    );
-                                    r
+                                    )
                                 }; // ← term 锁在此释放
                                 if let Some((reply, osc_color)) = reply {
                                     if osc_color {
@@ -794,7 +798,7 @@ pub fn spawn(
                                 let mut t = term.write().unwrap();
                                 parser.advance(&mut *t, &merged);
                                 reply_to_queries(
-                                    &mut t,
+                                    &t,
                                     &merged,
                                     theme_dark.load(Ordering::Relaxed),
                                 )
@@ -827,7 +831,7 @@ pub fn spawn(
                             if let Ok(t) = term.read() {
                                 let content = t.renderable_content();
                                 let offset_val = content.display_offset;
-                                let colors = content.colors.clone();
+                                let colors = *content.colors;
                                 let cursor = content.cursor;
                                 let selection = t.selection.clone();
                                 let sel = selection.as_ref().and_then(|s| s.to_range(&t));
@@ -979,7 +983,7 @@ pub fn refresh_snapshot(sess: &mut Session) {
     if let Ok(t) = term.read() {
         let content = t.renderable_content();
         let offset_val = content.display_offset;
-        let colors = content.colors.clone();
+        let colors = *content.colors;
         let cursor = content.cursor;
         let selection = t.selection.clone();
         let sel = selection.as_ref().and_then(|s| s.to_range(&t));
@@ -1110,8 +1114,6 @@ mod tests {
             cell.flags
         );
     }
-    use std::time::Duration;
-
     #[test]
     fn sanitize_strips_bidi_and_nul() {
         let s = "\u{202a}D:\\tools\\app.exe\u{0} --flag";

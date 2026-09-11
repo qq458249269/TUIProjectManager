@@ -21,7 +21,12 @@ pub enum Screen {
 /// 顶部页签：第一个永远是首页，后面每个对应一个终端会话。
 pub enum Tab {
     Home,
-    Session(Session),
+    // Session 承载大量缓存（galley/图集/hash 缓冲）约 26KB，
+    // 不 Box 会让每个 Tab 都撑到最大变体大小。
+    Session(Box<Session>),
+    /// 重启/切换命令期间的占位页签：保持位置不变，标题可见，
+    /// 防止页签消失再出现的闪烁。
+    Placeholder { title: String },
     Settings,
 }
 
@@ -414,7 +419,7 @@ fn download_update(
         .map_err(|_| "解析版本信息失败".to_string())?;
     let assets = api_json["assets"].as_array().ok_or("无可用下载文件")?;
     let exe_asset = assets.iter().find(|a| {
-        a["name"].as_str().map_or(false, |n| n.ends_with(".exe"))
+        a["name"].as_str().is_some_and(|n| n.ends_with(".exe"))
     }).ok_or("未找到 exe 下载文件")?;
     let download_url = exe_asset["browser_download_url"].as_str()
         .ok_or("下载链接无效")?;
@@ -484,10 +489,10 @@ fn version_newer(a: &str, b: &str) -> bool {
 fn dir_exists(cache: &mut HashMap<String, (bool, Instant)>, path: &str) -> bool {
     const TTL: std::time::Duration = std::time::Duration::from_secs(2);
     let now = Instant::now();
-    if let Some(&(ok, at)) = cache.get(path) {
-        if now.duration_since(at) < TTL {
-            return ok;
-        }
+    if let Some(&(ok, at)) = cache.get(path)
+        && now.duration_since(at) < TTL
+    {
+        return ok;
     }
     let ok = Path::new(path).is_dir();
     cache.insert(path.to_string(), (ok, now));
@@ -505,6 +510,10 @@ enum ProjectSort {
     /// 按名称首字降序，仅显示层排序。
     NameDesc,
 }
+
+/// 后台 spawn 完成的结果消息：(result, is_restore, saved_index)。
+/// saved_index 仅恢复时有效（保存时的 dirs 索引），用于按原序插入页签。
+type SpawnResult = (Result<Session, String>, bool, Option<usize>);
 
 pub struct ClientApp {
     pub config: config::Config,
@@ -546,7 +555,7 @@ pub struct ClientApp {
     spawning: Vec<(String, bool, Option<usize>)>,
     /// 后台 spawn 完成的结果通道：(result, is_restore, saved_index)。
     /// saved_index 仅恢复时有效（保存时的 dirs 索引），用于按原序插入页签。
-    spawn_rx: Option<Receiver<(Result<Session, String>, bool, Option<usize>)>>,
+    spawn_rx: Option<Receiver<SpawnResult>>,
     /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
     pending_restore: Vec<PendingLaunch>,
     /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
@@ -817,13 +826,14 @@ impl ClientApp {
             return;
         }
         for (i, tab) in self.tabs.iter().enumerate() {
-            if let Tab::Session(s) = tab {
-                if s.dir == project.path && !s.exited.load(Ordering::Relaxed) {
-                    self.current = i;
-                    self.term_focused = true;
-                    self.status = Some(format!("已切换到会话: {}", s.title));
-                    return;
-                }
+            if let Tab::Session(s) = tab
+                && s.dir == project.path
+                && !s.exited.load(Ordering::Relaxed)
+            {
+                self.current = i;
+                self.term_focused = true;
+                self.status = Some(format!("已切换到会话: {}", s.title));
+                return;
             }
         }
         // 不在点击帧直接 spawn：此时还在首页布局，拿不到会话页签的真实可用面积；
@@ -839,7 +849,10 @@ impl ClientApp {
     }
 
     /// cmd /c 命令串里的目录参数：含空白时交给引号保护，否则 ^ 转义 cmd 特殊字符。
+    // 测试仅在内嵌 test 构建中使用 cmd_arg（命令串参数转义规则回归）；
+    // 生产构建无任何调用点，属于预期死代码，靠 cfg_attr 在非 test 下放行。
     #[cfg(windows)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn cmd_arg(dir: &str) -> String {
         if dir.chars().any(char::is_whitespace) {
             dir.to_string()
@@ -1013,23 +1026,23 @@ impl ClientApp {
     fn update_exited(&mut self) -> bool {
         let mut changed = false;
         for tab in self.tabs.iter_mut() {
-            if let Tab::Session(s) = tab {
-                if !s.exited.load(Ordering::Relaxed) {
-                    // reader 线程退出时设置 exited 标志（无需 term 锁）。
-                    // 兜底：子进程也已退出时同样标记。
-                    // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
-                    // reader 线程会在 PTY 管道断裂时设置 exited 标志。
-                    if s.foreground.load(Ordering::Relaxed) {
-                        let child_exited = s.child
-                            .as_deref_mut()
-                            .map_or(false, |c| matches!(c.try_wait(), Ok(Some(_))));
-                        if child_exited {
-                            s.exited.store(true, Ordering::Relaxed);
-                        }
+            if let Tab::Session(s) = tab
+                && !s.exited.load(Ordering::Relaxed)
+            {
+                // reader 线程退出时设置 exited 标志（无需 term 锁）。
+                // 兜底：子进程也已退出时同样标记。
+                // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
+                // reader 线程会在 PTY 管道断裂时设置 exited 标志。
+                if s.foreground.load(Ordering::Relaxed) {
+                    let child_exited = s.child
+                        .as_deref_mut()
+                        .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+                    if child_exited {
+                        s.exited.store(true, Ordering::Relaxed);
                     }
-                    if s.exited.load(Ordering::Relaxed) {
-                        changed = true;
-                    }
+                }
+                if s.exited.load(Ordering::Relaxed) {
+                    changed = true;
                 }
             }
         }
@@ -1432,6 +1445,54 @@ impl ClientApp {
                     let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                     ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
                     tab_rects.push((i, rect));
+                } else if let Tab::Placeholder { title } = tab {
+                    // ── 重启/切换命令占位页签：保持位置与标题可见，不可拖动/关闭。
+                    ui.add_space(4.0);
+                    let frame_resp = egui::Frame::new()
+                        .corner_radius(4.0)
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(tab_margin)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let min_width = ui.text_style_height(&egui::TextStyle::Body) * 4.0;
+                            let title_w = *self
+                                .title_width_cache
+                                .entry(title.clone())
+                                .or_insert_with(|| {
+                                    ui.ctx().fonts_mut(|f| {
+                                        f.layout_no_wrap(
+                                            title.clone(),
+                                            tab_font.clone(),
+                                            Color32::TRANSPARENT,
+                                        )
+                                        .size()
+                                        .x
+                                    })
+                                });
+                            let s = ui.spacing().item_spacing.x;
+                            let icon_title_w = slot_w + s + title_w;
+                            let slack = (min_width - icon_title_w - s).max(0.0);
+                            let pad_l = if slack > 0.0 { slack } else { 0.0 };
+                            if pad_l > 0.0 {
+                                ui.add_space(pad_l);
+                            }
+                            let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                            // 重启中：旋转箭头 + 标题。
+                            ui.add_sized(
+                                egui::vec2(slot_w, row_h),
+                                egui::Label::new(RichText::new("🔄").strong())
+                                    .selectable(false),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(title.as_str()).weak())
+                                    .selectable(false),
+                            );
+                            ui.response()
+                        })
+                        .inner;
+                    let rect = frame_resp.rect;
+                    // 占位页签不响应点击/拖拽：只展示，防止拖动后位置错乱。
+                    tab_rects.push((i, rect));
                 } else if let Tab::Settings = tab {
                     // ── 设置页签 ──
                     ui.add_space(4.0);
@@ -1626,13 +1687,9 @@ impl ClientApp {
         // 将 child 和 master 都移到后台线程异步清理，
         // 避免 Child::drop / MasterPty::drop 阻塞 UI 线程。
         s.kill_in_background();
-        self.tabs.remove(idx);
-        if self.current >= self.tabs.len() {
-            self.current = self.tabs.len().saturating_sub(1);
-        }
-        if self.current == 0 {
-            self.screen = Screen::Main;
-        }
+        // 用 Placeholder 替换而非 remove：保持页签位置不变，
+        // 防止重启期间页签消失再出现的闪烁。
+        self.tabs[idx] = Tab::Placeholder { title: title.clone() };
         self.refresh_focus();
         self.pending_relaunch.push(PendingRelaunch {
             tab_index: idx,
@@ -1658,15 +1715,18 @@ impl ClientApp {
     /// （opencode 等 TUI 启动时会查询终端颜色来匹配自己的配色）。
     /// 当前实际生效的主题深浅：跟随系统时取系统偏好，否则取用户设置。
     fn effective_dark(&self) -> bool {
-        if self.config.settings.follow_system {
-            // 直接读注册表：egui system_theme() 依赖 WM_SETTINGCHANGE，
-            // 窗口未激活/消息丢失时返回 None 导致跟随系统失效。
-            #[cfg(target_os = "windows")]
-            { return query_windows_dark_mode(); }
-            #[cfg(not(target_os = "windows"))]
-            { matches!(self.ctx.system_theme(), None | Some(egui::Theme::Dark)) }
-        } else {
-            self.config.settings.dark_mode
+        if !self.config.settings.follow_system {
+            return self.config.settings.dark_mode;
+        }
+        // 直接读注册表：egui system_theme() 依赖 WM_SETTINGCHANGE，
+        // 窗口未激活/消息丢失时返回 None 导致跟随系统失效。
+        #[cfg(target_os = "windows")]
+        {
+            query_windows_dark_mode()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            matches!(self.ctx.system_theme(), None | Some(egui::Theme::Dark))
         }
     }
 
@@ -1686,6 +1746,9 @@ impl ClientApp {
                 // 自绘光标扫描缓存也一并作废。否则出现汉字颜色错乱、
                 // 光标块停在旧位置的残留。
                 s.galley_cache.clear();
+                // ASCII 快捷 galley 槽用 ver==galley_gen 判断有效性，
+                // 主题切换必须递增使其全部过期，否则浅色下文本残留白色。
+                s.galley_gen = s.galley_gen.wrapping_add(1);
                 s.caret_scan = None;
                 s.cached_render_shapes = None;
                 s.cached_ansi_rgb = None;
@@ -1715,13 +1778,8 @@ impl ClientApp {
         // 将 child 和 master 都移到后台线程异步清理，
         // 避免 Child::drop / MasterPty::drop 阻塞 UI 线程。
         s.kill_in_background();
-        self.tabs.remove(idx);
-        if self.current >= self.tabs.len() {
-            self.current = self.tabs.len().saturating_sub(1);
-        }
-        if self.current == 0 {
-            self.screen = Screen::Main;
-        }
+        // 用 Placeholder 替换而非 remove：保持页签位置不变。
+        self.tabs[idx] = Tab::Placeholder { title: title.clone() };
         self.refresh_focus();
         self.pending_relaunch.push(PendingRelaunch {
             tab_index: idx,
@@ -1774,7 +1832,9 @@ impl ClientApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
                 let more_id = egui::Id::new("status_more_menu");
-                let more_resp = ui.add(egui::Button::new("⋯ 更多"))
+                // Sense::CLICK 不含 FOCUSABLE 位：不参与键盘焦点循环（Tab/方向键不会选中它）。
+                let more_resp = ui
+                    .add(egui::Button::new("⋯ 更多").sense(egui::Sense::CLICK))
                     .on_hover_text("打开用户目录 / 软件目录 / 检查更新");
                 if more_resp.clicked() && ui.input(|i| i.pointer.any_click()) {
                     egui::Popup::toggle_id(ui.ctx(), more_id);
@@ -1829,8 +1889,10 @@ impl ClientApp {
                 } else {
                     "☀ 浅色"
                 };
+                // Sense::CLICK 不含 FOCUSABLE 位：主题切换按钮同样只响应鼠标，
+                // 不参与键盘焦点循环（方向键不会选中它，回车不会误触发）。
                 let theme_btn = ui
-                    .button(label)
+                    .add(egui::Button::new(label).sense(egui::Sense::CLICK))
                     .on_hover_text("点击切换：深色 → 浅色 → 跟随系统（随 Windows 深浅自动切换）");
                 if theme_btn.clicked() && ui.input(|i| i.pointer.any_click()) {
                     if fs {
@@ -2053,21 +2115,21 @@ impl ClientApp {
                             row_rects.push((i, resp.rect));
                         }
                         // 拖动到列表上下边缘时自动滚动，让拖拽能到达视野外的项目。
-                        if self.drag_project.is_some() {
-                            if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                                let clip = ui.clip_rect();
-                                let edge = 28.0;
-                                let dy = if pos.y < clip.top() + edge {
-                                    -24.0
-                                } else if pos.y > clip.bottom() - edge {
-                                    24.0
-                                } else {
-                                    0.0
-                                };
-                                if dy != 0.0 {
-                                    ui.scroll_with_delta(egui::vec2(0.0, dy));
-                                    ui.ctx().request_repaint();
-                                }
+                        if self.drag_project.is_some()
+                            && let Some(pos) = ui.ctx().pointer_interact_pos()
+                        {
+                            let clip = ui.clip_rect();
+                            let edge = 28.0;
+                            let dy = if pos.y < clip.top() + edge {
+                                -24.0
+                            } else if pos.y > clip.bottom() - edge {
+                                24.0
+                            } else {
+                                0.0
+                            };
+                            if dy != 0.0 {
+                                ui.scroll_with_delta(egui::vec2(0.0, dy));
+                                ui.ctx().request_repaint();
                             }
                         }
                     });
@@ -2080,8 +2142,9 @@ impl ClientApp {
                 if let Some(i) = drag_index {
                     self.drag_project = Some(i);
                 }
-                if self.project_sort == ProjectSort::Default {
-                    if let Some(from) = self.drag_project {
+                if self.project_sort == ProjectSort::Default
+                    && let Some(from) = self.drag_project
+                {
                     let pointer = ui.ctx().pointer_interact_pos();
                     // 悬停目标：指针所在行的上半 → 插到它前面，下半 → 后面；
                     // 落在最后一行下方 → 末尾，第一行上方 → 开头。
@@ -2099,15 +2162,15 @@ impl ClientApp {
                             }
                         }
                         if target.is_none() {
-                            if let Some((last_i, last)) = row_rects.last() {
-                                if pos.y > last.bottom() {
-                                    target = Some((*last_i, last.bottom()));
-                                }
+                            if let Some((last_i, last)) = row_rects.last()
+                                && pos.y > last.bottom()
+                            {
+                                target = Some((*last_i, last.bottom()));
                             }
-                            if let Some((first_i, first)) = row_rects.first() {
-                                if pos.y < first.top() {
-                                    target = Some((*first_i, first.top()));
-                                }
+                            if let Some((first_i, first)) = row_rects.first()
+                                && pos.y < first.top()
+                            {
+                                target = Some((*first_i, first.top()));
                             }
                         }
                     }
@@ -2141,7 +2204,6 @@ impl ClientApp {
                             self.save_config("已调整项目顺序".to_string());
                         }
                     }
-                }
                 }
                 for action in actions {
                     match action {
@@ -2357,15 +2419,15 @@ impl ClientApp {
                     }
                 }
                 if target.is_none() {
-                    if let Some((last_i, last)) = row_rects.last() {
-                        if pos.y > last.bottom() {
-                            target = Some((*last_i, last.bottom()));
-                        }
+                    if let Some((last_i, last)) = row_rects.last()
+                        && pos.y > last.bottom()
+                    {
+                        target = Some((*last_i, last.bottom()));
                     }
-                    if let Some((first_i, first)) = row_rects.first() {
-                        if pos.y < first.top() {
-                            target = Some((*first_i, first.top()));
-                        }
+                    if let Some((first_i, first)) = row_rects.first()
+                        && pos.y < first.top()
+                    {
+                        target = Some((*first_i, first.top()));
                     }
                 }
             }
@@ -2406,18 +2468,18 @@ impl ClientApp {
                 }
             }
         }
-        if let Some(i) = remove_idx {
-            if i < self.settings_commands.len() {
-                let removed = self.settings_commands.remove(i);
-                if self.settings_command == removed {
-                    self.settings_command = self
-                        .settings_commands
-                        .first()
-                        .cloned()
-                        .unwrap_or_default();
-                }
-                dirty = true;
+        if let Some(i) = remove_idx
+            && i < self.settings_commands.len()
+        {
+            let removed = self.settings_commands.remove(i);
+            if self.settings_command == removed {
+                self.settings_command = self
+                    .settings_commands
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
             }
+            dirty = true;
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -2426,14 +2488,13 @@ impl ClientApp {
                     .desired_width(280.0)
                     .hint_text("新命令，如 lazygit / htop"),
             );
-            if ui.button("浏览…").on_hover_text("选择可执行文件").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
+            if ui.button("浏览…").on_hover_text("选择可执行文件").clicked()
+                && let Some(path) = rfd::FileDialog::new()
                     .set_title("选择 TUI 可执行文件")
                     .add_filter("可执行文件", &["exe", "bat", "cmd", "com"])
                     .pick_file()
-                {
-                    self.settings_new_command = path.to_string_lossy().to_string();
-                }
+            {
+                self.settings_new_command = path.to_string_lossy().to_string();
             }
             let clicked = ui.button("添加").clicked();
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2501,13 +2562,14 @@ impl ClientApp {
                     .desired_width(50.0)
                     .hint_text("10-60"),
             );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Ok(v) = self.settings_refresh_fps.parse::<u64>() {
-                    let clamped = v.clamp(10, 60);
-                    self.config.settings.refresh_fps = clamped;
-                    self.settings_refresh_fps = clamped.to_string();
-                    self.save_config(format!("帧率已设为 {clamped} FPS"));
-                }
+            if resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && let Ok(v) = self.settings_refresh_fps.parse::<u64>()
+            {
+                let clamped = v.clamp(10, 60);
+                self.config.settings.refresh_fps = clamped;
+                self.settings_refresh_fps = clamped.to_string();
+                self.save_config(format!("帧率已设为 {clamped} FPS"));
             }
         });
         ui.label(
@@ -2595,11 +2657,10 @@ impl ClientApp {
                                         .desired_width(80.0),
                                 )
                                 .changed()
+                                && let Ok(v) = ctx_str.parse()
                             {
-                                if let Ok(v) = ctx_str.parse() {
-                                    model.context_window = v;
-                                    pi_dirty = true;
-                                }
+                                model.context_window = v;
+                                pi_dirty = true;
                             }
                             ui.label("max:");
                             let mut max_str = model.max_tokens.to_string();
@@ -2609,11 +2670,10 @@ impl ClientApp {
                                         .desired_width(80.0),
                                 )
                                 .changed()
+                                && let Ok(v) = max_str.parse()
                             {
-                                if let Ok(v) = max_str.parse() {
-                                    model.max_tokens = v;
-                                    pi_dirty = true;
-                                }
+                                model.max_tokens = v;
+                                pi_dirty = true;
                             }
                             if ui.small_button("×").clicked() {
                                 model_remove = Some(mi);
@@ -2706,11 +2766,10 @@ impl ClientApp {
                                         .desired_width(80.0),
                                 )
                                 .changed()
+                                && let Ok(v) = ctx_str.parse()
                             {
-                                if let Ok(v) = ctx_str.parse() {
-                                    model.context_window = v;
-                                    omp_dirty = true;
-                                }
+                                model.context_window = v;
+                                omp_dirty = true;
                             }
                             ui.label("max:");
                             let mut max_str = model.max_tokens.to_string();
@@ -2720,11 +2779,10 @@ impl ClientApp {
                                         .desired_width(80.0),
                                 )
                                 .changed()
+                                && let Ok(v) = max_str.parse()
                             {
-                                if let Ok(v) = max_str.parse() {
-                                    model.max_tokens = v;
-                                    omp_dirty = true;
-                                }
+                                model.max_tokens = v;
+                                omp_dirty = true;
                             }
                             if ui.small_button("×").clicked() {
                                 model_remove = Some(mi);
@@ -2745,15 +2803,15 @@ impl ClientApp {
             }
         }
         // 自动保存
-        if pi_dirty {
-            if let Err(e) = config::save_pi_models(&self.pi_models) {
-                self.status = Some(format!("pi 配置保存失败: {e}"));
-            }
+        if pi_dirty
+            && let Err(e) = config::save_pi_models(&self.pi_models)
+        {
+            self.status = Some(format!("pi 配置保存失败: {e}"));
         }
-        if omp_dirty {
-            if let Err(e) = config::save_omp_models(&self.omp_models) {
-                self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
-            }
+        if omp_dirty
+            && let Err(e) = config::save_omp_models(&self.omp_models)
+        {
+            self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
         }
     }
 
@@ -2791,13 +2849,12 @@ impl ClientApp {
                                     .hint_text("选择或输入文件夹路径"),
                             );
                             let browse = ui.button("浏览…").clicked();
-                            if browse {
-                                if let Some(dir) = rfd::FileDialog::new()
+                            if browse
+                                && let Some(dir) = rfd::FileDialog::new()
                                     .set_title("选择项目文件夹")
                                     .pick_folder()
-                                {
-                                    *path = dir.to_string_lossy().to_string();
-                                }
+                            {
+                                *path = dir.to_string_lossy().to_string();
                             }
                             if ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 && (name_resp.has_focus() || path_resp.has_focus())
@@ -2823,15 +2880,13 @@ impl ClientApp {
                             if !resp.has_focus() {
                                 resp.request_focus();
                             }
-                            if is_edit_path {
-                                if ui.button("浏览…").clicked() {
-                                    if let Some(dir) = rfd::FileDialog::new()
-                                        .set_title("选择项目文件夹")
-                                        .pick_folder()
-                                    {
-                                        *value = dir.to_string_lossy().to_string();
-                                    }
-                                }
+                            if is_edit_path
+                                && ui.button("浏览…").clicked()
+                                && let Some(dir) = rfd::FileDialog::new()
+                                    .set_title("选择项目文件夹")
+                                    .pick_folder()
+                            {
+                                *value = dir.to_string_lossy().to_string();
                             }
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus() {
                                 commit = true;
@@ -2927,10 +2982,10 @@ impl Drop for ClientApp {
 impl eframe::App for ClientApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // 清理启动时创建的 .running 标记文件。
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
-                let _ = std::fs::remove_file(exe.with_file_name(format!("{name}.running")));
-            }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(name) = exe.file_name().and_then(|n| n.to_str())
+        {
+            let _ = std::fs::remove_file(exe.with_file_name(format!("{name}.running")));
         }
         // 记录打开中的终端页签（退出后下次启动自动重新拉起）。
         // active 指向 dirs 数组中的页签（0=Home, 1=dirs[0], …）。
@@ -3021,23 +3076,23 @@ impl eframe::App for ClientApp {
             ctx.request_repaint();
         }
         // 下载进度实时更新状态栏。
-        if let Some(rx) = &self.download_progress_rx {
-            if let Ok((downloaded, total)) = rx.try_recv() {
-                if total > 0 {
-                    let pct = downloaded as f64 / total as f64 * 100.0;
-                    self.status = Some(format!("下载中… {pct:.2}% ({}/{})",
-                        Self::format_bytes(downloaded),
-                        Self::format_bytes(total)));
-                } else {
-                    self.status = Some(format!("下载中… {}",
-                        Self::format_bytes(downloaded)));
-                }
-                ctx.request_repaint();
+        if let Some(rx) = &self.download_progress_rx
+            && let Ok((downloaded, total)) = rx.try_recv()
+        {
+            if total > 0 {
+                let pct = downloaded as f64 / total as f64 * 100.0;
+                self.status = Some(format!("下载中… {pct:.2}% ({}/{})",
+                    Self::format_bytes(downloaded),
+                    Self::format_bytes(total)));
+            } else {
+                self.status = Some(format!("下载中… {}",
+                    Self::format_bytes(downloaded)));
             }
+            ctx.request_repaint();
         }
         // 下载线程结束后清理通道。
         if self.downloading && self.download_progress_rx.as_ref()
-            .map_or(false, |rx| rx.try_recv().is_err())
+            .is_some_and(|rx| rx.try_recv().is_err())
         {
             self.downloading = false;
             self.download_progress_tx = None;
@@ -3090,6 +3145,7 @@ impl eframe::App for ClientApp {
                 for p in pending {
                     let title = p.title.clone();
                     let redraw = self.redraw_tx.clone();
+                    let wake = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let tx = tx.clone();
                     self.spawning.push((title, false, None));
@@ -3100,12 +3156,16 @@ impl eframe::App for ClientApp {
                             redraw, ctx,
                         );
                         let _ = tx.send((result, false, None));
+                        let _ = wake.try_send(());
                     });
                 }
                 for p in pending_rel {
                     let title = p.title.clone();
                     let tab_idx = p.tab_index;
                     let redraw = self.redraw_tx.clone();
+                    // spawn 完成后唤醒 UI：占位页签不是前台终端（2s 基线轮询），
+                    // 不唤醒的话新会话出现要等到下一次轮询/交互，明显延迟。
+                    let wake = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let tx = tx.clone();
                     self.spawning.push((title, false, Some(tab_idx)));
@@ -3116,13 +3176,14 @@ impl eframe::App for ClientApp {
                             redraw, ctx,
                         );
                         let _ = tx.send((result, false, Some(tab_idx)));
+                        let _ = wake.try_send(());
                     });
                 }
                 self.screen = Screen::Main;
                 self.check_updates(true);
             }
             // 轮询后台 spawn 结果：先收进临时列表，再逐条处理，避免 &rx 与 &mut self 借用冲突。
-            let mut spawn_results: Vec<(Result<Session, String>, bool, Option<usize>)> = Vec::new();
+            let mut spawn_results: Vec<SpawnResult> = Vec::new();
             if let Some(rx) = &self.spawn_rx {
                 while let Ok(item) = rx.try_recv() {
                     self.spawning.pop();
@@ -3132,16 +3193,32 @@ impl eframe::App for ClientApp {
             for (result, is_restore, saved_index) in spawn_results {
                 if is_restore {
                     let themed = self.apply_theme_to(result);
-                    if let Some(idx) = saved_index {
-                        if let Some(slot) = self.restore_slots.get_mut(idx) {
-                            *slot = Some(themed);
-                        }
+                    if let Some(idx) = saved_index
+                        && let Some(slot) = self.restore_slots.get_mut(idx)
+                    {
+                        *slot = Some(themed);
                     }
                 } else if let Some(relaunch_idx) = saved_index {
                     match self.apply_theme_to(result) {
                         Ok(sess) => {
-                            let idx = relaunch_idx.min(self.tabs.len());
-                            self.tabs.insert(idx, Tab::Session(sess));
+                            // 优先按标题找到对应占位页签（重启期间用户可能拖拽重排
+                            // 导致 relaunch_idx 不再指向它），避免幽灵占位页签永驻。
+                            let idx = self
+                                .tabs
+                                .iter()
+                                .position(|t| {
+                                    matches!(t, Tab::Placeholder { title } if title == &sess.title)
+                                })
+                                .unwrap_or_else(|| {
+                                    relaunch_idx.min(self.tabs.len().saturating_sub(1))
+                                });
+                            // 如果目标位置是 Placeholder（重启/切换命令），直接替换；
+                            // 否则 insert（崩溃恢复等场景）。
+                            if matches!(self.tabs.get(idx), Some(Tab::Placeholder { .. })) {
+                                self.tabs[idx] = Tab::Session(Box::new(sess));
+                            } else {
+                                self.tabs.insert(idx, Tab::Session(Box::new(sess)));
+                            }
                             self.current = idx;
                             self.term_focused = true;
                             self.screen = Screen::Main;
@@ -3149,6 +3226,13 @@ impl eframe::App for ClientApp {
                             self.status = Some("已启动".to_string());
                         }
                         Err(e) => {
+                            // 启动失败：移除 Placeholder，恢复到之前的状态。
+                            if matches!(self.tabs.get(relaunch_idx), Some(Tab::Placeholder { .. })) {
+                                self.tabs.remove(relaunch_idx);
+                                if self.current >= self.tabs.len() {
+                                    self.current = self.tabs.len().saturating_sub(1);
+                                }
+                            }
                             self.status = Some(format!("启动失败: {e}"));
                             self.refresh_focus();
                         }
@@ -3156,7 +3240,7 @@ impl eframe::App for ClientApp {
                 } else {
                     match self.apply_theme_to(result) {
                         Ok(sess) => {
-                            self.tabs.push(Tab::Session(sess));
+                            self.tabs.push(Tab::Session(Box::new(sess)));
                             self.current = self.tabs.len() - 1;
                             self.term_focused = true;
                             self.screen = Screen::Main;
@@ -3176,7 +3260,7 @@ impl eframe::App for ClientApp {
                 for slot in slots {
                     match slot {
                         Some(Ok(sess)) => {
-                            self.tabs.push(Tab::Session(sess));
+                            self.tabs.push(Tab::Session(Box::new(sess)));
                             restored += 1;
                         }
                         Some(Err(e)) => {
@@ -3278,6 +3362,21 @@ impl eframe::App for ClientApp {
                         self.status =
                             Some("该终端页签发生崩溃，已隔离并关闭（其他页签不受影响）。".to_string());
                     }
+                }
+                Some(Tab::Placeholder { title }) => {
+                    // 重启/切换命令期间：显示加载提示，不渲染终端。
+                    let title_clone = title.clone();
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() * 0.3);
+                            ui.label(RichText::new("🔄 正在重启...").strong().size(20.0));
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(format!("该页签（{title_clone}）正在后台重新启动，请稍候"))
+                                    .weak(),
+                            );
+                        });
+                    });
                 }
                 Some(Tab::Settings) => {
                     self.settings_ui(ui);

@@ -83,7 +83,7 @@ fn glyph_coverage() {
             let (x0, y0) = (r.min[0] as usize, r.min[1] as usize);
             let (x1, y1) = (r.max[0] as usize, r.max[1] as usize);
             let mut mx = 0u8;
-            let (mut sx, mut sy, mut n) = (0u32, 0u32, 0u32);
+            let (mut sx, mut n) = (0u32, 0u32);
             for y in y0..y1 {
                 for x in x0..x1 {
                     if x < atlas.width() && y < atlas.height() {
@@ -96,7 +96,7 @@ fn glyph_coverage() {
             }
             if n > 0 {
                 per_glyph.push((g.chr, mx));
-                let mean = sx / n;
+                let mean = sx.checked_div(n).unwrap_or(0);
                 println!("  字形 {:?} uv_rect {r:?} 面积{n} 最大alpha={mx} 平均={mean}", g.chr);
             }
         }

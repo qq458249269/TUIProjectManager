@@ -49,12 +49,12 @@ fn frame(ctx: &Context, events: Vec<Event>, sim: &mut TermSim) {
             sim.selection = false;
         }
         // ── 复制自 terminal.rs：快速拖选兜底 ──
-        if primary_released {
-            if let (Some(p0), Some(p1)) = (sim.drag_press_pos.take(), latest_pos) {
-                let moved = p0.distance(p1) > 4.0;
-                if moved && rect.contains(p1) && !sim.selection {
-                    sim.selection = true;
-                }
+        if primary_released
+            && let (Some(p0), Some(p1)) = (sim.drag_press_pos.take(), latest_pos)
+        {
+            let moved = p0.distance(p1) > 4.0;
+            if moved && rect.contains(p1) && !sim.selection {
+                sim.selection = true;
             }
         }
 
@@ -107,8 +107,10 @@ fn drag_select_then_right_click_menu_enabled() {
 #[test]
 fn single_click_clears_selection() {
     let ctx = Context::default();
-    let mut sim = TermSim::default();
-    sim.selection = true;
+    let mut sim = TermSim {
+        selection: true,
+        ..Default::default()
+    };
 
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(60.0, 60.0))], &mut sim);
     frame(&ctx, vec![btn(Pos2::new(60.0, 60.0), PointerButton::Primary, true)], &mut sim);
