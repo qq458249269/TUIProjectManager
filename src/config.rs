@@ -140,6 +140,9 @@ pub struct WindowState {
 pub struct TabsState {
     /// 打开的会话目录，按页签顺序。
     pub dirs: Vec<String>,
+    /// 各页签退出时使用的命令（与 dirs 一一对应，旧配置缺省时 fallback 到 tui_command）。
+    #[serde(default)]
+    pub cmds: Vec<String>,
     /// 上次激活的页签索引（0 = 首页）。
     pub active: usize,
 }

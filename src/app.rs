@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -350,6 +350,21 @@ fn ui_gray(ui: &egui::Ui) -> Color32 {
     }
 }
 
+/// 渲染时强制过一遍颜色：按实际背景亮度差验证前景色，
+/// 对比不足（含真假同色）时翻成黑/白兑底，保证文字与背景永不相同。
+fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
+    let lum = |c: Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    if (lum(fg) - lum(bg)).abs() < 60.0 {
+        if lum(bg) > 128.0 {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        }
+    } else {
+        fg
+    }
+}
+
 /// 从 GitHub Release 拉取最新版本号，返回（状态栏消息, 有新版本时的 tag）。
 fn fetch_latest_release() -> (String, Option<String>) {
     const URL: &str =
@@ -532,7 +547,6 @@ pub struct ClientApp {
     check_tx: Sender<(String, Option<String>)>,
     update_rx: Receiver<(String, Option<String>)>,
     /// 下载进度：后台线程通过通道报告 (bytes_downloaded, total_bytes)。
-    download_progress_tx: Option<std::sync::mpsc::Sender<(u64, u64)>>,
     download_progress_rx: Option<Receiver<(u64, u64)>>,
     /// 当前正在下载更新（显示进度条，禁用下载按钮）。
     downloading: bool,
@@ -645,7 +659,6 @@ impl ClientApp {
             config_path,
             term_focused: false,
             update_latest: None,
-            download_progress_tx: None,
             download_progress_rx: None,
             downloading: false,
             input: None,
@@ -684,7 +697,8 @@ impl ClientApp {
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
         // 不在构造期 spawn：此时窗口未布局，只有估算尺寸，会走错尺寸启动路径；
         // 收集成 pending_restore，等首帧会话页签布局里按精确尺寸启动（见 ui()）。
-        for d in &saved_tabs.dirs {
+        let default_cmd = app.config.settings.tui_command.clone();
+        for (i, d) in saved_tabs.dirs.iter().enumerate() {
             if !Path::new(d).is_dir() {
                 continue;
             }
@@ -701,10 +715,11 @@ impl ClientApp {
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| d.clone())
                 });
+            let cmd = saved_tabs.cmds.get(i).cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| default_cmd.clone());
             app.pending_restore.push(PendingLaunch {
                 title: name,
                 dir: d.clone(),
-                cmd: app.config.settings.tui_command.clone(),
+                cmd,
             });
         }
         if !app.pending_restore.is_empty() {
@@ -769,7 +784,6 @@ impl ClientApp {
         self.status = Some(format!("正在下载 {tag}…"));
         let tag = tag.to_string();
         let (ptx, prx) = std::sync::mpsc::channel();
-        self.download_progress_tx = Some(ptx.clone());
         self.download_progress_rx = Some(prx);
         let redraw_tx = self.redraw_tx.clone();
         let status_tx = self.check_tx.clone();
@@ -778,30 +792,38 @@ impl ClientApp {
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| PathBuf::from("."));
-            let result = download_update(&tag, &exe_path, ptx);
-            match result {
-                Ok(new_path) => {
-                    let new_file = PathBuf::from(&new_path);
-                    // 旧 exe 复制为 .old
-                    if let Ok(exe) = std::env::current_exe() {
-                        let old_path = exe.with_extension("exe.old");
-                        let _ = std::fs::copy(&exe, &old_path);
+            // 失败后 3 秒自动重试，直到下载成功为止。
+            let mut attempt = 1u32;
+            let new_path = loop {
+                match download_update(&tag, &exe_path, ptx.clone()) {
+                    Ok(p) => break p,
+                    Err(e) => {
+                        let _ = status_tx.send((
+                            format!("下载失败（第 {attempt} 次）: {e}，3 秒后自动重试…"),
+                            None,
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        attempt += 1;
                     }
-                    // .new 文件改为 .exe（去掉文件名末尾的 .new）
-                    let final_name = new_file.file_name()
-                        .map(|n| n.to_string_lossy().replacen(".new", "", 1))
-                        .unwrap_or_else(|| "TUIProjectManager.exe".into());
-                    let final_path = exe_path.join(final_name);
-                    let _ = std::fs::rename(&new_file, &final_path);
-                    let _ = status_tx.send((
-                        format!("下载完成！请手动重启应用以使用新版本 {tag}"),
-                        None,
-                    ));
                 }
-                Err(e) => {
-                    let _ = status_tx.send((format!("下载失败: {e}"), None));
-                }
+            };
+            let new_file = PathBuf::from(&new_path);
+            // 旧 exe 复制为 .old
+            if let Ok(exe) = std::env::current_exe() {
+                let old_path = exe.with_extension("exe.old");
+                let _ = std::fs::copy(&exe, &old_path);
             }
+            // .new 文件改为 .exe（去掉文件名末尾的 .new）
+            let final_name = new_file
+                .file_name()
+                .map(|n| n.to_string_lossy().replacen(".new", "", 1))
+                .unwrap_or_else(|| "TUIProjectManager.exe".into());
+            let final_path = exe_path.join(final_name);
+            let _ = std::fs::rename(&new_file, &final_path);
+            let _ = status_tx.send((
+                format!("下载完成！请手动重启应用以使用新版本 {tag}"),
+                None,
+            ));
             let _ = redraw_tx.try_send(());
         });
     }
@@ -1811,7 +1833,16 @@ impl ClientApp {
                     ),
                 },
             };
+            // 渲染时强制计算最终前景色：以状态栏实际背景（panel_fill）为基准，
+            // 亮度差不足则翻成黑/白兑底，杜绝背景与文字同色。
+            // override_text_color 优先级高于 RichText::color()，因此还要临时清除它，
+            // 否则 RichText 颜色被全局覆写，前面的对比兜底失效。
+            let bg = ui.visuals().panel_fill;
+            let color = forced_contrast_color(color, bg);
+            let saved_override = ui.visuals().override_text_color;
+            ui.visuals_mut().override_text_color = None;
             ui.label(RichText::new(text).color(color));
+            ui.visuals_mut().override_text_color = saved_override;
             if let Some(tag) = self.update_latest.clone() {
                 ui.separator();
                 if self.downloading {
@@ -1828,14 +1859,15 @@ impl ClientApp {
                     }
                 }
             }
-            // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录 / 检查更新）+ 深浅色切换（右侧第一个 = 最右）。
+            // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录）+「检查更新」+ 深浅色切换（右侧第一个 = 最右）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
                 let more_id = egui::Id::new("status_more_menu");
                 // Sense::CLICK 不含 FOCUSABLE 位：不参与键盘焦点循环（Tab/方向键不会选中它）。
+                // 最先添加 = 最右侧：⋯ 更多 固定在最右边。
                 let more_resp = ui
                     .add(egui::Button::new("⋯ 更多").sense(egui::Sense::CLICK))
-                    .on_hover_text("打开用户目录 / 软件目录 / 检查更新");
+                    .on_hover_text("打开用户目录 / 软件目录");
                 if more_resp.clicked() && ui.input(|i| i.pointer.any_click()) {
                     egui::Popup::toggle_id(ui.ctx(), more_id);
                 }
@@ -1855,6 +1887,7 @@ impl ClientApp {
                                 self.open_explorer(dir);
                                 ui.close();
                             }
+                            ui.separator();
                             if ui.selectable_label(false, "📂 打开软件目录")
                                 .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
                                 .clicked()
@@ -1866,16 +1899,15 @@ impl ClientApp {
                                 self.open_explorer(dir);
                                 ui.close();
                             }
-                            ui.separator();
-                            if ui.selectable_label(false, "🔄 检查更新")
-                                .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）")
-                                .clicked()
-                            {
-                                self.check_updates(false);
-                                ui.close();
-                            }
                         });
                     });
+                // 「检查更新」：放在 ⋯ 更多 左边，同样只响应鼠标点击。
+                let check_upd = ui
+                    .add(egui::Button::new("🔄 检查更新").sense(egui::Sense::CLICK))
+                    .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）");
+                if check_upd.clicked() && ui.input(|i| i.pointer.any_click()) {
+                    self.check_updates(false);
+                }
                 // 主题切换按钮：深色 → 浅色 → 跟随系统 → 深色 轮转。
                 // 只响应鼠标点击，防止键盘方向键选中后回车误触发。
                 let (fs, dark) = (
@@ -2991,17 +3023,19 @@ impl eframe::App for ClientApp {
         // active 指向 dirs 数组中的页签（0=Home, 1=dirs[0], …）。
         // 必须按 dirs 实际过滤后的顺序计算索引，不能直接用 self.current：
         // self.current 是 tabs 全数组含 Home/已退出页签的索引，与 dirs 不对应。
-        let dirs: Vec<String> = self
+        let active_sessions: Vec<&Session> = self
             .tabs
             .iter()
             .skip(1)
             .filter_map(|t| match t {
-                Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.dir.clone()),
+                Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.as_ref()),
                 _ => None,
             })
             .collect();
+        let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
+        let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
         let active = self.current;
-        self.config.tabs = config::TabsState { dirs, active };
+        self.config.tabs = config::TabsState { dirs, cmds, active };
         // 窗口状态已在每帧 logic 中记录，退出时落盘。
         let _ = config::save(&self.config);
     }
@@ -3090,12 +3124,15 @@ impl eframe::App for ClientApp {
             }
             ctx.request_repaint();
         }
-        // 下载线程结束后清理通道。
-        if self.downloading && self.download_progress_rx.as_ref()
-            .is_some_and(|rx| rx.try_recv().is_err())
+        // 下载线程结束后清理通道：仅当发送端已全部掉落（线程退出）才清理，
+        // 重试等待期（3 秒休眠无进度消息）不误判为结束。
+        if self.downloading
+            && self
+                .download_progress_rx
+                .as_ref()
+                .is_some_and(|rx| matches!(rx.try_recv(), Err(TryRecvError::Disconnected)))
         {
             self.downloading = false;
-            self.download_progress_tx = None;
             self.download_progress_rx = None;
             ctx.request_repaint();
         }
