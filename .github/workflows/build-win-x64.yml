@@ -106,7 +106,7 @@ jobs:
         shell: pwsh
         run: |
           $lines = @(
-            'Windows x64 自动构建（pre-release）'
+            'Windows x64 自动构建'
             ''
             "- 版本: $env:VERSION"
             '- 运行: 直接运行 `tui-project-manager.exe`'
@@ -130,7 +130,7 @@ jobs:
           path: target/release/tui-project-manager.exe
           if-no-files-found: error
 
-      - name: 发布 pre-release
+      - name: 发布 release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
@@ -138,5 +138,5 @@ jobs:
           body_path: release_notes.md
           files: target/release/tui-project-manager.exe
           draft: false
-          prerelease: true
+          prerelease: false
           update_release: true
