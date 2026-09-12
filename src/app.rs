@@ -450,9 +450,13 @@ fn download_update(
     dest_dir: &Path,
     progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
 ) -> Result<String, String> {
-    // 从 GitHub Release assets 里找 exe 文件名。
-    // 取资产列表只认 API（HTML 页面不含 assets），限流时可能拿不到；
-    // 下载按钮只有在 API 源成功时才展示（见 fetch_latest_release），此处限流仅影响重试间隔。
+    // 从 GitHub Release 里找 exe 直链：先 API（带 size），失败时回退 release
+    // HTML 页面（github.com CDN 比 api.github.com 更易连通，同检查更新多源策略）。
+    // 旧实现直接 parse API 输出：curl 带 -f 失败时 stdout 为空 → 笼统报
+    // 「解析版本信息失败」，真实原因（限流 403/断网）被吞。现在失败时透出
+    // curl 报错，HTML 兜底成功则照常下载。
+    let mut exe_info: Option<(String, String, u64)> = None; // (url, 文件名, 字节数)
+    let mut api_err: Option<String> = None;
     let api_url = format!(
         "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
     );
@@ -467,16 +471,66 @@ fn download_update(
         use std::os::windows::process::CommandExt;
         api_cmd.creation_flags(0x08000000);
     }
-    let api_out = api_cmd.output().map_err(|e| format!("获取版本信息失败: {e}"))?;
-    let api_json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&api_out.stdout))
-        .map_err(|_| "解析版本信息失败".to_string())?;
-    let assets = api_json["assets"].as_array().ok_or("无可用下载文件")?;
-    let exe_asset = assets.iter().find(|a| {
-        a["name"].as_str().is_some_and(|n| n.ends_with(".exe"))
-    }).ok_or("未找到 exe 下载文件")?;
-    let download_url = exe_asset["browser_download_url"].as_str()
-        .ok_or("下载链接无效")?;
-    let asset_name = exe_asset["name"].as_str().unwrap_or("update.exe");
+    match api_cmd.output() {
+        Ok(o) if o.status.success() => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                for a in v["assets"].as_array().into_iter().flatten() {
+                    let Some(name) = a["name"].as_str() else { continue };
+                    if !name.ends_with(".exe") {
+                        continue;
+                    }
+                    let Some(url) = a["browser_download_url"].as_str() else { continue };
+                    exe_info = Some((
+                        url.to_string(),
+                        name.to_string(),
+                        a["size"].as_u64().unwrap_or(0),
+                    ));
+                    break;
+                }
+            }
+            if exe_info.is_none() {
+                api_err = Some("GitHub API 响应中没有 exe 资产".to_string());
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = stderr.trim();
+            api_err = Some(if stderr.is_empty() {
+                format!("GitHub API 请求失败（HTTP {}）", o.status.code().unwrap_or(0))
+            } else {
+                format!("GitHub API 请求失败：{stderr}")
+            });
+        }
+        Err(e) => api_err = Some(format!("启动 curl 失败: {e}")),
+    }
+    if exe_info.is_none() {
+        // 兜底：API 限流（403）/被墙时从 release 页面直接抠 /releases/download/{tag}/*.exe 直链。
+        let page_url = format!(
+            "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
+        );
+        let mut page_cmd = std::process::Command::new("curl");
+        page_cmd.args([
+            "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+            "-H", "User-Agent: TUIProjectManager",
+            &page_url,
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            page_cmd.creation_flags(0x08000000);
+        }
+        if let Ok(o) = page_cmd.output()
+            && o.status.success()
+            && let Some(info) =
+                exe_asset_from_html(&String::from_utf8_lossy(&o.stdout), tag)
+        {
+            exe_info = Some(info);
+        }
+    }
+    let (download_url, asset_name, total) = exe_info.ok_or_else(|| {
+        // 两个源都没拿到：透出 API 的真实原因，不再笼统报「解析版本信息失败」。
+        api_err.unwrap_or_else(|| "获取版本信息失败".to_string())
+    })?;
     // 下载到 .new 文件，完成后由调用方替换旧 exe。
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
@@ -486,7 +540,7 @@ fn download_update(
         "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
         "-o", dest_path.to_str().unwrap_or("update.exe.new"),
-        download_url,
+        download_url.as_str(),
     ]);
     #[cfg(windows)]
     {
@@ -495,7 +549,6 @@ fn download_update(
     }
     let mut child = cmd.spawn().map_err(|e| format!("启动下载失败: {e}"))?;
 
-    let total = exe_asset["size"].as_u64().unwrap_or(0);
     // 轮询文件大小报告进度：每 200ms 检查一次。
     loop {
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -519,6 +572,29 @@ fn download_update(
             }
         }
     }
+}
+
+/// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
+/// 返回 (exe 文件名, 下载 URL, 0)；HTML 不含字节数，进度按已下载字节算。
+fn exe_asset_from_html(html: &str, tag: &str) -> Option<(String, String, u64)> {
+    const NEEDLE: &str = "releases/download/";
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(NEEDLE) {
+        let start = from + rel + NEEDLE.len();
+        let rest = &html[start..];
+        let end = rest.find(['\'', '\"', '<', '?', '\n']).unwrap_or(rest.len());
+        // 路径形如 {tag}/{xxx.exe}
+        let parts: Vec<&str> = rest[..end].split('/').collect();
+        if parts.len() == 2 && parts[0] == tag && parts[1].ends_with(".exe") {
+            return Some((
+                parts[1].to_string(),
+                format!("https://github.com/{NEEDLE}{}/{}", parts[0], parts[1]),
+                0,
+            ));
+        }
+        from = start;
+    }
+    None
 }
 
 /// 点分数字版本比较（如 2025.06.30.0001），a > b 返回 true。
@@ -3526,3 +3602,39 @@ mod vscode_tests {
         assert_eq!(ClientApp::cmd_arg(r"D:\p"), r"D:\p");
     }
 }
+
+#[cfg(all(test, windows))]
+mod update_tests {
+    use super::exe_asset_from_html;
+
+    #[test]
+    fn html_exe_extracted() {
+        let html = r#"<a href="/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe">TUIProjectManager.exe</a>"#;
+        let (name, url, _size) = exe_asset_from_html(html, "v2025.06.30.0001").unwrap();
+        assert_eq!(name, "TUIProjectManager.exe");
+        assert_eq!(
+            url,
+            "https://github.com/releases/download/v2025.06.30.0001/TUIProjectManager.exe"
+        );
+    }
+
+    #[test]
+    fn html_wrong_tag_ignored() {
+        let html = r#"<a href="/q/q/releases/download/vother/Other.exe">x</a>"#;
+        assert!(exe_asset_from_html(html, "v2025.06.30.0001").is_none());
+    }
+
+    #[test]
+    fn html_query_stripped() {
+        let html = r#"<a href="/q/q/releases/download/v1/TUIProjectManager.exe?download=1">x</a>"#;
+        let (name, url, _) = exe_asset_from_html(html, "v1").unwrap();
+        assert_eq!(name, "TUIProjectManager.exe");
+        assert!(!url.contains('?'));
+    }
+
+    #[test]
+    fn html_no_exe_returns_none() {
+        assert!(exe_asset_from_html("<html>nothing</html>", "v1").is_none());
+    }
+}
+
