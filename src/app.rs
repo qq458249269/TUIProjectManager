@@ -365,6 +365,23 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
     }
 }
 
+/// 网络诊断日志：追加写 exe 同级 update.log，带时间戳。多源失败时定位
+/// 到底是地址错、限流、还是镜像失效（exe 被替换/重建后仍可查原因）。
+fn log_update(msg: &str) {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("update.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now())
+            });
+    }
+}
+
 /// 拉取最新版本号。多源级联避免 GitHub API 限流（60 次/时）导致误报：
 /// ① /releases/latest 的 302 重定向目标（HTML 端点，无限流）取最新 tag；
 /// ② 重定向失败时回退 api.github.com 的 releases/latest JSON。
@@ -390,17 +407,26 @@ fn fetch_latest_release() -> (String, Option<String>) {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let out = cmd.output();
-    if let Ok(o) = out
+    if let Ok(o) = &out
         && o.status.success()
     {
         let url = String::from_utf8_lossy(&o.stdout);
         if let Some(pos) = url.find("/releases/tag/") {
             let tag = url[pos + "/releases/tag/".len()..].trim().to_string();
             if !tag.is_empty() {
+                log_update(&format!("检查更新 源① HTML 重定向 → tag {tag}"));
                 let msg = version_message(&tag);
                 return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
             }
         }
+        log_update(&format!("检查更新 源① HTML 返回但未解析出 tag（redirect={url}）"));
+    } else if let Err(e) = &out {
+        log_update(&format!("检查更新 源① 启动 curl 失败: {e}"));
+    } else if let Ok(o) = &out {
+        log_update(&format!(
+            "检查更新 源① HTML 非 2xx/3xx（HTTP {}）",
+            o.status.code().unwrap_or(0)
+        ));
     }
     // 源②：回退 GitHub API（可能触发限流，此时会明确报错而非误报已最新）。
     let mut cmd = std::process::Command::new("curl");
@@ -417,6 +443,7 @@ fn fetch_latest_release() -> (String, Option<String>) {
     let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => {
+            log_update(&format!("检查更新 源② API 成功，响应 {} 字节", o.stdout.len()));
             match serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
                 Ok(v) => {
                     let Some(tag) = v["tag_name"].as_str() else {
@@ -428,8 +455,17 @@ fn fetch_latest_release() -> (String, Option<String>) {
                 Err(_) => ("检查更新失败：无法解析 GitHub 响应".to_string(), None),
             }
         }
-        Ok(_) => ("检查更新失败：网络错误".to_string(), None),
-        Err(e) => (format!("检查更新失败：{e}"), None),
+        Ok(o) => {
+            log_update(&format!(
+                "检查更新 源② API HTTP {} 失败（限流/被墙）",
+                o.status.code().unwrap_or(0)
+            ));
+            ("检查更新失败：网络错误".to_string(), None)
+        }
+        Err(e) => {
+            log_update(&format!("检查更新 源② 启动 curl 失败: {e}"));
+            (format!("检查更新失败：{e}"), None)
+        }
     }
 }
 
@@ -475,11 +511,27 @@ fn download_update(
         use std::os::windows::process::CommandExt;
         page_cmd.creation_flags(0x08000000);
     }
-    if let Ok(o) = page_cmd.output()
-        && o.status.success()
-        && let Some(info) = exe_asset_from_html(&String::from_utf8_lossy(&o.stdout), tag)
-    {
-        exe_info = Some(info);
+    match page_cmd.output() {
+        Ok(o) if o.status.success() => {
+            let html = String::from_utf8_lossy(&o.stdout);
+            if let Some(info) = exe_asset_from_html(&html, tag) {
+                exe_info = Some(info);
+            } else {
+                // GitHub 资产列表是 lazy-load 的 expanded_assets fragment，
+                // 初始 HTML 无下载链接 → 解析必失败，转 API/直拼。
+                log_update(&format!(
+                    "下载 源② HTML 成功但未解析出 exe 直链（页面 {} 字节，资产懒加载），转 API/直拼",
+                    html.len()
+                ));
+            }
+        }
+        Ok(o) => {
+            log_update(&format!(
+                "下载 源② HTML HTTP {} 失败，转 API/直拼",
+                o.status.code().unwrap_or(0)
+            ));
+        }
+        Err(e) => log_update(&format!("下载 源② HTML: 启动 curl 失败: {e}")),
     }
     // 源①（已降为最低优先级）：仅 HTML 拿不到时才问 API，成功可补字节数。
     // 限流/被墙（curl HTTP 22）时此失败不再最先发生、不打头进错误汇总。
@@ -517,6 +569,7 @@ fn download_update(
                 }
                 if exe_info.is_none() {
                     api_err = Some("GitHub API 响应中没有 exe 资产".to_string());
+                    log_update("下载 源① API 成功但无 exe 资产");
                 }
             }
             Ok(o) => {
@@ -527,36 +580,68 @@ fn download_update(
                 } else {
                     format!("GitHub API 请求失败：{stderr}")
                 });
+                log_update(&format!(
+                    "下载 源① API HTTP {}：{stderr}",
+                    o.status.code().unwrap_or(0)
+                ));
             }
-            Err(e) => api_err = Some(format!("启动 curl 失败: {e}")),
+            Err(e) => {
+                log_update(&format!("下载 源① API: 启动 curl 失败: {e}"));
+                api_err = Some(format!("启动 curl 失败: {e}"));
+            }
         }
     }
-    // 源③保底：直拼直链，零网络请求，永远可用。GitHub 产物名固定为
-    // TUIProjectManager.exe，tag 与 release 页路径一致，不依赖任何
-    // API/页面解析；镜像链同样适用。HTML 已取的 info（真实文件名）优先。
-    let (download_url, asset_name, total) = match exe_info {
-        Some(info) => info,
+    // 源③保底：直拼直链，零网络请求，永远可用。GitHub 真实产物名是
+    // tui-project-manager.exe（小写连字符，2026-09 实测一直如此）；历史曾用
+    // TUIProjectManager.exe。两个候选都试，不依赖任何 API/页面解析。
+    // HTML 已取的 info（真实文件名）优先。
+    let (fallback, total) = match exe_info {
+        Some((url, name, size)) => (vec![(url, name)], size),
         None => (
-            format!(
-                "https://github.com/qq458249269/TUIProjectManager/releases/download/{tag}/TUIProjectManager.exe"
-            ),
-            "TUIProjectManager.exe".to_string(),
+            ["tui-project-manager.exe", "TUIProjectManager.exe"]
+                .iter()
+                .map(|f| {
+                    (
+                        format!(
+                            "https://github.com/qq458249269/TUIProjectManager/releases/download/{tag}/{f}"
+                        ),
+                        f.to_string(),
+                    )
+                })
+                .collect(),
             0,
         ),
     };
     // ── 候选下载链：原始直链 + 常见加速镜像，逐个尝试 ──
-    // 单一 URL 失败时 3 秒重试只打同一个 URL（可能一直失败）。
-    // 链路把 github.com 原始直链与几个 GH 加速镜像都试一遍，
-    // 全部失败才报错交给上层 3 秒重试。
-    let mut attempts: Vec<String> = vec![download_url.clone()];
-    for mirror in GH_MIRRORS {
-        attempts.push(format!("{mirror}{download_url}"));
+    // 每个文件名候选先打原始直链，再打各镜像；全部失败才报错交给上层
+    // 3 秒重试。GitHub 直链对未知文件名返回 404，先试真实名（必中）。
+    let mut attempts: Vec<(String, String)> = Vec::new();
+    for (url, name) in fallback {
+        attempts.push((url.clone(), name.clone()));
+        for mirror in GH_MIRRORS {
+            attempts.push((format!("{mirror}{url}"), name.clone()));
+        }
     }
+    log_update(&format!(
+        "下载 开始尝试 {} 个候选链（tag={tag}，total={total}）：{}",
+        attempts.len(),
+        attempts
+            .iter()
+            .map(|(u, _)| u.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
     let mut errors: Vec<String> = Vec::new();
-    for url in attempts {
-        match download_one(&url, &asset_name, total, dest_dir, &progress_tx) {
-            Ok(p) => return Ok(p),
-            Err(e) => errors.push(format!("{url}: {e}")),
+    for (url, name) in attempts {
+        match download_one(&url, &name, total, dest_dir, &progress_tx) {
+            Ok(p) => {
+                log_update(&format!("下载 成功：{url} → {p}"));
+                return Ok(p);
+            }
+            Err(e) => {
+                log_update(&format!("下载 失败：{url}：{e}"));
+                errors.push(format!("{url}: {e}"));
+            }
         }
     }
     // API 失败的真实原因（限流 403 等）并入汇总，不再被直拼兜底掩盖。
@@ -984,13 +1069,21 @@ impl ClientApp {
                 let old_path = exe.with_extension("exe.old");
                 let _ = std::fs::copy(&exe, &old_path);
             }
-            // .new 文件改为 .exe（去掉文件名末尾的 .new）
-            let final_name = new_file
-                .file_name()
-                .map(|n| n.to_string_lossy().replacen(".new", "", 1))
-                .unwrap_or_else(|| "TUIProjectManager.exe".into());
-            let final_path = exe_path.join(final_name);
+            // .new 文件替换当前运行的 exe：目标必须是当前 exe 路径（无论
+            // 资产名是小写 tui-project-manager.exe 还是历史大写名，最终都
+            // 落到运行路径），否则目录里出两个 exe，手动重启旧名仍跑旧版。
+            // 旧 exe 已备份 .old；Windows 下 std::fs::rename 目标存在会失败，
+            // 先删占位再 rename。
+            let final_path = std::env::current_exe().unwrap_or_else(|_| {
+                let fallback_name = new_file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().replacen(".new", "", 1))
+                    .unwrap_or_else(|| "TUIProjectManager.exe".into());
+                exe_path.join(fallback_name)
+            });
+            let _ = std::fs::remove_file(&final_path);
             let _ = std::fs::rename(&new_file, &final_path);
+            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}"));
             let _ = status_tx.send((
                 format!("下载完成！请手动重启应用以使用新版本 {tag}"),
                 None,
