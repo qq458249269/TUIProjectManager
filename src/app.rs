@@ -365,19 +365,22 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
     }
 }
 
-/// 从 GitHub Release 拉取最新版本号，返回（状态栏消息, 有新版本时的 tag）。
+/// 拉取最新版本号。多源级联避免 GitHub API 限流（60 次/时）导致误报：
+/// ① /releases/latest 的 302 重定向目标（HTML 端点，无限流）取最新 tag；
+/// ② 重定向失败时回退 api.github.com 的 releases/latest JSON。
+/// 返回（状态栏消息, 有新版本时的 tag）。
 fn fetch_latest_release() -> (String, Option<String>) {
-    const URL: &str =
-        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
+    // 源①：HTML 重定向。curl 不加 -L，从 redirect_url 里取 tag；
+    // HTTP 非 2xx/3xx 时 -f 会报错 → 链路不通 → 回退源②。
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
-        "-s",
-        "--connect-timeout",
-        "8",
+        "-s", "-f",
+        "-o", "NUL", // 丢弃响应体，只要重定向头
+        "-w", "%{redirect_url}",
+        "--connect-timeout", "8",
         "--ssl-no-revoke",
-        "-H",
-        "User-Agent: TUIProjectManager",
-        URL,
+        "-H", "User-Agent: TUIProjectManager",
+        "https://github.com/qq458249269/TUIProjectManager/releases/latest",
     ]);
     // GUI 程序 spawn 控制台程序（curl.exe）会闪一个黑窗口：
     // CREATE_NO_WINDOW 让子进程不分配控制台，彻底消除。
@@ -387,23 +390,56 @@ fn fetch_latest_release() -> (String, Option<String>) {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let out = cmd.output();
+    if let Ok(o) = out
+        && o.status.success()
+    {
+        let url = String::from_utf8_lossy(&o.stdout);
+        if let Some(pos) = url.find("/releases/tag/") {
+            let tag = url[pos + "/releases/tag/".len()..].trim().to_string();
+            if !tag.is_empty() {
+                let msg = version_message(&tag);
+                return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
+            }
+        }
+    }
+    // 源②：回退 GitHub API（可能触发限流，此时会明确报错而非误报已最新）。
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-H", "User-Agent: TUIProjectManager",
+        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => {
             match serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
                 Ok(v) => {
-                    let tag = v["tag_name"].as_str().unwrap_or("?").to_string();
-                    let latest = tag.trim_start_matches('v');
-                    if version_newer(latest, crate::app_version()) {
-                        (format!("发现新版本 {tag}，点击下方按钮下载"), Some(tag))
-                    } else {
-                        (format!("已是最新版本 ({tag})"), None)
-                    }
+                    let Some(tag) = v["tag_name"].as_str() else {
+                        return ("检查更新失败：GitHub 返回错误响应".to_string(), None);
+                    };
+                    let msg = version_message(tag);
+                    if msg.contains("发现新版本") { (msg, Some(tag.to_string())) } else { (msg, None) }
                 }
                 Err(_) => ("检查更新失败：无法解析 GitHub 响应".to_string(), None),
             }
         }
         Ok(_) => ("检查更新失败：网络错误".to_string(), None),
         Err(e) => (format!("检查更新失败：{e}"), None),
+    }
+}
+
+/// 根据 tag 与本地版本比较生成状态栏消息。
+fn version_message(tag: &str) -> String {
+    let latest = tag.trim_start_matches('v');
+    if version_newer(latest, crate::app_version()) {
+        format!("发现新版本 {tag}，点击下方按钮下载")
+    } else {
+        format!("已是最新版本 ({tag})")
     }
 }
 
@@ -415,12 +451,14 @@ fn download_update(
     progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
 ) -> Result<String, String> {
     // 从 GitHub Release assets 里找 exe 文件名。
+    // 取资产列表只认 API（HTML 页面不含 assets），限流时可能拿不到；
+    // 下载按钮只有在 API 源成功时才展示（见 fetch_latest_release），此处限流仅影响重试间隔。
     let api_url = format!(
         "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
     );
     let mut api_cmd = std::process::Command::new("curl");
     api_cmd.args([
-        "-s", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
         &api_url,
     ]);
@@ -445,7 +483,7 @@ fn download_update(
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
-        "-L", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
         "-o", dest_path.to_str().unwrap_or("update.exe.new"),
         download_url,
