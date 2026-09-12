@@ -450,96 +450,99 @@ fn download_update(
     dest_dir: &Path,
     progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
 ) -> Result<String, String> {
-    // 从 GitHub Release 里找 exe 直链：先 API（带 size），失败时回退 release
-    // HTML 页面（github.com CDN 比 api.github.com 更易连通，同检查更新多源策略）。
-    // 旧实现直接 parse API 输出：curl 带 -f 失败时 stdout 为空 → 笼统报
-    // 「解析版本信息失败」，真实原因（限流 403/断网）被吞。现在失败时透出
-    // curl 报错，HTML 兜底成功则照常下载。
+    // 从 GitHub Release 里找 exe 直链。优先级：HTML 页面（github.com CDN，
+    // 无限流、比 api.github.com 更易连通）→ 直拼直链（零请求保底）→ GitHub
+    // API 最低（仅 HTML 拿不到时兜底，成功可补字节数）。
+    // 旧实现 API 优先：限流/被墙时每次下载都先撞 API 失败（HTTP 22），错误
+    // 汇总里「源① API」长期打头误导；现在 API 降为最低优先级，curl 带 -f
+    // 失败时透出真实报错，HTML 兜底成功则照常下载。
     let mut exe_info: Option<(String, String, u64)> = None; // (url, 文件名, 字节数)
     let mut api_err: Option<String> = None;
-    let api_url = format!(
-        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
+    // 源②主路径：HTML 页面（github.com CDN 无限流）。HTML 成功即用，
+    // total=0（页面不含字节数，进度按已下载字节显示）。
+    // ponytail: 要百分比进度可另发一次 HEAD 取 Content-Length，或 API 仅补 size。
+    let page_url = format!(
+        "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
     );
-    let mut api_cmd = std::process::Command::new("curl");
-    api_cmd.args([
-        "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+    let mut page_cmd = std::process::Command::new("curl");
+    page_cmd.args([
+        "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
-        &api_url,
+        &page_url,
     ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        api_cmd.creation_flags(0x08000000);
+        page_cmd.creation_flags(0x08000000);
     }
-    match api_cmd.output() {
-        Ok(o) if o.status.success() => {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
-                for a in v["assets"].as_array().into_iter().flatten() {
-                    let Some(name) = a["name"].as_str() else { continue };
-                    if !name.ends_with(".exe") {
-                        continue;
-                    }
-                    let Some(url) = a["browser_download_url"].as_str() else { continue };
-                    exe_info = Some((
-                        url.to_string(),
-                        name.to_string(),
-                        a["size"].as_u64().unwrap_or(0),
-                    ));
-                    break;
-                }
-            }
-            if exe_info.is_none() {
-                api_err = Some("GitHub API 响应中没有 exe 资产".to_string());
-            }
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let stderr = stderr.trim();
-            api_err = Some(if stderr.is_empty() {
-                format!("GitHub API 请求失败（HTTP {}）", o.status.code().unwrap_or(0))
-            } else {
-                format!("GitHub API 请求失败：{stderr}")
-            });
-        }
-        Err(e) => api_err = Some(format!("启动 curl 失败: {e}")),
+    if let Ok(o) = page_cmd.output()
+        && o.status.success()
+        && let Some(info) = exe_asset_from_html(&String::from_utf8_lossy(&o.stdout), tag)
+    {
+        exe_info = Some(info);
     }
+    // 源①（已降为最低优先级）：仅 HTML 拿不到时才问 API，成功可补字节数。
+    // 限流/被墙（curl HTTP 22）时此失败不再最先发生、不打头进错误汇总。
     if exe_info.is_none() {
-        // 兜底：API 限流（403）/被墙时从 release 页面直接抠 /releases/download/{tag}/*.exe 直链。
-        let page_url = format!(
-            "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
+        let api_url = format!(
+            "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
         );
-        let mut page_cmd = std::process::Command::new("curl");
-        page_cmd.args([
-            "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        let mut api_cmd = std::process::Command::new("curl");
+        api_cmd.args([
+            "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
             "-H", "User-Agent: TUIProjectManager",
-            &page_url,
+            &api_url,
         ]);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            page_cmd.creation_flags(0x08000000);
+            api_cmd.creation_flags(0x08000000);
         }
-        if let Ok(o) = page_cmd.output()
-            && o.status.success()
-            && let Some(info) =
-                exe_asset_from_html(&String::from_utf8_lossy(&o.stdout), tag)
-        {
-            exe_info = Some(info);
+        match api_cmd.output() {
+            Ok(o) if o.status.success() => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    for a in v["assets"].as_array().into_iter().flatten() {
+                        let Some(name) = a["name"].as_str() else { continue };
+                        if !name.ends_with(".exe") {
+                            continue;
+                        }
+                        let Some(url) = a["browser_download_url"].as_str() else { continue };
+                        exe_info = Some((
+                            url.to_string(),
+                            name.to_string(),
+                            a["size"].as_u64().unwrap_or(0),
+                        ));
+                        break;
+                    }
+                }
+                if exe_info.is_none() {
+                    api_err = Some("GitHub API 响应中没有 exe 资产".to_string());
+                }
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stderr = stderr.trim();
+                api_err = Some(if stderr.is_empty() {
+                    format!("GitHub API 请求失败（HTTP {}）", o.status.code().unwrap_or(0))
+                } else {
+                    format!("GitHub API 请求失败：{stderr}")
+                });
+            }
+            Err(e) => api_err = Some(format!("启动 curl 失败: {e}")),
         }
     }
-    let (download_url, asset_name, total) = if let Some(info) = exe_info {
-        info
-    } else {
-        // 源③：API 限流（HTTP 403）且 release 页也拿不到时，按固定资产名直拼
-        // release 直链。GitHub 产物名固定为 TUIProjectManager.exe，tag 与
-        // release 页路径一致，直拼不依赖任何 API/页面解析；镜像链同样适用。
-        (
+    // 源③保底：直拼直链，零网络请求，永远可用。GitHub 产物名固定为
+    // TUIProjectManager.exe，tag 与 release 页路径一致，不依赖任何
+    // API/页面解析；镜像链同样适用。HTML 已取的 info（真实文件名）优先。
+    let (download_url, asset_name, total) = match exe_info {
+        Some(info) => info,
+        None => (
             format!(
                 "https://github.com/qq458249269/TUIProjectManager/releases/download/{tag}/TUIProjectManager.exe"
             ),
             "TUIProjectManager.exe".to_string(),
             0,
-        )
+        ),
     };
     // ── 候选下载链：原始直链 + 常见加速镜像，逐个尝试 ──
     // 单一 URL 失败时 3 秒重试只打同一个 URL（可能一直失败）。
