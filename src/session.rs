@@ -225,9 +225,9 @@ impl EventListener for SessionListener {
         // 页签标题/活动点由 1s 基线轮询更新。解析照常（管道不能停读）。
         if self.foreground.load(Ordering::Relaxed) {
             let _ = self.redraw.try_send(());
-            // 直接请求重绘（Context 线程安全）：空闲基线是 1s 轮询，若只靠
-            // logic() 里消费通道，PTY 输出刚错过一帧就要等最多 1s 才显示——
-            // 打字回显也是 PTY 输出，会明显发粘。这里即时唤醒下一帧。
+            // 直接请求重绘（Context 线程安全）：空闲时已停帧（省电），若只靠
+            // logic() 里消费通道调度，PTY 输出刚错过一帧就要等下一次输出/交互
+            // 才显示——打字回显也是 PTY 输出，会明显发粘。这里即时唤醒下一帧。
             self.ctx.request_repaint();
         }
     }
@@ -547,6 +547,10 @@ pub fn spawn(
     });
 
     let redraw_reader = redraw.clone();
+    // 退出时唤醒 UI：reader 线程设 exited 后立即 request_repaint（线程安全），
+    // 停帧空闲时 `update_exited()` 才能在本帧发现退出（页签✔/状态栏/通知）。
+    // 仅退出这一次，无常耗——后台输出/空闲不唤醒。
+    let reader_ctx = ctx.clone();
     // 前台标记：UI 线程每帧同步 self.current；后台会话输出不唤醒 UI。
     let foreground = Arc::new(AtomicBool::new(false));
     let listener_fg = foreground.clone();
@@ -667,6 +671,7 @@ pub fn spawn(
                         }
                         reader_exited.store(true, Ordering::Relaxed);
                         let _ = redraw_reader.send(());
+                        reader_ctx.request_repaint();
                         break;
                     },
                     Ok(n) => {

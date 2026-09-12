@@ -143,8 +143,14 @@ pub struct TabsState {
     /// 各页签退出时使用的命令（与 dirs 一一对应，旧配置缺省时 fallback 到 tui_command）。
     #[serde(default)]
     pub cmds: Vec<String>,
-    /// 上次激活的页签索引（0 = 首页）。
+    /// 上次激活的页签索引（满页签栏索引，0 = 首页）。
     pub active: usize,
+    /// 上次退出时设置页签是否打开。
+    #[serde(default)]
+    pub settings_open: bool,
+    /// 设置页签在页签栏中的位置（0 = 首页）。
+    #[serde(default)]
+    pub settings_pos: usize,
 }
 
 /// 与程序可执行文件同级的 config 目录。

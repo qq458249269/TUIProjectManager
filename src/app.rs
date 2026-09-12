@@ -612,6 +612,8 @@ pub struct ClientApp {
     pending_restore: Vec<PendingLaunch>,
     /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
     restore_active: Option<usize>,
+    /// 退出时设置页签开着：启动时在原位置插回（满页签栏索引，仅恢复时消费一次）。
+    restore_settings_pos: Option<usize>,
     /// 启动恢复的会话按保存序暂存于此（save_i 槽位），全部完成后按序插入页签。
     /// 后台 spawn 完成顺序随机，逐条插入会因先到的高索引越界 panic，故先攒槽。
     restore_slots: Vec<Option<Result<Session, String>>>,
@@ -715,6 +717,7 @@ impl ClientApp {
             spawning: Vec::new(),
             spawn_rx: None,
             restore_active: None,
+            restore_settings_pos: None,
             last_term_size: (80, 24),
             titlebar_hwnd,
             last_theme_dark: initial_dark,
@@ -760,7 +763,10 @@ impl ClientApp {
                 cmd,
             });
         }
-        if !app.pending_restore.is_empty() {
+        if saved_tabs.settings_open {
+            app.restore_settings_pos = Some(saved_tabs.settings_pos.max(1));
+        }
+        if !app.pending_restore.is_empty() || app.restore_settings_pos.is_some() {
             app.restore_active = Some(saved_active);
         }
         // 每次启动自动检查一次更新。
@@ -3083,7 +3089,20 @@ impl eframe::App for ClientApp {
         let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
         let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
         let active = self.current;
-        self.config.tabs = config::TabsState { dirs, cmds, active };
+        // 设置页签也记录：退出时开着则启动时在相同位置恢复（见构造器 restore_settings_pos）。
+        let settings_open = self.tabs.iter().any(|t| matches!(t, Tab::Settings));
+        let settings_pos = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Settings))
+            .unwrap_or(1);
+        self.config.tabs = config::TabsState {
+            dirs,
+            cmds,
+            active,
+            settings_open,
+            settings_pos,
+        };
         // 窗口状态已在每帧 logic 中记录，退出时落盘。
         let _ = config::save(&self.config);
     }
@@ -3133,21 +3152,30 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 帧率控制：前台页签有输出时按配置 FPS，空闲时 1 FPS 基线（保持光标闪烁、
-        // 页签图标更新），后台页签/首页/设置页不调度。
+        // 帧率控制：前台页签有输出（或鼠标按住拖选区）时按配置 FPS 调度，
+        // 空闲时停帧省电（SessionListener 在下次 PTY 输出时即时唤醒）。
+        // 恢复/重启 spawn 挂起时保持短周期轮询结果（首页靠它应用恢复页签），
+        // 结束后落停。首页/设置页空闲不调度，靠 egui 输入自动唤醒。
         let is_foreground_term = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
         let redraw_count = self.redraw_rx.try_iter().count();
+        let restoring = self.spawn_rx.is_some()
+            || !self.spawning.is_empty()
+            || !self.restore_slots.is_empty()
+            || self.restore_settings_pos.is_some();
         if is_foreground_term {
             if redraw_count > 0 {
                 // 有 PTY 输出 → 按配置帧率持续刷新（打字回显、TUI 动画）。
+                // 鼠标拖动选区的帧调度由 show_terminal 内部 request_repaint 负责，
+                // 不在 logic() 里用 ctx.input() 判 pointer_down：按住不动会满帧空转。
                 let fps = self.config.settings.refresh_fps.clamp(10, 60);
                 ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
-            } else {
-                // 空闲 → 10 FPS 基线：保持光标闪烁、页签状态图标更新流畅。
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
+            // 空闲不调度：SessionListener 在下次 PTY 输出时调 request_repaint 唤醒。
+        } else if restoring {
+            // 恢复/重启挂起：50ms 轮询 spawn_rx，spawn 一完成下一帧即应用页签。
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        // 首页/设置页不调度轮询：egui 输入处理会自动唤醒渲染循环。
+        // 首页/设置页空闲不轮询：egui 输入处理自动唤醒渲染循环。
         // 更新检查结果在用户交互时自然被消费。
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
@@ -3337,35 +3365,6 @@ impl eframe::App for ClientApp {
                     }
                 }
             }
-            // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
-            // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
-            if self.spawning.is_empty() && !self.restore_slots.is_empty() {
-                let slots = std::mem::take(&mut self.restore_slots);
-                let mut restored = 0usize;
-                for slot in slots {
-                    match slot {
-                        Some(Ok(sess)) => {
-                            self.tabs.push(Tab::Session(Box::new(sess)));
-                            restored += 1;
-                        }
-                        Some(Err(e)) => {
-                            self.status = Some(format!("启动失败: {e}"));
-                        }
-                        None => {}
-                    }
-                }
-                if restored > 0 {
-                    if let Some(active) = self.restore_active.take() {
-                        self.current = active.min(self.tabs.len() - 1);
-                        self.term_focused = self.current != 0;
-                    }
-                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
-                }
-            }
-            if self.spawning.is_empty() {
-                self.spawn_rx = None;
-            }
-
             // 启动时恢复上次的会话：后台线程 spawn，避免阻塞首帧。
             let pending = std::mem::take(&mut self.pending_restore);
             if !pending.is_empty() {
@@ -3373,8 +3372,7 @@ impl eframe::App for ClientApp {
                 let (cols, rows) = geom.unwrap_or((80, 24));
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.spawn_rx = Some(rx);
-                let restore_count = pending.len();
-                self.restore_slots = (0..restore_count).map(|_| None).collect();
+                self.restore_slots = (0..pending.len()).map(|_| None).collect();
                 for (save_i, p) in pending.into_iter().enumerate() {
                     let title = p.title;
                     let dir = p.dir;
@@ -3394,9 +3392,43 @@ impl eframe::App for ClientApp {
                         let _ = tx.send((result, true, Some(save_i)));
                     });
                 }
-                // 恢复的会话数已知，等后台线程完成后一次性应用 restore_active。
-                // 先记下待恢复数，spawn_rx 轮询时消费。
-                let _ = restore_count;
+            }
+            // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
+            // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
+            // 恢复 spawn 必须在本块之前执行：首帧先把 spawning 填上，否则单独恢复
+            // 设置页签（无会话）会在会话 spawn 前误触发，导致设置插到会话前面。
+            if self.spawning.is_empty()
+                && (!self.restore_slots.is_empty() || self.restore_settings_pos.is_some())
+            {
+                let slots = std::mem::take(&mut self.restore_slots);
+                let mut restored = 0usize;
+                for slot in slots {
+                    match slot {
+                        Some(Ok(sess)) => {
+                            self.tabs.push(Tab::Session(Box::new(sess)));
+                            restored += 1;
+                        }
+                        Some(Err(e)) => {
+                            self.status = Some(format!("启动失败: {e}"));
+                        }
+                        None => {}
+                    }
+                }
+                // 退出时设置页签开着：按满页签栏索引插回原位置（首页后、会话之间）。
+                if let Some(pos) = self.restore_settings_pos.take() {
+                    self.tabs.insert(pos.min(self.tabs.len()), Tab::Settings);
+                }
+                if let Some(active) = self.restore_active.take() {
+                    self.current = active.min(self.tabs.len() - 1);
+                    self.term_focused =
+                        matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
+                }
+                if restored > 0 {
+                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
+                }
+            }
+            if self.spawning.is_empty() {
+                self.spawn_rx = None;
             }
 
             match self.tabs.get(self.current) {
