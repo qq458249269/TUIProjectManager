@@ -1047,24 +1047,34 @@ impl ClientApp {
 
     fn update_exited(&mut self) -> bool {
         let mut changed = false;
-        for tab in self.tabs.iter_mut() {
-            if let Tab::Session(s) = tab
-                && !s.exited.load(Ordering::Relaxed)
-            {
-                // reader 线程退出时设置 exited 标志（无需 term 锁）。
-                // 兜底：子进程也已退出时同样标记。
-                // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
-                // reader 线程会在 PTY 管道断裂时设置 exited 标志。
-                if s.foreground.load(Ordering::Relaxed) {
-                    let child_exited = s.child
-                        .as_deref_mut()
-                        .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
-                    if child_exited {
-                        s.exited.store(true, Ordering::Relaxed);
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if let Tab::Session(s) = tab {
+                if !s.exited.load(Ordering::Relaxed) {
+                    // reader 线程退出时设置 exited 标志（无需 term 锁）。
+                    // 兜底：子进程也已退出时同样标记。
+                    // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
+                    // reader 线程会在 PTY 管道断裂时设置 exited 标志。
+                    if s.foreground.load(Ordering::Relaxed) {
+                        let child_exited = s.child
+                            .as_deref_mut()
+                            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+                        if child_exited {
+                            s.exited.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    if s.exited.load(Ordering::Relaxed) {
+                        changed = true;
                     }
                 }
-                if s.exited.load(Ordering::Relaxed) {
-                    changed = true;
+                // 运行结束提醒：不管谁先置位 exited 都只处理一次（notified 去重）。
+                // 用户正盯着该页签（当前页签且本应用在前台）时不打扰；
+                // kill_in_background 已提前置位 notified，程序化终止（重启/切命令/关闭）不弹。
+                if s.exited.load(Ordering::Relaxed)
+                    && !s.notified.swap(true, Ordering::Relaxed)
+                    && !(i == self.current && crate::app_is_foreground(self.titlebar_hwnd))
+                {
+                    crate::notify_run_finished(&s.title);
+                    crate::flash_taskbar(self.titlebar_hwnd);
                 }
             }
         }

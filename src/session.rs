@@ -118,6 +118,9 @@ pub struct Session {
     pub foreground: Arc<AtomicBool>,
     /// 子进程是否已退出（reader 线程写、UI 线程读，无需 term 锁）。
     pub exited: Arc<AtomicBool>,
+    /// 是否已发送过「运行结束」提醒：正常退出置位后只提醒一次；
+    /// kill_in_background 提前置位，重启/切命令/关闭页签等程序化终止不弹通知。
+    pub notified: Arc<AtomicBool>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
@@ -904,6 +907,7 @@ pub fn spawn(
         osc_theme_aware,
         foreground,
         exited: exited.clone(),
+        notified: Arc::new(AtomicBool::new(false)),
         last_clipboard_seq: None,
         output_count,
         last_output_ms,
@@ -939,6 +943,8 @@ impl Session {
     /// 调用方在 tabs.remove() 之前调用：Session::drop 时 child=None + master=None，
     /// 零阻塞。
     pub fn kill_in_background(&mut self) {
+        // 程序化终止不弹「运行结束」提醒（首次启动的会话此刻未必被 update_exited 处理过）。
+        self.notified.store(true, Ordering::Relaxed);
         let child = self.child.take();
         let master = self.master.take();
         if child.is_some() || master.is_some() {

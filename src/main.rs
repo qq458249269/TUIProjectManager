@@ -51,6 +51,73 @@ fn unlock_exe() {
         }
     }
  
+/// 顶层窗口是否为给定 hwnd（判断本应用是否在前台：用户正盯着看就不弹提醒）。
+pub fn app_is_foreground(hwnd: isize) -> bool {
+    hwnd != 0 && unsafe { GetForegroundWindow() } == hwnd
+}
+
+/// 运行结束系统通知：PowerShell WinRT toast，免注册 AUMID，best-effort。
+/// CREATE_NO_WINDOW 启动，不闪控制台；AppId 用固定串，未注册时 toast
+/// 仍会显示（标注该名称 + 占位图标）——比 Shell_NotifyIcon 托盘气球干净：
+/// 不进通知中心残留托盘图标，自动消失。
+pub fn notify_run_finished(title: &str) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let t = title.replace('\'', "''");
+    let script = format!(
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; \
+         [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null; \
+         $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+         $n = $x.GetElementsByTagName('text'); \
+         $n.Item(0).AppendChild($x.CreateTextNode('运行结束')) > $null; \
+         $n.Item(1).AppendChild($x.CreateTextNode('{t}')) > $null; \
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('TUI Project Manager').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+        t = t
+    );
+    let _ = std::process::Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("-NoProfile")
+        .arg("-WindowStyle")
+        .arg("Hidden")
+        .arg("-Command")
+        .arg(script)
+        .spawn();
+}
+
+/// 任务栏闪烁提醒：FLASHW_ALL | FLASHW_TIMERNOFG = 持续闪到窗口回到前台。
+/// 窗口本身在前台时 FlashWindowEx 自动不闪，无需额外判断。
+#[repr(C)]
+struct FlashWInfo {
+    cb_size: u32,
+    hwnd: isize,
+    dw_flags: u32,
+    u_count: u32,
+    dw_timeout: u32,
+}
+const FLASHW_ALL: u32 = 0x3;
+const FLASHW_TIMERNOFG: u32 = 0xC;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetForegroundWindow() -> isize;
+    fn FlashWindowEx(pfwi: *mut FlashWInfo) -> i32;
+}
+
+/// 开始任务栏闪烁（hwnd=0 时静默返回）。
+pub fn flash_taskbar(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let mut info = FlashWInfo {
+        cb_size: std::mem::size_of::<FlashWInfo>() as u32,
+        hwnd,
+        dw_flags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        u_count: 0,   // TIMERNOFG 下忽略次数
+        dw_timeout: 0, // 0 = 系统默认闪烁速度
+    };
+    unsafe { FlashWindowEx(&mut info) };
+}
+
 fn main() -> eframe::Result {
     // 全进程 panic 钩子：任何线程 panic（页签 reader/渲染/解析线程）都记到崩溃日志，
     // 不静默吞掉。日志写在 exe 同级 crash.log，供事后定位到底哪个页签/线程崩了。
