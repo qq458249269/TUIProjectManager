@@ -527,10 +527,61 @@ fn download_update(
             exe_info = Some(info);
         }
     }
-    let (download_url, asset_name, total) = exe_info.ok_or_else(|| {
-        // 两个源都没拿到：透出 API 的真实原因，不再笼统报「解析版本信息失败」。
-        api_err.unwrap_or_else(|| "获取版本信息失败".to_string())
-    })?;
+    let (download_url, asset_name, total) = if let Some(info) = exe_info {
+        info
+    } else {
+        // 源③：API 限流（HTTP 403）且 release 页也拿不到时，按固定资产名直拼
+        // release 直链。GitHub 产物名固定为 TUIProjectManager.exe，tag 与
+        // release 页路径一致，直拼不依赖任何 API/页面解析；镜像链同样适用。
+        (
+            format!(
+                "https://github.com/qq458249269/TUIProjectManager/releases/download/{tag}/TUIProjectManager.exe"
+            ),
+            "TUIProjectManager.exe".to_string(),
+            0,
+        )
+    };
+    // ── 候选下载链：原始直链 + 常见加速镜像，逐个尝试 ──
+    // 单一 URL 失败时 3 秒重试只打同一个 URL（可能一直失败）。
+    // 链路把 github.com 原始直链与几个 GH 加速镜像都试一遍，
+    // 全部失败才报错交给上层 3 秒重试。
+    let mut attempts: Vec<String> = vec![download_url.clone()];
+    for mirror in GH_MIRRORS {
+        attempts.push(format!("{mirror}{download_url}"));
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for url in attempts {
+        match download_one(&url, &asset_name, total, dest_dir, &progress_tx) {
+            Ok(p) => return Ok(p),
+            Err(e) => errors.push(format!("{url}: {e}")),
+        }
+    }
+    // API 失败的真实原因（限流 403 等）并入汇总，不再被直拼兜底掩盖。
+    let mut parts = errors;
+    if let Some(e) = &api_err {
+        parts.push(format!("源① API: {e}"));
+    }
+    Err(format!("所有下载源失败：{}", parts.join("；")))
+}
+
+/// GitHub release 下载加速镜像（前缀拼接原始 github.com 直链，如
+/// {mirror}https://github.com/...）。第三方镜像域名会更换：失效时把
+/// 列表换成当前可用的即可，补一个零成本、挂了自动跳过。
+const GH_MIRRORS: &[&str] = &[
+    "https://ghfast.top/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+];
+
+/// 用 curl 把单个 URL 下载到 dest_dir/{asset_name}.new，轮询文件大小报告进度。
+/// 返回 Ok(下载文件路径) 或 Err(具体失败原因)。
+fn download_one(
+    url: &str,
+    asset_name: &str,
+    total: u64,
+    dest_dir: &Path,
+    progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
+) -> Result<String, String> {
     // 下载到 .new 文件，完成后由调用方替换旧 exe。
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
@@ -540,7 +591,7 @@ fn download_update(
         "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
         "-o", dest_path.to_str().unwrap_or("update.exe.new"),
-        download_url.as_str(),
+        url,
     ]);
     #[cfg(windows)]
     {
@@ -562,13 +613,13 @@ fn download_update(
                     return Ok(dest_path.to_string_lossy().into_owned());
                 } else {
                     let _ = std::fs::remove_file(&dest_path);
-                    return Err(format!("下载失败: curl 退出码 {}", status.code().unwrap_or(-1)));
+                    return Err(format!("curl 退出码 {}", status.code().unwrap_or(-1)));
                 }
             }
             Ok(None) => continue,
             Err(e) => {
                 let _ = std::fs::remove_file(&dest_path);
-                return Err(format!("下载失败: {e}"));
+                return Err(format!("{e}"));
             }
         }
     }
