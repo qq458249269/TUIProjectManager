@@ -1337,6 +1337,8 @@ impl ClientApp {
         // 图标槽与 × 的宽度对所有页签相同；标题宽度按字符串缓存，标题
         // 不变时零排版成本。
         let tab_font = egui::TextStyle::Body.resolve(ui.style());
+        // 应用是否前台：每帧取一次（update_exited 的「运行结束」通知同样用它判断）。
+        let app_fg = crate::app_is_foreground(self.titlebar_hwnd);
         let slot_w = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap("✏️".to_string(), tab_font.clone(), Color32::TRANSPARENT)
                 .size()
@@ -1436,17 +1438,19 @@ impl ClientApp {
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
-                    // 「执行完成」提醒：后台页签进入 ✅（输出结束待查看）/ ✏️（TUI
+                    // 「执行完成」提醒：页签进入 ✅（输出结束待查看）/ ✏️（TUI
                     // 等待选择）状态后需稳定停留 DONE_STABLE_MS 才弹系统通知 + 任务栏
                     // 闪烁（done_notified 去重，只提示一次）。稳定窗口过滤误触发：
                     // top/watch/编译间歇输出等周期性进程在 🔄↔✏️/✅ 间横跳，每次横跳
                     // 都重置计时，永远到不了窗口 → 不弹；真正完成的任务（输出停止
-                    // 2 秒以上）只弹一次。当前页签用户正盯着：不弹且重置计时。图标
-                    // 离开这两个状态时重置，下一轮输出完成再提示。
+                    // 2 秒以上）只弹一次。仅当「当前页签且应用在前台」（用户正盯着）
+                    // 才静默；当前页签但应用在后台（焦点在别的窗口）→ 用户没在看，
+                    // 照常计时弹通知 + 闪烁，与 update_exited 的「运行结束」语义一致。
+                    // 图标离开这两个状态时重置，下一轮输出完成再提示。
                     const DONE_STABLE_MS: u64 = 2000;
                     if matches!(icon, Some("✅") | Some("✏️")) {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
-                        if i == self.current {
+                        if i == self.current && app_fg {
                             s.done_since_ms.store(0, Ordering::Relaxed);
                         } else if since == 0 {
                             s.done_since_ms.store(now_ms, Ordering::Relaxed);
