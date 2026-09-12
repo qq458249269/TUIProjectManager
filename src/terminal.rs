@@ -1062,6 +1062,18 @@ pub fn show_terminal(
     let cursor_cell_char = snap.cursor_cell_char;
     let cursor_cell_flags = snap.cursor_cell_flags;
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
+    // 启动占位：会话启动中且快照还没有任何格子（子进程首屏未渲染）时，
+    // 终端区显示「正在启动会话…」，避免纯黑屏让用户以为页签没打开。
+    // 子进程一旦画出内容（snap.cells 非空）或 loading 清除，提示自动消失。
+    if sess.loading.load(Ordering::Relaxed) && snap.cells.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "正在启动会话…",
+            egui::FontId::proportional(15.0),
+            color_for(dark, Color32::from_gray(170), Color32::from_gray(90)),
+        );
+    }
     // 选区范围从终端实时读取，不依赖快照（快照的 sel_range 只有 reader 线程刷新，
     // 用户拖动选区不会更新快照，导致渲染用旧选区高亮）。
     let sel_range = sess.term.try_read().ok().and_then(|t| {

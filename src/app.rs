@@ -1423,16 +1423,30 @@ impl ClientApp {
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
-                    // 「执行完成」提醒：后台页签首次出现 ✅（输出结束待查看）或
-                    // ✏️（TUI 等待选择）图标时弹系统通知 + 任务栏闪烁（done_notified
-                    // 去重，只提示一次）；当前页签用户正盯着，不弹。图标离开这两个
-                    // 状态时重置，下一轮输出完成再提示。
+                    // 「执行完成」提醒：后台页签进入 ✅（输出结束待查看）/ ✏️（TUI
+                    // 等待选择）状态后需稳定停留 DONE_STABLE_MS 才弹系统通知 + 任务栏
+                    // 闪烁（done_notified 去重，只提示一次）。稳定窗口过滤误触发：
+                    // top/watch/编译间歇输出等周期性进程在 🔄↔✏️/✅ 间横跳，每次横跳
+                    // 都重置计时，永远到不了窗口 → 不弹；真正完成的任务（输出停止
+                    // 2 秒以上）只弹一次。当前页签用户正盯着：不弹且重置计时。图标
+                    // 离开这两个状态时重置，下一轮输出完成再提示。
+                    const DONE_STABLE_MS: u64 = 2000;
                     if matches!(icon, Some("✅") | Some("✏️")) {
-                        if i != self.current && !s.done_notified.swap(true, Ordering::Relaxed) {
-                            crate::notify_run_finished(&title, "任务完成");
+                        let since = s.done_since_ms.load(Ordering::Relaxed);
+                        if i == self.current {
+                            s.done_since_ms.store(0, Ordering::Relaxed);
+                        } else if since == 0 {
+                            s.done_since_ms.store(now_ms, Ordering::Relaxed);
+                        } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
+                            && !s.done_notified.swap(true, Ordering::Relaxed)
+                        {
+                            let heading =
+                                if matches!(icon, Some("✅")) { "任务完成" } else { "等待你的选择" };
+                            crate::notify_run_finished(&title, heading);
                             crate::flash_taskbar(self.titlebar_hwnd);
                         }
                     } else {
+                        s.done_since_ms.store(0, Ordering::Relaxed);
                         s.done_notified.store(false, Ordering::Relaxed);
                     }
                     // 本页签当前启动命令（切换菜单里勾选当前项）。
@@ -2749,7 +2763,7 @@ impl ClientApp {
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("界面恒定按配置帧率刷新，不做任何节能停帧操作。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。").weak());
+        ui.label(RichText::new("界面恒定按配置帧率刷新，不做任何节能停帧操作。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 稳定停留 2 秒才弹「任务完成/等待选择」通知，周期性输出进程（top/watch/编译间歇）不会误报。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
@@ -3321,8 +3335,8 @@ impl eframe::App for ClientApp {
                 for p in pending {
                     let title = p.title.clone();
                     let redraw = self.redraw_tx.clone();
-                    let wake = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
+                    let wake_ctx = ctx.clone();
                     let tx = tx.clone();
                     self.spawning.push((title, false, None));
                     std::thread::spawn(move || {
@@ -3332,17 +3346,19 @@ impl eframe::App for ClientApp {
                             redraw, ctx,
                         );
                         let _ = tx.send((result, false, None));
-                        let _ = wake.try_send(());
+                        // spawn 完成立即唤醒 UI 应用页签（恒定帧率下最多省掉
+                        // 一帧 ~100ms 的等待；恢复/重启路径行为一致）。
+                        wake_ctx.request_repaint();
                     });
                 }
                 for p in pending_rel {
                     let title = p.title.clone();
                     let tab_idx = p.tab_index;
                     let redraw = self.redraw_tx.clone();
-                    // spawn 完成后唤醒 UI：占位页签不是前台终端（2s 基线轮询），
-                    // 不唤醒的话新会话出现要等到下一次轮询/交互，明显延迟。
-                    let wake = self.redraw_tx.clone();
+                    // spawn 完成后唤醒 UI：占位页签不是前台终端，不唤醒的话新会话
+                    // 出现要等到下一帧恒定帧（最多 ~100ms），明显延迟。
                     let ctx = self.ctx.clone();
+                    let wake_ctx = ctx.clone();
                     let tx = tx.clone();
                     self.spawning.push((title, false, Some(tab_idx)));
                     std::thread::spawn(move || {
@@ -3352,7 +3368,7 @@ impl eframe::App for ClientApp {
                             redraw, ctx,
                         );
                         let _ = tx.send((result, false, Some(tab_idx)));
-                        let _ = wake.try_send(());
+                        wake_ctx.request_repaint();
                     });
                 }
                 self.screen = Screen::Main;
@@ -3442,6 +3458,7 @@ impl eframe::App for ClientApp {
                     let cmd = p.cmd;
                     let redraw = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
+                    let wake_ctx = ctx.clone();
                     let tx = tx.clone();
                     self.spawning.push((title.clone(), true, Some(save_i)));
                     std::thread::spawn(move || {
@@ -3453,6 +3470,9 @@ impl eframe::App for ClientApp {
                         // saved_index：恢复时按保存时的原序插入，保证页签顺序不因
                         // 后台 spawn 完成先后而打乱。
                         let _ = tx.send((result, true, Some(save_i)));
+                        // 恢复完成立即唤醒 UI，页签尽快出现（spawn 慢的页签不拖累
+                        // 其他页签应用，全部完成后统一追加）。
+                        wake_ctx.request_repaint();
                     });
                 }
             }

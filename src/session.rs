@@ -124,6 +124,10 @@ pub struct Session {
     /// 是否已发送过「执行完成」提醒（✅ 输出结束 / ✏️ TUI 等待输入图标首次出现时
     /// 提示一次；图标离开这两个状态后重置，下轮输出完成再提示）。
     pub done_notified: Arc<AtomicBool>,
+    /// 进入 ✅/✏️ 状态的时刻（毫秒）。0 = 不在该状态。UI 页签检测到状态后需
+    /// 稳定停留 DONE_STABLE_MS 才提醒，过滤 top/watch/编译间歇输出等周期性
+    /// 进程在 🔄↔✏️/✅ 间横跳造成的重复误报。
+    pub done_since_ms: Arc<AtomicU64>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
@@ -917,6 +921,7 @@ pub fn spawn(
         exited: exited.clone(),
         notified: Arc::new(AtomicBool::new(false)),
         done_notified: Arc::new(AtomicBool::new(false)),
+        done_since_ms: Arc::new(AtomicU64::new(0)),
         last_clipboard_seq: None,
         output_count,
         last_output_ms,
