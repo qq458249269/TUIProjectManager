@@ -1414,8 +1414,17 @@ impl ClientApp {
                     } else if !any_silent && count > 0 {
                         // 正在输出 → 🔄
                         Some("🔄")
-                    } else if is_tui && cursor_vis && content_silent && content_fresh && count > 0 {
-                        // TUI 空闲 + 光标可见 + 近期有内容输出 = 等待用户输入
+                    } else if is_tui
+                        && cursor_vis
+                        && any_silent     // 字节级静止：最近 500ms 无任何输出
+                        && content_silent  // 网格级静止：格子 500ms 无变化
+                        && content_fresh
+                        && count > 0
+                    {
+                        // TUI 空闲 + 光标可见 + 字节/网格双静止 = 等待用户输入。
+                        // any_silent 挡动画与周期重绘：进程只要还在输出（无论内容
+                        // 是否重复）就不算等待，内容不变的 watch/重绘不再误判；
+                        // content_silent 挡字节稀疏但网格在变的慢速输出。
                         // （排除会话结束后 shell 空闲停在提示符的情况）
                         Some("✏️")
                     } else if count > 0 && !viewed {
