@@ -128,14 +128,15 @@ pub struct Session {
     /// 稳定停留 DONE_STABLE_MS 才提醒，过滤 top/watch/编译间歇输出等周期性
     /// 进程在 🔄↔✏️/✅ 间横跳造成的重复误报。
     pub done_since_ms: Arc<AtomicU64>,
+    /// 网格内容最后一次实质性变化的时刻（毫秒）。reader 线程每次生成快照时
+    /// 比较新旧可见格子：相同则内容未变。TUI 动画/spinner/周期重绘（top/watch）
+    /// 都会改变格子，只有真正静止等待输入时才不变化。UI 用它区分「忙碌」与
+    /// 「等待选择」，比字节级可打印内容判据更接近真值。
+    pub last_grid_change_ms: Arc<AtomicU64>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     pub last_output_ms: Arc<AtomicU64>,
-    /// 最近一次有「实际内容」输出的时间戳（毫秒）。排除纯 escape 序列的
-    /// TUI 动画帧（光标移动、屏幕重绘），只在有可打印字符输出时更新。
-    /// UI 用它区分「TUI 自带动画」（content 静默）vs「正在产生内容」（content 活跃）。
-    pub last_content_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
@@ -628,7 +629,9 @@ pub fn spawn(
         .unwrap_or_default()
         .as_millis() as u64;
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
-    let last_content_ms = Arc::new(AtomicU64::new(now_ts));
+    // 初始用 spawn 时刻：新会话尚无内容，首块输出（或 TUI 首屏）到来时
+    // 与空快照比较必然不同 → 更新为实际内容变化时刻。
+    let last_grid_change_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
@@ -641,7 +644,7 @@ pub fn spawn(
         let osc_theme_aware = osc_theme_aware.clone();
         let output_count = output_count.clone();
         let last_output_ms = last_output_ms.clone();
-        let last_content_ms = last_content_ms.clone();
+        let last_grid_change_ms = last_grid_change_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
@@ -734,7 +737,6 @@ pub fn spawn(
                             || (esc_ratio > 0.5 && n < 200)
                             || esc_ratio > 0.8;
                         if !is_animation {
-                            last_content_ms.store(now_ms, Ordering::Relaxed);
                             // 首次有实际内容输出 → 标记加载完成，停止旋转动画。
                             if reader_loading.load(Ordering::Relaxed) {
                                 reader_loading.store(false, Ordering::Relaxed);
@@ -867,6 +869,17 @@ pub fn spawn(
                                         cells.push((p, indexed.cell.clone()));
                                     }
                                 }
+                                // ── 内容级静止检测 ──
+                                // 与上一张快照的可见格子逐项比较：相同说明网格内容
+                                // 未变。TUI 动画/spinner/周期重绘（top/watch）会改变
+                                // 格子 → 内容新鲜；真正静止等待输入时格子不变 → 静默。
+                                // 光标移动/显示隐藏类 escape 重绘不改格子，不打断静止。
+                                let prev_ptr = reader_snapshot.load(Ordering::Acquire);
+                                let grid_unchanged = !prev_ptr.is_null()
+                                    && unsafe { (&*prev_ptr).cells == cells };
+                                if !grid_unchanged {
+                                    last_grid_change_ms.store(now_ms, Ordering::Relaxed);
+                                }
                                 let new_snap = Box::into_raw(Box::new(TermSnapshot {
                                     cells,
                                     offset: offset_val,
@@ -922,10 +935,10 @@ pub fn spawn(
         notified: Arc::new(AtomicBool::new(false)),
         done_notified: Arc::new(AtomicBool::new(false)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
+        last_grid_change_ms,
         last_clipboard_seq: None,
         output_count,
         last_output_ms,
-        last_content_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
         alt_screen: Arc::new(AtomicBool::new(false)),
         cursor_hidden: Arc::new(AtomicBool::new(true)),

@@ -1391,9 +1391,13 @@ impl ClientApp {
                     // ── TUI 状态检测 ──
                     let is_tui = s.alt_screen.load(Ordering::Relaxed);
                     let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
-                    let last_content = s.last_content_ms.load(Ordering::Relaxed);
+                    let last_content = s.last_grid_change_ms.load(Ordering::Relaxed);
+                    // 网格内容级静止：reader 每块输出后比较新旧可见格子（见
+                    // session.rs），动画/spinner/周期重绘（top/watch）都改变格子
+                    // → 内容新鲜；只有真正静止等待输入时才静默。比字节级可打印内容
+                    // 判据更接近真值，思考动画期不再被误判为「等待你的选择」。
                     let content_silent = now_ms.saturating_sub(last_content) > 500;
-                    // 内容新鲜度：最近 3 秒内有过可打印内容输出 → TUI 活跃。
+                    // 内容新鲜度：最近 3 秒内网格有过实质变化 → TUI 活跃。
                     let content_fresh = now_ms.saturating_sub(last_content) < 3000;
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
