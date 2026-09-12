@@ -121,6 +121,9 @@ pub struct Session {
     /// 是否已发送过「运行结束」提醒：正常退出置位后只提醒一次；
     /// kill_in_background 提前置位，重启/切命令/关闭页签等程序化终止不弹通知。
     pub notified: Arc<AtomicBool>,
+    /// 是否已发送过「执行完成」提醒（✅ 输出结束 / ✏️ TUI 等待输入图标首次出现时
+    /// 提示一次；图标离开这两个状态后重置，下轮输出完成再提示）。
+    pub done_notified: Arc<AtomicBool>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
@@ -913,6 +916,7 @@ pub fn spawn(
         foreground,
         exited: exited.clone(),
         notified: Arc::new(AtomicBool::new(false)),
+        done_notified: Arc::new(AtomicBool::new(false)),
         last_clipboard_seq: None,
         output_count,
         last_output_ms,

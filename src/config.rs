@@ -11,8 +11,8 @@ pub struct Project {
     pub hidden: bool,
 }
 
-/// 界面基线刷新帧率的默认值（帧/秒），对应默认 30 帧/秒。
-pub(crate) const DEFAULT_REFRESH_FPS: u64 = 30;
+/// 界面基线刷新帧率的默认值（帧/秒），对应默认 10 帧/秒。
+pub(crate) const DEFAULT_REFRESH_FPS: u64 = 10;
 
 fn default_refresh_fps() -> u64 {
     DEFAULT_REFRESH_FPS

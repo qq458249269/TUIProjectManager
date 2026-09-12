@@ -667,7 +667,6 @@ pub struct ClientApp {
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
-    redraw_rx: Receiver<()>,
     /// 主题切换后的延迟全量重绘时刻：立即清缓存之外，等子进程重绘尘埃落定
     /// 后（约 100ms）再清一遍所有会话缓存并强制整帧，兜住晚到的脏状态。
     theme_settle_at: Option<std::time::Instant>,
@@ -754,9 +753,8 @@ impl ClientApp {
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
-        // 重绘信号用容量 1 的有界通道：任意多个终端会话/后台线程并发投递时，
-        // 通道满即丢弃新信号（try_send），刷新请求被合并——不会出现消息堆积。
-        let (redraw_tx, redraw_rx) = std::sync::mpsc::sync_channel(1);
+        // 恒定帧率渲染，无需唤醒通道；保留 sender 供历史代码 try_send（无 receiver 时直接报错，不阻塞）。
+        let redraw_tx = std::sync::mpsc::sync_channel(1).0;
         let ctx = cc.egui_ctx.clone();
         let (check_tx, update_rx) = std::sync::mpsc::channel();
         let saved_tabs = config.tabs.clone();
@@ -782,7 +780,6 @@ impl ClientApp {
             check_tx,
             update_rx,
             redraw_tx,
-            redraw_rx,
             theme_settle_at: None,
             drag_tab: None,
             drag_project: None,
@@ -1193,7 +1190,7 @@ impl ClientApp {
                     && !s.notified.swap(true, Ordering::Relaxed)
                     && !(i == self.current && crate::app_is_foreground(self.titlebar_hwnd))
                 {
-                    crate::notify_run_finished(&s.title);
+                    crate::notify_run_finished(&s.title, "运行结束");
                     crate::flash_taskbar(self.titlebar_hwnd);
                 }
             }
@@ -1426,6 +1423,18 @@ impl ClientApp {
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
+                    // 「执行完成」提醒：后台页签首次出现 ✅（输出结束待查看）或
+                    // ✏️（TUI 等待选择）图标时弹系统通知 + 任务栏闪烁（done_notified
+                    // 去重，只提示一次）；当前页签用户正盯着，不弹。图标离开这两个
+                    // 状态时重置，下一轮输出完成再提示。
+                    if matches!(icon, Some("✅") | Some("✏️")) {
+                        if i != self.current && !s.done_notified.swap(true, Ordering::Relaxed) {
+                            crate::notify_run_finished(&title, "任务完成");
+                            crate::flash_taskbar(self.titlebar_hwnd);
+                        }
+                    } else {
+                        s.done_notified.store(false, Ordering::Relaxed);
+                    }
                     // 本页签当前启动命令（切换菜单里勾选当前项）。
                     let tab_cmd = s.cmd.clone();
                     // 刚拖起的帧里画底色需要 Noop 在内容之前插入，所以先占位。
@@ -2735,12 +2744,12 @@ impl ClientApp {
             }
         });
         ui.label(
-            RichText::new("默认 30 FPS，10 省电 / 30 均衡 / 60 流畅")
+            RichText::new("默认 10 FPS，恒定按配置帧率刷新（无空闲停帧节能）")
                 .weak()
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("界面刷新：空闲时每秒 1 次，进程有输出时 300ms 一帧动画（页签柱状指示），降低 CPU 占用。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。").weak());
+        ui.label(RichText::new("界面恒定按配置帧率刷新，不做任何节能停帧操作。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
@@ -3228,31 +3237,9 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 帧率控制：前台页签有输出（或鼠标按住拖选区）时按配置 FPS 调度，
-        // 空闲时停帧省电（SessionListener 在下次 PTY 输出时即时唤醒）。
-        // 恢复/重启 spawn 挂起时保持短周期轮询结果（首页靠它应用恢复页签），
-        // 结束后落停。首页/设置页空闲不调度，靠 egui 输入自动唤醒。
-        let is_foreground_term = matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
-        let redraw_count = self.redraw_rx.try_iter().count();
-        let restoring = self.spawn_rx.is_some()
-            || !self.spawning.is_empty()
-            || !self.restore_slots.is_empty()
-            || self.restore_settings_pos.is_some();
-        if is_foreground_term {
-            if redraw_count > 0 {
-                // 有 PTY 输出 → 按配置帧率持续刷新（打字回显、TUI 动画）。
-                // 鼠标拖动选区的帧调度由 show_terminal 内部 request_repaint 负责，
-                // 不在 logic() 里用 ctx.input() 判 pointer_down：按住不动会满帧空转。
-                let fps = self.config.settings.refresh_fps.clamp(10, 60);
-                ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
-            }
-            // 空闲不调度：SessionListener 在下次 PTY 输出时调 request_repaint 唤醒。
-        } else if restoring {
-            // 恢复/重启挂起：50ms 轮询 spawn_rx，spawn 一完成下一帧即应用页签。
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        // 首页/设置页空闲不轮询：egui 输入处理自动唤醒渲染循环。
-        // 更新检查结果在用户交互时自然被消费。
+        // 帧率控制：恒定按配置 FPS 调度每帧，不做空闲停帧等任何节能操作。
+        let fps = self.config.settings.refresh_fps.clamp(10, 60);
+        ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
         // 更新检查结果回到状态栏。

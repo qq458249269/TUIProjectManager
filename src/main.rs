@@ -60,7 +60,7 @@ pub fn app_is_foreground(hwnd: isize) -> bool {
 /// CREATE_NO_WINDOW 启动，不闪控制台；AppId 用固定串，未注册时 toast
 /// 仍会显示（标注该名称 + 占位图标）——比 Shell_NotifyIcon 托盘气球干净：
 /// 不进通知中心残留托盘图标，自动消失。
-pub fn notify_run_finished(title: &str) {
+pub fn notify_run_finished(title: &str, heading: &str) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let t = title.replace('\'', "''");
@@ -69,10 +69,11 @@ pub fn notify_run_finished(title: &str) {
          [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null; \
          $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
          $n = $x.GetElementsByTagName('text'); \
-         $n.Item(0).AppendChild($x.CreateTextNode('运行结束')) > $null; \
+         $n.Item(0).AppendChild($x.CreateTextNode('{heading}')) > $null; \
          $n.Item(1).AppendChild($x.CreateTextNode('{t}')) > $null; \
          [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('TUI Project Manager').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
-        t = t
+        t = t,
+        heading = heading
     );
     let _ = std::process::Command::new("powershell")
         .creation_flags(CREATE_NO_WINDOW)
