@@ -12,6 +12,11 @@ use crate::config;
 use crate::session::{self, Session};
 use crate::terminal;
 
+/// 启动宽限期：会话创建后一分钟内不弹「运行结束」/「执行完成」系统通知与
+/// 任务栏闪烁。刚启动的会话 shell 初始化/命令首屏输出会制造大量看似「完成」
+/// 的瞬间，宽限期过滤误报（进度型命令会在宽限期后再按正常规则提示）。
+const STARTUP_GRACE_MS: u64 = 60_000;
+
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -803,6 +808,8 @@ pub struct ClientApp {
     download_progress_rx: Option<Receiver<(u64, u64)>>,
     /// 当前正在下载更新（显示进度条，禁用下载按钮）。
     downloading: bool,
+    /// 下载完成、新 exe 已替换，等待用户重启应用（显示重启按钮）。
+    update_done: bool,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
@@ -914,6 +921,7 @@ impl ClientApp {
             update_latest: None,
             download_progress_rx: None,
             downloading: false,
+        update_done: false,
             input: None,
             confirm: None,
             check_tx,
@@ -1037,6 +1045,7 @@ impl ClientApp {
             return;
         }
         self.downloading = true;
+        self.update_done = false; // 新一轮下载，重启按钮回到待完成态。
         self.status = Some(format!("正在下载 {tag}…"));
         let tag = tag.to_string();
         let (ptx, prx) = std::sync::mpsc::channel();
@@ -1090,6 +1099,28 @@ impl ClientApp {
             ));
             let _ = redraw_tx.try_send(());
         });
+    }
+
+    /// 重启应用：以新进程启动当前 exe（透传原参数）后关闭本进程。
+    /// 新 exe 已替换到当前路径，重启即加载新版。
+    fn restart_app(&mut self) {
+        log_update("重启应用：spawn 新进程并退出");
+        let mut cmd =
+            std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "TUIProjectManager.exe".into()));
+        // 透传启动参数（如 --restore），保持与会话恢复行为一致。
+        cmd.args(std::env::args().skip(1));
+        match cmd.spawn() {
+            Ok(_) => {
+                // Windows 下子进程不随父进程退出而终止，先起新进程再关自身。
+                // 正常退出路径会触发配置（窗口位置/大小）保存。
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                log_update(&format!("重启应用 启动新进程失败: {e}"));
+                self.status = Some(format!("启动新进程失败: {e}"));
+                self.update_done = false; // 允许再次点击重试。
+            }
+        }
     }
 
     /// 后台 spawn 完成的应用注册：给会话同步深浅主题后原样返回，供插入页签。
@@ -1310,6 +1341,10 @@ impl ClientApp {
     }
 
     fn update_exited(&mut self) -> bool {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let mut changed = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if let Tab::Session(s) = tab {
@@ -1337,8 +1372,14 @@ impl ClientApp {
                     && !s.notified.swap(true, Ordering::Relaxed)
                     && !(i == self.current && crate::app_is_foreground(self.titlebar_hwnd))
                 {
-                    crate::notify_run_finished(&s.title, "运行结束");
-                    crate::flash_taskbar(self.titlebar_hwnd);
+                    // 启动宽限期：创建后一分钟内退出也静默（刚启动就崩/秒退
+                    // 不打扰），notified 已置位因此宽限期后也不会补弹。
+                    if now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
+                        >= STARTUP_GRACE_MS
+                    {
+                        crate::notify_run_finished(&s.title, "运行结束");
+                        crate::flash_taskbar(self.titlebar_hwnd);
+                    }
                 }
             }
         }
@@ -1604,10 +1645,16 @@ impl ClientApp {
                         } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
                             && !s.done_notified.swap(true, Ordering::Relaxed)
                         {
-                            let heading =
-                                if matches!(icon, Some("✅")) { "任务完成" } else { "等待你的选择" };
-                            crate::notify_run_finished(&title, heading);
-                            crate::flash_taskbar(self.titlebar_hwnd);
+                            // 启动宽限期：刚启动的会话（含其首轮输出）不弹通知/闪烁，
+                            // done_notified 已置位，宽限期结束后不会为这一轮补弹。
+                            if now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
+                                >= STARTUP_GRACE_MS
+                            {
+                                let heading =
+                                    if matches!(icon, Some("✅")) { "任务完成" } else { "等待你的选择" };
+                                crate::notify_run_finished(&title, heading);
+                                crate::flash_taskbar(self.titlebar_hwnd);
+                            }
                         }
                     } else {
                         s.done_since_ms.store(0, Ordering::Relaxed);
@@ -2174,6 +2221,17 @@ impl ClientApp {
                     {
                         self.start_download(&tag);
                     }
+                }
+            }
+            // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
+            if self.update_done {
+                ui.separator();
+                if ui
+                    .button("🔄 重启应用")
+                    .on_hover_text("新版本已下载并替换，点击重启使新版本生效")
+                    .clicked()
+                {
+                    self.restart_app();
                 }
             }
             // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录）+「检查更新」+ 深浅色切换（右侧第一个 = 最右）。
@@ -3422,6 +3480,11 @@ impl eframe::App for ClientApp {
 
         // 更新检查结果回到状态栏。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
+            // 完成消息只在下载线程成功替换 exe 后发出：置标记，状态栏改显
+            // 「重启应用」按钮。失败消息（“下载失败…重试”）不含该前缀。
+            if msg.contains("下载完成") {
+                self.update_done = true;
+            }
             self.status = Some(msg);
             self.update_latest = latest;
             ctx.request_repaint();

@@ -121,6 +121,9 @@ pub struct Session {
     /// 是否已发送过「运行结束」提醒：正常退出置位后只提醒一次；
     /// kill_in_background 提前置位，重启/切命令/关闭页签等程序化终止不弹通知。
     pub notified: Arc<AtomicBool>,
+    /// 会话创建时刻（毫秒时间戳）。UI 用它做启动宽限期判定：启动后一分钟内
+    /// 不弹「运行结束」/「执行完成」通知，过滤启动瞬间输出高峰的误报。
+    pub started_ms: Arc<AtomicU64>,
     /// 是否已发送过「执行完成」提醒（✅ 输出结束 / ✏️ TUI 等待输入图标首次出现时
     /// 提示一次；图标离开这两个状态后重置，下轮输出完成再提示）。
     pub done_notified: Arc<AtomicBool>,
@@ -933,6 +936,7 @@ pub fn spawn(
         foreground,
         exited: exited.clone(),
         notified: Arc::new(AtomicBool::new(false)),
+        started_ms: Arc::new(AtomicU64::new(now_ts)),
         done_notified: Arc::new(AtomicBool::new(false)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
         last_grid_change_ms,
