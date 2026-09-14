@@ -215,6 +215,16 @@ fn strip_ansi(s: &str) -> String {
                 for _ in 0..skip {
                     chars.next();
                 }
+                // 残片原本占据一个断词空格（如 `%{http_code}\n"[13;5u--max-time` 中
+                // `"` 与 `--max-time` 之间），直接删掉会把前后词粘在一起。补一个空格还原断词；
+                // 残片后紧跟的水平空白（空格/Tab，常为断词位置原有空白）一并吞掉，
+                // 保证整段残片最终只还原为一个空格（`Thinking...[残片] 当前` → `Thinking... 当前`）。
+                while matches!(chars.peek(), Some(' ' | '\t')) {
+                    chars.next();
+                }
+                if !out.chars().last().is_some_and(|c| c.is_whitespace()) {
+                    out.push(' ');
+                }
             }
         } else {
             out.push(c);
@@ -1933,21 +1943,24 @@ mod tests {
     }
 
     /// 孤儿 CSI-u 残片：kitty 键码经 ConPTY 回显后 ESC 丢失，只剩可见尾巴，粘贴时
-    /// 必须整段丢弃；普通 `[` 开头文本（"[abc"、"[0]"、数组字面量等）不受影响。
+    /// 必须整段丢弃；残片原本占据一个断词空格，丢弃时补一个空格还原（紧邻空白不补）。
+    /// 普通 `[` 开头文本（"[abc"、"[0]"、数组字面量等）不受影响。
     #[test]
     fn strip_ansi_removes_orphan_csi_u() {
-        // 用户报告的实况：多段 Ctrl+Enter 与释放事件残片。
+        // 用户报告的实况：多段 Ctrl+Enter 与释放事件残片，连续残片只补一个空格。
         assert_eq!(
             strip_ansi("[13;5u[57442;1:3u[13;5u[57442;1:3u[13;5u[57442;1"),
-            ""
+            " "
         );
-        // 单个完整残片 + 前后正常文本。
-        assert_eq!(strip_ansi("a[13;5ub"), "ab");
-        assert_eq!(strip_ansi("x[57442;1:3uy"), "xy");
-        // 末尾被截断的 `[57442;1`（; 分隔但 u 丢失）也丢弃。
-        assert_eq!(strip_ansi("ok[123;45"), "ok");
+        // 单个完整残片 + 前后正常文本：残片位置补空格断词。
+        assert_eq!(strip_ansi("a[13;5ub"), "a b");
+        assert_eq!(strip_ansi("x[57442;1:3uy"), "x y");
+        // 末尾被截断的 `[57442;1`（; 分隔但 u 丢失）也丢弃并补空格。
+        assert_eq!(strip_ansi("ok[123;45"), "ok ");
+        // 残片后紧邻已有空格时不重复补（`Thinking...` 实况）。
+        assert_eq!(strip_ansi("T[13;5u[57442;1:3u X"), "T X");
         // 与 ESC 前缀序列混合时同样干净。
-        assert_eq!(strip_ansi("\x1b[200~[13;5u\x1b[201~"), "");
+        assert_eq!(strip_ansi("\x1b[200~[13;5u\x1b[201~"), " ");
         // 普通文本不受影响：无分隔符的 `[123`、非数字开头的 `[abc`、`[0]`。
         assert_eq!(strip_ansi("arr[0] = [1, 2]"), "arr[0] = [1, 2]");
         assert_eq!(strip_ansi("[abc]"), "[abc]");
