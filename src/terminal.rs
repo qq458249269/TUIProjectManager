@@ -1060,6 +1060,13 @@ pub fn show_terminal(
                         let alt = modifiers.alt;
                         let shift = modifiers.shift;
 
+                        // Ctrl+C 永不发送给终端（0x03 SIGINT）：egui 会以 Event::Copy
+                        // 形式另行送达做选区复制，这里明确拦截，防止任何路径把 0x03
+                        // 写进 PTY。
+                        if ctrl && *key == egui::Key::C {
+                            continue;
+                        }
+
                         // Esc 清除文本选择（按键仍转发给终端，兼容 vim 等应用）。
                         // 通过命令通道异步清除，避免 UI 线程获取 term 写锁。
                         if *key == egui::Key::Escape {
@@ -1085,21 +1092,13 @@ pub fn show_terminal(
                         }
                     }
                     egui::Event::Copy => {
-                        // 有选区时 Ctrl+C 复制选区；无选区才发 SIGINT（0x03）。
-                        // 注意：Ctrl+C 会同时触发 Event::Key(C,ctrl) 和 Event::Copy。
-                        // Key 处理器里 Ctrl+字母已经通过 encode_char_key 发了 0x03，
-                        // 这里只在「无选区且 Key 处理器未发过」时才补发，避免双发。
-                        let key_already_sent = !bytes_out.is_empty()
-                            && bytes_out.last().is_some_and(|b| b.as_slice() == [0x03]);
-                        let mut copied = false;
+                        // Ctrl+C 统一走这里：有选区复制，无选区不发送任何内容。
+                        // 已拦截 Event::Key 中的 Ctrl+C，不会产生 0x03。
                         if let Ok(mut t) = sess.term.write() {
-                            copied = copy_selection(&t, ui.ctx(), status);
+                            let copied = copy_selection(&t, ui.ctx(), status);
                             if copied {
                                 t.selection = None;
                             }
-                        }
-                        if !copied && !key_already_sent {
-                            bytes_out.push(vec![0x03]);
                         }
                     }
                     egui::Event::Cut => {

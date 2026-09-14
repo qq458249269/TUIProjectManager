@@ -100,6 +100,14 @@ if sel_range != snap.sel_range {
 
 **正确做法**：仅发送 100 次 `\x15`（Ctrl+U）清行刷新提示符，重复 100 次确保多行残留内容全部清除，不发送任何 `\x03`。
 
+## Ctrl+C 拦截为复制（不发送 SIGINT）
+
+**禁止**把 `0x03`（Ctrl+C/SIGINT）写进 PTY：cmd 下 Ctrl+C 是复制快捷键。
+
+**正确做法**：
+- egui-winit 检测到复制命令（Ctrl+C）时只投递 `Event::Copy`，不产生 `Event::Key(C,ctrl)`；`Event::Copy` 处理器里有选区就 `copy_selection` 并清选区，无选区就什么都不发
+- `Event::Key` 处理器对 `ctrl && key == C` 直接 `continue` 拦截，防任何路径产生 `0x03`
+
 ## 选区点击清除必须区分纯点击与拖动结束
 **禁止**在 `resp.clicked()` 时无条件清除选区：用户按下→拖动→释放时，释放帧 `clicked()=true` 会把刚创建的选区清掉。
 
