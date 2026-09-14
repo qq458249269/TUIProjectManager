@@ -127,6 +127,12 @@ fn copy_selection(
                 .map(|l| l.trim_end())
                 .collect::<Vec<_>>()
                 .join("\n");
+            // 历史输出里可能已回显了 ConPTY 泄漏的 CSI-u 残片（[13;5u 等），
+            // 复制屏幕时一并带走，粘贴到别处就是杂字——复制前先清一遍。
+            let text = strip_ansi(&text);
+            if text.trim().is_empty() {
+                return false;
+            }
             ctx.copy_text(text);
             *status = Some("已复制选中的文本".to_string());
             true
@@ -137,6 +143,9 @@ fn copy_selection(
 
 /// 去掉文本中的 ANSI 转义序列（CSI/OSC/ESC 等），防止粘贴时把终端控制码当字面文本插入。
 /// 过滤模式：ESC 后跟 [ 或 ] 或单个字符的序列（如 ESCc、ESC(M 等）。
+/// 另外清理「孤儿 CSI-u」残片：kitty 键盘协议按键码（如 Ctrl+Enter 的 `[13;5u`、
+/// 按键释放的 `[57442;1:3u`）经 ConPTY 回显/选区复制后不可见的 ESC 字节丢失，
+/// 剪贴板里只剩可见的 `[...u` 尾巴，粘贴时整段丢弃（含末尾被截断的 `[57442;1`）。
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -166,6 +175,44 @@ fn strip_ansi(s: &str) -> String {
             } else if let Some(&next) = chars.peek() {
                 // 其他 ESC 序列（如 ESC c、ESC(M）：跳过下一个字符
                 if next != '[' && next != ']' {
+                    chars.next();
+                }
+            }
+        } else if c == '[' {
+            // 孤儿 CSI-u 残片：`[` 后是纯参数（数字 ; :）且以 `u` 结尾 → 整段丢弃；
+            // 末尾被截断的 `[57442;1`（有 ; : 分隔但 u 丢失）也丢弃。
+            // 其余 `[` 开头的普通文本（"[abc"、"[0]"、"[123"）原样保留。
+            let mut probe = chars.clone();
+            let mut n = 0usize; // 已扫过的参数字符数
+            let mut seps = 0usize; // ; 或 : 的个数
+            let mut drop_u = 0usize; // 完整 `[...u` 时要丢弃的字符数（含 u）
+            while let Some(&p) = probe.peek() {
+                if p.is_ascii_digit() {
+                    probe.next();
+                    n += 1;
+                } else if p == ';' || p == ':' {
+                    probe.next();
+                    n += 1;
+                    seps += 1;
+                } else if p == 'u' && n > 0 {
+                    probe.next();
+                    drop_u = n + 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            let skip = if drop_u > 0 {
+                drop_u
+            } else if n > 0 && seps > 0 && probe.peek().is_none() {
+                n // 末尾截断的多参数残片
+            } else {
+                0
+            };
+            if skip == 0 {
+                out.push('[');
+            } else {
+                for _ in 0..skip {
                     chars.next();
                 }
             }
@@ -1883,6 +1930,30 @@ mod tests {
         assert_eq!(key_bytes(egui::Key::Num5, false, true, false), Some(b"\x1b5".to_vec()));
         // alt+ctrl+a -> ESC + 0x01
         assert_eq!(key_bytes(egui::Key::A, true, true, false), Some(b"\x1b\x01".to_vec()));
+    }
+
+    /// 孤儿 CSI-u 残片：kitty 键码经 ConPTY 回显后 ESC 丢失，只剩可见尾巴，粘贴时
+    /// 必须整段丢弃；普通 `[` 开头文本（"[abc"、"[0]"、数组字面量等）不受影响。
+    #[test]
+    fn strip_ansi_removes_orphan_csi_u() {
+        // 用户报告的实况：多段 Ctrl+Enter 与释放事件残片。
+        assert_eq!(
+            strip_ansi("[13;5u[57442;1:3u[13;5u[57442;1:3u[13;5u[57442;1"),
+            ""
+        );
+        // 单个完整残片 + 前后正常文本。
+        assert_eq!(strip_ansi("a[13;5ub"), "ab");
+        assert_eq!(strip_ansi("x[57442;1:3uy"), "xy");
+        // 末尾被截断的 `[57442;1`（; 分隔但 u 丢失）也丢弃。
+        assert_eq!(strip_ansi("ok[123;45"), "ok");
+        // 与 ESC 前缀序列混合时同样干净。
+        assert_eq!(strip_ansi("\x1b[200~[13;5u\x1b[201~"), "");
+        // 普通文本不受影响：无分隔符的 `[123`、非数字开头的 `[abc`、`[0]`。
+        assert_eq!(strip_ansi("arr[0] = [1, 2]"), "arr[0] = [1, 2]");
+        assert_eq!(strip_ansi("[abc]"), "[abc]");
+        assert_eq!(strip_ansi("[123"), "[123");
+        // 冒号分隔但无 u 结尾且后接其它字符 → 保留（避免误删子命令等）。
+        assert_eq!(strip_ansi("a[1:2b"), "a[1:2b");
     }
 
     #[test]
