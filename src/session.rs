@@ -169,6 +169,12 @@ pub struct Session {
     /// 鼠标按下时的位置（纯点击判定用）：press_origin() 在释放帧返回 None，
     /// 自己从 raw events 捕获按下坐标，用于区分点击与拖动。
     pub click_press_pos: Option<egui::Pos2>,
+    /// 已转发给子进程的鼠标按下（code, col, row, sgr）：等释放帧分类后补发配对释放。
+    /// None = 没有待配对的按下（普通点击手势已立即转发）。
+    pub mouse_press_pending: Option<(u16, usize, usize, bool)>,
+    /// 本次主键手势被判为本地选区手势（拖选/快速拖选兜底建出选区）。
+    /// 释放帧据此吞掉配对的按下/释放，不给子进程发幽灵点击。
+    pub mouse_gesture_sel: bool,
     /// 上一帧 IME 预编辑文本（拼音等）：非空时强制刷新快照，避免跳过 clone
     /// 导致输入法组合/提交时内容不同步。
     pub last_preedit: String,
@@ -955,6 +961,8 @@ pub fn spawn(
         last_input_ms,
         drag_press_pos: None,
         click_press_pos: None,
+        mouse_press_pending: None,
+        mouse_gesture_sel: false,
         last_preedit: String::new(),
         cached_ansi_rgb: None,
         cached_metrics: None,

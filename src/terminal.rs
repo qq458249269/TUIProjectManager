@@ -405,6 +405,8 @@ fn encode_char_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option
 /// 组合回车（Shift/Alt/Ctrl+Enter）编码。full=true 时按 CSI-u 发送
 /// （kitty 键盘协议 / modifyOtherKeys 同款格式），opencode 等全屏 TUI 靠它区分
 /// 「换行」与「提交」；full=false 回退普通 \r（普通 shell 收到转义串会当文本回显）。
+/// 注意：仅 Shift+Enter 允许 full——Ctrl/Alt+Enter 走 CSI-u 会被 ConPTY
+/// 重编码为 kitty 修饰键事件，时序错位时污染子进程输出（见调用点注释）。
 fn encode_modified_enter(shift: bool, alt: bool, ctrl: bool, full: bool) -> Vec<u8> {
     if !full {
         return vec![b'\r'];
@@ -501,19 +503,12 @@ pub fn term_grid_size(ui: &egui::Ui) -> Option<(usize, usize)> {
     ))
 }
 
-/// 按子进程启用的鼠标编码（SGR ?1006 或默认 X10）把一次鼠标事件写入 PTY。
+/// 按子进程启用的鼠标编码（SGR ?1006 或默认 X10）把一次鼠标事件编码成字节。
 /// 新版 ConPTY 对宿主写入的鼠标序列只透传、不重编码，所以编码必须与子进程
 /// 声明的一致；code 为 xterm 事件码：按键 0/1/2，移动 +32，滚轮上 64 下 65，
 /// 释放固定 0（X10 载荷里自动变 3）。col/row 已是 1-based。
-fn send_mouse_event(
-    writer: &std::sync::mpsc::SyncSender<Vec<u8>>,
-    sgr: bool,
-    code: u16,
-    col: usize,
-    row: usize,
-    release: bool,
-) {
-    let bytes = if sgr {
+fn mouse_event_bytes(sgr: bool, code: u16, col: usize, row: usize, release: bool) -> Vec<u8> {
+    if sgr {
         format!("\x1b[<{code};{col};{row}{}", if release { 'm' } else { 'M' }).into_bytes()
     } else {
         // X10 三字节载荷：事件码+32、列+32、行+32；列/行上限 223 防 u8 回绕。
@@ -525,8 +520,24 @@ fn send_mouse_event(
             (col.clamp(1, 223) as u8).wrapping_add(32),
             (row.clamp(1, 223) as u8).wrapping_add(32),
         ]
-    };
+    }
+}
+
+/// 把编码好的鼠标事件字节写入 PTY。
+fn send_mouse_bytes(writer: &std::sync::mpsc::SyncSender<Vec<u8>>, bytes: Vec<u8>) {
     let _ = writer.try_send(bytes);
+}
+
+/// 按子进程启用的鼠标编码把一次鼠标事件写入 PTY。
+fn send_mouse_event(
+    writer: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    sgr: bool,
+    code: u16,
+    col: usize,
+    row: usize,
+    release: bool,
+) {
+    send_mouse_bytes(writer, mouse_event_bytes(sgr, code, col, row, release));
 }
 
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
@@ -625,6 +636,14 @@ pub fn show_terminal(
         .unwrap_or(TermMode::empty())
         .contains(TermMode::ALT_SCREEN);
 
+    // 像素坐标 → 终端 1-based (col, row)：mouse reporting 转发与
+    // 释放帧分类补发共用（scope 需覆盖两处）。
+    let to_col_row = |pos: Pos2| -> (usize, usize) {
+        let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1).clamp(1, cols);
+        let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1).clamp(1, rows);
+        (col, row)
+    };
+
     // ── 鼠标滚轮 ──
     // 用 pointer_hover_pos() + latest_pos() 双重检测：
     // hover_pos() 在 click_and_drag 感知下某些帧返回 None；
@@ -683,14 +702,6 @@ pub fn show_terminal(
     // - 左键拖拽不转发 → 一律做本地文本选择（选中→复制是终端的通用刚需）；
     // - 右键永不转发 → 固定弹本地菜单（复制/粘贴/清空输入）。
     if mouse_reporting {
-        let to_col_row = |pos: Pos2| -> (usize, usize) {
-            let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
-                .clamp(1, cols);
-            let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
-                    .clamp(1, rows);
-            (col, row)
-        };
-
         // --- 按下/释放：直接从 egui 原始指针状态检测，不依赖 resp.clicked()——
         //    Sense::click_and_drag() 下有时序问题（drag_started 同帧 clicked=false）。
         let ptr_pressed = ui.input(|i| {
@@ -704,24 +715,41 @@ pub fn show_terminal(
                 || i.pointer.button_released(egui::PointerButton::Middle)
         });
 
+        // ── 本地选区手势期间暂停按下/释放转发（防 TUI 全屏重绘） ──
+        // 拖选/取消选区是纯宿主行为：若把这次手势的按下/释放原样转发，
+        // TUI（opencode/pi 等）会当成点击，触发整页重绘 + 页签通知图标误闪。
+        // 策略：主键按下只记录不转发（按压是即时的，不会给 TUI 卡手感）；
+        // 释放帧在下方「本地文本选择」块内分类：
+        // - 本地选区手势（拖选/兜底快速拖选建出选区）→ 吞掉这对按下/释放；
+        // - 释放时已有选区（取消选中的纯点击、拖选释放帧）→ 同样吞掉；
+        // - 只有无选区的普通点击 → 按原行为成对转发（TUI 收到真实点击）。
+        // 中键不受影响：立即转发，行为与原来完全一致。
+        let primary_press_pos = ui.input(|i| {
+            i.pointer.button_pressed(egui::PointerButton::Primary)
+                .then(|| i.pointer.latest_pos())
+                .flatten()
+        });
+
         if resp.hovered() && ptr_pressed {
-            // 按下：检测哪个按钮
-            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+            if let Some(pos) = primary_press_pos {
+                // 主键：先记账，等释放帧分类（可能被本地选区手势吞掉）。
                 let (col, row) = to_col_row(pos);
-                let btn = ui.input(|i| {
-                    if i.pointer.button_pressed(egui::PointerButton::Primary) {
-                        0
-                    } else {
-                        1
-                    }
-                });
-                send_mouse_event(&sess.writer, sgr_mouse, btn, col, row, false);
-                ui.ctx().request_repaint();
+                sess.mouse_press_pending = Some((0, col, row, sgr_mouse));
+            } else {
+                // 中键：照旧立即转发。
+                if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                    let (col, row) = to_col_row(pos);
+                    send_mouse_event(&sess.writer, sgr_mouse, 1, col, row, false);
+                    ui.ctx().request_repaint();
+                }
             }
         }
 
-        // --- 释放 ---
+        // --- 释放：分类转发 ---
+        // 主键释放帧在下面「本地文本选择」块内处理（先建/清选区，再按手势类别
+        // 决定是否补发这对按下/释放）；中键释放仍在此立即转发。
         if ptr_released
+            && !ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
             && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
         {
             let (col, row) = to_col_row(pos);
@@ -748,6 +776,9 @@ pub fn show_terminal(
             latest_pos.is_some_and(|p1| p1.distance(p0) < 4.0)
         });
         if let Ok(mut t) = sess.term.write() {
+            // 释放帧分类要用「本帧开始时的选区状态」：点击清除选区分支会把
+            // selection 清成 None，之后就没法区分「取消选中点击」和「普通点击」了。
+            let sel_at_frame_start = t.selection.is_some();
             let disp_off = t.grid().display_offset();
             let point_at = |pos: Pos2| -> Option<Point> {
                 let col = ((pos.x - rect.left()) / cell_w).floor() as i64;
@@ -764,6 +795,9 @@ pub fn show_terminal(
                 if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
                     t.selection =
                         Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
+                    // 本地选区手势认领：吞掉这对按下/释放，不给 TUI 发幽灵点击。
+                    sess.mouse_gesture_sel = true;
+                    sess.mouse_press_pending = None;
                     ui.ctx().request_repaint();
                 }
             } else if resp.dragged_by(egui::PointerButton::Primary)
@@ -772,6 +806,9 @@ pub fn show_terminal(
                 if let Some(sel) = t.selection.as_mut() {
                     sel.update(pos, Side::Left);
                 }
+                // 拖动续帧同样认领（拖选已在 started 帧标记，这里兜底保险）。
+                sess.mouse_gesture_sel = true;
+                sess.mouse_press_pending = None;
                 ui.ctx().request_repaint();
             }
             if resp.clicked() && is_true_click {
@@ -814,10 +851,35 @@ pub fn show_terminal(
                             if let (Some(end), Some(sel)) = (point_at(p1), t.selection.as_mut()) {
                                 sel.update(end, Side::Left);
                             }
+                            // 快速拖选兜底建出选区 → 同样算本地选区手势。
+                            sess.mouse_gesture_sel = true;
+                            sess.mouse_press_pending = None;
                             ui.ctx().request_repaint();
                         }
                     }
                 }
+            // ── 释放帧分类：普通点击 → 补发这对按下/释放；选区手势 → 吞掉 ──
+            // 吞掉的三种情况（全部是纯宿主行为，TUI 不应感知）：
+            // 1. mouse_gesture_sel：拖选（started/dragged 帧建/改选区）；
+            // 2. sel_at_frame_start：释放时已有选区——包括取消选中的纯点击
+            //    （<4px，clicked 清掉选区）和拖选的释放帧本身；
+            // 3. mouse_gesture_sel 由兜底快速拖选建出选区时置位。
+            // 只有「无选区时的普通点击」才按原行为成对转发（TUI 收到真实点击）。
+            if primary_released {
+                let gesture_sel = sess.mouse_gesture_sel || sel_at_frame_start;
+                if gesture_sel {
+                    // 本地选区手势：不给 TUI 发幽灵点击，静默丢弃。
+                    sess.mouse_press_pending = None;
+                } else if let Some((code, col, row, sgr)) = sess.mouse_press_pending.take() {
+                    // 普通点击：按原行为成对转发（按下位置 + 释放位置）。
+                    send_mouse_bytes(&sess.writer, mouse_event_bytes(sgr, code, col, row, false));
+                    let (col2, row2) = to_col_row(latest_pos.unwrap_or(rect.center()));
+                    send_mouse_bytes(&sess.writer, mouse_event_bytes(sgr, 0, col2, row2, true));
+                    ui.ctx().request_repaint();
+                }
+                // 手势结束后复位标记。
+                sess.mouse_gesture_sel = false;
+            }
             // 在同一次加锁内完成选区状态读取，消除与右键菜单之间的竞态窗口。
             has_selection = t.selection.is_some();
         }
@@ -991,14 +1053,19 @@ pub fn show_terminal(
                             let _ = sess.cmd_tx.send(TermCommand::UpdateSelection(None));
                         }
 
-                        // 组合回车：仅当应用真的推过 kitty 键盘协议（协商成功）
-                        // 才发 CSI-u（Shift+Enter = opencode 输入框换行）；否则退回 \r。
+                        // 组合回车：仅 Shift+Enter 发 CSI-u（opencode 输入框换行）。
                         // 不能拿备用屏当信号——ConPTY 会吞掉协议协商，对端不认识
                         // CSI-u 时会把它当字面文本插进输入框（实测 opencode 出乱码）。
+                        // 限 Shift 是关键：Ctrl/Alt+Enter 发 CSI-u 时，ConPTY 输入引擎
+                        // 会把它重新编码为 kitty 修饰键事件（如 [13;5u、[57442;1:3u），
+                        // 时序错位时被子进程当字面文本接收并回显进输出流（pi 的转录
+                        // 里全是这种残片，复制屏幕时一并带走）。Shift+Enter 实测被
+                        // ConPTY 干净消费，保留 CSI-u；其余组合退回普通 \r。
                         if *key == egui::Key::Enter && (shift || alt || ctrl) {
-                            let full = term_mode_snapshot.is_some_and(|m| {
-                                m.intersects(TermMode::DISAMBIGUATE_ESC_CODES)
-                            });
+                            let full = shift && !alt && !ctrl
+                                && term_mode_snapshot.is_some_and(|m| {
+                                    m.intersects(TermMode::DISAMBIGUATE_ESC_CODES)
+                                });
                             bytes_out.push(encode_modified_enter(shift, alt, ctrl, full));
                         } else if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
                             bytes_out.push(bytes);
