@@ -127,7 +127,10 @@ fn copy_selection(
                 .map(|l| l.trim_end())
                 .collect::<Vec<_>>()
                 .join("\n");
-            // 复制侧保持原样（所见即所得）；乱码过滤只在粘贴侧做（见 Event::Paste）。
+            // 复制侧同样清理孤儿 CSI-u 残片与 ANSI 转义（与粘贴侧同规则）：
+            // 键盘协议回显的 `[13;5u`、`[57442;1:3u` 残片随选区进剪贴板，
+            // 粘贴到外部应用时没有站内净化，复制时就整段替换为断词空格。
+            let text = strip_ansi(&text);
             if text.trim().is_empty() {
                 return false;
             }
@@ -2052,7 +2055,17 @@ mod tests {
     }
 
     /// 粘贴侧净化链：strip_ansi 把孤儿 CSI-u 残片替换为空格；collapse_spaces 把
-    /// 连续多个空格并为一个（换行、单个空格不动）。复制侧不处理（raw）。
+    /// 连续多个空格并为一个（换行、单个空格不动）。复制侧只过 strip_ansi
+    /// （残片→断词空格），不做 collapse——保留对齐空格（所见即所得）。
+    #[test]
+    fn copy_side_strips_residue_but_keeps_spaces() {
+        // 用户实况：复制“换行和 T”，剪贴板里带残片，期望只有空格+T。
+        assert_eq!(strip_ansi("[13;5u[57442;1:3u T"), " T");
+        // 复制侧保留连续空格（代码缩进/对齐），仅清残片。
+        assert_eq!(strip_ansi("a   b[13;5u c"), "a   b c");
+        // 两端都有内容时残片替换为断词空格。
+        assert_eq!(strip_ansi("x[13;5u[57442;1:3uy"), "x y");
+    }
     #[test]
     fn paste_cleanup_collapses_spaces() {
         assert_eq!(
