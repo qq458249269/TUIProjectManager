@@ -1659,6 +1659,9 @@ impl ClientApp {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
                         if i == self.current && app_fg {
                             s.done_since_ms.store(0, Ordering::Relaxed);
+                            // 用户正看着 ✅/✏️（当前页签且前台），视为已知晓，
+                            // 切走时不弹重复通知。
+                            s.done_notified.store(true, Ordering::Relaxed);
                         } else if since == 0 {
                             s.done_since_ms.store(now_ms, Ordering::Relaxed);
                         } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
