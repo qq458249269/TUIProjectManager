@@ -127,9 +127,7 @@ fn copy_selection(
                 .map(|l| l.trim_end())
                 .collect::<Vec<_>>()
                 .join("\n");
-            // 历史输出里可能已回显了 ConPTY 泄漏的 CSI-u 残片（[13;5u 等），
-            // 复制屏幕时一并带走，粘贴到别处就是杂字——复制前先清一遍。
-            let text = strip_ansi(&text);
+            // 复制侧保持原样（所见即所得）；乱码过滤只在粘贴侧做（见 Event::Paste）。
             if text.trim().is_empty() {
                 return false;
             }
@@ -139,6 +137,19 @@ fn copy_selection(
         }
         _ => false,
     }
+}
+
+/// 把粘贴文本里连续出现的多个空格合并为一个（如 `Boundary   ` 里多空格缩进），
+/// 粘贴到终端时保持单个空格，避免把对齐空格当回显文本送进子进程。
+fn collapse_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c == ' ' { if prev_space { continue; } prev_space = true; }
+        else { prev_space = false; }
+        out.push(c);
+    }
+    out
 }
 
 /// 去掉文本中的 ANSI 转义序列（CSI/OSC/ESC 等），防止粘贴时把终端控制码当字面文本插入。
@@ -1102,6 +1113,10 @@ pub fn show_terminal(
                             // 被当字面文本插入输入行。
                             let cleaned = strip_ansi(text);
                             if cleaned.is_empty() { continue; }
+                            // 多个空格合并为一个（粘贴侧统一：断词乱码已补空格，
+                            // 连续多空格缩进也归一，避免把对齐空格当字面回显文本送进子进程）。
+                            let cleaned = collapse_spaces(&cleaned);
+                            if cleaned.is_empty() { continue; }
                             let bracketed = sess
                                 .term
                                 .read()
@@ -2036,7 +2051,29 @@ mod tests {
         assert_eq!(strip_ansi("a[1:2b"), "a[1:2b");
     }
 
+    /// 粘贴侧净化链：strip_ansi 把孤儿 CSI-u 残片替换为空格；collapse_spaces 把
+    /// 连续多个空格并为一个（换行、单个空格不动）。复制侧不处理（raw）。
     #[test]
+    fn paste_cleanup_collapses_spaces() {
+        assert_eq!(
+            collapse_spaces(&strip_ansi("Thinking...[13;5u[57442;1:3u 当前复现不了")),
+            "Thinking... 当前复现不了"
+        );
+        assert_eq!(
+            collapse_spaces(&strip_ansi("-w \"%{http_code}\n\"[13;5u[57442;1:3u--max-time")),
+            "-w \"%{http_code}\n\" --max-time"
+        );
+        // 正常文本里的连续空格也统一为一个；换行不动。
+        assert_eq!(collapse_spaces("a   b
+  c"), "a b
+ c");
+        assert_eq!(collapse_spaces("single space"), "single space");
+        // 残片紧跟空格时（断词处），strip 吞掉该空格、补单个空格，最终不会双空格。
+        assert_eq!(strip_ansi("x [13;5u y"), "x y");
+        assert_eq!(collapse_spaces(&strip_ansi("x [13;5u  y")), "x y");
+    }
+
+#[test]
     fn modified_enter() {
         // 主屏 shell：组合回车回退普通 \r。
         assert_eq!(encode_modified_enter(true, false, false, false), vec![b'\r']);

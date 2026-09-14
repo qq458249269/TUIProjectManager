@@ -370,22 +370,10 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
     }
 }
 
-/// 网络诊断日志：追加写 exe 同级 update.log，带时间戳。多源失败时定位
-/// 到底是地址错、限流、还是镜像失效（exe 被替换/重建后仍可查原因）。
-fn log_update(msg: &str) {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("update.log"))
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now())
-            });
-    }
-}
+/// 网络诊断日志：保留调用点但不再落盘（用户要求移除写入 update.log 的逻辑，
+/// 除错信息不对外写文件；误用时改回带时间戳追加即可）。
+#[allow(unused_variables)]
+fn log_update(_msg: &str) {}
 
 /// 拉取最新版本号。多源级联避免 GitHub API 限流（60 次/时）导致误报：
 /// ① /releases/latest 的 302 重定向目标（HTML 端点，无限流）取最新 tag；
