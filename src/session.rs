@@ -388,6 +388,105 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
     (!out.is_empty()).then_some((out, osc_color))
 }
 
+/// 去掉 PTY 输出字节流中的孤儿 CSI-u 残片（kitty 键盘协议回显时
+/// ESC 前缀被 ConPTY 吞掉，只剩 `[13;5u`、`[57442;1:3u` 等可见文本）。
+/// 不影响真正的 ESC 转义序列；只处理无 ESC 前缀的 `[数字;数字u` 残片。
+/// 替换规则与 `strip_ansi` 的孤儿逻辑一致：每个连续残片段替换为
+/// 单个空格（残片后已有空白则吞掉多余空白）。
+fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            // 真正的 ESC 转义序列：原样复制。
+            out.push(b);
+            i += 1;
+            if i < bytes.len() {
+                out.push(bytes[i]);
+                let next = bytes[i];
+                i += 1;
+                if next == b'[' {
+                    // CSI：跳过参数字节 (0x30..=0x3F) + 中间字节 (0x20..=0x2F) + 终止字节
+                    while i < bytes.len() && ((0x20..=0x2f).contains(&bytes[i]) || (0x30..=0x3f).contains(&bytes[i])) {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                    if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                } else if next == b']' {
+                    // OSC：消耗到 BEL 或 ESC \
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            out.push(bytes[i]);
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            out.push(bytes[i]);
+                            out.push(bytes[i + 1]);
+                            i += 2;
+                            break;
+                        }
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+        } else if b == b'[' {
+            // 孤儿 CSI-u 探测：`[` + 纯参数(数字/;/:) + `u` → 整段丢弃；
+            // 末尾截断残片 `[57442;1`（有参数但无 u）也丢弃。
+            let mut j = i + 1;
+            let mut n = 0usize;
+            let mut seps = 0usize;
+            while j < bytes.len() {
+                let pb = bytes[j];
+                if pb.is_ascii_digit() {
+                    j += 1;
+                    n += 1;
+                } else if pb == b';' || pb == b':' {
+                    j += 1;
+                    n += 1;
+                    seps += 1;
+                } else if pb == b'u' && n > 0 {
+                    // 完整孤儿 `[数字;数字:数字u`
+                    j += 1; // 包含 u
+                    break;
+                } else {
+                    break;
+                }
+            }
+            let skip = if j > i + 1 && bytes.get(j - 1) == Some(&b'u') && n > 1 {
+                j - i
+            } else if n > 0 && seps > 0 && j >= bytes.len() {
+                j - i // 末尾截断残片
+            } else {
+                0
+            };
+            if skip == 0 {
+                out.push(b'[');
+                i += 1;
+            } else {
+                i += skip;
+                // 吞掉残片后紧跟的空白（断词位置原有空白）
+                while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                    i += 1;
+                }
+                // 补一个空格还原断词，但不重复（前一字符已是空白则跳过）
+                if !out.last().is_some_and(|&c| c == b' ' || c == b'\t' || c == b'\n') {
+                    out.push(b' ');
+                }
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// 去掉路径/命令里可能混入的不可见 Unicode 控制符（如复制粘贴带进来的
 /// U+202A 双向嵌入符）以及 NUL 字节，避免 CreateProcessW 因非法字符失败。
 fn sanitize(s: &str) -> String {
@@ -786,6 +885,10 @@ pub fn spawn(
                                 query_leftover.extend_from_slice(tail);
                             }
                         }
+                        // 清理孤儿 CSI-u 残片：kitty 键盘协议回显的 `[13;5u`、
+                        // `[57442;1:3u` 等无 ESC 前缀的残片会被 VT parser 当字面文本
+                        // 渲染成可见乱码。在喂给 parser 前整段清理。
+                        let merged = strip_orphan_csi_u_bytes(&merged);
                         // ── 分块处理：每次最多 CHUNK_SIZE 字节后释放 term 锁，
                         //    让 UI 线程有机会获取读锁做渲染/响应输入。
                         //    VT parser 内部状态（部分序列缓冲）独立于 term 锁，
@@ -1165,6 +1268,32 @@ mod tests {
         assert_eq!(sanitize(s), "D:\\tools\\app.exe --flag");
         assert_eq!(split_command(s), vec!["D:\\tools\\app.exe", "--flag"]);
         assert_eq!(sanitize("D:\\projects\\PG数据库性能测试\u{202e}"), "D:\\projects\\PG数据库性能测试");
+    }
+
+    /// 孤儿 CSI-u 残片替换为单个空格（与 strip_ansi 同规则，字节级）。
+    #[test]
+    fn strip_orphan_csi_u_bytes_works() {
+        // 用户实况：多个连续残片 → 单个空格。
+        assert_eq!(
+            strip_orphan_csi_u_bytes(b"[13;5u[57442;1:3u[13;5u[57442;1:3u"),
+            b" "
+        );
+        // 前后有正常文本：残片位置补空格断词。
+        assert_eq!(strip_orphan_csi_u_bytes(b"a[13;5ub"), b"a b");
+        assert_eq!(strip_orphan_csi_u_bytes(b"x[57442;1:3uy"), b"x y");
+        // 末尾截断残片丢弃。
+        assert_eq!(strip_orphan_csi_u_bytes(b"ok[123;45"), b"ok ");
+        // 残片后已有空格不重复补。
+        assert_eq!(strip_orphan_csi_u_bytes(b"T[13;5u X"), b"T X");
+        // 真正的 ESC 转义序列原样保留。
+        let s = b"\x1b[31mred\x1b[0m[13;5u";
+        assert_eq!(strip_orphan_csi_u_bytes(s), b"\x1b[31mred\x1b[0m ");
+        // 普通文本不受影响。
+        assert_eq!(strip_orphan_csi_u_bytes(b"arr[0] = [1, 2]"), b"arr[0] = [1, 2]");
+        assert_eq!(strip_orphan_csi_u_bytes(b"[abc]"), b"[abc]");
+        assert_eq!(strip_orphan_csi_u_bytes(b"[123"), b"[123");
+        // 冒号分隔但无 u 结尾且后接其它字符 → 保留。
+        assert_eq!(strip_orphan_csi_u_bytes(b"a[1:2b"), b"a[1:2b");
     }
 }
 
