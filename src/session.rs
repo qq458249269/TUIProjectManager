@@ -458,10 +458,10 @@ fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
                     break;
                 }
             }
-            let skip = if j > i + 1 && bytes.get(j - 1) == Some(&b'u') && n > 1 {
+            let skip = if (j > i + 1 && bytes.get(j - 1) == Some(&b'u') && n > 1)
+                || (n > 0 && seps > 0 && j >= bytes.len())
+            {
                 j - i
-            } else if n > 0 && seps > 0 && j >= bytes.len() {
-                j - i // 末尾截断残片
             } else {
                 0
             };
