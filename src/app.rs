@@ -1027,6 +1027,18 @@ impl ClientApp {
         });
     }
 
+    /// 当前 exe 的正式路径：unlock_exe 启动时把运行映像改名成 {name}.running，
+    /// current_exe() 返回的是 .running 锁定路径；更新替换和重启都必须在正式名
+    /// 上操作（该名字空闲可写）。
+    fn canonical_exe_path(exe: PathBuf) -> PathBuf {
+        let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if let Some(base) = name.strip_suffix(".running") {
+            exe.with_file_name(base)
+        } else {
+            exe
+        }
+    }
+
     /// 后台下载更新：下载到 .new 文件，完成后替换旧 exe。
     fn start_download(&mut self, tag: &str) {
         if self.downloading {
@@ -1061,25 +1073,40 @@ impl ClientApp {
                 }
             };
             let new_file = PathBuf::from(&new_path);
-            // 旧 exe 复制为 .old
+            // 旧 exe 复制为 .old。使用正式名（去掉 .running），既避免
+            // .exe.exe.old 双后缀，也确保 .old 指向可读的空闲拷贝。
             if let Ok(exe) = std::env::current_exe() {
-                let old_path = exe.with_extension("exe.old");
-                let _ = std::fs::copy(&exe, &old_path);
+                let canonical = Self::canonical_exe_path(exe);
+                let old_path = canonical.with_extension("exe.old");
+                let _ = std::fs::copy(&canonical, &old_path);
             }
-            // .new 文件替换当前运行的 exe：目标必须是当前 exe 路径（无论
-            // 资产名是小写 tui-project-manager.exe 还是历史大写名，最终都
-            // 落到运行路径），否则目录里出两个 exe，手动重启旧名仍跑旧版。
+            // .new 文件替换当前运行的 exe：目标必须是去掉 .running 的正式名
+            // （unlock_exe 把映像改名到 {name}.running 后，正式名空闲可写；
+            // 若目标打成 .running 路径，remove/rename 都打在锁定映像上 →
+            // 替换失败，只剩 .new 和 .old）。无论资产名是小写
+            // tui-project-manager.exe 还是历史大写名，最终都落到正式名，
+            // 避免目录里出两个 exe。
             // 旧 exe 已备份 .old；Windows 下 std::fs::rename 目标存在会失败，
             // 先删占位再 rename。
-            let final_path = std::env::current_exe().unwrap_or_else(|_| {
-                let fallback_name = new_file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().replacen(".new", "", 1))
-                    .unwrap_or_else(|| "TUIProjectManager.exe".into());
-                exe_path.join(fallback_name)
-            });
+            let final_path = match std::env::current_exe() {
+                Ok(exe) => Self::canonical_exe_path(exe),
+                Err(_) => {
+                    let fallback_name = new_file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().replacen(".new", "", 1))
+                        .unwrap_or_else(|| "TUIProjectManager.exe".into());
+                    exe_path.join(fallback_name)
+                }
+            };
             let _ = std::fs::remove_file(&final_path);
-            let _ = std::fs::rename(&new_file, &final_path);
+            if let Err(e) = std::fs::rename(&new_file, &final_path) {
+                let _ = status_tx.send((
+                    format!("替换失败: {e}（请先退出本程序，再手动删掉 {final_path:?} 并把 {new_file:?} 重命名回 exe）"),
+                    None,
+                ));
+                let _ = redraw_tx.try_send(());
+                return;
+            }
             log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}"));
             let _ = status_tx.send((
                 format!("下载完成！请手动重启应用以使用新版本 {tag}"),
@@ -1093,8 +1120,12 @@ impl ClientApp {
     /// 新 exe 已替换到当前路径，重启即加载新版。
     fn restart_app(&mut self) {
         log_update("重启应用：spawn 新进程并退出");
-        let mut cmd =
-            std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "TUIProjectManager.exe".into()));
+        // 必须启动正式名（去掉 .running）：新 exe 替换到正式名，而
+        // current_exe() 返回的是旧映像所在的 .running 锁定路径。
+        let exe = std::env::current_exe()
+            .map(Self::canonical_exe_path)
+            .unwrap_or_else(|_| PathBuf::from("TUIProjectManager.exe"));
+        let mut cmd = std::process::Command::new(&exe);
         // 透传启动参数（如 --restore），保持与会话恢复行为一致。
         cmd.args(std::env::args().skip(1));
         match cmd.spawn() {
@@ -3827,7 +3858,22 @@ mod vscode_tests {
 
 #[cfg(all(test, windows))]
 mod update_tests {
-    use super::exe_asset_from_html;
+    use super::{exe_asset_from_html, ClientApp};
+    use std::path::PathBuf;
+
+    /// unlock_exe 把运行映像改名成 {name}.running，替换/重启目标必须去掉后缀
+    /// 落到正式名，否则 remove/rename 打在锁定映像上 → 更新失败只剩 .new/.old。
+    #[test]
+    fn canonical_exe_path_strips_running() {
+        assert_eq!(
+            ClientApp::canonical_exe_path(PathBuf::from(r"D:\a\TUIProjectManager.exe.running")),
+            PathBuf::from(r"D:\a\TUIProjectManager.exe")
+        );
+        assert_eq!(
+            ClientApp::canonical_exe_path(PathBuf::from(r"D:\a\TUIProjectManager.exe")),
+            PathBuf::from(r"D:\a\TUIProjectManager.exe")
+        );
+    }
 
     #[test]
     fn html_exe_extracted() {
