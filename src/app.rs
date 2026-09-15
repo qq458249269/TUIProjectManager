@@ -1620,8 +1620,8 @@ impl ClientApp {
                         Some("❌")
                     } else if s.loading.load(Ordering::Relaxed) {
                         Some("🔄")
-                    } else if !any_silent && count > 0 {
-                        // 正在输出 → 🔄
+                    } else if !content_silent && count > 0 {
+                        // 网格内容在变化 → 正在输出 🔄
                         Some("🔄")
                     } else if is_tui
                         && cursor_vis
