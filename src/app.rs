@@ -804,6 +804,9 @@ pub struct ClientApp {
     pub settings_command: String,
     pub settings_commands: Vec<String>,
     pub settings_new_command: String,
+    /// 编辑命令时的索引和缓冲区（Some(i) = 内联编辑第 i 行）。
+    pub settings_edit_idx: Option<usize>,
+    pub settings_edit_buffer: String,
     pub settings_refresh_fps: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
@@ -923,6 +926,8 @@ impl ClientApp {
             settings_command,
             settings_commands,
             settings_new_command: String::new(),
+            settings_edit_idx: None,
+            settings_edit_buffer: String::new(),
             settings_refresh_fps: config::DEFAULT_REFRESH_FPS.to_string(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
@@ -2826,12 +2831,36 @@ impl ClientApp {
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut drag_index: Option<usize> = None;
         let sel_fill = ui.visuals().selection.bg_fill;
-        for (i, cmd) in self.settings_commands.iter().enumerate() {
+        let n_cmds = self.settings_commands.len();
+        for i in 0..n_cmds {
+            let cmd = self.settings_commands[i].clone();
             ui.horizontal(|ui| {
                 let selected = *cmd == self.settings_command;
-                // 整行可点可拖（click_and_drag 由 egui 延迟判定拖动，纯点击天然保留）；
-                // 不设 min_size：让「删除/复制」排在右侧不顶行，否则全宽会把按钮顶到下一行。
-                // selectable_label 即 Button::selectable。
+                let is_editing = self.settings_edit_idx == Some(i);
+                if is_editing {
+                    // ── 内联编辑模式：TextEdit + 保存/取消 ──
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_edit_buffer)
+                            .desired_width(280.0),
+                    );
+                    if ui.small_button("保存").clicked() {
+                        let new_cmd = self.settings_edit_buffer.trim().to_string();
+                        if !new_cmd.is_empty() && !self.settings_commands.contains(&new_cmd) {
+                            let old_cmd = std::mem::take(&mut self.settings_commands[i]);
+                            if self.settings_command == old_cmd {
+                                self.settings_command = new_cmd.clone();
+                            }
+                            self.settings_commands[i] = new_cmd;
+                            dirty = true;
+                        }
+                        self.settings_edit_idx = None;
+                    }
+                    if ui.small_button("取消").clicked() {
+                        self.settings_edit_idx = None;
+                    }
+                    return; // 编辑行不参与拖动/删除等
+                }
+                // ── 正常显示模式 ──
                 let resp = ui.add(
                     egui::Button::selectable(
                         selected,
@@ -2847,11 +2876,18 @@ impl ClientApp {
                     self.settings_command = cmd.clone();
                     dirty = true;
                 }
-                // 拖动悬浮帧：记录源索引；行矩形供落位定位。
                 if resp.dragged() {
                     drag_index = Some(i);
                 }
                 row_rects.push((i, resp.rect));
+                if ui
+                    .small_button("编辑")
+                    .on_hover_text("内联编辑此命令")
+                    .clicked()
+                {
+                    self.settings_edit_idx = Some(i);
+                    self.settings_edit_buffer = cmd.clone();
+                }
                 if ui
                     .small_button("删除")
                     .on_hover_text("从命令列表中移除")
@@ -2859,7 +2895,6 @@ impl ClientApp {
                 {
                     remove_idx = Some(i);
                 }
-                // 复制命令到系统剪贴板：可粘贴到终端/配置别处使用。
                 if ui
                     .small_button("复制")
                     .on_hover_text("把此命令复制到系统剪贴板")
