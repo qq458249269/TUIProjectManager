@@ -815,6 +815,16 @@ pub fn spawn(
                             }
                         }
                         last_output_ms.store(now_ms, Ordering::Relaxed);
+                        // 兜底：启动超时后强制退出加载态。TUI 首屏若整块几乎全是
+                        // 转义序列（ConPTY 握手/清屏/定位），启发式会把它误判为
+                        // 「动画」而永不置 false → 页签 🔄 常驻，即使终端画面早已
+                        // 静止。3 秒后无论内容分类如何都结束加载态（now_ts 即
+                        // spawn 时刻）。
+                        if reader_loading.load(Ordering::Relaxed)
+                            && now_ms.saturating_sub(now_ts) > 3000
+                        {
+                            reader_loading.store(false, Ordering::Relaxed);
+                        }
                         // 分析输出内容：区分 TUI 自带动画 vs 实际回答文本。
                         let chunk = &buf[..n];
                         let mut esc_bytes: u32 = 0;

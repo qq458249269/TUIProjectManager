@@ -15,7 +15,7 @@ use portable_pty::PtySize;
 use crate::session::{Session, SessionListener, TermCommand};
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
-use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw};
+use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw, set_clipboard_string};
 
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
@@ -112,10 +112,13 @@ enum TermAction {
     ClearInput,
 }
 
-/// 有选中文本时复制到系统剪贴板（并清除选区），返回是否复制了内容。
+/// 有选中文本时复制到系统剪贴板，返回是否复制了内容。
+/// 剪贴板写入在后台线程执行：Windows 剪贴板被挂起/延迟渲染的进程占用时，
+/// OpenClipboard/SetClipboardData 会无限阻塞调用线程——放在 UI 线程上会直接
+/// 卡死整个应用（Ctrl+C 复制即曾因此无响应）。后台线程 best-effort 写入，
+/// 失败静默吞掉（与原 ctx.copy_text 的吞错行为一致）。
 fn copy_selection(
     term: &alacritty_terminal::term::Term<SessionListener>,
-    ctx: &egui::Context,
     status: &mut Option<String>,
 ) -> bool {
     // 复制前先取字符串再释放锁（selection_to_string 内部也会拿锁）。
@@ -134,7 +137,9 @@ fn copy_selection(
             if text.trim().is_empty() {
                 return false;
             }
-            ctx.copy_text(text);
+            std::thread::spawn(move || {
+                let _ = set_clipboard_string(&text);
+            });
             *status = Some("已复制选中的文本".to_string());
             true
         }
@@ -936,7 +941,7 @@ pub fn show_terminal(
                 .term
                 .write()
                 .map(|mut t| {
-                    let copied = copy_selection(&t, ui.ctx(), status);
+                    let copied = copy_selection(&t, status);
                     if copied {
                         t.selection = None;
                     }
@@ -1073,6 +1078,30 @@ pub fn show_terminal(
                             let _ = sess.cmd_tx.send(TermCommand::UpdateSelection(None));
                         }
 
+                        // 翻页（视口滚动）仅由 PageUp/PageDown 与鼠标滚轮控制：
+                        // Home/End 不参与翻页，只作输入光标控制转发给子进程。
+                        // 普通屏（无鼠标上报、非备用屏）下 PageUp/PageDown 直接翻
+                        // 本地视口一页；备用屏/鼠标上报的 TUI（less/opencode 等）
+                        // 需要按键本身翻页，照常转发给子进程。
+                        if (*key == egui::Key::PageUp || *key == egui::Key::PageDown)
+                            && !mouse_reporting
+                            && !alt_screen
+                        {
+                            if let Ok(mut t) = sess.term.write() {
+                                t.scroll_display(if *key == egui::Key::PageUp {
+                                    Scroll::PageUp
+                                } else {
+                                    Scroll::PageDown
+                                });
+                            }
+                            // 立即刷新快照：reader 线程在无 PTY 输出时不生成新快照，
+                            // 快照 offset 不更新则滚动无可见效果；refresh_snapshot
+                            // 内部同步清 cached_render_shapes 强制重绘。
+                            crate::session::refresh_snapshot(sess);
+                            ui.ctx().request_repaint();
+                            continue;
+                        }
+
                         // 组合回车：仅 Shift+Enter 发 CSI-u（opencode 输入框换行）。
                         // 不能拿备用屏当信号——ConPTY 会吞掉协议协商，对端不认识
                         // CSI-u 时会把它当字面文本插进输入框（实测 opencode 出乱码）。
@@ -1092,14 +1121,10 @@ pub fn show_terminal(
                         }
                     }
                     egui::Event::Copy => {
-                        // Ctrl+C 统一走这里：有选区复制，无选区不发送任何内容。
-                        // 已拦截 Event::Key 中的 Ctrl+C，不会产生 0x03。
-                        if let Ok(mut t) = sess.term.write() {
-                            let copied = copy_selection(&t, ui.ctx(), status);
-                            if copied {
-                                t.selection = None;
-                            }
-                        }
+                        // Ctrl+C / Ctrl+Insert 完全无动作：不复制（剪贴板写入已
+                        // 移到右键菜单的后台线程路径，规避 Windows 剪贴板被占用
+                        // 时 OpenClipboard 无限阻塞导致的整窗卡死），也不发送
+                        // 0x03 SIGINT。复制统一走右键菜单「📋 复制」。
                     }
                     egui::Event::Cut => {
                         bytes_out.push(vec![0x18]); // Ctrl+X
