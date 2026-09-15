@@ -1121,10 +1121,14 @@ pub fn show_terminal(
                         }
                     }
                     egui::Event::Copy => {
-                        // Ctrl+C / Ctrl+Insert 完全无动作：不复制（剪贴板写入已
-                        // 移到右键菜单的后台线程路径，规避 Windows 剪贴板被占用
-                        // 时 OpenClipboard 无限阻塞导致的整窗卡死），也不发送
-                        // 0x03 SIGINT。复制统一走右键菜单「📋 复制」。
+                        // Ctrl+C / Ctrl+Insert → 复制选区并清除选中。剪贴板写入在后台线程，
+                        // 规避 Windows 剪贴板被占用时 OpenClipboard 无限阻塞 UI 线程。
+                        if let Ok(mut t) = sess.term.write() {
+                            let copied = copy_selection(&t, status);
+                            if copied {
+                                t.selection = None;
+                            }
+                        }
                     }
                     egui::Event::Cut => {
                         bytes_out.push(vec![0x18]); // Ctrl+X
