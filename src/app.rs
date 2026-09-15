@@ -478,6 +478,7 @@ fn download_update(
     tag: &str,
     dest_dir: &Path,
     progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
     // 从 GitHub Release 里找 exe 直链。优先级：HTML 页面（github.com CDN，
     // 无限流、比 api.github.com 更易连通）→ 直拼直链（零请求保底）→ GitHub
@@ -626,7 +627,11 @@ fn download_update(
     ));
     let mut errors: Vec<String> = Vec::new();
     for (url, name) in attempts {
-        match download_one(&url, &name, total, dest_dir, &progress_tx) {
+        // 用户取消时立即停止所有候选链
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
+        match download_one(&url, &name, total, dest_dir, &progress_tx, cancel) {
             Ok(p) => {
                 log_update(&format!("下载 成功：{url} → {p}"));
                 return Ok(p);
@@ -646,7 +651,7 @@ fn download_update(
 }
 
 /// GitHub release 下载加速镜像（前缀拼接原始 github.com 直链，如
-/// {mirror}https://github.com/...）。第三方镜像域名会更换：失效时把
+/// 下载单个文件：通过 curl 下载到 dest_dir/{asset_name}.new，支持断点续传和取消。
 /// 列表换成当前可用的即可，补一个零成本、挂了自动跳过。
 const GH_MIRRORS: &[&str] = &[
     "https://ghfast.top/",
@@ -662,18 +667,26 @@ fn download_one(
     total: u64,
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
     // 下载到 .new 文件，完成后由调用方替换旧 exe。
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
+
+    // 断点续传：若 .new 文件已存在，记录已下载字节数，用 curl -C - 续传。
+    let downloaded_before = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
         "-o", dest_path.to_str().unwrap_or("update.exe.new"),
-        url,
     ]);
+    // 已有部分文件时续传；否则从头下载。
+    if downloaded_before > 0 {
+        cmd.arg("-C").arg("-");
+    }
+    cmd.arg(url);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -683,6 +696,12 @@ fn download_one(
 
     // 轮询文件大小报告进度：每 200ms 检查一次。
     loop {
+        // 检查取消信号
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = std::fs::remove_file(&dest_path);
+            return Err("下载已取消".to_string());
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
         let downloaded = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
         let _ = progress_tx.send((downloaded, total));
@@ -693,7 +712,7 @@ fn download_one(
                     let _ = progress_tx.send((final_size, total));
                     return Ok(dest_path.to_string_lossy().into_owned());
                 } else {
-                    let _ = std::fs::remove_file(&dest_path);
+                    // 失败时保留 .new 文件以供下次续传，不删除
                     return Err(format!("curl 退出码 {}", status.code().unwrap_or(-1)));
                 }
             }
@@ -796,6 +815,8 @@ pub struct ClientApp {
     download_progress_rx: Option<Receiver<(u64, u64)>>,
     /// 当前正在下载更新（显示进度条，禁用下载按钮）。
     downloading: bool,
+    /// 取消下载信号：用户点击取消时置 true，下载线程检测后退出。
+    cancel_download: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 下载完成、新 exe 已替换，等待用户重启应用（显示重启按钮）。
     update_done: bool,
     pub input: Option<InputDialog>,
@@ -909,6 +930,7 @@ impl ClientApp {
             update_latest: None,
             download_progress_rx: None,
             downloading: false,
+            cancel_download: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         update_done: false,
             input: None,
             confirm: None,
@@ -1047,9 +1069,12 @@ impl ClientApp {
         self.downloading = true;
         self.update_done = false; // 新一轮下载，重启按钮回到待完成态。
         self.status = Some(format!("正在下载 {tag}…"));
+        // 重置取消信号
+        self.cancel_download.store(false, std::sync::atomic::Ordering::Relaxed);
         let tag = tag.to_string();
         let (ptx, prx) = std::sync::mpsc::channel();
         self.download_progress_rx = Some(prx);
+        let cancel = self.cancel_download.clone();
         let redraw_tx = self.redraw_tx.clone();
         let status_tx = self.check_tx.clone();
         std::thread::spawn(move || {
@@ -1060,7 +1085,13 @@ impl ClientApp {
             // 失败后 3 秒自动重试，直到下载成功为止。
             let mut attempt = 1u32;
             let new_path = loop {
-                match download_update(&tag, &exe_path, ptx.clone()) {
+                // 用户取消时跳出重试循环
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = status_tx.send(("下载已取消".to_string(), None));
+                    let _ = redraw_tx.try_send(());
+                    return;
+                }
+                match download_update(&tag, &exe_path, ptx.clone(), &cancel) {
                     Ok(p) => break p,
                     Err(e) => {
                         let _ = status_tx.send((
@@ -1080,14 +1111,12 @@ impl ClientApp {
                 let old_path = canonical.with_extension("exe.old");
                 let _ = std::fs::copy(&canonical, &old_path);
             }
-            // .new 文件替换当前运行的 exe：目标必须是去掉 .running 的正式名
-            // （unlock_exe 把映像改名到 {name}.running 后，正式名空闲可写；
-            // 若目标打成 .running 路径，remove/rename 都打在锁定映像上 →
-            // 替换失败，只剩 .new 和 .old）。无论资产名是小写
-            // tui-project-manager.exe 还是历史大写名，最终都落到正式名，
-            // 避免目录里出两个 exe。
-            // 旧 exe 已备份 .old；Windows 下 std::fs::rename 目标存在会失败，
-            // 先删占位再 rename。
+            // .new 文件替换当前运行的 exe。
+            // Windows 锁定运行中 exe → remove_file 必失败（拒绝访问）。
+            // 正确路径：rename 当前 exe → .exe.running（Windows 允许 rename 运行中映像），
+            // 再 rename .new → 正式名。若 .running 已存在说明上次替换中断，先清理。
+            // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，
+            // 最终都落到正式名，避免目录里出两个 exe。
             let final_path = match std::env::current_exe() {
                 Ok(exe) => Self::canonical_exe_path(exe),
                 Err(_) => {
@@ -1098,16 +1127,28 @@ impl ClientApp {
                     exe_path.join(fallback_name)
                 }
             };
-            let _ = std::fs::remove_file(&final_path);
-            if let Err(e) = std::fs::rename(&new_file, &final_path) {
+            let running_path = final_path.with_extension("exe.running");
+            // 清理上次中断残留的 .running
+            let _ = std::fs::remove_file(&running_path);
+            // rename 当前 exe → .running（Windows 对运行中 exe 可 rename 不可 delete）
+            if let Err(e) = std::fs::rename(&final_path, &running_path) {
                 let _ = status_tx.send((
-                    format!("替换失败: {e}（请先退出本程序，再手动删掉 {final_path:?} 并把 {new_file:?} 重命名回 exe）"),
+                    format!("替换失败: 无法重命名当前程序 ({e})"),
                     None,
                 ));
                 let _ = redraw_tx.try_send(());
                 return;
             }
-            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}"));
+            // rename .new → 正式名
+            if let Err(e) = std::fs::rename(&new_file, &final_path) {
+                let _ = status_tx.send((
+                    format!("替换失败: {e}（请手动将 {new_file:?} 重命名为 {final_path:?}）"),
+                    None,
+                ));
+                let _ = redraw_tx.try_send(());
+                return;
+            }
+            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}（旧版本 → {running_path:?}）"));
             let _ = status_tx.send((
                 format!("下载完成！请手动重启应用以使用新版本 {tag}"),
                 None,
@@ -2232,9 +2273,13 @@ impl ClientApp {
             if let Some(tag) = self.update_latest.clone() {
                 ui.separator();
                 if self.downloading {
-                    // 下载中：显示进度文本，按钮禁用
-                    ui.add_enabled(false,
-                        egui::Button::new(format!("⬇ 下载中… {tag}")));
+                    // 下载中：显示进度文本 + 取消按钮
+                    ui.label(RichText::new(format!("⬇ 下载中… {tag}")).color(
+                        ui.visuals().widgets.inactive.text_color()));
+                    if ui.button("✕ 取消").on_hover_text("取消当前下载").clicked() {
+                        self.cancel_download.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.status = Some("正在取消下载…".to_string());
+                    }
                 } else {
                     if ui
                         .button(format!("⬇ 下载 {tag}"))
@@ -3506,6 +3551,11 @@ impl eframe::App for ClientApp {
             // 「重启应用」按钮。失败消息（“下载失败…重试”）不含该前缀。
             if msg.contains("下载完成") {
                 self.update_done = true;
+            }
+            // 取消/失败时立即重置 downloading 状态，UI 即时恢复
+            if msg.contains("已取消") || msg.contains("失败") {
+                self.downloading = false;
+                self.download_progress_rx = None;
             }
             self.status = Some(msg);
             self.update_latest = latest;
