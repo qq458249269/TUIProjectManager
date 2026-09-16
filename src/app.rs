@@ -1109,19 +1109,8 @@ impl ClientApp {
                 }
             };
             let new_file = PathBuf::from(&new_path);
-            // 旧 exe 复制为 .old。使用正式名（去掉 .running），既避免
-            // .exe.exe.old 双后缀，也确保 .old 指向可读的空闲拷贝。
-            if let Ok(exe) = std::env::current_exe() {
-                let canonical = Self::canonical_exe_path(exe);
-                let old_path = canonical.with_extension("exe.old");
-                let _ = std::fs::copy(&canonical, &old_path);
-            }
-            // .new 文件替换当前运行的 exe。
-            // Windows 锁定运行中 exe → remove_file 必失败（拒绝访问）。
-            // 正确路径：rename 当前 exe → .exe.running（Windows 允许 rename 运行中映像），
-            // 再 rename .new → 正式名。若 .running 已存在说明上次替换中断，先清理。
-            // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，
-            // 最终都落到正式名，避免目录里出两个 exe。
+            // .new 文件直接覆盖正式名 exe。无论资产名是小写 tui-project-manager.exe
+            // 还是历史大写名，最终都落到正式名，避免目录里出两个 exe。
             let final_path = match std::env::current_exe() {
                 Ok(exe) => Self::canonical_exe_path(exe),
                 Err(_) => {
@@ -1132,19 +1121,18 @@ impl ClientApp {
                     exe_path.join(fallback_name)
                 }
             };
-            let running_path = final_path.with_extension("exe.running");
-            // 清理上次中断残留的 .running
-            let _ = std::fs::remove_file(&running_path);
-            // rename 当前 exe → .running（Windows 对运行中 exe 可 rename 不可 delete）
-            if let Err(e) = std::fs::rename(&final_path, &running_path) {
+            // 运行中的映像由 unlock_exe 在启动时挪到 .running，正式名 exe 是
+            // 空闲副本（可覆盖），直接替换即可。不能再 rename 正式名 → .running：
+            // 该文件正被本进程映像锁定，rename 必现拒绝访问 (os error 5)。
+            let old_path = final_path.with_extension("exe.old");
+            // copy 目标已存在则直接覆盖（.old 始终保留最新旧版），失败不阻断替换。
+            if let Err(e) = std::fs::copy(&final_path, &old_path) {
                 let _ = status_tx.send((
-                    format!("替换失败: 无法重命名当前程序 ({e})"),
+                    format!("提示: 旧版备份到 {old_path:?} 失败（{e}），不影响替换"),
                     None,
                 ));
                 let _ = redraw_tx.try_send(());
-                return;
             }
-            // rename .new → 正式名
             if let Err(e) = std::fs::rename(&new_file, &final_path) {
                 let _ = status_tx.send((
                     format!("替换失败: {e}（请手动将 {new_file:?} 重命名为 {final_path:?}）"),
@@ -1153,7 +1141,7 @@ impl ClientApp {
                 let _ = redraw_tx.try_send(());
                 return;
             }
-            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}（旧版本 → {running_path:?}）"));
+            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}（旧版本备份 → {old_path:?}）"));
             let _ = status_tx.send((
                 format!("下载完成！请手动重启应用以使用新版本 {tag}"),
                 None,
