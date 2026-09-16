@@ -1255,9 +1255,14 @@ pub fn show_terminal(
     }
     // 选区范围从终端实时读取，不依赖快照（快照的 sel_range 只有 reader 线程刷新，
     // 用户拖动选区不会更新快照，导致渲染用旧选区高亮）。
-    let sel_range = sess.term.try_read().ok().and_then(|t| {
-        t.selection.as_ref().and_then(|s| s.to_range(&t))
-    });
+    // 但频繁输出时 reader 线程解析输出连续持有写锁，try_read 几乎必然失败 →
+    // sel_range 变成 None，选区高亮随帧消失（表现为“选中运行中的文本立马被取消”）。
+    // 失败时回退到快照 sel_range：它在每次解析输出后由 reader 重新生成，
+    // 包含最新选区（含 UI 拖动更新），渲染结果与实时读取一致。
+    let sel_range = match sess.term.try_read() {
+        Ok(t) => t.selection.as_ref().and_then(|s| s.to_range(&t)),
+        Err(_) => snap.sel_range,
+    };
     // 选区变化时清缓存：即使快照未变（gen_changed=false），选区高亮也必须重绘。
     if sel_range != snap.sel_range {
         sess.cached_render_shapes = None;
