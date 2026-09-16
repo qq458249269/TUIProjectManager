@@ -810,6 +810,13 @@ pub fn show_terminal(
                     Column((col as usize).min(cols.saturating_sub(1))),
                 ))
             };
+            // 鼠标在格内的水平位置决定锚点边界：停在格左半 → Left（选区不含该格），
+            // 右半 → Right（选区含该格）。全用 Left 会让终点格被 range_simple 减一列，
+            // 拖选高亮整体向左偏移一个字符。
+            let side_at = |pos: Pos2| -> Side {
+                let frac = (pos.x - rect.left()) / cell_w;
+                if frac - frac.floor() < 0.5 { Side::Left } else { Side::Right }
+            };
             if resp.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
                     t.selection =
@@ -820,10 +827,11 @@ pub fn show_terminal(
                     ui.ctx().request_repaint();
                 }
             } else if resp.dragged_by(egui::PointerButton::Primary)
-                && let Some(pos) = resp.interact_pointer_pos().and_then(point_at)
+                && let Some(pos) = resp.interact_pointer_pos()
+                && let Some(point) = point_at(pos)
             {
                 if let Some(sel) = t.selection.as_mut() {
-                    sel.update(pos, Side::Left);
+                    sel.update(point, side_at(pos));
                 }
                 // 拖动续帧同样认领（拖选已在 started 帧标记，这里兜底保险）。
                 sess.mouse_gesture_sel = true;
@@ -867,8 +875,10 @@ pub fn show_terminal(
                         if let Some(start) = point_at(p0) {
                             t.selection =
                                 Some(TermSelection::new(SelectionType::Simple, start, Side::Left));
-                            if let (Some(end), Some(sel)) = (point_at(p1), t.selection.as_mut()) {
-                                sel.update(end, Side::Left);
+                            if let Some(end) = point_at(p1)
+                                && let Some(sel) = t.selection.as_mut()
+                            {
+                                sel.update(end, side_at(p1));
                             }
                             // 快速拖选兜底建出选区 → 同样算本地选区手势。
                             sess.mouse_gesture_sel = true;

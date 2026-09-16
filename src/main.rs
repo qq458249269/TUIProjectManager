@@ -157,8 +157,14 @@ fn main() -> eframe::Result {
     if config.window.maximized {
         viewport = viewport.with_maximized(true);
     }
+    // 渲染后端：默认 wgpu（Windows 走 DX12，绕开 Intel OpenGL 驱动 ig9icd64.dll 的
+    // 已知闪退 0xc0000005）。wgpu 在个别机器不可用时，设 TPM_RENDERER=glow 回退 OpenGL。
+    let renderer = match std::env::var("TPM_RENDERER").as_deref() {
+        Ok("glow") => eframe::Renderer::Glow,
+        _ => eframe::Renderer::Wgpu,
+    };
     let options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Glow,
+        renderer,
         viewport,
         ..Default::default()
     };
