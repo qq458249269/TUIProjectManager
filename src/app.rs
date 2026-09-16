@@ -17,6 +17,10 @@ use crate::terminal;
 /// 的瞬间，宽限期过滤误报（进度型命令会在宽限期后再按正常规则提示）。
 const STARTUP_GRACE_MS: u64 = 60_000;
 
+/// 配置节流落盘间隔：仅窗口位置/尺寸变化（拖动/resize 每帧连续变化）时
+/// 最多每 CONFIG_SAVE_INTERVAL 写盘一次；页签结构变化、显式保存都立即落盘。
+const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -857,6 +861,10 @@ pub struct ClientApp {
     titlebar_hwnd: isize,
     /// 上一次实际生效的主题深浅：跟随系统时每帧对比，系统主题变化即重应用。
     last_theme_dark: bool,
+    /// 上次配置成功落盘时刻：窗口拖动/缩放变化时按它节流（见 CONFIG_SAVE_INTERVAL）。
+    last_config_save: std::time::Instant,
+    /// 连续落盘失败标记：每个失败区间只在状态栏提示一次，避免反复刷屏。
+    config_save_failed: bool,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
     ctx: egui::Context,
 
@@ -956,6 +964,8 @@ impl ClientApp {
             last_term_size: (80, 24),
             titlebar_hwnd,
             last_theme_dark: initial_dark,
+            last_config_save: std::time::Instant::now(),
+            config_save_failed: false,
 
             ctx,
             dir_exists_cache: HashMap::new(),
@@ -1009,9 +1019,66 @@ impl ClientApp {
         app
     }
 
+    /// 从当前页签实时计算 TabsState（与 on_exit 同一套规则），
+    /// 供「页签变化立即落盘」的崩溃防护使用。
+    fn current_tabs_state(&self) -> config::TabsState {
+        // active 指向 dirs 数组中的页签（0=Home, 1=dirs[0], …）。
+        // 必须按 dirs 实际过滤后的顺序计算索引，不能直接用 self.current：
+        // self.current 是 tabs 全数组含 Home/已退出页签的索引，与 dirs 不对应。
+        let active_sessions: Vec<&Session> = self
+            .tabs
+            .iter()
+            .skip(1)
+            .filter_map(|t| match t {
+                Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
+        let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
+        let active = self.current;
+        // 设置页签也记录：退出时开着则启动时在相同位置恢复（见构造器 restore_settings_pos）。
+        let settings_open = self.tabs.iter().any(|t| matches!(t, Tab::Settings));
+        let settings_pos = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Settings))
+            .unwrap_or(1);
+        config::TabsState {
+            dirs,
+            cmds,
+            active,
+            settings_open,
+            settings_pos,
+        }
+    }
+
+    /// 静默落盘（不覆盖状态栏已有消息）；同一失败区间只在状态栏提示一次。
+    /// 返回是否成功。
+    fn persist_config(&mut self) -> bool {
+        match config::save(&self.config) {
+            Ok(()) => {
+                self.config_save_failed = false;
+                self.last_config_save = std::time::Instant::now();
+                true
+            }
+            Err(e) => {
+                if !self.config_save_failed {
+                    self.config_save_failed = true;
+                    self.status = Some(format!("保存配置失败: {e}"));
+                }
+                false
+            }
+        }
+    }
+
     fn save_config(&mut self, msg: String) {
         match config::save(&self.config) {
-            Ok(()) => self.status = Some(msg),
+            Ok(()) => {
+                self.config_save_failed = false;
+                self.last_config_save = std::time::Instant::now();
+                self.status = Some(msg);
+            }
             Err(e) => self.status = Some(format!("保存配置失败: {e}")),
         }
     }
@@ -3485,36 +3552,9 @@ impl eframe::App for ClientApp {
             let _ = std::fs::remove_file(exe.with_file_name(format!("{name}.running")));
         }
         // 记录打开中的终端页签（退出后下次启动自动重新拉起）。
-        // active 指向 dirs 数组中的页签（0=Home, 1=dirs[0], …）。
-        // 必须按 dirs 实际过滤后的顺序计算索引，不能直接用 self.current：
-        // self.current 是 tabs 全数组含 Home/已退出页签的索引，与 dirs 不对应。
-        let active_sessions: Vec<&Session> = self
-            .tabs
-            .iter()
-            .skip(1)
-            .filter_map(|t| match t {
-                Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.as_ref()),
-                _ => None,
-            })
-            .collect();
-        let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
-        let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
-        let active = self.current;
-        // 设置页签也记录：退出时开着则启动时在相同位置恢复（见构造器 restore_settings_pos）。
-        let settings_open = self.tabs.iter().any(|t| matches!(t, Tab::Settings));
-        let settings_pos = self
-            .tabs
-            .iter()
-            .position(|t| matches!(t, Tab::Settings))
-            .unwrap_or(1);
-        self.config.tabs = config::TabsState {
-            dirs,
-            cmds,
-            active,
-            settings_open,
-            settings_pos,
-        };
-        // 窗口状态已在每帧 logic 中记录，退出时落盘。
+        // 规则与运行期随时落盘共用 current_tabs_state()，行为保持一致。
+        self.config.tabs = self.current_tabs_state();
+        // 窗口状态已在每帧 logic 中记录；运行期已随时落盘，这里退出时保底一次。
         let _ = config::save(&self.config);
     }
 
@@ -3617,8 +3657,9 @@ impl eframe::App for ClientApp {
             ctx.request_repaint();
         }
 
-        // 记录窗口状态，退出时保存。只读需要的三个字段，
-        // 不整份 clone ViewportInfo（内含多个 String 字段，每帧一次）。
+        // 记录窗口状态（每帧刷新内存态，运行期随时落盘，退出时再保底一次）。
+        // 只读需要的三个字段，不整份 clone ViewportInfo（内含多个 String 字段，每帧一次）。
+        let prev_window = self.config.window.clone();
         ctx.input(|i| {
             let vp = i.viewport();
             self.config.window.maximized = vp.maximized.unwrap_or(false);
@@ -3631,6 +3672,25 @@ impl eframe::App for ClientApp {
                 }
             }
         });
+        let window_changed = prev_window != self.config.window;
+
+        // 配置随时落盘（防闪退丢配置）：
+        // - 页签结构变化（打开/关闭/切换/拖拽/会话退出）→ 立即保存；
+        // - 仅窗口位置/尺寸变化（拖动/缩放每帧连续变）→ 节流到
+        //   CONFIG_SAVE_INTERVAL 写一次，避免拖动窗口时写盘风暴。
+        // 恢复/启动中的会话还没长成真实页签前不落盘：此时 current_tabs_state()
+        // 会算出空列表，提前写盘会把磁盘上待恢复的页签列表清空。
+        let tabs_state = self.current_tabs_state();
+        let tabs_changed = tabs_state != self.config.tabs;
+        let settled = self.pending_launch.is_empty()
+            && self.pending_restore.is_empty()
+            && self.pending_relaunch.is_empty()
+            && self.spawning.is_empty();
+        let window_debounce_ok = self.last_config_save.elapsed() >= CONFIG_SAVE_INTERVAL;
+        if settled && (tabs_changed || (window_changed && window_debounce_ok)) {
+            self.config.tabs = tabs_state;
+            self.persist_config();
+        }
 
         // 窗口标题保持固定，不根据等待输入状态动态修改。
         // 动态标题会频繁调用 send_viewport_cmd，可能干扰 winit 的 hover 跟踪，
