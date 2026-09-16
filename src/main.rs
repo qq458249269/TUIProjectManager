@@ -157,21 +157,46 @@ fn main() -> eframe::Result {
     if config.window.maximized {
         viewport = viewport.with_maximized(true);
     }
-    // 渲染后端：默认 wgpu（Windows 走 DX12，绕开 Intel OpenGL 驱动 ig9icd64.dll 的
-    // 已知闪退 0xc0000005）。wgpu 在个别机器不可用时，设 TPM_RENDERER=glow 回退 OpenGL。
+    // 渲染后端：默认 wgpu，且在 Windows 上强制只走系统级 D3D12（DX12）
+    // （微软 D3D 运行时+厂商 DX12 驱动），绕开 Intel 老驱动的两个已知闪退：
+    // OpenGL 的 ig9icd64.dll 与 Vulkan 的 igvk64.dll（均 0xc0000005）。
+    // wgpu 默认后端优先级 Vulkan>DX12，本机 Intel UHD 630 的 Vulkan 驱动会闪退，
+    // 所以这里必须把后端限定为 DX12。可用 TPM_RENDERER=glow 强制 OpenGL。
     let renderer = match std::env::var("TPM_RENDERER").as_deref() {
         Ok("glow") => eframe::Renderer::Glow,
         _ => eframe::Renderer::Wgpu,
     };
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         renderer,
         viewport,
         ..Default::default()
     };
+    #[cfg(windows)]
+    if renderer == eframe::Renderer::Wgpu
+        && let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) =
+            &mut options.wgpu_options.wgpu_setup
+    {
+        create_new.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    }
+    let title = format!("TUI 项目管理器 v{}", app_version());
+    // DX12 不可用（如 Win7/无 DX12 驱动）时 wgpu 初始化返回 Err → 自动回退 glow，
+    // 避免“启动不了”。失败的 Err 分支不吞掉：仍会向上传播。
+    let mut glow_fallback = options.clone();
+    glow_fallback.renderer = eframe::Renderer::Glow;
+    match eframe::run_native(&title, options, Box::new(create_app)) {
+        Ok(()) => Ok(()),
+        Err(err) if renderer == eframe::Renderer::Wgpu => {
+            // 无控制台可看时记入 crash.log（与 panic 钩子同一目录）
+            eprintln!("[wgpu] 初始化失败，自动回退 glow：{err}");
+            eframe::run_native(&title, glow_fallback, Box::new(create_app))
+        }
+        Err(err) => Err(err),
+    }
+}
 
-    eframe::run_native(
-        &format!("TUI 项目管理器 v{}", app_version()),
-        options,
-        Box::new(|cc| Ok(Box::new(app::ClientApp::new(cc)))),
-    )
+/// 创建应用实例；run_native 可能调用两次（wgpu 失败回退 glow）。
+fn create_app(
+    cc: &eframe::CreationContext<'_>,
+) -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Box::new(app::ClientApp::new(cc)))
 }

@@ -21,6 +21,11 @@ const STARTUP_GRACE_MS: u64 = 60_000;
 /// 最多每 CONFIG_SAVE_INTERVAL 写盘一次；页签结构变化、显式保存都立即落盘。
 const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// 全部静止时的慢心跳帧间隔（cmd/conhost 式节能：无脏区不持续重绘）。
+/// 输出到达、鼠标/键盘事件都走 request_repaint() 即时唤醒，心跳只负责
+/// 兜底捕获无事件干系的状态推进（任务完成通知稳定窗口、状态栏倒计时等）。
+const IDLE_HEARTBEAT_MS: u64 = 500;
+
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -3603,9 +3608,40 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 帧率控制：恒定按配置 FPS 调度每帧，不做空闲停帧等任何节能操作。
-        let fps = self.config.settings.refresh_fps.clamp(10, 60);
-        ctx.request_repaint_after(std::time::Duration::from_millis(1000 / fps));
+        // ── 帧率调度（cmd/conhost 式：有脏区才持续刷新，静止降为慢心跳）──
+        // 旧实现恒定按配置 FPS 每帧重绘：空闲时也满帧空转，白白烧核显/CPU。
+        // 有活干（输出在途/加载/动画/交互/下载/后台 spawn）→ 按配置帧率；
+        // 全部静止 → IDLE_HEARTBEAT_MS 慢心跳兜底，省 ~95% 空闲重绘。
+        // 输出到达的唤醒不依赖心跳：reader 线程解析完直接 request_repaint()，
+        // 下一帧即显示，回显延迟仍是单帧 vsync（≤16ms@60Hz）。
+        let mut busy = self.downloading
+            || !self.spawning.is_empty()
+            || self.theme_settle_at.is_some()
+            || ctx.input(|i| i.pointer.any_down());
+        if !busy {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            for tab in &self.tabs {
+                if let Tab::Session(s) = tab {
+                    // 最近 300ms 有输出或仍在启动 → 持续刷新（TUI 动画/top/watch 等
+                    // 周期性进程依赖持续帧；加载态也需帧渲染启动画面）。
+                    if now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed)) < 300
+                        || s.loading.load(Ordering::Relaxed)
+                    {
+                        busy = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let delay_ms = if busy {
+            1000 / self.config.settings.refresh_fps.clamp(10, 60)
+        } else {
+            IDLE_HEARTBEAT_MS
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
         // 更新检查结果回到状态栏。
