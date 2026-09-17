@@ -181,28 +181,6 @@ unsafe extern "system" {
         attr_value: *const std::ffi::c_void,
         attr_size: u32,
     ) -> i32;
-    fn DwmGetWindowAttribute(
-        hwnd: isize,
-        attr: u32,
-        attr_value: *mut std::ffi::c_void,
-        attr_size: u32,
-    ) -> i32;
-}
-
-/// 标题栏当前是否已是深色（DWM 属性 20 读回是否为 1）。
-#[cfg(target_os = "windows")]
-fn is_titlebar_dark(hwnd: isize) -> bool {
-    if hwnd == 0 { return false; }
-    let mut v: i32 = 0;
-    let hr = unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            20, // DWMWA_USE_IMMERSIVE_DARK_MODE
-            &mut v as *mut i32 as *mut std::ffi::c_void,
-            4,
-        )
-    };
-    hr >= 0 && v == 1
 }
 
 /// 只设 DWM 深色属性，不调 refresh_titlebar（避免 SWP_FRAMECHANGED 重置 hover 跟踪）。
@@ -3107,7 +3085,7 @@ impl ClientApp {
         ui.separator();
         ui.add_space(6.0);
         // ── 帧率预设 ──
-        ui.label(RichText::new("前台终端页签帧率（后台页签始终不渲染，不影响 CPU）").strong());
+        ui.label(RichText::new("终端页签刷新帧率（10–60 FPS）").strong());
         ui.add_space(4.0);
         let presets = [10u64, 30, 60];
         let cur_fps = self.config.settings.refresh_fps;
@@ -3142,12 +3120,12 @@ impl ClientApp {
             }
         });
         ui.label(
-            RichText::new("默认 10 FPS，恒定按配置帧率刷新（无空闲停帧节能）")
+            RichText::new("有输出/交互时按此帧率刷新，全部静止自动降为 2 FPS 慢心跳省电")
                 .weak()
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("界面恒定按配置帧率刷新，不做任何节能停帧操作。\n✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 稳定停留 2 秒才弹「任务完成/等待选择」通知，周期性输出进程（top/watch/编译间歇）不会误报。").weak());
+        ui.label(RichText::new("✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 稳定停留 2 秒才弹「任务完成/等待选择」通知，周期性输出进程（top/watch/编译间歇）不会误报。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
@@ -3564,12 +3542,10 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 固定深色标题栏：每帧检查 DWM 属性，被系统重置（WM_SETTINGCHANGE）时补设。
-        // 只调 DwmSetWindowAttribute（不调 refresh_titlebar），不干扰 hover 跟踪。
-        if !is_titlebar_dark(self.titlebar_hwnd) {
-            set_dwm_dark(self.titlebar_hwnd);
-        }
-
+        // 固定深色标题栏：只在启动时设一次（见 ClientApp::new）。
+        // 不再每帧轮询补设 DWM 属性：DwmSetWindowAttribute 会触发 DWM 重算
+        // 非客户区，重置 winit 的 hover 跟踪 → 「鼠标悬停激活窗口」失效
+        // （回归 c829b31）。属性被系统重置时最多标题栏暂时不深色，代价可接受。
         // 跟随系统：系统深浅变化时重应用主题并广播到所有会话。
         let cur_dark = self.effective_dark();
         if cur_dark != self.last_theme_dark {
@@ -3609,15 +3585,22 @@ impl eframe::App for ClientApp {
         }
 
         // ── 帧率调度（cmd/conhost 式：有脏区才持续刷新，静止降为慢心跳）──
-        // 旧实现恒定按配置 FPS 每帧重绘：空闲时也满帧空转，白白烧核显/CPU。
-        // 有活干（输出在途/加载/动画/交互/下载/后台 spawn）→ 按配置帧率；
+        // 有活干（输出在途/加载/交互/下载/后台 spawn）→ 按配置帧率；
         // 全部静止 → IDLE_HEARTBEAT_MS 慢心跳兜底，省 ~95% 空闲重绘。
-        // 输出到达的唤醒不依赖心跳：reader 线程解析完直接 request_repaint()，
-        // 下一帧即显示，回显延迟仍是单帧 vsync（≤16ms@60Hz）。
+        // 输出唤醒不再由 reader 线程直接 request_repaint（持续输出会把整窗
+        // 帧率顶到 CPU 全速，干扰 winit hover 跟踪 → 悬停激活失效）：
+        // SessionListener 只发合并信号（容量 1），此处消费后按配置帧率唤醒。
+        // 后台页签不消费信号（画面不可见，切回那帧自然重绘）。
         let mut busy = self.downloading
             || !self.spawning.is_empty()
             || self.theme_settle_at.is_some()
             || ctx.input(|i| i.pointer.any_down());
+        if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
+            // 仅前台页签消费合并信号：解析线程有新输出待画时按配置帧率刷新。
+            if s.redraw_rx.try_recv().is_ok() {
+                busy = true;
+            }
+        }
         if !busy {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3752,7 +3735,6 @@ impl eframe::App for ClientApp {
                 self.spawn_rx = Some(rx);
                 for p in pending {
                     let title = p.title.clone();
-                    let redraw = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let wake_ctx = ctx.clone();
                     let tx = tx.clone();
@@ -3761,7 +3743,7 @@ impl eframe::App for ClientApp {
                         let result = session::spawn(
                             &p.title, &p.dir, &p.cmd,
                             cols as u16, rows as u16,
-                            redraw, ctx,
+                            ctx,
                         );
                         let _ = tx.send((result, false, None));
                         // spawn 完成立即唤醒 UI 应用页签（恒定帧率下最多省掉
@@ -3772,7 +3754,6 @@ impl eframe::App for ClientApp {
                 for p in pending_rel {
                     let title = p.title.clone();
                     let tab_idx = p.tab_index;
-                    let redraw = self.redraw_tx.clone();
                     // spawn 完成后唤醒 UI：占位页签不是前台终端，不唤醒的话新会话
                     // 出现要等到下一帧恒定帧（最多 ~100ms），明显延迟。
                     let ctx = self.ctx.clone();
@@ -3783,7 +3764,7 @@ impl eframe::App for ClientApp {
                         let result = session::spawn(
                             &p.title, &p.dir, &p.cmd,
                             cols as u16, rows as u16,
-                            redraw, ctx,
+                            ctx,
                         );
                         let _ = tx.send((result, false, Some(tab_idx)));
                         wake_ctx.request_repaint();
@@ -3874,7 +3855,6 @@ impl eframe::App for ClientApp {
                     let title = p.title;
                     let dir = p.dir;
                     let cmd = p.cmd;
-                    let redraw = self.redraw_tx.clone();
                     let ctx = self.ctx.clone();
                     let wake_ctx = ctx.clone();
                     let tx = tx.clone();
@@ -3883,7 +3863,7 @@ impl eframe::App for ClientApp {
                         let result = session::spawn(
                             &title, &dir, &cmd,
                             cols as u16, rows as u16,
-                            redraw, ctx,
+                            ctx,
                         );
                         // saved_index：恢复时按保存时的原序插入，保证页签顺序不因
                         // 后台 spawn 完成先后而打乱。

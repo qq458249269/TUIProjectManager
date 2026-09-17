@@ -116,6 +116,9 @@ pub struct Session {
     /// 本会话是否为前台页签（UI 线程每帧同步 self.current）。后台会话的
     /// 输出仍照常解析（管道不能停读），但不唤醒 UI 重绘。
     pub foreground: Arc<AtomicBool>,
+    /// UI → 解析线程无信号：解析线程每消费一块前台输出后发一个合并信号，
+    /// logic() 每帧消费一次并据此决定是否按配置帧率唤醒 UI。
+    pub redraw_rx: std::sync::mpsc::Receiver<()>,
     /// 子进程是否已退出（reader 线程写、UI 线程读，无需 term 锁）。
     pub exited: Arc<AtomicBool>,
     /// 是否已发送过「运行结束」提醒：正常退出置位后只提醒一次；
@@ -232,20 +235,13 @@ impl EventListener for SessionListener {
             // opencode 等 TUI 的 OSC 52 复制：直接写系统剪贴板。egui Context 线程安全。
             self.ctx.copy_text(text.clone());
         }
-        // Event::PtyWrite（仿真器对 DA/DSR/DECRQM/键盘模式查询的自发应答）一律丢弃：
-        // 应答权统一归 reply_to_queries。否则双重应答，且这些应答经 ConPTY 输入
-        // 引擎时序错位时会被当键盘文本打进子进程（实测 cmd 提示符后多出 ?6c 尾巴）。
-        // 其余 PtyWrite 一律不投递。try_send：通道容量 1，满则丢弃，刷新信号合并为一个。
-        // 必须非阻塞：解析线程持有 term 锁时回调这里，若 send 阻塞，
-        // 会与 UI 线程的 term 读锁渲染互相等待而死锁。
         // 后台会话不唤醒 UI：画面反正不可见，切回该页签的那一帧自然会重绘；
-        // 页签标题/活动点由 1s 基线轮询更新。解析照常（管道不能停读）。
+        // 页签标题/活动点由基线轮询更新。解析照常（管道不能停读）。
+        // 前台会话：仅发合并信号（容量 1，满则丢弃），由 logic() 统一按帧调度
+        // request_repaint——避免每个输出块直接抢唤醒，持续输出期间把整窗
+        // 帧率顶到 CPU 全速，干扰 winit 的 hover 跟踪（悬停激活失效）。
         if self.foreground.load(Ordering::Relaxed) {
             let _ = self.redraw.try_send(());
-            // 直接请求重绘（Context 线程安全）：空闲时已停帧（省电），若只靠
-            // logic() 里消费通道调度，PTY 输出刚错过一帧就要等下一次输出/交互
-            // 才显示——打字回显也是 PTY 输出，会明显发粘。这里即时唤醒下一帧。
-            self.ctx.request_repaint();
         }
     }
 }
@@ -579,7 +575,6 @@ pub fn spawn(
     tui_command: &str,
     cols: u16,
     rows: u16,
-    redraw: std::sync::mpsc::SyncSender<()>,
     ctx: eframe::egui::Context,
 ) -> Result<Session, String> {
     #[cfg(windows)]
@@ -662,7 +657,11 @@ pub fn spawn(
         }
     });
 
-    let redraw_reader = redraw.clone();
+    // 合并重绘信号：解析线程每消费一块输出发一个（容量 1，满则丢弃合并）。
+    // logic() 每帧消费一次并按配置帧率唤醒 UI——替代旧的每块直接
+    // request_repaint（持续输出会把整窗帧率顶到 CPU 全速，干扰 winit
+    // hover 跟踪 → 悬停激活失效）。
+    let (redraw_tx, redraw_rx) = std::sync::mpsc::sync_channel::<()>(1);
     // 退出时唤醒 UI：reader 线程设 exited 后立即 request_repaint（线程安全），
     // 停帧空闲时 `update_exited()` 才能在本帧发现退出（页签✔/状态栏/通知）。
     // 仅退出这一次，无常耗——后台输出/空闲不唤醒。
@@ -671,7 +670,7 @@ pub fn spawn(
     let foreground = Arc::new(AtomicBool::new(false));
     let listener_fg = foreground.clone();
     let listener = SessionListener {
-        redraw,
+        redraw: redraw_tx.clone(),
         ctx,
         foreground: listener_fg,
     };
@@ -788,7 +787,6 @@ pub fn spawn(
                             query_leftover.clear();
                         }
                         reader_exited.store(true, Ordering::Relaxed);
-                        let _ = redraw_reader.send(());
                         reader_ctx.request_repaint();
                         break;
                     },
@@ -1024,7 +1022,8 @@ pub fn spawn(
                             }
                         }
                         if is_fg {
-                            let _ = redraw_reader.send(());
+                            // 前台会话发合并信号：logic() 每帧消费，按配置帧率唤醒。
+                            let _ = redraw_tx.send(());
                         } else {
                             // 后台页签攒批：攒满阈值或超时才处理，降低加锁频率。
                             // 分块已在上方完成，此处仅控制处理时机。
@@ -1053,6 +1052,7 @@ pub fn spawn(
         theme_dark,
         osc_theme_aware,
         foreground,
+        redraw_rx,
         exited: exited.clone(),
         notified: Arc::new(AtomicBool::new(false)),
         started_ms: Arc::new(AtomicU64::new(now_ts)),
