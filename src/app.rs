@@ -362,9 +362,37 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
 #[allow(unused_variables)]
 fn log_update(_msg: &str) {}
 
+/// 用 curl 请求 URL 并解析 JSON 中的 tag_name。
+/// 返回 Ok(tag) 或 Err(错误描述)。
+fn fetch_tag_from_url(url: &str) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-H", "User-Agent: TUIProjectManager",
+        url,
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().map_err(|e| format!("启动 curl 失败: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("HTTP {}", output.status.code().unwrap_or(0)));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "无法解析 GitHub 响应".to_string())?;
+    v["tag_name"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "GitHub 返回错误响应".to_string())
+}
+
 /// 拉取最新版本号。多源级联避免 GitHub API 限流（60 次/时）导致误报：
 /// ① /releases/latest 的 302 重定向目标（HTML 端点，无限流）取最新 tag；
-/// ② 重定向失败时回退 api.github.com 的 releases/latest JSON。
+/// ② 重定向失败时回退 api.github.com 的 releases/latest JSON；
+/// ③ 直连失败时依次尝试 GH_MIRRORS 镜像代理 API。
 /// 返回（状态栏消息, 有新版本时的 tag）。
 fn fetch_latest_release() -> (String, Option<String>) {
     // 源①：HTML 重定向。curl 不加 -L，从 redirect_url 里取 tag；
@@ -409,44 +437,34 @@ fn fetch_latest_release() -> (String, Option<String>) {
         ));
     }
     // 源②：回退 GitHub API（可能触发限流，此时会明确报错而非误报已最新）。
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args([
-        "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "-H", "User-Agent: TUIProjectManager",
-        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest",
-    ]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    let out = cmd.output();
-    match out {
-        Ok(o) if o.status.success() => {
-            log_update(&format!("检查更新 源② API 成功，响应 {} 字节", o.stdout.len()));
-            match serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
-                Ok(v) => {
-                    let Some(tag) = v["tag_name"].as_str() else {
-                        return ("检查更新失败：GitHub 返回错误响应".to_string(), None);
-                    };
-                    let msg = version_message(tag);
-                    if msg.contains("发现新版本") { (msg, Some(tag.to_string())) } else { (msg, None) }
-                }
-                Err(_) => ("检查更新失败：无法解析 GitHub 响应".to_string(), None),
-            }
-        }
-        Ok(o) => {
-            log_update(&format!(
-                "检查更新 源② API HTTP {} 失败（限流/被墙）",
-                o.status.code().unwrap_or(0)
-            ));
-            ("检查更新失败：网络错误".to_string(), None)
+    let api_url =
+        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
+    match fetch_tag_from_url(api_url) {
+        Ok(tag) => {
+            log_update(&format!("检查更新 源② API 成功 → tag {tag}"));
+            let msg = version_message(&tag);
+            return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
         }
         Err(e) => {
-            log_update(&format!("检查更新 源② 启动 curl 失败: {e}"));
-            (format!("检查更新失败：{e}"), None)
+            log_update(&format!("检查更新 源② API 失败: {e}"));
         }
     }
+    // 源③：直连 GitHub 全部失败，依次尝试加速镜像代理 API。
+    // 镜像前缀 + 原始 API URL 组成代理地址，适用于中国大陆等 GitHub 受限网络。
+    for mirror in GH_MIRRORS {
+        let proxy_url = format!("{mirror}{api_url}");
+        match fetch_tag_from_url(&proxy_url) {
+            Ok(tag) => {
+                log_update(&format!("检查更新 镜像 {mirror} 成功 → tag {tag}"));
+                let msg = version_message(&tag);
+                return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
+            }
+            Err(e) => {
+                log_update(&format!("检查更新 镜像 {mirror} 失败: {e}"));
+            }
+        }
+    }
+    ("检查更新失败：网络错误，请检查网络连接或代理设置".to_string(), None)
 }
 
 /// 根据 tag 与本地版本比较生成状态栏消息。
