@@ -183,7 +183,15 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[link(name = "uxtheme")]
+unsafe extern "system" {
+    fn SetWindowTheme(hwnd: isize, psz_sub_app_name: *const u16, psz_sub_id_list: *const u16) -> i32;
+}
+
 /// 只设 DWM 深色属性，不调 refresh_titlebar（避免 SWP_FRAMECHANGED 重置 hover 跟踪）。
+/// 再调 SetWindowTheme 把主题名钉回 DarkMode_Explorer：winit 深浅切换只会
+/// SetWindowTheme(hwnd, L"", …) 复位主题名，纯 DwmSetWindowAttribute 压不住它；
+/// Win11 额外把标题栏底色钉成纯黑、文字纯白（Win10 不支持这两个属性，静默失败）。
 #[cfg(target_os = "windows")]
 fn set_dwm_dark(hwnd: isize) {
     if hwnd == 0 { return; }
@@ -198,6 +206,16 @@ fn set_dwm_dark(hwnd: isize) {
             );
             if ok >= 0 { break; }
         }
+    }
+    unsafe {
+        // Win11：标题栏底色纯黑、文字纯白（属性 35/36；Win10 不支持，返回失败忽略）。
+        let black: u32 = 0x0000_0000;
+        let white: u32 = 0x00FF_FFFF;
+        DwmSetWindowAttribute(hwnd, 35, &black as *const u32 as *const std::ffi::c_void, 4);
+        DwmSetWindowAttribute(hwnd, 36, &white as *const u32 as *const std::ffi::c_void, 4);
+        // 主题名钉回深色：winit 的 SetTheme(Light) 只 SetWindowTheme(hwnd, L"", …)。
+        let dark_name = "DarkMode_Explorer\0".encode_utf16().collect::<Vec<u16>>();
+        SetWindowTheme(hwnd, dark_name.as_ptr(), std::ptr::null());
     }
 }
 
@@ -862,6 +880,8 @@ pub struct ClientApp {
     titlebar_hwnd: isize,
     /// 上一次实际生效的主题深浅：跟随系统时每帧对比，系统主题变化即重应用。
     last_theme_dark: bool,
+    /// 主题切换后延迟补设黑色标题栏的时刻（等 winit 应用完帧尾的 SetTheme 命令）。
+    titlebar_restore_at: Option<std::time::Instant>,
     /// 上次配置成功落盘时刻：窗口拖动/缩放变化时按它节流（见 CONFIG_SAVE_INTERVAL）。
     last_config_save: std::time::Instant,
     /// 连续落盘失败标记：每个失败区间只在状态栏提示一次，避免反复刷屏。
@@ -880,8 +900,8 @@ pub struct ClientApp {
     pi_models: config::ModelsConfig,
     /// oh-my-pi 模型配置（编辑态）。
     omp_models: config::ModelsConfig,
-    /// 模型设置是否展开编辑。
-    model_settings_open: bool,
+    /// 模型设置当前页签：0=pi 模型配置，1=oh-my-pi 模型配置。
+    model_settings_tab: usize,
     /// 后台重绘跳帧计数器：后台页签收到 redraw 信号时累计，达到跳帧阈值才真正重绘。
     bg_frame: u64,
     /// 首页项目列表搜索过滤文本。
@@ -965,6 +985,7 @@ impl ClientApp {
             last_term_size: (80, 24),
             titlebar_hwnd,
             last_theme_dark: initial_dark,
+            titlebar_restore_at: None,
             last_config_save: std::time::Instant::now(),
             config_save_failed: false,
 
@@ -973,7 +994,7 @@ impl ClientApp {
             title_width_cache: HashMap::new(),
             pi_models: config::load_pi_models(),
             omp_models: config::load_omp_models(),
-            model_settings_open: false,
+            model_settings_tab: 0,
             bg_frame: 0,
             search_query: String::new(),
             show_hidden: false,
@@ -3085,20 +3106,19 @@ impl ClientApp {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
-        // ── 模型配置 ──
+        // ── 模型配置（页签：pi / oh-my-pi） ──
         ui.horizontal(|ui| {
-            let arrow = if self.model_settings_open { "▼" } else { "▶" };
-            if ui
-                .button(format!("{arrow} 模型配置"))
-                .on_hover_text("配置 pi / oh-my-pi 的模型参数")
-                .clicked()
-            {
-                self.model_settings_open = !self.model_settings_open;
+            ui.label(RichText::new("模型配置:").strong());
+            for (i, name) in ["pi 模型配置", "oh-my-pi 模型配置"].iter().enumerate() {
+                if ui
+                    .add(egui::Button::selectable(self.model_settings_tab == i, *name))
+                    .clicked()
+                {
+                    self.model_settings_tab = i;
+                }
             }
         });
-        if self.model_settings_open {
-            self.model_settings_ui(ui);
-        }
+        self.model_settings_ui(ui, self.model_settings_tab);
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
@@ -3148,19 +3168,12 @@ impl ClientApp {
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
 
-    fn model_settings_ui(&mut self, ui: &mut egui::Ui) {
-        // ── pi 配置 ──
-        ui.label(RichText::new("pi 模型配置").strong());
-        ui.label(
-            RichText::new(format!("路径: {}", config::pi_models_path().display()))
-                .weak()
-                .small(),
-        );
-        let mut pi_dirty = false;
-        // providers 列表
-        let pi_keys: Vec<String> = self.pi_models.providers.keys().cloned().collect();
-        for key in &pi_keys {
-            if let Some(provider) = self.pi_models.providers.get_mut(key) {
+    /// provider/models 编辑表单（pi / oh-my-pi 共用），返回是否有改动。
+    fn provider_list_ui(ui: &mut egui::Ui, models: &mut config::ModelsConfig) -> bool {
+        let mut dirty = false;
+        let keys: Vec<String> = models.providers.keys().cloned().collect();
+        for key in &keys {
+            if let Some(provider) = models.providers.get_mut(key) {
                 ui.indent(key, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Provider:");
@@ -3175,7 +3188,7 @@ impl ClientApp {
                             )
                             .changed()
                         {
-                            pi_dirty = true;
+                            dirty = true;
                         }
                     });
                     ui.horizontal(|ui| {
@@ -3187,7 +3200,7 @@ impl ClientApp {
                             )
                             .changed()
                         {
-                            pi_dirty = true;
+                            dirty = true;
                         }
                     });
                     // models 列表
@@ -3202,7 +3215,7 @@ impl ClientApp {
                                 )
                                 .changed()
                             {
-                                pi_dirty = true;
+                                dirty = true;
                             }
                             ui.label("name:");
                             if ui
@@ -3212,7 +3225,7 @@ impl ClientApp {
                                 )
                                 .changed()
                             {
-                                pi_dirty = true;
+                                dirty = true;
                             }
                             ui.label("context:");
                             let mut ctx_str = model.context_window.to_string();
@@ -3225,7 +3238,7 @@ impl ClientApp {
                                 && let Ok(v) = ctx_str.parse()
                             {
                                 model.context_window = v;
-                                pi_dirty = true;
+                                dirty = true;
                             }
                             ui.label("max:");
                             let mut max_str = model.max_tokens.to_string();
@@ -3238,7 +3251,7 @@ impl ClientApp {
                                 && let Ok(v) = max_str.parse()
                             {
                                 model.max_tokens = v;
-                                pi_dirty = true;
+                                dirty = true;
                             }
                             if ui.small_button("×").clicked() {
                                 model_remove = Some(mi);
@@ -3247,136 +3260,44 @@ impl ClientApp {
                     }
                     if let Some(mi) = model_remove {
                         provider.models.remove(mi);
-                        pi_dirty = true;
+                        dirty = true;
                     }
                     if ui.button("+ 添加模型").clicked() {
-                        provider
-                            .models
-                            .push(config::ModelEntry::default());
-                        pi_dirty = true;
+                        provider.models.push(config::ModelEntry::default());
+                        dirty = true;
                     }
                 });
             }
         }
-        ui.add_space(4.0);
-        ui.separator();
-        // ── oh-my-pi 配置 ──
-        ui.label(RichText::new("oh-my-pi 模型配置").strong());
-        ui.label(
-            RichText::new(format!("路径: {}", config::omp_models_path().display()))
-                .weak()
-                .small(),
-        );
-        let mut omp_dirty = false;
-        let omp_keys: Vec<String> = self.omp_models.providers.keys().cloned().collect();
-        for key in &omp_keys {
-            if let Some(provider) = self.omp_models.providers.get_mut(key) {
-                ui.indent(key, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Provider:");
-                        ui.label(RichText::new(key).strong());
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("baseUrl:");
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut provider.base_url)
-                                    .desired_width(320.0),
-                            )
-                            .changed()
-                        {
-                            omp_dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("apiKey:");
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut provider.api_key)
-                                    .desired_width(320.0),
-                            )
-                            .changed()
-                        {
-                            omp_dirty = true;
-                        }
-                    });
-                    let mut model_remove: Option<usize> = None;
-                    for (mi, model) in provider.models.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Model[{}]:", mi));
-                            ui.label("id:");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut model.id).desired_width(60.0),
-                                )
-                                .changed()
-                            {
-                                omp_dirty = true;
-                            }
-                            ui.label("name:");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut model.name)
-                                        .desired_width(100.0),
-                                )
-                                .changed()
-                            {
-                                omp_dirty = true;
-                            }
-                            ui.label("context:");
-                            let mut ctx_str = model.context_window.to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut ctx_str)
-                                        .desired_width(80.0),
-                                )
-                                .changed()
-                                && let Ok(v) = ctx_str.parse()
-                            {
-                                model.context_window = v;
-                                omp_dirty = true;
-                            }
-                            ui.label("max:");
-                            let mut max_str = model.max_tokens.to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut max_str)
-                                        .desired_width(80.0),
-                                )
-                                .changed()
-                                && let Ok(v) = max_str.parse()
-                            {
-                                model.max_tokens = v;
-                                omp_dirty = true;
-                            }
-                            if ui.small_button("×").clicked() {
-                                model_remove = Some(mi);
-                            }
-                        });
-                    }
-                    if let Some(mi) = model_remove {
-                        provider.models.remove(mi);
-                        omp_dirty = true;
-                    }
-                    if ui.button("+ 添加模型").clicked() {
-                        provider
-                            .models
-                            .push(config::ModelEntry::default());
-                        omp_dirty = true;
-                    }
-                });
+        dirty
+    }
+
+    /// 模型配置页签内容：0=pi，1=oh-my-pi。
+    fn model_settings_ui(&mut self, ui: &mut egui::Ui, tab: usize) {
+        if tab == 0 {
+            ui.label(RichText::new("pi 模型配置").strong());
+            ui.label(
+                RichText::new(format!("路径: {}", config::pi_models_path().display()))
+                    .weak()
+                    .small(),
+            );
+            if Self::provider_list_ui(ui, &mut self.pi_models)
+                && let Err(e) = config::save_pi_models(&self.pi_models)
+            {
+                self.status = Some(format!("pi 配置保存失败: {e}"));
             }
-        }
-        // 自动保存
-        if pi_dirty
-            && let Err(e) = config::save_pi_models(&self.pi_models)
-        {
-            self.status = Some(format!("pi 配置保存失败: {e}"));
-        }
-        if omp_dirty
-            && let Err(e) = config::save_omp_models(&self.omp_models)
-        {
-            self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
+        } else {
+            ui.label(RichText::new("oh-my-pi 模型配置").strong());
+            ui.label(
+                RichText::new(format!("路径: {}", config::omp_models_path().display()))
+                    .weak()
+                    .small(),
+            );
+            if Self::provider_list_ui(ui, &mut self.omp_models)
+                && let Err(e) = config::save_omp_models(&self.omp_models)
+            {
+                self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
+            }
         }
     }
 
@@ -3560,10 +3481,11 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 固定深色标题栏：只在启动时设一次（见 ClientApp::new）。
-        // 不再每帧轮询补设 DWM 属性：DwmSetWindowAttribute 会触发 DWM 重算
-        // 非客户区，重置 winit 的 hover 跟踪 → 「鼠标悬停激活窗口」失效
-        // （回归 c829b31）。属性被系统重置时最多标题栏暂时不深色，代价可接受。
+        // 标题栏固定黑色：启动时设一次 + 主题切换时补设（见下），不每帧轮询
+        // （DwmSetWindowAttribute 触发 DWM 重算非客户区，重置 winit 的 hover 跟踪
+        // → 「鼠标悬停激活窗口」失效）。补设走延迟时刻：egui 深浅切换会在帧尾经
+        // ViewportCommand::SetTheme 让 winit SetWindowTheme("") 复位标题栏为浅色，
+        // 立即补设压不住，延迟一拍再钉回黑。
         // 跟随系统：系统深浅变化时重应用主题并广播到所有会话。
         let cur_dark = self.effective_dark();
         if cur_dark != self.last_theme_dark {
@@ -3573,6 +3495,16 @@ impl eframe::App for ClientApp {
             self.theme_settle_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
             ctx.request_repaint();
+            set_dwm_dark(self.titlebar_hwnd);
+            self.titlebar_restore_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+        }
+        // 延迟补设黑色标题栏：等 winit 应用完帧尾的 SetTheme 命令后再压一次。
+        if let Some(t) = self.titlebar_restore_at
+            && std::time::Instant::now() >= t
+        {
+            self.titlebar_restore_at = None;
+            set_dwm_dark(self.titlebar_hwnd);
         }
 
         // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。

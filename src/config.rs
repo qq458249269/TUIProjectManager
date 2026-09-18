@@ -89,7 +89,7 @@ pub struct Settings {
     pub tui_commands: Vec<String>,
     /// 当前选中的 TUI 命令（启动项目时使用）。
     pub tui_command: String,
-    /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 30。
+    /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 10。
     #[serde(default = "default_refresh_fps")]
     pub refresh_fps: u64,
     /// 深浅主题：true=深色（默认），false=浅色。
@@ -212,7 +212,7 @@ impl Default for ModelEntry {
         Self {
             id: "1".into(),
             name: "1".into(),
-            context_window: 200_000,
+            context_window: 100_000,
             max_tokens: 8192,
         }
     }
