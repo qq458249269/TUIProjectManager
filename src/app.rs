@@ -419,7 +419,11 @@ fn log_update(_msg: &str) {}
 fn fetch_tag_from_url(url: &str) -> Result<String, String> {
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
+        // 直连下载：强制绕过 ~/.curlrc / 环境变量里的本地代理。
+        // 本机曾因 .curlrc 残留 Clash 127.0.0.1:7897 导致所有 curl 走代理、
+        // 隧道握手失败，检查更新/下载一律报「网络错误」。
         "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "--proxy", "", "--noproxy", "*",
         "-H", "User-Agent: TUIProjectManager",
         url,
     ]);
@@ -456,6 +460,7 @@ fn fetch_latest_release() -> (String, Option<String>) {
         "-w", "%{redirect_url}",
         "--connect-timeout", "8",
         "--ssl-no-revoke",
+        "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
         "-H", "User-Agent: TUIProjectManager",
         "https://github.com/qq458249269/TUIProjectManager/releases/latest",
     ]);
@@ -516,7 +521,7 @@ fn fetch_latest_release() -> (String, Option<String>) {
             }
         }
     }
-    ("检查更新失败：网络错误，请检查网络连接或代理设置".to_string(), None)
+    ("检查更新失败：网络错误（已绕过本地代理直连，请检查网络连接或加速工具如 Steam++）".to_string(), None)
 }
 
 /// 根据 tag 与本地版本比较生成状态栏消息。
@@ -554,6 +559,7 @@ fn download_update(
     let mut page_cmd = std::process::Command::new("curl");
     page_cmd.args([
         "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
         "-H", "User-Agent: TUIProjectManager",
         &page_url,
     ]);
@@ -593,6 +599,7 @@ fn download_update(
         let mut api_cmd = std::process::Command::new("curl");
         api_cmd.args([
             "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+            "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
             "-H", "User-Agent: TUIProjectManager",
             &api_url,
         ]);
@@ -736,6 +743,7 @@ fn download_one(
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
         "-H", "User-Agent: TUIProjectManager",
         "-o", dest_path.to_str().unwrap_or("update.exe.new"),
     ]);
