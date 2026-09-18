@@ -1951,11 +1951,20 @@ impl ClientApp {
                         Some("❌")
                     } else if s.loading.load(Ordering::Relaxed) {
                         Some("🔄")
-                    } else if count > 0 && (!content_silent || cpu_busy) {
+                    } else if count > 0 && !typing && (!content_silent || cpu_busy) {
                         // 网格内容在变化，或进程树最近 3s 在消耗 CPU（Agent 静默
                         // 思考/长编译/搜索）→ 正在运行 🔄。旧版只认网格变化：
                         // 静默期（思考/链接）被误判完成。用户刚输入时除外 → 空。
-                        if typing { None } else { Some("🔄") }
+                        Some("🔄")
+                    } else if count > 0
+                        && !viewed
+                        // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
+                        // CPU 已在前置分支挡住静默思考，3s 够判定
+                        // 「输出确实停了」→ 真实完成通知延迟压回 3 秒级。
+                        && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
+                    {
+                        // 输出已结束（连续 3s 零输出且 CPU 静默）+ 未查看 → ✅
+                        Some("✅")
                     } else if count > 0 && is_tui && cursor_vis && any_silent {
                         // TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止（前置分支已
                         // 筛掉 CPU 忙与网格动）= 在等用户输入/选择 → 空。无
@@ -1966,15 +1975,6 @@ impl ClientApp {
                     } else if count > 0 && typing {
                         // 空白 shell / 无回显场景下刚输入过 → 空，不误判 🔄/✅。
                         None
-                    } else if count > 0
-                        && !viewed
-                        // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
-                        // CPU 判据已在前置分支挡住静默思考，3s 就够判定
-                        // 「输出确实停了」→ 真实完成通知延迟压回 3 秒级。
-                        && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
-                    {
-                        // 输出已结束（连续 3s 零输出且 CPU 静默）+ 未查看 → ✅
-                        Some("✅")
                     } else {
                         None
                     };
