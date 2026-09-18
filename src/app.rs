@@ -26,27 +26,28 @@ const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// 兜底捕获无事件干系的状态推进（任务完成通知稳定窗口、状态栏倒计时等）。
 const IDLE_HEARTBEAT_MS: u64 = 500;
 
-/// TUI 状态检测阈值（页签图标 / 完成通知判定）。准确性优先：宁可晚几秒
-/// 提醒，绝不把「还在运行」误报成「任务完成 / 等待你的选择」。
+/// TUI 状态检测阈值（页签图标 / 完成通知判定）。准确性优先，但拒绝
+/// 「拉长静默阈值」式消误报——那会把真实完成的通知推迟到十几秒。
+/// 「还在运行」的正确证据是进程树在消耗 CPU（session::tree_cpu_active）：
+/// Agent 静默思考/编译/搜索/打包都是 CPU 活跃，只是终端没输出。
 ///
 /// 误报成因复盘：
-/// - 旧 content_fresh=3s：TUI 静默 >3 秒（长思考/链接/等网络）就掉出
-///   「活跃」，落入 ✅「输出结束」——但进程其实还在跑。
-/// - 旧 ✅ 分支只有 `count>0 && !viewed`，没有任何「输出确实停止」的
-///   时间判据：字节一静 500ms 就亮 ✅。
-/// - 旧 DONE_STABLE_MS=2s：✅/✏️ 稳定 2 秒就弹系统通知 + 任务栏闪烁，
-///   周期输出间隙（web 抓取、编译间歇、进度暂停）>2s 就误报。
+/// - 旧 ✅ 分支只有 `count>0 && !viewed`，无「输出确实停止」时间判据，
+///   字节一静 500ms 就亮 ✅。
+/// - 旧 DONE_STABLE_MS=2s：周期输出间隙 >2s 就弹「任务完成」，实为还在跑。
+/// - 旧 content_fresh=3s：TUI 静默 >3s（思考/链接）掉出「活跃」落 ✅。
 ///
-/// 现阈值：
-/// - CONTENT_FRESH_MS=30s：网格最近 30 秒内有实质变化都算「活跃」，
-///   ✏️ 持续更久，不急着判完成。
-/// - OUTPUT_END_MS=15s：✅ 必须「连续 15 秒零字节输出」才判定输出结束；
-///   只是暂时静默（仍会输出）时保持无图标/✏️，绝不落 ✅。
-/// - DONE_STABLE_MS=10s：通知/闪烁需在 ✅/✏️ 稳定停留 10 秒，周期输出
-///   的间隙横跳会不断重置计时，基本不再误触。
+/// 现方案：
+/// - 🔄 判定扩为「网格在变 或 进程树近 3s 有 CPU 增量」——静默思考期间
+///   保持 🔄，绝不落 ✅/✏️（CPU 判据见 session.rs tree_cpu_active）。
+/// - OUTPUT_END_MS=3s：✅ 需连续 3s 零字节输出 + CPU 静默 + 网格静止。
+/// - DONE_STABLE_MS=2s：通知/闪烁需在 ✅/✏️ 稳定停留 2 秒；实际通知延迟：
+///   ✏️ 路径约 2.5s（0.5s 静默入场 + 2s 稳定），✅ 路径约 5s。
+/// - CONTENT_FRESH_MS=30s：✏️「等待选择」需网格近 30s 有过实质变化，
+///   CPU 静默挡静默思考，时长只影响图标形态、不影响通知延迟。
 const CONTENT_FRESH_MS: u64 = 30_000;
-const OUTPUT_END_MS: u64 = 15_000;
-const DONE_STABLE_MS: u64 = 10_000;
+const OUTPUT_END_MS: u64 = 3_000;
+const DONE_STABLE_MS: u64 = 2_000;
 
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1758,40 +1759,49 @@ impl ClientApp {
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let any_silent = now_ms.saturating_sub(last_out) > 500;
+                    // ── 进程树 CPU 活动：Agent 静默思考/编译/搜索等「无输出但
+                    //    仍在计算」的硬判据（session::tree_cpu_active，Toolhelp32
+                    //    快照采样会话进程树 CPU 增量）。它才是「还在运行」的
+                    //    证据——有它就不需要靠十几秒的静默阈值换准确性。 ──
+                    let cpu_busy = session::tree_cpu_active(s.pid, now_ms);
                     // 图标逻辑：
                     //   ❌ 已退出
-                    //   🔄 会话启动中 / 正在输出
+                    //   🔄 会话启动中 / 正在输出 / 进程树在计算（静默思考等）
                     //   ✏️ TUI 空闲等待用户输入
                     //   ✅ 输出结束（本轮对话完成，点击页签后消失）
                     let icon: Option<&str> = if s.exited.load(Ordering::Relaxed) {
                         Some("❌")
                     } else if s.loading.load(Ordering::Relaxed) {
                         Some("🔄")
-                    } else if !content_silent && count > 0 {
-                        // 网格内容在变化 → 正在输出 🔄
+                    } else if count > 0 && (!content_silent || cpu_busy) {
+                        // 网格内容在变化，或进程树最近 3s 在消耗 CPU
+                        // （Agent 静默思考/长编译/搜索）→ 正在运行 🔄。
+                        // 旧版只认网格变化：静默期（思考/链接）被误判完成。
                         Some("🔄")
                     } else if is_tui
                         && cursor_vis
                         && any_silent     // 字节级静止：最近 500ms 无任何输出
                         && content_silent  // 网格级静止：格子 500ms 无变化
                         && content_fresh
+                        && !cpu_busy      // CPU 也静默：真在等用户，不是在算
                         && count > 0
                     {
-                        // TUI 空闲 + 光标可见 + 字节/网格双静止 = 等待用户输入。
+                        // TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止 = 等待用户输入。
                         // any_silent 挡动画与周期重绘：进程只要还在输出（无论内容
-                        // 是否重复）就不算等待，内容不变的 watch/重绘不再误判；
-                        // content_silent 挡字节稀疏但网格在变的慢速输出。
+                        // 是否重复）就不算等待；content_silent 挡字节稀疏但网格在
+                        // 变的慢速输出；cpu_busy 挡静默思考（此刻 TUI 恰好不画动画）。
                         // （排除会话结束后 shell 空闲停在提示符的情况）
                         Some("✏️")
                     } else if count > 0
                         && !viewed
                         && content_silent
+                        && !cpu_busy
                         // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
-                        // 旧版缺此判据，字节一静 500ms 就亮 ✅——长任务静默期
-                        // （web 抓取/长编译/Agent 思考）被误报「任务完成」。
+                        // CPU 判据已在前置分支挡住静默思考，这里 3s 就够判定
+                        // 「输出确实停了」→ 真实完成的通知延迟压回 3 秒级。
                         && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
                     {
-                        // 输出已结束（连续 15s 零输出）+ 未查看 → ✅
+                        // 输出已结束（连续 3s 零输出且 CPU 静默）+ 未查看 → ✅
                         Some("✅")
                     } else {
                         None
@@ -1800,16 +1810,16 @@ impl ClientApp {
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
                     // 「执行完成」提醒：页签进入 ✅（输出结束待查看）/ ✏️（TUI
-                    // 等待选择）状态后需稳定停留 DONE_STABLE_MS（10s）才弹系统通知
-                    // + 任务栏闪烁（done_notified 去重，只提示一次）。稳定窗口拉长
-                    // 过滤误触发：top/watch/编译间歇输出等周期性进程在 🔄↔✏️/✅ 间
-                    // 横跳，每次横跳都重置计时，永远到不了窗口 → 不弹；真正完成的
-                    // 任务（输出停止 10 秒以上）只弹一次。准确性优先：宁可晚几秒
-                    // 提醒，不把「还在跑」误报成「完成」。仅当「当前页签且应用在
-                    // 前台」（用户正盯着）才静默；当前页签但应用在后台（焦点在别的
-                    // 窗口）→ 用户没在看，照常计时弹通知 + 闪烁，与 update_exited
-                    // 的「运行结束」语义一致。图标离开这两个状态时重置，下一轮输出
-                    // 完成再提示。
+                    // 等待选择）状态后需稳定停留 DONE_STABLE_MS（2s）才弹系统通知
+                    // + 任务栏闪烁（done_notified 去重，只提示一次）。稳定窗口过滤
+                    // 误触发：top/watch/编译间歇输出等进程在 🔄↔✏️/✅ 间横跳时
+                    // 重置计时；「还在跑」由前置的进程树 CPU 判据（cpu_busy）挡在
+                    // 🔄，所以短稳定窗口就够区分真实完成与周期性输出——通知延迟保持
+                    // 在 3 秒级，不再用十几秒的静默阈值换准确性。仅当
+                    // 「当前页签且应用在前台」（用户正盯着）才静默；当前页签但应用
+                    // 在后台（焦点在别的窗口）→ 用户没在看，照常计时弹通知 + 闪烁，
+                    // 与 update_exited 的「运行结束」语义一致。图标离开这两个状态
+                    // 时重置，下一轮输出完成再提示。
                     if matches!(icon, Some("✅") | Some("✏️")) {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
                         if i == self.current && app_fg {
@@ -3195,7 +3205,7 @@ impl ClientApp {
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 需稳定停留 10 秒（准确性优先，宁可晚提醒也不误报）才弹「任务完成/等待选择」通知，周期性输出进程（top/watch/编译间歇）不会误报。").weak());
+        ui.label(RichText::new("✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 稳定停留 2 秒即弹「任务完成/等待选择」通知；进程树 CPU 活跃（静默思考/编译）会保持 🔄 不误报，周期输出横跳会重置计时。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
