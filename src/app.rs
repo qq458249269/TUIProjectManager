@@ -26,6 +26,28 @@ const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// 兜底捕获无事件干系的状态推进（任务完成通知稳定窗口、状态栏倒计时等）。
 const IDLE_HEARTBEAT_MS: u64 = 500;
 
+/// TUI 状态检测阈值（页签图标 / 完成通知判定）。准确性优先：宁可晚几秒
+/// 提醒，绝不把「还在运行」误报成「任务完成 / 等待你的选择」。
+///
+/// 误报成因复盘：
+/// - 旧 content_fresh=3s：TUI 静默 >3 秒（长思考/链接/等网络）就掉出
+///   「活跃」，落入 ✅「输出结束」——但进程其实还在跑。
+/// - 旧 ✅ 分支只有 `count>0 && !viewed`，没有任何「输出确实停止」的
+///   时间判据：字节一静 500ms 就亮 ✅。
+/// - 旧 DONE_STABLE_MS=2s：✅/✏️ 稳定 2 秒就弹系统通知 + 任务栏闪烁，
+///   周期输出间隙（web 抓取、编译间歇、进度暂停）>2s 就误报。
+///
+/// 现阈值：
+/// - CONTENT_FRESH_MS=30s：网格最近 30 秒内有实质变化都算「活跃」，
+///   ✏️ 持续更久，不急着判完成。
+/// - OUTPUT_END_MS=15s：✅ 必须「连续 15 秒零字节输出」才判定输出结束；
+///   只是暂时静默（仍会输出）时保持无图标/✏️，绝不落 ✅。
+/// - DONE_STABLE_MS=10s：通知/闪烁需在 ✅/✏️ 稳定停留 10 秒，周期输出
+///   的间隙横跳会不断重置计时，基本不再误触。
+const CONTENT_FRESH_MS: u64 = 30_000;
+const OUTPUT_END_MS: u64 = 15_000;
+const DONE_STABLE_MS: u64 = 10_000;
+
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -1720,7 +1742,7 @@ impl ClientApp {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    // ── TUI 状态检测 ──
+                    // ── TUI 状态检测（准确性优先：宁可晚判定，不误报） ──
                     let is_tui = s.alt_screen.load(Ordering::Relaxed);
                     let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
                     let last_content = s.last_grid_change_ms.load(Ordering::Relaxed);
@@ -1729,8 +1751,10 @@ impl ClientApp {
                     // → 内容新鲜；只有真正静止等待输入时才静默。比字节级可打印内容
                     // 判据更接近真值，思考动画期不再被误判为「等待你的选择」。
                     let content_silent = now_ms.saturating_sub(last_content) > 500;
-                    // 内容新鲜度：最近 3 秒内网格有过实质变化 → TUI 活跃。
-                    let content_fresh = now_ms.saturating_sub(last_content) < 3000;
+                    // 内容新鲜度：最近 CONTENT_FRESH_MS 内网格有过实质变化 → 仍活跃。
+                    // 拉长到 30s：TUI 静默思考/链接/等网络期间不掉出「活跃」，
+                    // 避免静默 >3s 就被误判成「输出结束」。
+                    let content_fresh = now_ms.saturating_sub(last_content) < CONTENT_FRESH_MS;
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let any_silent = now_ms.saturating_sub(last_out) > 500;
@@ -1759,8 +1783,15 @@ impl ClientApp {
                         // content_silent 挡字节稀疏但网格在变的慢速输出。
                         // （排除会话结束后 shell 空闲停在提示符的情况）
                         Some("✏️")
-                    } else if count > 0 && !viewed {
-                        // 输出已结束 + 未查看 → ✅
+                    } else if count > 0
+                        && !viewed
+                        && content_silent
+                        // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
+                        // 旧版缺此判据，字节一静 500ms 就亮 ✅——长任务静默期
+                        // （web 抓取/长编译/Agent 思考）被误报「任务完成」。
+                        && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
+                    {
+                        // 输出已结束（连续 15s 零输出）+ 未查看 → ✅
                         Some("✅")
                     } else {
                         None
@@ -1769,15 +1800,16 @@ impl ClientApp {
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
                     // 「执行完成」提醒：页签进入 ✅（输出结束待查看）/ ✏️（TUI
-                    // 等待选择）状态后需稳定停留 DONE_STABLE_MS 才弹系统通知 + 任务栏
-                    // 闪烁（done_notified 去重，只提示一次）。稳定窗口过滤误触发：
-                    // top/watch/编译间歇输出等周期性进程在 🔄↔✏️/✅ 间横跳，每次横跳
-                    // 都重置计时，永远到不了窗口 → 不弹；真正完成的任务（输出停止
-                    // 2 秒以上）只弹一次。仅当「当前页签且应用在前台」（用户正盯着）
-                    // 才静默；当前页签但应用在后台（焦点在别的窗口）→ 用户没在看，
-                    // 照常计时弹通知 + 闪烁，与 update_exited 的「运行结束」语义一致。
-                    // 图标离开这两个状态时重置，下一轮输出完成再提示。
-                    const DONE_STABLE_MS: u64 = 2000;
+                    // 等待选择）状态后需稳定停留 DONE_STABLE_MS（10s）才弹系统通知
+                    // + 任务栏闪烁（done_notified 去重，只提示一次）。稳定窗口拉长
+                    // 过滤误触发：top/watch/编译间歇输出等周期性进程在 🔄↔✏️/✅ 间
+                    // 横跳，每次横跳都重置计时，永远到不了窗口 → 不弹；真正完成的
+                    // 任务（输出停止 10 秒以上）只弹一次。准确性优先：宁可晚几秒
+                    // 提醒，不把「还在跑」误报成「完成」。仅当「当前页签且应用在
+                    // 前台」（用户正盯着）才静默；当前页签但应用在后台（焦点在别的
+                    // 窗口）→ 用户没在看，照常计时弹通知 + 闪烁，与 update_exited
+                    // 的「运行结束」语义一致。图标离开这两个状态时重置，下一轮输出
+                    // 完成再提示。
                     if matches!(icon, Some("✅") | Some("✏️")) {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
                         if i == self.current && app_fg {
@@ -3163,7 +3195,7 @@ impl ClientApp {
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 稳定停留 2 秒才弹「任务完成/等待选择」通知，周期性输出进程（top/watch/编译间歇）不会误报。").weak());
+        ui.label(RichText::new("✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 需稳定停留 10 秒（准确性优先，宁可晚提醒也不误报）才弹「任务完成/等待选择」通知，周期性输出进程（top/watch/编译间歇）不会误报。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
