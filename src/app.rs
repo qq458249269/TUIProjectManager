@@ -415,14 +415,18 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
 fn log_update(_msg: &str) {}
 
 /// 用 curl 请求 URL 并解析 JSON 中的 tag_name。
+/// connect_timeout / max_time（秒）由调用方决定：镜像请求收紧（4s/10s）
+/// 保证坏镜像几秒内跳过、检查不拖慢；直连 GitHub 放宽（8s/15s）。
 /// 返回 Ok(tag) 或 Err(错误描述)。
-fn fetch_tag_from_url(url: &str) -> Result<String, String> {
+fn fetch_tag_from_url(url: &str, connect_timeout: u64, max_time: u64) -> Result<String, String> {
     let mut cmd = std::process::Command::new("curl");
+    let ct = connect_timeout.to_string();
+    let mt = max_time.to_string();
     cmd.args([
         // 直连下载：强制绕过 ~/.curlrc / 环境变量里的本地代理。
         // 本机曾因 .curlrc 残留 Clash 127.0.0.1:7897 导致所有 curl 走代理、
         // 隧道握手失败，检查更新/下载一律报「网络错误」。
-        "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "-s", "-f", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
         "--proxy", "", "--noproxy", "*",
         "-H", "User-Agent: TUIProjectManager",
         url,
@@ -446,13 +450,33 @@ fn fetch_tag_from_url(url: &str) -> Result<String, String> {
 }
 
 /// 拉取最新版本号。多源级联避免 GitHub API 限流（60 次/时）导致误报：
-/// ① /releases/latest 的 302 重定向目标（HTML 端点，无限流）取最新 tag；
-/// ② 重定向失败时回退 api.github.com 的 releases/latest JSON；
-/// ③ 直连失败时依次尝试 GH_MIRRORS 镜像代理 API。
+/// ① 默认优先：GH_MIRRORS 国内镜像代理 API 轮流试——镜像 CDN 缓存、大陆
+///    延迟低（大陆直连 GitHub 慢/被墙），逐个轮询、坏镜像几秒内自动跳过；
+/// ② 镜像全挂回退 github.com /releases/latest 的 302 重定向目标取 tag
+///    （HTML 端点，无限流）；
+/// ③ 最后回退 api.github.com 的 releases/latest JSON。
 /// 返回（状态栏消息, 有新版本时的 tag）。
 fn fetch_latest_release() -> (String, Option<String>) {
-    // 源①：HTML 重定向。curl 不加 -L，从 redirect_url 里取 tag；
-    // HTTP 非 2xx/3xx 时 -f 会报错 → 链路不通 → 回退源②。
+    // 源①（默认）：国内镜像代理 API，轮流加速。镜像前缀 + 原始 API URL
+    // 组成代理地址，多个镜像按可靠性排序轮询；超时收紧（connect 4s /
+    // 总 10s）保证「没延迟」——某个镜像挂了会在几秒内跳过，不拖慢检查。
+    let api_url =
+        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
+    for mirror in GH_MIRRORS {
+        let proxy_url = format!("{mirror}{api_url}");
+        match fetch_tag_from_url(&proxy_url, 4, 10) {
+            Ok(tag) => {
+                log_update(&format!("检查更新 镜像① {mirror} 成功 → tag {tag}"));
+                let msg = version_message(&tag);
+                return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
+            }
+            Err(e) => {
+                log_update(&format!("检查更新 镜像① {mirror} 失败: {e}"));
+            }
+        }
+    }
+    // 源②：直连 HTML 重定向。curl 不加 -L，从 redirect_url 里取 tag；
+    // HTTP 非 2xx/3xx 时 -f 会报错 → 链路不通 → 回退源③。
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-s", "-f",
@@ -479,49 +503,32 @@ fn fetch_latest_release() -> (String, Option<String>) {
         if let Some(pos) = url.find("/releases/tag/") {
             let tag = url[pos + "/releases/tag/".len()..].trim().to_string();
             if !tag.is_empty() {
-                log_update(&format!("检查更新 源① HTML 重定向 → tag {tag}"));
+                log_update(&format!("检查更新 源② HTML 重定向 → tag {tag}"));
                 let msg = version_message(&tag);
                 return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
             }
         }
-        log_update(&format!("检查更新 源① HTML 返回但未解析出 tag（redirect={url}）"));
+        log_update(&format!("检查更新 源② HTML 返回但未解析出 tag（redirect={url}）"));
     } else if let Err(e) = &out {
-        log_update(&format!("检查更新 源① 启动 curl 失败: {e}"));
+        log_update(&format!("检查更新 源② 启动 curl 失败: {e}"));
     } else if let Ok(o) = &out {
         log_update(&format!(
-            "检查更新 源① HTML 非 2xx/3xx（HTTP {}）",
+            "检查更新 源② HTML 非 2xx/3xx（HTTP {}）",
             o.status.code().unwrap_or(0)
         ));
     }
-    // 源②：回退 GitHub API（可能触发限流，此时会明确报错而非误报已最新）。
-    let api_url =
-        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
-    match fetch_tag_from_url(api_url) {
+    // 源③：最后回退 GitHub API（可能触发限流，此时会明确报错而非误报已最新）。
+    match fetch_tag_from_url(api_url, 8, 15) {
         Ok(tag) => {
-            log_update(&format!("检查更新 源② API 成功 → tag {tag}"));
+            log_update(&format!("检查更新 源③ API 成功 → tag {tag}"));
             let msg = version_message(&tag);
             return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
         }
         Err(e) => {
-            log_update(&format!("检查更新 源② API 失败: {e}"));
+            log_update(&format!("检查更新 源③ API 失败: {e}"));
         }
     }
-    // 源③：直连 GitHub 全部失败，依次尝试加速镜像代理 API。
-    // 镜像前缀 + 原始 API URL 组成代理地址，适用于中国大陆等 GitHub 受限网络。
-    for mirror in GH_MIRRORS {
-        let proxy_url = format!("{mirror}{api_url}");
-        match fetch_tag_from_url(&proxy_url) {
-            Ok(tag) => {
-                log_update(&format!("检查更新 镜像 {mirror} 成功 → tag {tag}"));
-                let msg = version_message(&tag);
-                return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
-            }
-            Err(e) => {
-                log_update(&format!("检查更新 镜像 {mirror} 失败: {e}"));
-            }
-        }
-    }
-    ("检查更新失败：网络错误（已绕过本地代理直连，请检查网络连接或加速工具如 Steam++）".to_string(), None)
+    ("检查更新失败：网络错误（镜像①与直连②③均失败，请检查网络连接或加速工具如 Steam++）".to_string(), None)
 }
 
 /// 根据 tag 与本地版本比较生成状态栏消息。
@@ -670,15 +677,16 @@ fn download_update(
             0,
         ),
     };
-    // ── 候选下载链：原始直链 + 常见加速镜像，逐个尝试 ──
-    // 每个文件名候选先打原始直链，再打各镜像；全部失败才报错交给上层
+    // ── 候选下载链：常见加速镜像 + 原始直链，逐个尝试 ──
+    // 与检查更新一致，默认先走国内镜像（CDN 缓存热文件、大陆延迟低）；
+    // 每个文件名候选先打各镜像，全部失败才打原始直链，再交给上层
     // 3 秒重试。GitHub 直链对未知文件名返回 404，先试真实名（必中）。
     let mut attempts: Vec<(String, String)> = Vec::new();
     for (url, name) in fallback {
-        attempts.push((url.clone(), name.clone()));
         for mirror in GH_MIRRORS {
             attempts.push((format!("{mirror}{url}"), name.clone()));
         }
+        attempts.push((url.clone(), name.clone()));
     }
     log_update(&format!(
         "下载 开始尝试 {} 个候选链（tag={tag}，total={total}）：{}",
@@ -714,13 +722,20 @@ fn download_update(
     Err(format!("所有下载源失败：{}", parts.join("；")))
 }
 
-/// GitHub release 下载加速镜像（前缀拼接原始 github.com 直链，如
-/// 下载单个文件：通过 curl 下载到 dest_dir/{asset_name}.new，支持断点续传和取消。
-/// 列表换成当前可用的即可，补一个零成本、挂了自动跳过。
+/// GitHub Release 检查/下载加速镜像（前缀拼接原始 github.com 或
+/// api.github.com 直链，如 {mirror}https://github.com/...）。大陆直连 GitHub
+/// 慢/被墙，镜像 CDN 缓存、延迟低；按可靠性排序，检查与下载都先打镜像、
+/// 逐个轮询，挂了自动跳到下一个，全挂才回退原始直链。列表换成当前可用
+/// 即可，多放几个零成本、坏节点自动跳过。
 const GH_MIRRORS: &[&str] = &[
-    "https://ghfast.top/",
-    "https://gh-proxy.com/",
-    "https://ghproxy.net/",
+    "https://ghfast.top/",       // ghproxy 继任（v2），CDN 缓存，延迟低
+    "https://gh-proxy.com/",     // 热门前缀代理，带缓存
+    "https://ghproxy.net/",      // ghproxy 系实例
+    "https://ghps.cc/",          // 极速代理
+    "https://github.moeyy.xyz/", // moeyy CDN
+    "https://gh.ddlc.top/",      // moeyy CDN 备用节点
+    "https://ghproxy.cc/",       // 备用
+    "https://gh-proxy.net/",     // 备用
 ];
 
 /// 用 curl 把单个 URL 下载到 dest_dir/{asset_name}.new，轮询文件大小报告进度。
