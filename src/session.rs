@@ -149,6 +149,11 @@ pub struct Session {
     pub last_output_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
+    /// 累计实质输出字节数（非动画块的可打印字节，读取线程写、UI 线程读）。
+    /// 通知过滤判据：会话从未显示过实质内容（纯零输出/秒退/仅 spinner 动画，
+    /// 动画不属于可打印字节）时，「运行结束」/「任务完成」都不弹通知
+    /// （见 app.rs MIN_OUTPUT_BYTES）。
+    pub out_bytes: Arc<AtomicU64>,
     /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
     pub has_been_viewed: Arc<AtomicBool>,
     /// 终端是否处于备用屏（ALT_SCREEN / DECSET 1049）。
@@ -886,6 +891,7 @@ pub fn spawn(
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<TermCommand>();
 
     let output_count = Arc::new(AtomicU32::new(0));
+    let out_bytes = Arc::new(AtomicU64::new(0));
     let loading = Arc::new(AtomicBool::new(true));
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -906,6 +912,7 @@ pub fn spawn(
         let reader_exited = exited.clone();
         let osc_theme_aware = osc_theme_aware.clone();
         let output_count = output_count.clone();
+        let reader_out_bytes = out_bytes.clone();
         let last_output_ms = last_output_ms.clone();
         let last_grid_change_ms = last_grid_change_ms.clone();
         let reader_input_ms = last_input_ms.clone();
@@ -1009,6 +1016,9 @@ pub fn spawn(
                             || (esc_ratio > 0.5 && n < 200)
                             || esc_ratio > 0.8;
                         if !is_animation {
+                            // 累计实质输出字节（非动画块的可打印字节）：
+                            // 「任务完成」/「运行结束」通知的过滤判据。
+                            reader_out_bytes.fetch_add(printable as u64, Ordering::Relaxed);
                             // 首次有实际内容输出 → 标记加载完成，停止旋转动画。
                             if reader_loading.load(Ordering::Relaxed) {
                                 reader_loading.store(false, Ordering::Relaxed);
@@ -1218,6 +1228,7 @@ pub fn spawn(
         last_grid_change_ms,
         last_clipboard_seq: None,
         output_count,
+        out_bytes,
         last_output_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
         alt_screen: Arc::new(AtomicBool::new(false)),

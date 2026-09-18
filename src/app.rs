@@ -52,6 +52,14 @@ const INPUT_ACTIVE_MS: u64 = 1_500;
 const OUTPUT_END_MS: u64 = 3_000;
 const DONE_STABLE_MS: u64 = 2_000;
 
+/// 通知过滤阈值：会话累计实质输出字节数（非动画块的可打印字节，见
+/// session.rs out_bytes）不足此值时，「运行结束」/「任务完成」一律不弹通知。
+/// 过滤目标：终端零输入零输出、界面无任何变化却突然弹「完成」的误报——
+/// bare shell 提示符（一二十字节）、秒退命令、纯 spinner 动画（动画不计入
+/// 可打印字节）都不构成用户可看的内容；任何一行真实命令输出（>32 字节）
+/// 即达标，正常任务完成提醒不受影响。
+const MIN_OUTPUT_BYTES: u64 = 32;
+
 /// 首页里的两个子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -1711,11 +1719,12 @@ impl ClientApp {
                     && !s.notified.swap(true, Ordering::Relaxed)
                     && !(i == self.current && crate::app_is_foreground(self.titlebar_hwnd))
                 {
-                    // 启动宽限期：创建后一分钟内退出也静默（刚启动就崩/秒退
-                    // 不打扰），notified 已置位因此宽限期后也不会补弹。
-                    if now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
-                        >= STARTUP_GRACE_MS
-                    {
+            // 启动宽限期：创建后一分钟内退出也静默（刚启动就崩/秒退
+            // 不打扰），notified 已置位因此宽限期后也不会补弹。
+            if s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
+                && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
+                    >= STARTUP_GRACE_MS
+            {
                         crate::notify_run_finished(&s.title, "运行结束");
                         crate::flash_taskbar(self.titlebar_hwnd);
                     }
@@ -2001,6 +2010,7 @@ impl ClientApp {
                         } else if since == 0 {
                             s.done_since_ms.store(now_ms, Ordering::Relaxed);
                         } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
+                            && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
                             && !s.done_notified.swap(true, Ordering::Relaxed)
                         {
                             // 启动宽限期：刚启动的会话（含其首轮输出）不弹通知/闪烁，
