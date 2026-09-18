@@ -37,15 +37,18 @@ const IDLE_HEARTBEAT_MS: u64 = 500;
 /// - 旧 DONE_STABLE_MS=2s：周期输出间隙 >2s 就弹「任务完成」，实为还在跑。
 /// - 旧 content_fresh=3s：TUI 静默 >3s（思考/链接）掉出「活跃」落 ✅。
 ///
-/// 现方案：
-/// - 🔄 判定扩为「网格在变 或 进程树近 3s 有 CPU 增量」——静默思考期间
-///   保持 🔄，绝不落 ✅/✏️（CPU 判据见 session.rs tree_cpu_active）。
+/// 现方案（页签运行态图标只保留 空 / 🔄 / ✅ 三态，原 ✏️「等待输入」并入空；
+/// ❌ 已退出单独保留、不随此判断改变）：
+/// - 🔄 判定为「网格在变 或 进程树近 3s 有 CPU 增量」——静默思考期间
+///   保持 🔄，绝不误落 ✅（CPU 判据见 session.rs tree_cpu_active）。
+/// - 🔄 的唯一例外：用户刚在终端里输入（按键/粘贴/IME，last_input_ms 距今
+///   不足 INPUT_ACTIVE_MS）→ 回显与格内刷新是输入驱动，不是任务在跑 → 空，
+///   修复「输入时被误判成 🔄」。
+/// - TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止 → 空，且无「内容新鲜度」
+///   时间窗：TUI 挂着等待多久都保持空，不会因长时间静默翻成 ✅。
 /// - OUTPUT_END_MS=3s：✅ 需连续 3s 零字节输出 + CPU 静默 + 网格静止。
-/// - DONE_STABLE_MS=2s：通知/闪烁需在 ✅/✏️ 稳定停留 2 秒；实际通知延迟：
-///   ✏️ 路径约 2.5s（0.5s 静默入场 + 2s 稳定），✅ 路径约 5s。
-/// - CONTENT_FRESH_MS=30s：✏️「等待选择」需网格近 30s 有过实质变化，
-///   CPU 静默挡静默思考，时长只影响图标形态、不影响通知延迟。
-const CONTENT_FRESH_MS: u64 = 30_000;
+/// - DONE_STABLE_MS=2s：通知/闪烁需在 ✅ 稳定停留 2 秒；实际通知延迟约 5s。
+const INPUT_ACTIVE_MS: u64 = 1_500;
 const OUTPUT_END_MS: u64 = 3_000;
 const DONE_STABLE_MS: u64 = 2_000;
 
@@ -771,15 +774,56 @@ fn download_one(
     }
 }
 
-/// 把已下载的 .new 文件安装到正式名 exe，处理 Windows 下目标被占用的场景。
+/// 带指数退避的 rename 重试。Windows 下杀软/Defender 实时扫描会短暂持有
+/// 源或目标文件的句柄（未授予 FILE_SHARE_DELETE），rename 因此报拒绝访问
+/// （os error 5）；扫描大多几秒内结束，等待后重试即可成功。
+/// progress_msg 每 report_every 次尝试向状态栏发一条进度提示——注意消息
+/// 不能含「失败」字样：UI 按该关键字复位 downloading 状态，会干扰安装。
+/// 返回 Ok(()) 或 deadline 耗尽时的最后一次错误。
+fn retry_rename(
+    src: &Path,
+    dst: &Path,
+    deadline: std::time::Duration,
+    status_tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
+    redraw_tx: &std::sync::mpsc::SyncSender<()>,
+    progress_msg: &str,
+    report_every: usize,
+) -> std::io::Result<()> {
+    let start = std::time::Instant::now();
+    let mut wait_ms: u64 = 300;
+    let mut attempt = 0usize;
+    loop {
+        match std::fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                log_update(&format!(
+                    "替换 重试 rename {src:?}→{dst:?} 第 {attempt} 次失败: {e}"
+                ));
+                if report_every > 0 && attempt % report_every == 0 {
+                    let _ =
+                        status_tx.send((format!("{progress_msg}（等待系统释放…）"), None));
+                    let _ = redraw_tx.try_send(());
+                }
+                if start.elapsed() >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                wait_ms = (wait_ms * 2).min(2000);
+            }
+        }
+    }
+}
+
+/// 把已下载的 .new 文件安装到正式名 exe，处理 Windows 下目标/源被占用的场景。
 ///
 /// Windows 规则：运行中的映像文件允许 rename（Vista+），但禁止原地替换/删除。
-/// 因此当 rename(.new → 正式名) 因目标被占用而失败（拒绝访问 os error 5 ——
-/// 可能是本进程映像未被 unlock_exe 挪走、双开实例、或杀软瞬时句柄）时：
-/// 1) 快路径：直接替换并带重试，等杀软/Defender 释放目标；
-/// 2) 慢路径：把正式名先 rename 到 .old 腾出名字（运行中的映像也可 rename，
-///    .old 兼作旧版备份），再放入新文件；失败自动回滚，正式名始终可用。
-/// 返回是否安装成功。
+/// 替换链路的任一步都可能撞上杀软瞬时句柄（拒绝访问 os error 5），因此：
+/// 1) 快路径：直接 rename(.new → 正式名)，带 ~10s 退避重试等杀软释放；
+/// 2) 慢路径：正式名仍被占用时，先 rename(正式名 → .old) 腾名（运行中的
+///    映像也可 rename，.old 兼作旧版备份），再放入新文件——最后一步是
+///    最常失败处（刚下载完的 .new 正被 Defender 扫描），给足 ~20s 重试；
+/// 失败自动回滚，正式名始终可用。返回是否安装成功。
 fn install_update(
     new_file: &Path,
     final_path: &Path,
@@ -797,34 +841,44 @@ fn install_update(
         let _ = redraw_tx.try_send(());
         return false;
     }
-    // 1) 快路径：正式名空闲 → 直接替换。带重试：杀软/Defender 扫描时会短暂
-    //    占用正式名或 .new（拒绝访问 os error 5），等它释放。
-    for i in 0..5 {
-        match std::fs::rename(new_file, final_path) {
-            Ok(()) => return true,
+    // 1) 快路径：正式名空闲 → 直接替换。~10s 重试窗口：杀软/Defender 扫描
+    //    刚下载完的 .new 或正式名副本（拒绝访问 os error 5），等它释放。
+    if retry_rename(
+        new_file,
+        final_path,
+        std::time::Duration::from_secs(10),
+        status_tx,
+        redraw_tx,
+        "正在替换 exe",
+        4,
+    )
+    .is_ok()
+    {
+        return true;
+    }
+    // 2) 慢路径：正式名仍被占用。先清掉旧 .old（避免 rename 目标被占，
+    //    遇到杀软持有旧 .old 时也带重试等待），再把正式名 rename 走腾出
+    //    名字；运行中的映像也允许 rename。
+    for i in 0..10 {
+        match std::fs::remove_file(old_path) {
+            Ok(()) => break,
             Err(e) => {
-                log_update(&format!("替换 直接替换第 {} 次失败: {e}", i + 1));
+                log_update(&format!("替换 清理旧 .old 第 {} 次失败: {e}", i + 1));
                 std::thread::sleep(std::time::Duration::from_millis(400));
             }
         }
     }
-    // 2) 慢路径：正式名仍被占用。先清掉旧 .old（避免 rename 目标被占），
-    //    再把正式名 rename 走腾出名字；运行中的映像也允许 rename。
-    let _ = std::fs::remove_file(old_path);
-    let mut moved = false;
-    for _ in 0..5 {
-        match std::fs::rename(final_path, old_path) {
-            Ok(()) => {
-                moved = true;
-                break;
-            }
-            Err(e) => {
-                log_update(&format!("替换 挪走占用目标失败: {e}"));
-                std::thread::sleep(std::time::Duration::from_millis(400));
-            }
-        }
-    }
-    if !moved {
+    if retry_rename(
+        final_path,
+        old_path,
+        std::time::Duration::from_secs(8),
+        status_tx,
+        redraw_tx,
+        "正在挪开旧版本",
+        4,
+    )
+    .is_err()
+    {
         let msg = format!(
             "替换失败: 正式名 {final_path:?} 一直被其他进程占用（多为杀软扫描或另一个正在运行的实例），新文件保留在 {new_file:?}，请稍后重试"
         );
@@ -832,14 +886,44 @@ fn install_update(
         let _ = redraw_tx.try_send(());
         return false;
     }
-    match std::fs::rename(new_file, final_path) {
+    // 3) 最后一步：把 .new 放进腾出的正式名。这是最常失败的一步——刚下载
+    //    完的 .new 正被 Defender 实时扫描，给它 ~20s 重试窗口。
+    match retry_rename(
+        new_file,
+        final_path,
+        std::time::Duration::from_secs(20),
+        status_tx,
+        redraw_tx,
+        "正在放入新版本",
+        4,
+    ) {
         Ok(()) => true,
         Err(e) => {
             // 回滚：把挪走的旧映像放回正式名，确保目录里始终有可用 exe。
-            let _ = std::fs::rename(old_path, final_path);
-            let msg = format!(
-                "替换失败: {e}（已自动回滚，正式名保留旧版本；新文件仍在 {new_file:?}）"
+            let _ = retry_rename(
+                old_path,
+                final_path,
+                std::time::Duration::from_secs(5),
+                status_tx,
+                redraw_tx,
+                "正在回滚旧版本",
+                5,
             );
+            // 区分失败原因：20s 后仍失败，多半是 .new 被杀软长时间持有
+            //（写打开再失败即源被占用，与目标名无关）。
+            let src_locked = std::fs::OpenOptions::new()
+                .write(true)
+                .open(new_file)
+                .is_err();
+            let msg = if src_locked {
+                format!(
+                    "替换失败: 新文件 {new_file:?} 持续被其他进程占用（多为杀软/Defender 实时扫描），已回滚保留旧版本；请稍后重试，或将应用目录加入 Windows 安全中心排除项"
+                )
+            } else {
+                format!(
+                    "替换失败: {e}（已自动回滚，正式名保留旧版本；新文件仍在 {new_file:?}）"
+                )
+            };
             let _ = status_tx.send((msg, None));
             let _ = redraw_tx.try_send(());
             false
@@ -1783,7 +1867,7 @@ impl ClientApp {
         // 应用是否前台：每帧取一次（update_exited 的「运行结束」通知同样用它判断）。
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd);
         let slot_w = ui.ctx().fonts_mut(|f| {
-            f.layout_no_wrap("✏️".to_string(), tab_font.clone(), Color32::TRANSPARENT)
+            f.layout_no_wrap("🔄".to_string(), tab_font.clone(), Color32::TRANSPARENT)
                 .size()
                 .x
         });
@@ -1842,10 +1926,8 @@ impl ClientApp {
                     // → 内容新鲜；只有真正静止等待输入时才静默。比字节级可打印内容
                     // 判据更接近真值，思考动画期不再被误判为「等待你的选择」。
                     let content_silent = now_ms.saturating_sub(last_content) > 500;
-                    // 内容新鲜度：最近 CONTENT_FRESH_MS 内网格有过实质变化 → 仍活跃。
-                    // 拉长到 30s：TUI 静默思考/链接/等网络期间不掉出「活跃」，
-                    // 避免静默 >3s 就被误判成「输出结束」。
-                    let content_fresh = now_ms.saturating_sub(last_content) < CONTENT_FRESH_MS;
+                    // 无「内容新鲜度」时间窗：TUI 在等输入/选择时挂多久都是「在等」
+                    // → 空，不会因长时间静默而翻成 ✅（CPU 判据已挡静默思考）。
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let any_silent = now_ms.saturating_sub(last_out) > 500;
@@ -1854,41 +1936,41 @@ impl ClientApp {
                     //    快照采样会话进程树 CPU 增量）。它才是「还在运行」的
                     //    证据——有它就不需要靠十几秒的静默阈值换准确性。 ──
                     let cpu_busy = session::tree_cpu_active(s.pid, now_ms);
-                    // 图标逻辑：
-                    //   ❌ 已退出
+                    // 图标逻辑（仅 空 / 🔄 / ✅ 三态；❌ 已退出独立于状态判断）：
                     //   🔄 会话启动中 / 正在输出 / 进程树在计算（静默思考等）
-                    //   ✏️ TUI 空闲等待用户输入
+                    //   空  TUI 空闲等待输入、用户正在输入（原 ✏️ 状态并入空）
                     //   ✅ 输出结束（本轮对话完成，点击页签后消失）
+                    // 输入驱动判据：最近 INPUT_ACTIVE_MS 内用户向终端输过键。
+                    // last_input_ms 仅键盘/IME/粘贴路径更新（terminal.rs 投递
+                    // bytes_out 时记录），鼠标上报走独立写入不触碰它，悬停/滚动
+                    // 不会误伤。输入期的回显与格内刷新是输入引发、不是任务在跑。
+                    let typing = s.last_input_ms.load(Ordering::Relaxed) != 0
+                        && now_ms.saturating_sub(s.last_input_ms.load(Ordering::Relaxed))
+                            < INPUT_ACTIVE_MS;
                     let icon: Option<&str> = if s.exited.load(Ordering::Relaxed) {
                         Some("❌")
                     } else if s.loading.load(Ordering::Relaxed) {
                         Some("🔄")
                     } else if count > 0 && (!content_silent || cpu_busy) {
-                        // 网格内容在变化，或进程树最近 3s 在消耗 CPU
-                        // （Agent 静默思考/长编译/搜索）→ 正在运行 🔄。
-                        // 旧版只认网格变化：静默期（思考/链接）被误判完成。
-                        Some("🔄")
-                    } else if is_tui
-                        && cursor_vis
-                        && any_silent     // 字节级静止：最近 500ms 无任何输出
-                        && content_silent  // 网格级静止：格子 500ms 无变化
-                        && content_fresh
-                        && !cpu_busy      // CPU 也静默：真在等用户，不是在算
-                        && count > 0
-                    {
-                        // TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止 = 等待用户输入。
-                        // any_silent 挡动画与周期重绘：进程只要还在输出（无论内容
-                        // 是否重复）就不算等待；content_silent 挡字节稀疏但网格在
-                        // 变的慢速输出；cpu_busy 挡静默思考（此刻 TUI 恰好不画动画）。
+                        // 网格内容在变化，或进程树最近 3s 在消耗 CPU（Agent 静默
+                        // 思考/长编译/搜索）→ 正在运行 🔄。旧版只认网格变化：
+                        // 静默期（思考/链接）被误判完成。用户刚输入时除外 → 空。
+                        if typing { None } else { Some("🔄") }
+                    } else if count > 0 && is_tui && cursor_vis && any_silent {
+                        // TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止（前置分支已
+                        // 筛掉 CPU 忙与网格动）= 在等用户输入/选择 → 空。无
+                        // 「内容新鲜度」时间窗：等到任何时候都保持空，不翻 ✅。
+                        // any_silent 挡动画与周期重绘：进程只要还在输出就不算等待。
                         // （排除会话结束后 shell 空闲停在提示符的情况）
-                        Some("✏️")
+                        None
+                    } else if count > 0 && typing {
+                        // 空白 shell / 无回显场景下刚输入过 → 空，不误判 🔄/✅。
+                        None
                     } else if count > 0
                         && !viewed
-                        && content_silent
-                        && !cpu_busy
                         // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
-                        // CPU 判据已在前置分支挡住静默思考，这里 3s 就够判定
-                        // 「输出确实停了」→ 真实完成的通知延迟压回 3 秒级。
+                        // CPU 判据已在前置分支挡住静默思考，3s 就够判定
+                        // 「输出确实停了」→ 真实完成通知延迟压回 3 秒级。
                         && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
                     {
                         // 输出已结束（连续 3s 零输出且 CPU 静默）+ 未查看 → ✅
@@ -1899,22 +1981,21 @@ impl ClientApp {
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
-                    // 「执行完成」提醒：页签进入 ✅（输出结束待查看）/ ✏️（TUI
-                    // 等待选择）状态后需稳定停留 DONE_STABLE_MS（2s）才弹系统通知
-                    // + 任务栏闪烁（done_notified 去重，只提示一次）。稳定窗口过滤
-                    // 误触发：top/watch/编译间歇输出等进程在 🔄↔✏️/✅ 间横跳时
-                    // 重置计时；「还在跑」由前置的进程树 CPU 判据（cpu_busy）挡在
-                    // 🔄，所以短稳定窗口就够区分真实完成与周期性输出——通知延迟保持
-                    // 在 3 秒级，不再用十几秒的静默阈值换准确性。仅当
-                    // 「当前页签且应用在前台」（用户正盯着）才静默；当前页签但应用
-                    // 在后台（焦点在别的窗口）→ 用户没在看，照常计时弹通知 + 闪烁，
-                    // 与 update_exited 的「运行结束」语义一致。图标离开这两个状态
-                    // 时重置，下一轮输出完成再提示。
-                    if matches!(icon, Some("✅") | Some("✏️")) {
+                    // 「执行完成」提醒：页签进入 ✅（输出结束待查看）后需稳定停留
+                    // DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁（done_notified
+                    // 去重，只提示一次）。稳定窗口过滤误触发：top/watch/编译间歇
+                    // 输出等进程在 🔄↔✅ 间横跳时重置计时；「还在跑」由前置的
+                    // 进程树 CPU 判据（cpu_busy）挡在 🔄，所以短稳定窗口就够区分
+                    // 真实完成与周期性输出——通知延迟保持在 3 秒级，不再用十几秒
+                    // 的静默阈值换准确性。仅当「当前页签且应用在前台」（用户正
+                    // 盯着）才静默；当前页签但应用在后台（焦点在别的窗口）→ 用户
+                    // 没在看，照常计时弹通知 + 闪烁，与 update_exited 的「运行
+                    // 结束」语义一致。图标离开 ✅ 时重置，下一轮输出结束再提示。
+                    if icon == Some("✅") {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
                         if i == self.current && app_fg {
                             s.done_since_ms.store(0, Ordering::Relaxed);
-                            // 用户正看着 ✅/✏️（当前页签且前台），视为已知晓，
+                            // 用户正看着 ✅（当前页签且前台），视为已知晓，
                             // 切走时不弹重复通知。
                             s.done_notified.store(true, Ordering::Relaxed);
                         } else if since == 0 {
@@ -1927,9 +2008,7 @@ impl ClientApp {
                             if now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
                                 >= STARTUP_GRACE_MS
                             {
-                                let heading =
-                                    if matches!(icon, Some("✅")) { "任务完成" } else { "等待你的选择" };
-                                crate::notify_run_finished(&title, heading);
+                                crate::notify_run_finished(&title, "任务完成");
                                 crate::flash_taskbar(self.titlebar_hwnd);
                             }
                         }
@@ -3295,7 +3374,7 @@ impl ClientApp {
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("✏️ = TUI 近期有输出且等待选择（会话结束后不显示），✅ = 输出结束待查看，点击页签后消失。\n✅/✏️ 稳定停留 2 秒即弹「任务完成/等待选择」通知；进程树 CPU 活跃（静默思考/编译）会保持 🔄 不误报，周期输出横跳会重置计时。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（点击页签后消失），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知；周期输出横跳会重置计时。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
@@ -3795,7 +3874,7 @@ impl eframe::App for ClientApp {
 
         // 窗口标题保持固定，不根据等待输入状态动态修改。
         // 动态标题会频繁调用 send_viewport_cmd，可能干扰 winit 的 hover 跟踪，
-        // 导致 Windows「鼠标悬停激活窗口」失效。等待输入提示改用页签 ✏️ 图标。
+        // 导致 Windows「鼠标悬停激活窗口」失效。等待输入的状态由页签空图标表达。
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
