@@ -771,6 +771,93 @@ fn download_one(
     }
 }
 
+/// 把已下载的 .new 文件安装到正式名 exe，处理 Windows 下目标被占用的场景。
+///
+/// Windows 规则：运行中的映像文件允许 rename（Vista+），但禁止原地替换/删除。
+/// 因此当 rename(.new → 正式名) 因目标被占用而失败（拒绝访问 os error 5 ——
+/// 可能是本进程映像未被 unlock_exe 挪走、双开实例、或杀软瞬时句柄）时：
+/// 1) 快路径：直接替换并带重试，等杀软/Defender 释放目标；
+/// 2) 慢路径：把正式名先 rename 到 .old 腾出名字（运行中的映像也可 rename，
+///    .old 兼作旧版备份），再放入新文件；失败自动回滚，正式名始终可用。
+/// 返回是否安装成功。
+fn install_update(
+    new_file: &Path,
+    final_path: &Path,
+    old_path: &Path,
+    status_tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
+    redraw_tx: &std::sync::mpsc::SyncSender<()>,
+) -> bool {
+    // 0) 校验下载产物（MZ 头）：镜像偶发返回错误页/空文件，装上就无法启动。
+    if !looks_like_exe(new_file) {
+        let _ = std::fs::remove_file(new_file); // 删掉坏的，下次重新下载
+        let msg = format!(
+            "替换失败: 下载文件损坏或不是可执行文件（{new_file:?}），已删除，请重新下载"
+        );
+        let _ = status_tx.send((msg, None));
+        let _ = redraw_tx.try_send(());
+        return false;
+    }
+    // 1) 快路径：正式名空闲 → 直接替换。带重试：杀软/Defender 扫描时会短暂
+    //    占用正式名或 .new（拒绝访问 os error 5），等它释放。
+    for i in 0..5 {
+        match std::fs::rename(new_file, final_path) {
+            Ok(()) => return true,
+            Err(e) => {
+                log_update(&format!("替换 直接替换第 {} 次失败: {e}", i + 1));
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        }
+    }
+    // 2) 慢路径：正式名仍被占用。先清掉旧 .old（避免 rename 目标被占），
+    //    再把正式名 rename 走腾出名字；运行中的映像也允许 rename。
+    let _ = std::fs::remove_file(old_path);
+    let mut moved = false;
+    for _ in 0..5 {
+        match std::fs::rename(final_path, old_path) {
+            Ok(()) => {
+                moved = true;
+                break;
+            }
+            Err(e) => {
+                log_update(&format!("替换 挪走占用目标失败: {e}"));
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        }
+    }
+    if !moved {
+        let msg = format!(
+            "替换失败: 正式名 {final_path:?} 一直被其他进程占用（多为杀软扫描或另一个正在运行的实例），新文件保留在 {new_file:?}，请稍后重试"
+        );
+        let _ = status_tx.send((msg, None));
+        let _ = redraw_tx.try_send(());
+        return false;
+    }
+    match std::fs::rename(new_file, final_path) {
+        Ok(()) => true,
+        Err(e) => {
+            // 回滚：把挪走的旧映像放回正式名，确保目录里始终有可用 exe。
+            let _ = std::fs::rename(old_path, final_path);
+            let msg = format!(
+                "替换失败: {e}（已自动回滚，正式名保留旧版本；新文件仍在 {new_file:?}）"
+            );
+            let _ = status_tx.send((msg, None));
+            let _ = redraw_tx.try_send(());
+            false
+        }
+    }
+}
+
+/// 粗略校验文件是否为 Windows PE 可执行文件（MZ 头）。
+fn looks_like_exe(p: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return false;
+    };
+    let mut buf = [0u8; 2];
+    let n = f.read(&mut buf).unwrap_or(0);
+    n == 2 && &buf == b"MZ"
+}
+
 /// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
 /// 返回 (exe 文件名, 下载 URL, 0)；HTML 不含字节数，进度按已下载字节算。
 fn exe_asset_from_html(html: &str, tag: &str) -> Option<(String, String, u64)> {
@@ -868,6 +955,9 @@ pub struct ClientApp {
     cancel_download: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 下载完成、新 exe 已替换，等待用户重启应用（显示重启按钮）。
     update_done: bool,
+    /// 本次更新安装到的正式名 exe 路径：安装兜底可能把运行映像 rename 成 .old，
+    /// 重启必须仍指向正式名（新版本），不能依赖 current_exe() 现算。
+    update_final: Option<PathBuf>,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
@@ -989,6 +1079,7 @@ impl ClientApp {
             downloading: false,
             cancel_download: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         update_done: false,
+        update_final: None,
             input: None,
             confirm: None,
             check_tx,
@@ -1194,6 +1285,18 @@ impl ClientApp {
         let cancel = self.cancel_download.clone();
         let redraw_tx = self.redraw_tx.clone();
         let status_tx = self.check_tx.clone();
+        // 在 UI 线程确定正式名并记住：安装兜底可能把运行映像 rename 成 .old，
+        // 之后 current_exe() 返回的将不再是正式名，重启必须用这里记住的路径。
+        let final_path = std::env::current_exe()
+            .map(Self::canonical_exe_path)
+            .unwrap_or_else(|_| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("TUIProjectManager.exe")
+            });
+        self.update_final = Some(final_path.clone());
         std::thread::spawn(move || {
             let exe_path = std::env::current_exe()
                 .ok()
@@ -1221,36 +1324,20 @@ impl ClientApp {
                 }
             };
             let new_file = PathBuf::from(&new_path);
-            // .new 文件直接覆盖正式名 exe。无论资产名是小写 tui-project-manager.exe
-            // 还是历史大写名，最终都落到正式名，避免目录里出两个 exe。
-            let final_path = match std::env::current_exe() {
-                Ok(exe) => Self::canonical_exe_path(exe),
-                Err(_) => {
-                    let fallback_name = new_file
-                        .file_name()
-                        .map(|n| n.to_string_lossy().replacen(".new", "", 1))
-                        .unwrap_or_else(|| "TUIProjectManager.exe".into());
-                    exe_path.join(fallback_name)
-                }
-            };
-            // 运行中的映像由 unlock_exe 在启动时挪到 .running，正式名 exe 是
-            // 空闲副本（可覆盖），直接替换即可。不能再 rename 正式名 → .running：
-            // 该文件正被本进程映像锁定，rename 必现拒绝访问 (os error 5)。
+            // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，最终都落到
+            // 正式名（unlock_exe 启动时把运行映像挪成 .running 腾出的空闲名）。
             let old_path = final_path.with_extension("exe.old");
             // copy 目标已存在则直接覆盖（.old 始终保留最新旧版），失败不阻断替换。
+            // 注意该提示不能含「失败」字样：UI 按关键字把 downloading 复位，避免干扰安装。
             if let Err(e) = std::fs::copy(&final_path, &old_path) {
                 let _ = status_tx.send((
-                    format!("提示: 旧版备份到 {old_path:?} 失败（{e}），不影响替换"),
+                    format!("提示: 旧版备份 {old_path:?} 未完成（{e}），不影响替换"),
                     None,
                 ));
                 let _ = redraw_tx.try_send(());
             }
-            if let Err(e) = std::fs::rename(&new_file, &final_path) {
-                let _ = status_tx.send((
-                    format!("替换失败: {e}（请手动将 {new_file:?} 重命名为 {final_path:?}）"),
-                    None,
-                ));
-                let _ = redraw_tx.try_send(());
+            if !install_update(&new_file, &final_path, &old_path, &status_tx, &redraw_tx) {
+                // 安装失败：保留 .new 与 .old 供排查/手动处理，稍后可重新下载。
                 return;
             }
             log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}（旧版本备份 → {old_path:?}）"));
@@ -1266,11 +1353,14 @@ impl ClientApp {
     /// 新 exe 已替换到当前路径，重启即加载新版。
     fn restart_app(&mut self) {
         log_update("重启应用：spawn 新进程并退出");
-        // 必须启动正式名（去掉 .running）：新 exe 替换到正式名，而
-        // current_exe() 返回的是旧映像所在的 .running 锁定路径。
-        let exe = std::env::current_exe()
-            .map(Self::canonical_exe_path)
-            .unwrap_or_else(|_| PathBuf::from("TUIProjectManager.exe"));
+        // 必须启动正式名（新 exe 替换到正式名）。优先用安装时记住的路径：
+        // 安装兜底可能把运行映像 rename 成 .old，current_exe() 不再等于正式名，
+        // 现算会指向旧版本；否则去掉 .running 后缀现算。
+        let exe = self
+            .update_final
+            .clone()
+            .or_else(|| std::env::current_exe().ok().map(Self::canonical_exe_path))
+            .unwrap_or_else(|| PathBuf::from("TUIProjectManager.exe"));
         let mut cmd = std::process::Command::new(&exe);
         // 透传启动参数（如 --restore），保持与会话恢复行为一致。
         cmd.args(std::env::args().skip(1));
@@ -4047,6 +4137,19 @@ mod update_tests {
     #[test]
     fn html_no_exe_returns_none() {
         assert!(exe_asset_from_html("<html>nothing</html>", "v1").is_none());
+    }
+
+    #[test]
+    fn looks_like_exe_checks_mz_header() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("tpm_test_mz_check.bin");
+        std::fs::write(&p, b"MZ\x90\x00\x03\x00").unwrap();
+        assert!(super::looks_like_exe(&p));
+        std::fs::write(&p, b"<html>404 Not Found</html>").unwrap();
+        assert!(!super::looks_like_exe(&p));
+        std::fs::write(&p, b"MXZ").unwrap();
+        assert!(!super::looks_like_exe(&p));
+        let _ = std::fs::remove_file(&p);
     }
 }
 

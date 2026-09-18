@@ -33,6 +33,11 @@ fn unlock_exe() {
     if let Ok(exe) = std::env::current_exe()
         && let Some(name) = exe.file_name().and_then(|n| n.to_str())
     {
+        // 已在 .running（上次启动改名后本进程又由 .running 路径启动的极端情况）：
+        // 不再继续套娃，保持现状即可，更新侧的 canonical_exe_path 会去掉后缀。
+        if name.ends_with(".running") {
+            return;
+        }
         if let Some(parent) = exe.parent() {
                 let _ = std::fs::remove_file(parent.join(format!("{name}.running")));
             }
