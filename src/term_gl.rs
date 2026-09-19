@@ -25,13 +25,31 @@ const GLYPH_PAD: u32 = 1;
 // → 重启卡顿。fontdue::Font 不可变，解析结果可跨会话共享（Arc 引用）。
 // key = 原始字节序列（会话间恒定，进程内只解析一次）。
 /// 原始字体源：(文件字节, ttc 子索引)。
-type FontSource = (Vec<u8>, u32);
-/// 缓存条目：源列表（字节级全等判定命中）+ 物理字号档（px 取整）+ 解析结果。
+type FontSource = (Arc<Vec<u8>>, u32);
 type FontCacheEntry = (Vec<FontSource>, u32, Vec<Arc<fontdue::Font>>);
 static FONT_CACHE: OnceLock<Mutex<Vec<FontCacheEntry>>> = OnceLock::new();
-/// 缓存条目上限：按物理字号（px 取整）分档，DPI 不变时只有一档；
-/// 防止用户来回切换显示器 DPI 时无限膨胀。每档持有原始字体字节（~20MB）。
 const FONT_CACHE_MAX: usize = 4;
+
+/// 进程级字体字节缓存：egui 的 FontData 是 Cow::Owned，`definitions().clone()`
+/// 会深拷贝整份字体，而 TermGpu::new 每次新页签都调一次 → 每页签白吃
+/// ~20MB。首次从 egui 提取一次后存入 Arc，后续会话 Arc clone 零拷贝。
+static FONT_DATA_CACHE: OnceLock<Mutex<Vec<FontSource>>> = OnceLock::new();
+
+fn cached_font_data(ctx: &egui::Context) -> Vec<FontSource> {
+    let cache = FONT_DATA_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap();
+    if guard.is_empty() {
+        let defs = ctx.fonts_mut(|f| f.definitions().clone()); // 仅首次深拷贝
+        if let Some(mono) = defs.families.get(&egui::FontFamily::Monospace) {
+            for name in mono {
+                if let Some(d) = defs.font_data.get(name) {
+                    guard.push((Arc::new(d.font.clone().into_owned()), d.index));
+                }
+            }
+        }
+    }
+    guard.clone() // Arc clone，零拷贝
+}
 
 /// 从进程级缓存取（或解析后缓存）fontdue 解析结果。
 /// 命中条件：字体列表字节级全等 + 物理字号一致。
@@ -115,8 +133,8 @@ pub struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    /// `font_data`：(字体文件字节, ttc 子索引)。解析失败的字体跳过。
-    pub fn new(font_data: &[(Vec<u8>, u32)], font_size_pt: f32, ppp: f32) -> Self {
+    /// `font_data`：(字体文件字节的 Arc，ttc 子索引)。解析失败的字体跳过。
+    pub fn new(font_data: &[FontSource], font_size_pt: f32, ppp: f32) -> Self {
         let px = font_size_pt * ppp;
         // 进程级缓存：跨会话共享 fontdue 解析结果（msyh.ttc 20MB 解析 ~400ms，
         // 每 Session 首帧都重建 TermGpu 的话重启/新开页签必卡）。
@@ -321,8 +339,8 @@ pub fn hash_mix(h: &mut u64, v: u64) {
 /// 每会话 GPU 批渲染状态。`None` = 尚未初始化或初始化失败，整格走 galley 回落。
 pub struct TermGpu {
     pub atlas: GlyphAtlas,
-    /// 图集重建所需的原始字体字节（fontdue 不外借字节，DPI 变化时重建用）。
-    font_bytes: Vec<(Vec<u8>, u32)>,
+    /// 图集重建所需的原始字体字节（Arc 共享，DPI 变化时重建用）。
+    sources: Vec<FontSource>,
     font_size_pt: f32,
     params_ppp: f32,
     pub tex: Option<TextureHandle>,
@@ -340,21 +358,14 @@ pub struct TermGpu {
 impl TermGpu {
     /// 从 egui 已注册的 Monospace 家族提取字体数据初始化。字体链为空返回 None。
     pub fn new(ctx: &egui::Context, font_size_pt: f32, ppp: f32) -> Option<Self> {
-        let defs = ctx.fonts_mut(|f| f.definitions().clone());
-        let mono = defs.families.get(&egui::FontFamily::Monospace)?.clone();
-        let mut font_bytes: Vec<(Vec<u8>, u32)> = Vec::new();
-        for name in mono {
-            if let Some(d) = defs.font_data.get(&name) {
-                font_bytes.push((d.font.as_ref().to_vec(), d.index));
-            }
-        }
-        if font_bytes.is_empty() {
+        let sources = cached_font_data(ctx); // 进程级零拷贝，见 FONT_DATA_CACHE
+        if sources.is_empty() {
             return None;
         }
-        let atlas = GlyphAtlas::new(&font_bytes, font_size_pt, ppp);
+        let atlas = GlyphAtlas::new(&sources, font_size_pt, ppp);
         Some(Self {
             atlas,
-            font_bytes,
+            sources,
             font_size_pt,
             params_ppp: ppp,
             tex: None,
@@ -371,7 +382,7 @@ impl TermGpu {
         if self.params_ppp == ppp && self.font_size_pt == font_size_pt {
             return;
         }
-        self.atlas = GlyphAtlas::new(&self.font_bytes, font_size_pt, ppp);
+        self.atlas = GlyphAtlas::new(&self.sources, font_size_pt, ppp);
         self.params_ppp = ppp;
         self.font_size_pt = font_size_pt;
         self.tex_version = 0; // 强制重传纹理
@@ -421,11 +432,7 @@ mod tests {
     use super::*;
 
     fn test_atlas(ppp: f32) -> GlyphAtlas {
-        GlyphAtlas::new(
-            &[(epaint_default_fonts::HACK_REGULAR.to_vec(), 0)],
-            14.0,
-            ppp,
-        )
+        GlyphAtlas::new(&[(Arc::new(epaint_default_fonts::HACK_REGULAR.to_vec()), 0)], 14.0, ppp)
     }
 
     /// ASCII 字形应成功光栅化入库，且二次查询走缓存返回同一槽位。
