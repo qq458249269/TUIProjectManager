@@ -94,6 +94,7 @@ pub struct Settings {
     #[serde(default)]
     pub tui_commands: Vec<String>,
     /// 当前选中的 TUI 命令（启动项目时使用）。
+    #[serde(default)]
     pub tui_command: String,
     /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 10。
     #[serde(default = "default_refresh_fps")]
@@ -125,6 +126,7 @@ impl Default for Settings {
 /// 应用配置，保存到与程序同级目录下的 config/config.json。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
     pub projects: Vec<Project>,
     pub settings: Settings,
     /// 窗口位置/大小，下次启动时恢复。
@@ -182,7 +184,10 @@ pub fn config_path() -> PathBuf {
 pub fn load() -> Config {
     let path = config_path();
     let mut config = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Ok(raw) => match serde_json::from_str::<Config>(&raw) {
+            Ok(c) => c,
+            Err(_) => Config::default(),
+        },
         Err(_) => Config::default(),
     };
     // 旧版本只有 tui_command，迁移到 tui_commands 列表。

@@ -591,10 +591,10 @@ pub fn show_terminal(
     // 首帧懒预热：图集为空时一次性光栅化 ASCII 可打印字符，
     // 避免首帧逐字光栅化的卡顿峰值。只在 map 为空时执行（首次或 DPI 变化后）。
     if let Some(g) = sess.gpu.as_mut()
-        && g.atlas.is_empty()
+        && g.is_empty()
     {
         for ch in (32u8..=126).map(|b| b as char) {
-            g.atlas.glyph(ch);
+            g.glyph(ch);
         }
     }
     let avail = ui.available_size();
@@ -1434,14 +1434,14 @@ pub fn show_terminal(
         // GPU 批渲染优先：图集命中（含本次成功入库）直推 quad；空槽回落下方
         // galley 路径（emoji 等缺字形格子逐格混合，不整屏切换）。
         if let Some(g) = sess.gpu.as_mut() {
-            let slot = g.atlas.glyph(ch);
+            let (pg, slot) = g.glyph(ch);
             if slot.w > 0.0 {
-                let baseline = y + g.atlas.baseline_rel(cell_h);
+                let baseline = y + g.pages[pg].baseline_rel(cell_h);
                 let uv_solid = GlyphAtlas::solid_uv();
                 // 位图与显示 1:1，但落点若是小数设备像素，LINEAR 采样会混入
                 // 邻素发虚 —— 原点对齐设备像素网格保证锐利。
                 let snap = |v: f32| (v * ppp).round() / ppp;
-                g.quads.push(CellQuad {
+                g.push_quad(pg, CellQuad {
                     rect: Rect::from_min_size(
                         Pos2::new(snap(x + slot.dx), snap(baseline + slot.dy)),
                         Vec2::new(slot.w, slot.h),
@@ -1451,9 +1451,10 @@ pub fn show_terminal(
                     color: fg,
                 });
                 if underlined {
-                    g.quads.push(CellQuad {
+                    let uy = y + g.pages[pg].underline_rel(cell_h);
+                    g.push_quad(pg, CellQuad {
                         rect: Rect::from_min_size(
-                            Pos2::new(x_slot, y + g.atlas.underline_rel(cell_h)),
+                            Pos2::new(x_slot, uy),
                             Vec2::new(slot_w, 1.0),
                         ),
                         uv0: uv_solid,
@@ -1497,12 +1498,13 @@ pub fn show_terminal(
     if let Some((run, c)) = bg_run.take() {
         bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
     }
-    // GPU 字形层：内容变化才重建网格；静止帧直接重放上一帧的同一 Arc<Mesh>，
-    // 跳过全部 quad 重建（egui 每帧仍会重画它，省的是 CPU 侧组装）。
-    if let Some(g) = sess.gpu.as_mut()
-        && let Some(mesh) = g.end_frame(ui.ctx())
-    {
-        bg_shapes.push(egui::Shape::Mesh(mesh));
+    // GPU 字形层：内容变化才重建网格；静止帧直接重放上一帧的同一批 Arc<Mesh>，
+    // 跳过全部 quad 重建（egui 每帧仍会重画它，省的是 CPU 侧组装）。分页图集
+    // 可能有多页 mesh，逐个提交。
+    if let Some(g) = sess.gpu.as_mut() {
+        for (_tid, mesh) in g.end_frame(ui.ctx()) {
+            bg_shapes.push(egui::Shape::Mesh(mesh.clone()));
+        }
     }
     bg_shapes.extend(fg_shapes);
     // 缓存完整渲染结果供静止帧重放：下帧 gen_changed=false 时直接提交，

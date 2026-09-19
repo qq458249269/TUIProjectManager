@@ -61,10 +61,35 @@ pub fn app_is_foreground(hwnd: isize) -> bool {
     hwnd != 0 && unsafe { GetForegroundWindow() } == hwnd
 }
 
-/// 运行结束系统通知：PowerShell WinRT toast，免注册 AUMID，best-effort。
-/// CREATE_NO_WINDOW 启动，不闪控制台；AppId 用固定串，未注册时 toast
-/// 仍会显示（标注该名称 + 占位图标）——比 Shell_NotifyIcon 托盘气球干净：
-/// 不进通知中心残留托盘图标，自动消失。
+/// 运行结束系统通知：PowerShell WinRT toast，免安装器（无 AUMID 注册）也能显示。
+/// Win10 2004+ / Win11 会静默丢弃未注册 AppUserModelID 的 toast——非激活时的
+/// 提示之所以失效，就是 AppId 没注册。启动时 ensure_toast_registered() 往
+/// HKCU\Software\Classes\AppUserModelId\<AUMID>\CustomActivator 埋注册项
+/// （Microsoft 文档：unpackaged 桌面应用两种注册方式之一，reg 一个 CLSID 即
+/// 可；点按激活让系统处理即可，本应用不接 toast 激活回调），以后显示就走
+/// 这个固定 AUMID。CREATE_NO_WINDOW 启动，不闪控制台。
+pub const TOAST_AUMID: &str = "TUIProjectManager.Toast";
+
+/// STARTUP 时幂等注册 toast AUMID（best-effort，失败静默：下次启动再试）。
+pub fn ensure_toast_registered() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "$k = 'HKCU:\\Software\\Classes\\AppUserModelId\\{aumid}'; \
+         New-Item -Force -Path $k | Out-Null; \
+         New-ItemProperty -Force -Path $k -Name CustomActivator -Value '{{00000000-0000-0000-0000-000000000000}}' -PropertyType String | Out-Null",
+        aumid = TOAST_AUMID
+    );
+    let _ = std::process::Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("-NoProfile")
+        .arg("-WindowStyle")
+        .arg("Hidden")
+        .arg("-Command")
+        .arg(script)
+        .spawn();
+}
+
 pub fn notify_run_finished(title: &str, heading: &str) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -76,9 +101,10 @@ pub fn notify_run_finished(title: &str, heading: &str) {
          $n = $x.GetElementsByTagName('text'); \
          $n.Item(0).AppendChild($x.CreateTextNode('{heading}')) > $null; \
          $n.Item(1).AppendChild($x.CreateTextNode('{t}')) > $null; \
-         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('TUI Project Manager').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{aumid}').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
         t = t,
-        heading = heading
+        heading = heading,
+        aumid = TOAST_AUMID
     );
     let _ = std::process::Command::new("powershell")
         .creation_flags(CREATE_NO_WINDOW)
@@ -148,6 +174,7 @@ fn main() -> eframe::Result {
         default_hook(info);
     }));
     unlock_exe();
+    ensure_toast_registered();
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])

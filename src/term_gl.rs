@@ -6,6 +6,13 @@
 //!
 //! 静止帧优化：每格算 FNV 哈希入表，与上一帧全等则直接重放缓存的 Mesh，
 //! 跳过 quad 重建；内容一变即整帧重建（不做局部更新——重建本身已是微秒级）。
+//!
+//! 内存控制（实测驱动）：
+//! - 分页图集：单页 1024² RGBA ≈ 4MB，满页开新页渐进，不做整体清空重灌
+//!   （整体清空曾造成汉字输入 ~400ms 卡顿）。
+//! - 懒加载字体链：fontdue::from_bytes 是全字形 eager 解析，CJK ~30K 字形
+//!   几何 ≈ +127MB/字体。默认只解析链首等宽字体（ASCII 场景省 ~170MB）；
+//!   首个缺字形（如汉字）出现时一次性补全整条链并缓存，之后所有会话零重解析。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,7 +21,7 @@ use eframe::egui;
 use egui::{Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureOptions};
 
 /// 图集边长（物理像素）。1024×1024 RGBA ≈ 4MB 显存；CJK 字形约 28px 高，
-/// 可容纳上千个不同字符，超出后整体清空按需重灌（下一帧自然恢复）。
+/// 可容纳上千个不同字符，满页开新页（页号随 quad 记录）。
 const ATLAS_SIZE: u32 = 1024;
 /// 字形位图之间的间隔像素：LINEAR 采样时防止相邻字形边缘渗色。
 const GLYPH_PAD: u32 = 1;
@@ -51,20 +58,15 @@ fn cached_font_data(ctx: &egui::Context) -> Vec<FontSource> {
     guard.clone() // Arc clone，零拷贝
 }
 
-/// 从进程级缓存取（或解析后缓存）fontdue 解析结果。
-/// 命中条件：字体列表字节级全等 + 物理字号一致。
-fn cached_fonts(sources: &[FontSource], px: f32) -> Vec<Arc<fontdue::Font>> {
-    let cache = FONT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    let mut guard = cache.lock().unwrap();
-    if let Some((_, _, fonts)) = guard
-        .iter()
-        .find(|(sources2, px2, _)| *px2 == px as u32 && sources2 == sources)
-    {
-        return fonts.clone();
-    }
-    // 未命中：解析并缓存。持锁解析：首个会话启动时一次性代价，后续全部命中。
+/// 解析 `sources[..take]` 中每个字体为 fontdue::Font（跳过失败项）。
+fn parse_fonts(sources: &[FontSource], px: f32, full: bool) -> Vec<Arc<fontdue::Font>> {
+    let take = if full {
+        sources.len()
+    } else {
+        1.min(sources.len())
+    };
     let mut fonts: Vec<Arc<fontdue::Font>> = Vec::new();
-    for (data, index) in sources {
+    for (data, index) in &sources[..take] {
         let settings = fontdue::FontSettings {
             collection_index: *index,
             scale: px,
@@ -74,11 +76,39 @@ fn cached_fonts(sources: &[FontSource], px: f32) -> Vec<Arc<fontdue::Font>> {
             fonts.push(Arc::new(f));
         }
     }
-    guard.push((sources.to_vec(), px as u32, fonts.clone()));
+    fonts
+}
+
+/// 从进程级缓存取（或解析后缓存）fontdue 解析结果。
+/// 命中条件：字体列表字节级全等 + 物理字号一致。
+///
+/// `full=false`：只解析链首等宽字体（懒加载：ASCII 场景不碰 CJK/emoji 的
+/// ~170MB eager 解析）；`full=true`：整条链，缓存条目就地升级为全量。
+fn cached_fonts(sources: &[FontSource], px: f32, full: bool) -> Vec<Arc<fontdue::Font>> {
+    let cache = FONT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(idx) = guard
+        .iter()
+        .position(|(sources2, px2, _)| *px2 == px as u32 && sources2 == sources)
+    {
+        let (_, _, fonts) = &guard[idx];
+        if !full || fonts.len() >= sources.len() {
+            return fonts.clone();
+        }
+        // full 但缓存只有链首（懒加载未完成）：全量解析并升级缓存条目。
+        let full_fonts = parse_fonts(sources, px, true);
+        guard[idx].2 = full_fonts.clone();
+        return full_fonts;
+    }
+    guard.push((
+        sources.to_vec(),
+        px as u32,
+        parse_fonts(sources, px, full),
+    ));
     if guard.len() > FONT_CACHE_MAX {
         guard.remove(0);
     }
-    fonts
+    guard.last().unwrap().2.clone()
 }
 
 /// 单个字形的图集记录。UV 指向图集内的位图矩形；
@@ -112,33 +142,37 @@ impl GlyphSlot {
 
 /// 字形纹理图集：动态 shelf 打包，按需光栅化。
 pub struct GlyphAtlas {
-    /// Monospace 家族字体链（主字体在前，CJK fallback 在后），按序试到命中。
-    /// Arc：跨会话共享进程级解析缓存，避免每次重建重复解析。
     fonts: Vec<Arc<fontdue::Font>>,
-    /// 光栅化字号（物理像素）= 字号 pt × ppp。
+    /// 懒加载源（全链字节）：缺字形时补全字体链用。
+    lazy_sources: Vec<FontSource>,
+    /// 懒加载已完成（或字体链本就单条）。标记后不再重复尝试。
+    lazy_done: bool,
     px: f32,
     ppp: f32,
     ascent_px: f32,
     descent_px: f32,
     w: u32,
     h: u32,
-    /// RGBA8 预乘白色覆盖度（rgb == a）。
+    /// RGBA 位图；(0,0) 保留为纯白素。
     rgba: Vec<u8>,
     cx: u32,
     cy: u32,
     rh: u32,
+    /// 页满标记：放不下任何新字形。分页打开新页，不再整体清空重灌。
+    full: bool,
+    /// char → 槽位（含负缓存：w==0 的空槽）。
     map: HashMap<char, GlyphSlot>,
-    /// 图集内容版本号：新增/清空字形时 +1，驱动调用方重传纹理并重建网格。
-    pub version: u64,
+    /// 内容版本：光栅化新字形后 +1，纹理已上传方据此决定是否重传。
+    version: u64,
 }
 
 impl GlyphAtlas {
     /// `font_data`：(字体文件字节的 Arc，ttc 子索引)。解析失败的字体跳过。
     pub fn new(font_data: &[FontSource], font_size_pt: f32, ppp: f32) -> Self {
         let px = font_size_pt * ppp;
-        // 进程级缓存：跨会话共享 fontdue 解析结果（msyh.ttc 20MB 解析 ~400ms，
-        // 每 Session 首帧都重建 TermGpu 的话重启/新开页签必卡）。
-        let fonts = cached_fonts(font_data, px);
+        // 懒加载：先只解析链首等宽字体。CJK/emoji 的 eager 解析（~170MB）
+        // 推迟到首个缺字形时（cached_fonts full=true，进程级缓存跨会话共享）。
+        let fonts = cached_fonts(font_data, px, false);
         let mut ascent_px = px * 0.8;
         let mut descent_px = -px * 0.2;
         if let Some(f) = fonts.first()
@@ -149,6 +183,8 @@ impl GlyphAtlas {
         }
         let mut atlas = Self {
             fonts,
+            lazy_sources: font_data.to_vec(),
+            lazy_done: font_data.len() <= 1,
             px,
             ppp,
             ascent_px,
@@ -164,6 +200,7 @@ impl GlyphAtlas {
             cx: 1, // (0,0) 保留为纯白素：实心 quad（下划线）取色用
             cy: 0,
             rh: 0,
+            full: false,
             map: HashMap::with_capacity(256),
             version: 0,
         };
@@ -178,6 +215,28 @@ impl GlyphAtlas {
     /// 图集是否为空（尚未光栅化任何字形）。首帧懒预热据此判断。
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// 是否已满（放不下任何新字形）。满页由调用方开新页接管。
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
+    /// 查询已缓存槽位（不触发光栅化）。调用方跨页查命中用。
+    #[inline]
+    pub fn peek(&self, ch: char) -> Option<GlyphSlot> {
+        self.map.get(&ch).copied()
+    }
+
+    /// 替换字体链（懒加载补全）。字体没变多则忽略；负缓存无效化：
+    /// 懒加载前缺失的字形可能已命中新字体，清空重试。
+    fn swap_fonts(&mut self, fonts: Vec<Arc<fontdue::Font>>) {
+        if fonts.len() <= self.fonts.len() {
+            return;
+        }
+        self.fonts = fonts;
+        self.map.retain(|_, s| s.w > 0.0);
     }
 
     /// 基线相对格子顶部的偏移（逻辑点）：内容行高在 cell_h 内垂直居中，
@@ -200,9 +259,10 @@ impl GlyphAtlas {
         Pos2::new(0.5 / ATLAS_SIZE as f32, 0.5 / ATLAS_SIZE as f32)
     }
 
-    /// shelf 打包：返回位图区域左上角。满则整体清空重试一次，仍放不下返回 None。
+    /// shelf 打包：返回位图区域左上角。放不下（含换行后）标记页满返回 None。
     fn alloc(&mut self, gw: u32, gh: u32) -> Option<(u32, u32)> {
         if gw > self.w || gh > self.h {
+            self.full = true;
             return None;
         }
         if self.cx + gw > self.w {
@@ -211,25 +271,13 @@ impl GlyphAtlas {
             self.rh = 0;
         }
         if self.cy + gh > self.h {
-            self.reset();
-            if self.cx + gw > self.w || self.cy + gh > self.h {
-                return None;
-            }
+            self.full = true;
+            return None;
         }
         let pos = (self.cx, self.cy);
         self.cx += gw;
         self.rh = self.rh.max(gh);
         Some(pos)
-    }
-
-    fn reset(&mut self) {
-        self.rgba.fill(0);
-        self.paint_white_texel();
-        self.map.clear();
-        self.cx = 1;
-        self.cy = 0;
-        self.rh = 0;
-        self.version += 1;
     }
 
     /// 查询字形，未缓存则光栅化入库。永不失败：缺字形/图集满记为空槽
@@ -247,6 +295,15 @@ impl GlyphAtlas {
             hit = Some(font.rasterize(ch, self.px));
             break;
         }
+        // 懒加载：链首等宽字体缺该字形且全链未补 → 一次性补全字体链重试。
+        if hit.is_none() && !self.lazy_done && self.lazy_sources.len() > 1 {
+
+            self.lazy_done = true;
+            let px = self.px;
+            let full = cached_fonts(&self.lazy_sources, px, true);
+            self.swap_fonts(full);
+            return self.glyph(ch);
+        }
         let slot = match hit {
             // 有字形无笔画（零宽/空白）：空槽即可
             Some((m, _)) if m.width == 0 || m.height == 0 => GlyphSlot::EMPTY,
@@ -254,8 +311,8 @@ impl GlyphAtlas {
                 let gw = m.width as u32 + GLYPH_PAD * 2;
                 let gh = m.height as u32 + GLYPH_PAD * 2;
                 let Some((ax, ay)) = self.alloc(gw, gh) else {
-                    // 图集放不下（超大字形或真满了）：回落 galley，不占缓存位
-                    // 以便 reset 后重试。ponytail: 上限=单字形 ATLAS_SIZE 像素，
+                    // 页满（超大字形或空间耗尽）：回落 galley，不入缓存，
+                    // 调用方据此开新页。ponytail: 上限=单字形 ATLAS_SIZE 像素，
                     // 更大字形永远走 galley；需要时改分块图集。
                     return GlyphSlot::EMPTY;
                 };
@@ -336,23 +393,25 @@ pub fn hash_mix(h: &mut u64, v: u64) {
     *h = h.wrapping_mul(0x100_0000_01b3);
 }
 
-/// 每会话 GPU 批渲染状态。`None` = 尚未初始化或初始化失败，整格走 galley 回落。
+// @@PART2@@/// 每会话 GPU 批渲染状态。`None` = 尚未初始化或初始化失败，整格走 galley 回落。
+/// 分页架构：`pages[i]` 一张独立图集 + 独立纹理，`glyph()` 返回 (页号, 槽位)，
+/// quad 也要带页号收集到 `quads[pg]`。
 pub struct TermGpu {
-    pub atlas: GlyphAtlas,
+    pub pages: Vec<GlyphAtlas>,
     /// 图集重建所需的原始字体字节（Arc 共享，DPI 变化时重建用）。
     sources: Vec<FontSource>,
     font_size_pt: f32,
     params_ppp: f32,
-    pub tex: Option<TextureHandle>,
-    tex_version: u64,
+    pub texs: Vec<Option<TextureHandle>>,
+    tex_versions: Vec<u64>,
     /// 上一帧每格哈希（rows×cols，索引 vline*cols+col，未访问格保持 0）。
     prev_hash: Vec<u64>,
     /// 本帧哈希写入缓冲（跨帧复用分配）。
     pub hash_scratch: Vec<u64>,
-    /// 本帧 quad 收集缓冲（跨帧复用分配）。
-    pub quads: Vec<CellQuad>,
-    /// 静止帧复用的已提交网格。
-    pub mesh: Option<std::sync::Arc<Mesh>>,
+    /// 本帧 quad 收集缓冲（跨帧复用分配），按页分桶。
+    pub quads: Vec<Vec<CellQuad>>,
+    /// 静止帧复用的已提交网格（页序号 → 纹理 id + Arc<Mesh>）。
+    pub meshes: Vec<(egui::TextureId, std::sync::Arc<Mesh>)>,
 }
 
 impl TermGpu {
@@ -364,17 +423,22 @@ impl TermGpu {
         }
         let atlas = GlyphAtlas::new(&sources, font_size_pt, ppp);
         Some(Self {
-            atlas,
+            pages: vec![atlas],
             sources,
             font_size_pt,
             params_ppp: ppp,
-            tex: None,
-            tex_version: 0,
+            texs: vec![None],
+            tex_versions: vec![0],
             prev_hash: Vec::new(),
             hash_scratch: Vec::new(),
-            quads: Vec::new(),
-            mesh: None,
+            quads: vec![Vec::new()],
+            meshes: Vec::new(),
         })
+    }
+
+    /// 图集是否完全为空（尚未光栅化任何字形）。首帧懒预热据此判断。
+    pub fn is_empty(&self) -> bool {
+        self.pages.iter().all(|p| p.is_empty())
     }
 
     /// DPI 变化时重建图集（光栅化字号随物理像素变化）；其余情况原地复用。
@@ -382,15 +446,18 @@ impl TermGpu {
         if self.params_ppp == ppp && self.font_size_pt == font_size_pt {
             return;
         }
-        self.atlas = GlyphAtlas::new(&self.sources, font_size_pt, ppp);
+        let sources = self.sources.clone(); // 避开 &mut self 与 &self 的借用冲突
+        self.pages = vec![GlyphAtlas::new(&sources, font_size_pt, ppp)];
+        self.texs = vec![None];
+        self.tex_versions = vec![0];
+        self.quads = vec![Vec::new()];
+        self.meshes.clear();
+        self.prev_hash.clear();
         self.params_ppp = ppp;
         self.font_size_pt = font_size_pt;
-        self.tex_version = 0; // 强制重传纹理
-        self.mesh = None; // UV 全部失效，强制重建网格
-        self.prev_hash.clear();
     }
 
-    /// 帧首准备：哈希缓冲对齐 rows×cols。返回 true 表示几何参数变了需全量重绘。
+    /// 帧首准备：哈希缓冲对齐 rows×cols，清空各页 quad 桶。
     pub fn begin_frame(&mut self, rows: usize, cols: usize) {
         let needed = rows * cols;
         if self.hash_scratch.len() >= needed {
@@ -401,29 +468,72 @@ impl TermGpu {
             self.hash_scratch.clear();
             self.hash_scratch.resize(needed, 0);
         }
-        self.quads.clear();
+        for q in &mut self.quads {
+            q.clear();
+        }
     }
 
-    /// 帧尾判定 + 网格组装。返回 Some(mesh) 需要提交绘制（静止帧返回缓存的
-    /// 同一 Arc，调用方 clone 后照常 add——egui 每帧都要画，省的是 CPU 侧重建）。
-    pub fn end_frame(&mut self, ctx: &egui::Context) -> Option<std::sync::Arc<Mesh>> {
-        let changed =
-            self.prev_hash != self.hash_scratch || self.tex_version != self.atlas.version;
+    /// 查询/光栅化字形，返回 (页号, 槽位)。缺字形且末页满 → 开新页重试
+    /// （页码单调递增，旧页字形常驻，永不整体重灌）。
+    pub fn glyph(&mut self, ch: char) -> (usize, GlyphSlot) {
+        // 跨页查缓存：从最新页往前找（新字形普遍落在最新页）。
+        for i in (0..self.pages.len()).rev() {
+            if let Some(s) = self.pages[i].peek(ch) {
+                return (i, s);
+            }
+        }
+        let last = self.pages.len() - 1;
+        let slot = self.pages[last].glyph(ch);
+        if slot.w > 0.0 || !self.pages[last].is_full() {
+            return (last, slot);
+        }
+        // 末页满且该字形无可见笔画：开新页（新页懒加载未触发时缺字形自动补链）。
+        let sources = self.sources.clone();
+        let mut atlas = GlyphAtlas::new(&sources, self.font_size_pt, self.params_ppp);
+        let slot = atlas.glyph(ch);
+        let idx = self.pages.len();
+        self.pages.push(atlas);
+        self.texs.push(None);
+        self.tex_versions.push(0);
+        self.quads.push(Vec::new());
+        (idx, slot)
+    }
+
+    /// 往指定页收一个 quad（跨帧复用分配）。
+    #[inline]
+    pub fn push_quad(&mut self, pg: usize, q: CellQuad) {
+        if let Some(bucket) = self.quads.get_mut(pg) {
+            bucket.push(q);
+        }
+    }
+
+    /// 帧尾判定 + 网格组装。返回本帧应提交的 (纹理, Mesh) 列表；静止帧返回
+    /// 上一帧的同一批 Arc（调用方 clone 后照常 add——egui 每帧都要画，
+    /// 省的是 CPU 侧 quad→mesh 组装）。
+    pub fn end_frame(&mut self, ctx: &egui::Context) -> &[(egui::TextureId, std::sync::Arc<Mesh>)] {
+        let changed = self.prev_hash != self.hash_scratch;
         if changed {
             self.prev_hash.clear();
             self.prev_hash.extend_from_slice(&self.hash_scratch);
-            if self.tex.is_none() || self.tex_version != self.atlas.version {
-                self.tex = Some(ctx.load_texture(
-                    "term_glyph_atlas",
-                    self.atlas.image(),
-                    TextureOptions::LINEAR,
-                ));
-                self.tex_version = self.atlas.version;
+            self.meshes.clear();
+            for (pi, page) in self.pages.iter().enumerate() {
+                if self.texs[pi].is_none() || self.tex_versions[pi] != page.version {
+                    self.texs[pi] = Some(ctx.load_texture(
+                        format!("term_glyph_atlas_{pi}"),
+                        page.image(),
+                        TextureOptions::LINEAR,
+                    ));
+                    self.tex_versions[pi] = page.version;
+                }
+                // 空桶页跳过：该页无新字形，旧 mesh 继续有效。
+                if !self.quads[pi].is_empty() {
+                    let tid = self.texs[pi].as_ref().unwrap().id();
+                    self.meshes
+                        .push((tid, std::sync::Arc::new(build_mesh(&self.quads[pi], tid))));
+                }
             }
-            let tid = self.tex.as_ref().unwrap().id();
-            self.mesh = Some(std::sync::Arc::new(build_mesh(&self.quads, tid)));
         }
-        self.mesh.clone()
+        self.meshes.as_slice()
     }
 }
 
@@ -493,5 +603,18 @@ mod tests {
         let mut h3 = h1;
         hash_mix(&mut h3, 'b' as u64);
         assert_ne!(h1, h3);
+    }
+
+    /// 懒加载：只有链首等宽字体的图集，缺字形（CJK）应触发一次性补链尝试，
+    /// 之后不再重复（负缓存生效）。
+    #[test]
+    fn lazy_font_chain_attempted_once() {
+        let mut a = test_atlas(1.0);
+        let s = a.glyph('\u{6C49}'); // 汉：Hack 无此字形
+        assert_eq!(s.w, 0.0, "Hack 缺 CJK 字形应回落空槽");
+        assert!(a.lazy_done, "缺字形应触发懒加载补链");
+        let v = a.version;
+        a.glyph('\u{8BD5}'); // 试：补链后（无 CJK 字体可用）仍空槽，且不重复补链
+        assert_eq!(a.version, v, "补链后不得再重复触发（lazy_done 置位）");
     }
 }
