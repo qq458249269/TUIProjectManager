@@ -414,20 +414,25 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
 #[allow(unused_variables)]
 fn log_update(_msg: &str) {}
 
-/// 用 curl 请求 URL 并解析 JSON 中的 tag_name。
-/// connect_timeout / max_time（秒）由调用方决定：镜像请求收紧（4s/10s）
-/// 保证坏镜像几秒内跳过、检查不拖慢；直连 GitHub 放宽（8s/15s）。
-/// 返回 Ok(tag) 或 Err(错误描述)。
-fn fetch_tag_from_url(url: &str, connect_timeout: u64, max_time: u64) -> Result<String, String> {
+/// 用 curl 请求 URL 并解析 JSON 中的 tag。extract 决定取哪个字段：GitHub
+/// API 用 tag_name，jsDelivr 数据 API 用 tags[0]。
+/// 通用性说明：`-q` 让 curl 完全不读 ~/.curlrc（曾有残留 Clash 127.0.0.1:7897
+/// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误）——任何机器上的
+/// 用户残留配置都不影响；`--noproxy *` 连 http_proxy 等环境代理一并禁用，
+/// 全程直连、不依赖任何代理与端口。connect_timeout / max_time（秒）由调用方决定。
+fn fetch_tag_from_url(
+    url: &str,
+    connect_timeout: u64,
+    max_time: u64,
+    extract: fn(&serde_json::Value) -> Option<String>,
+) -> Result<String, String> {
     let mut cmd = std::process::Command::new("curl");
     let ct = connect_timeout.to_string();
     let mt = max_time.to_string();
     cmd.args([
-        // 直连下载：强制绕过 ~/.curlrc / 环境变量里的本地代理。
-        // 本机曾因 .curlrc 残留 Clash 127.0.0.1:7897 导致所有 curl 走代理、
-        // 隧道握手失败，检查更新/下载一律报「网络错误」。
+        "-q", // 忽略 .curlrc / _curlrc，防用户机器上的残留代理端口
         "-s", "-f", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
-        "--proxy", "", "--noproxy", "*",
+        "--noproxy", "*", // 直连，不读环境变量里的代理
         "-H", "User-Agent: TUIProjectManager",
         url,
     ]);
@@ -442,51 +447,24 @@ fn fetch_tag_from_url(url: &str, connect_timeout: u64, max_time: u64) -> Result<
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "无法解析 GitHub 响应".to_string())?;
-    v["tag_name"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "GitHub 返回错误响应".to_string())
+        serde_json::from_str(&text).map_err(|_| "无法解析 JSON 响应".to_string())?;
+    extract(&v).ok_or_else(|| "返回结构不符合预期".to_string())
 }
 
-/// 拉取最新版本号。多源级联避免 GitHub API 限流（60 次/时）导致误报：
-/// ① 默认优先：GH_MIRRORS 国内镜像代理 API 轮流试——镜像 CDN 缓存、大陆
-///    延迟低（大陆直连 GitHub 慢/被墙），逐个轮询、坏镜像几秒内自动跳过；
-/// ② 镜像全挂回退 github.com /releases/latest 的 302 重定向目标取 tag
-///    （HTML 端点，无限流）；
-/// ③ 最后回退 api.github.com 的 releases/latest JSON。
-/// 返回（状态栏消息, 有新版本时的 tag）。
-fn fetch_latest_release() -> (String, Option<String>) {
-    // 源①（默认）：国内镜像代理 API，轮流加速。镜像前缀 + 原始 API URL
-    // 组成代理地址，多个镜像按可靠性排序轮询；超时收紧（connect 4s /
-    // 总 10s）保证「没延迟」——某个镜像挂了会在几秒内跳过，不拖慢检查。
-    let api_url =
-        "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/latest";
-    for mirror in GH_MIRRORS {
-        let proxy_url = format!("{mirror}{api_url}");
-        match fetch_tag_from_url(&proxy_url, 4, 10) {
-            Ok(tag) => {
-                log_update(&format!("检查更新 镜像① {mirror} 成功 → tag {tag}"));
-                let msg = version_message(&tag);
-                return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
-            }
-            Err(e) => {
-                log_update(&format!("检查更新 镜像① {mirror} 失败: {e}"));
-            }
-        }
-    }
-    // 源②：直连 HTML 重定向。curl 不加 -L，从 redirect_url 里取 tag；
-    // HTTP 非 2xx/3xx 时 -f 会报错 → 链路不通 → 回退源③。
+/// HTML 302 重定向取 tag（github.com /releases/latest 重定向到
+/// /releases/tag/<tag>，免 API 限流）。同样 -q 直连、无代理无端口。
+fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<String, String> {
     let mut cmd = std::process::Command::new("curl");
+    let ct = connect_timeout.to_string();
+    let mt = max_time.to_string();
     cmd.args([
-        "-s", "-f",
+        "-q", "-s", "-f",
         "-o", "NUL", // 丢弃响应体，只要重定向头
         "-w", "%{redirect_url}",
-        "--connect-timeout", "8",
-        "--ssl-no-revoke",
-        "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
+        "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
+        "--noproxy", "*",
         "-H", "User-Agent: TUIProjectManager",
-        "https://github.com/qq458249269/TUIProjectManager/releases/latest",
+        url,
     ]);
     // GUI 程序 spawn 控制台程序（curl.exe）会闪一个黑窗口：
     // CREATE_NO_WINDOW 让子进程不分配控制台，彻底消除。
@@ -495,40 +473,113 @@ fn fetch_latest_release() -> (String, Option<String>) {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let out = cmd.output();
-    if let Ok(o) = &out
-        && o.status.success()
-    {
-        let url = String::from_utf8_lossy(&o.stdout);
-        if let Some(pos) = url.find("/releases/tag/") {
-            let tag = url[pos + "/releases/tag/".len()..].trim().to_string();
-            if !tag.is_empty() {
-                log_update(&format!("检查更新 源② HTML 重定向 → tag {tag}"));
+    let o = cmd.output().map_err(|e| format!("启动 curl 失败: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("HTTP {}", o.status.code().unwrap_or(0)));
+    }
+    let redirect = String::from_utf8_lossy(&o.stdout);
+    match redirect.find("/releases/tag/") {
+        Some(pos) => {
+            let tag = redirect[pos + "/releases/tag/".len()..].trim().to_string();
+            if tag.is_empty() {
+                Err("HTML 返回空 tag".to_string())
+            } else {
+                Ok(tag)
+            }
+        }
+        None => Err(format!("HTML 未解析出 tag（redirect={redirect}）")),
+    }
+}
+
+/// 拉取最新版本号。所有源**并发**探查、先到先得：GH_MIRRORS 国内镜像、
+/// jsDelivr 数据 API（Fastly CDN，大陆友好、不依赖 GitHub 可达性）、
+/// GitHub HTML 302（免 API 限流）、GitHub API（可能限流）同时发起，
+/// 任一源在自身超时内返回有效 tag 即胜出——坏源零成本跳过，总耗时封顶在
+/// 最快源的超时内（≈6s），不再逐源串行、最坏吃满全表，也顺带防限流误报。
+/// 全程 -q 直连、不读任何代理配置与端口。返回（状态栏消息, 有新版本时的 tag）。
+fn fetch_latest_release() -> (String, Option<String>) {
+    const REPO: &str = "qq458249269/TUIProjectManager";
+    let api_url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let html_url = format!("https://github.com/{REPO}/releases/latest");
+    let jd_url = format!("https://data.jsdelivr.com/v1/packages/gh/{REPO}");
+
+    // 每个源：描述、URL、取 tag 方式（JSON 提取器或 HTML 302）、超时。
+    struct Src {
+        desc: &'static str,
+        url: String,
+        html: bool,
+        extract: fn(&serde_json::Value) -> Option<String>,
+        ct: u64,
+        mt: u64,
+    }
+    let gh_api: fn(&serde_json::Value) -> Option<String> =
+        |v| v["tag_name"].as_str().map(str::to_string);
+    let mut sources: Vec<Src> = Vec::new();
+    for m in GH_MIRRORS {
+        sources.push(Src {
+            desc: m,
+            url: format!("{m}{api_url}"),
+            html: false,
+            extract: gh_api,
+            ct: 3,
+            mt: 6,
+        });
+    }
+    // jsDelivr 数据 API：JSON 是 {"tags":[…]}}，最新 tag 在数组首位。
+    sources.push(Src {
+        desc: "jsDelivr",
+        url: jd_url,
+        html: false,
+        extract: |v: &serde_json::Value| -> Option<String> {
+            v["tags"].as_array()?.first()?.as_str().map(str::to_string)
+        },
+        ct: 4,
+        mt: 8,
+    });
+    sources.push(Src { desc: "GitHub HTML", url: html_url, html: true, extract: gh_api, ct: 6, mt: 12 });
+    sources.push(Src { desc: "GitHub API", url: api_url, html: false, extract: gh_api, ct: 6, mt: 12 });
+
+    let n = sources.len();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(String, String), String>>();
+    for s in sources {
+        let tx = tx.clone();
+        let done = done.clone();
+        std::thread::spawn(move || {
+            if done.load(Ordering::Relaxed) {
+                return; // 已有源胜出，本线程不再发消息
+            }
+            let tag = if s.html {
+                fetch_tag_html(&s.url, s.ct, s.mt)
+            } else {
+                fetch_tag_from_url(&s.url, s.ct, s.mt, s.extract)
+            };
+            let msg = match &tag {
+                Ok(t) => format!("检查更新 {} 成功 → tag {t}", s.desc),
+                Err(e) => format!("检查更新 {} 失败: {e}", s.desc),
+            };
+            log_update(&msg);
+            if tag.is_ok() {
+                done.store(true, Ordering::Relaxed);
+            }
+            let _ = tx.send(tag.map(|t| (s.desc.to_string(), t)));
+        });
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for _ in 0..n {
+        match rx.recv() {
+            Ok(Ok((_desc, tag))) => {
+                done.store(true, Ordering::Relaxed);
                 let msg = version_message(&tag);
                 return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
             }
-        }
-        log_update(&format!("检查更新 源② HTML 返回但未解析出 tag（redirect={url}）"));
-    } else if let Err(e) = &out {
-        log_update(&format!("检查更新 源② 启动 curl 失败: {e}"));
-    } else if let Ok(o) = &out {
-        log_update(&format!(
-            "检查更新 源② HTML 非 2xx/3xx（HTTP {}）",
-            o.status.code().unwrap_or(0)
-        ));
-    }
-    // 源③：最后回退 GitHub API（可能触发限流，此时会明确报错而非误报已最新）。
-    match fetch_tag_from_url(api_url, 8, 15) {
-        Ok(tag) => {
-            log_update(&format!("检查更新 源③ API 成功 → tag {tag}"));
-            let msg = version_message(&tag);
-            return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
-        }
-        Err(e) => {
-            log_update(&format!("检查更新 源③ API 失败: {e}"));
+            Ok(Err(e)) => errors.push(e),
+            Err(_) => break,
         }
     }
-    ("检查更新失败：网络错误（镜像①与直连②③均失败，请检查网络连接或加速工具如 Steam++）".to_string(), None)
+    // 具体失败原因已逐条 log_update；这里只给用户一句可行动的提示。
+    let _ = errors;
+    ("检查更新失败：网络错误（镜像与直连、jsDelivr 均失败，请检查网络连接或加速工具如 Steam++）".to_string(), None)
 }
 
 /// 根据 tag 与本地版本比较生成状态栏消息。
@@ -565,8 +616,8 @@ fn download_update(
     );
     let mut page_cmd = std::process::Command::new("curl");
     page_cmd.args([
-        "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
+        "-q", "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
         "-H", "User-Agent: TUIProjectManager",
         &page_url,
     ]);
@@ -605,8 +656,8 @@ fn download_update(
         );
         let mut api_cmd = std::process::Command::new("curl");
         api_cmd.args([
-            "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-            "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
+            "-q", "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+            "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
             "-H", "User-Agent: TUIProjectManager",
             &api_url,
         ]);
@@ -724,9 +775,9 @@ fn download_update(
 
 /// GitHub Release 检查/下载加速镜像（前缀拼接原始 github.com 或
 /// api.github.com 直链，如 {mirror}https://github.com/...）。大陆直连 GitHub
-/// 慢/被墙，镜像 CDN 缓存、延迟低；按可靠性排序，检查与下载都先打镜像、
-/// 逐个轮询，挂了自动跳到下一个，全挂才回退原始直链。列表换成当前可用
-/// 即可，多放几个零成本、坏节点自动跳过。
+/// 慢/被墙，镜像 CDN 缓存、延迟低；检查更新时所有镜像**并发**探查、先到
+/// 先得（挂了零成本跳过）；下载仍逐链尝试、挂了自动跳到下一个，全挂才回退
+/// 原始直链。列表换成当前可用即可，多放几个零成本、坏节点自动跳过。
 const GH_MIRRORS: &[&str] = &[
     "https://ghfast.top/",       // ghproxy 继任（v2），CDN 缓存，延迟低
     "https://gh-proxy.com/",     // 热门前缀代理，带缓存
@@ -757,8 +808,8 @@ fn download_one(
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
-        "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "--proxy", "", "--noproxy", "*", // 强制直连，绕过本地代理
+        "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+        "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
         "-H", "User-Agent: TUIProjectManager",
         "-o", dest_path.to_str().unwrap_or("update.exe.new"),
     ]);
