@@ -881,18 +881,17 @@ fn download_update(
             0,
         ),
     };
-    // ── 候选下载链：PS WinHTTP 直连（本机实测可用）→ 国内镜像 → curl 直链 ──
-    // PS 通道独立于 curl（curl 在这台机器上反复失败/崩溃，而 PS 直连实测
-    // 1.1s 返回）；镜像 CDN 缓存热文件、大陆延迟低；curl 直链保底。
+    // ── 候选下载链：国内镜像优先 → PS WinHTTP 直连 → curl 直链兜底 ──
+    // 镜像 CDN 缓存热文件、大陆延迟低；PS 通道独立于 curl 作补充；curl 直链保底。
     let mut attempts: Vec<(String, String, bool)> = Vec::new(); // (url, 文件名, 走 PS)
     for (url, name) in fallback {
+        for mirror in GH_MIRRORS {
+            attempts.push((format!("{mirror}{url}"), name.clone(), false));
+        }
         #[cfg(windows)]
         attempts.push((url.clone(), name.clone(), true));
         #[cfg(not(windows))]
         attempts.push((url.clone(), name.clone(), false));
-        for mirror in GH_MIRRORS {
-            attempts.push((format!("{mirror}{url}"), name.clone(), false));
-        }
         // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
         #[cfg(windows)]
         attempts.push((url.clone(), name.clone(), false));
