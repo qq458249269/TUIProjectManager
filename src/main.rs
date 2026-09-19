@@ -162,14 +162,10 @@ fn main() -> eframe::Result {
     if config.window.maximized {
         viewport = viewport.with_maximized(true);
     }
-    // 渲染后端：默认 wgpu，且在 Windows 上强制只走系统级 D3D12（DX12）
-    // （微软 D3D 运行时+厂商 DX12 驱动），绕开 Intel 老驱动的两个已知闪退：
-    // OpenGL 的 ig9icd64.dll 与 Vulkan 的 igvk64.dll（均 0xc0000005）。
-    // wgpu 默认后端优先级 Vulkan>DX12，本机 Intel UHD 630 的 Vulkan 驱动会闪退，
-    // 所以这里必须把后端限定为 DX12。可用 TPM_RENDERER=glow 强制 OpenGL。
-    let renderer = match std::env::var("TPM_RENDERER").as_deref() {
-        Ok("glow") => eframe::Renderer::Glow,
-        _ => eframe::Renderer::Wgpu,
+    let renderer = if prefer_glow() {
+        eframe::Renderer::Glow
+    } else {
+        eframe::Renderer::Wgpu
     };
     let mut options = eframe::NativeOptions {
         renderer,
@@ -196,6 +192,40 @@ fn main() -> eframe::Result {
             eframe::run_native(&title, glow_fallback, Box::new(create_app))
         }
         Err(err) => Err(err),
+    }
+}
+
+//// 渲染后端选择：AMD/NVIDIA 默认 glow（同帧输出，内存比 DX12 省 ~200MB）；
+/// Intel iGPU 走 wgpu/DX12——其 OpenGL/Vulkan 老驱动会闪退（ig9icd64.dll /
+/// igvk64.dll，0xc0000005），DX12 用微软运行时+厂商驱动可绕开。
+/// TPM_RENDERER=glow|wgpu 显式强制，跳过检测。
+fn prefer_glow() -> bool {
+    match std::env::var("TPM_RENDERER").as_deref() {
+        Ok("glow") => return true,
+        Ok("wgpu") => return false,
+        _ => {}
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // 纯设备枚举：不建窗口/渲染上下文，只查 DX12+Vulkan 后端（Intel iGPU
+        // 必然由 DXGI 列出），不触 GL 枚举，规避老 Intel GL 驱动闪退触发面。
+        let has_intel = std::panic::catch_unwind(|| {
+            let instance = eframe::wgpu::Instance::new(
+                eframe::wgpu::InstanceDescriptor::new_without_display_handle(),
+            );
+            let adapters = pollster::block_on(instance.enumerate_adapters(
+                eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::VULKAN,
+            ));
+            adapters
+                .iter()
+                .any(|a| a.get_info().name.to_ascii_lowercase().contains("intel"))
+        })
+        .unwrap_or(true); // 枚举异常时当 Intel 处理，走老 wgpu/DX12 路径
+        !has_intel
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
     }
 }
 

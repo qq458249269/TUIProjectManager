@@ -3164,6 +3164,7 @@ dependencies = [
  "eframe",
  "epaint_default_fonts",
  "fontdue",
+ "pollster 1.0.1",
  "portable-pty",
  "raw-window-handle",
  "rfd",
