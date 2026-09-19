@@ -191,6 +191,31 @@ fn setup_fonts(ctx: &egui::Context) {
             break;
         }
     }
+    // 状态图标 ✅🔄❌ 是 emoji，HACK/CJK 无这些字形 → 显示方块。注入系统
+    // Segoe UI Emoji 作逐字形兜底（egui 按缺字形回退，不影响 ASCII/CJK 度量）；
+    // seguisym.ttf 额外覆盖 ✓✗ 等符号。仅缺失时入图集，内存开销≈0。
+    let emoji = [
+        ("segoe-emoji", r"C:\Windows\Fonts\seguiemj.ttf"),
+        ("segoe-symbol", r"C:\Windows\Fonts\seguisym.ttf"),
+    ];
+    for (name, path) in emoji {
+        if let Ok(data) = std::fs::read(path) {
+            ctx.add_font(egui::epaint::text::FontInsert::new(
+                name,
+                egui::epaint::text::FontData::from_owned(data),
+                vec![
+                    egui::epaint::text::InsertFontFamily {
+                        family: egui::FontFamily::Proportional,
+                        priority: egui::epaint::text::FontPriority::Lowest,
+                    },
+                    egui::epaint::text::InsertFontFamily {
+                        family: egui::FontFamily::Monospace,
+                        priority: egui::epaint::text::FontPriority::Lowest,
+                    },
+                ],
+            ));
+        }
+    }
 }
 
 /// 应用深浅主题（egui 全部控件/字体颜色随之切换）。
@@ -509,6 +534,72 @@ fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<Stri
     }
 }
 
+/// 跑一段 PowerShell 并把 stdout 取回（redirect 时 PS 输出编码默认 GBK，ASCII
+/// 无差异，仍显式钉死 UTF-8 防意外）。CreationFlags CREATE_NO_WINDOW 不闪黑
+/// 窗，与 curl 路径一致。
+#[cfg(windows)]
+fn ps_run(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("powershell")
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(script)
+        .output()
+        .map_err(|e| format!("启动 PowerShell 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("PowerShell 退出码 {}", out.status.code().unwrap_or(0)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// PowerShell Invoke-RestMethod 拉 JSON 取 tag。独立网络栈（WinHTTP/Schannel，
+/// 走系统代理设置）——curl 在这个目标机上反复失败（含 ACCESS_VIOLATION），
+/// PS 通道实测直连 api.github.com ~1.1s 返回 tag，是「别的办法绕过」的主力源。
+#[cfg(windows)]
+fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
+    let script = format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+         $ErrorActionPreference='Stop'; \
+         $r = Invoke-RestMethod -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t}; \
+         $r | ConvertTo-Json -Depth 10",
+        url = url,
+        t = timeout_secs,
+    );
+    let out = ps_run(&script)?;
+    let v: serde_json::Value =
+        serde_json::from_str(&out).map_err(|e| format!("PS 响应解析失败: {e}"))?;
+    v["tag_name"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "PS 返回结构不符合预期".to_string())
+}
+
+/// PowerShell Invoke-WebRequest 取 GitHub releases/latest 页（自动跟随 302）后
+/// 从响应体里挖 /releases/tag/<tag>。
+#[cfg(windows)]
+fn ps_fetch_html_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing).Content",
+        url = url,
+        t = timeout_secs,
+    );
+    let body = ps_run(&script)?;
+    match body.find("/releases/tag/") {
+        Some(pos) => {
+            let tag = body[pos + "/releases/tag/".len()..]
+                .trim()
+                .to_string();
+            if tag.is_empty() {
+                Err("PS HTML 返回空 tag".to_string())
+            } else {
+                Ok(tag)
+            }
+        }
+        None => Err("PS HTML 未解析出 tag".to_string()),
+    }
+}
+
 /// 拉取最新版本号。所有源**并发**探查、先到先得：GH_MIRRORS 国内镜像、
 /// jsDelivr 数据 API（Fastly CDN，大陆友好、不依赖 GitHub 可达性）、
 /// GitHub HTML 302（免 API 限流）、GitHub API（可能限流）同时发起，
@@ -526,6 +617,7 @@ fn fetch_latest_release() -> (String, Option<String>) {
         desc: &'static str,
         url: String,
         html: bool,
+        ps: bool, // 走 PowerShell WinHTTP 通道（curl 崩溃/失败时的绕过源）
         extract: fn(&serde_json::Value) -> Option<String>,
         ct: u64,
         mt: u64,
@@ -538,6 +630,7 @@ fn fetch_latest_release() -> (String, Option<String>) {
             desc: m,
             url: format!("{m}{api_url}"),
             html: false,
+            ps: false,
             extract: gh_api,
             ct: 3,
             mt: 6,
@@ -548,14 +641,42 @@ fn fetch_latest_release() -> (String, Option<String>) {
         desc: "jsDelivr",
         url: jd_url,
         html: false,
+        ps: false,
         extract: |v: &serde_json::Value| -> Option<String> {
             v["tags"].as_array()?.first()?.as_str().map(str::to_string)
         },
         ct: 4,
         mt: 8,
     });
-    sources.push(Src { desc: "GitHub HTML", url: html_url, html: true, extract: gh_api, ct: 6, mt: 12 });
-    sources.push(Src { desc: "GitHub API", url: api_url, html: false, extract: gh_api, ct: 6, mt: 12 });
+    sources.push(Src { desc: "GitHub HTML", url: html_url.clone(), html: true, ps: false, extract: gh_api, ct: 6, mt: 12 });
+    sources.push(Src { desc: "GitHub API", url: api_url.clone(), html: false, ps: false, extract: gh_api, ct: 6, mt: 12 });
+
+    // PowerShell 通道（独立 WinHTTP 网络栈）：curl 失败/崩溃时仍可检查更新。
+    // 实测本机直连 api.github.com 1.1s 可达；不读任何代理端口。
+    #[cfg(windows)]
+    {
+        sources.push(Src {
+            desc: "PS API",
+            url: api_url.clone(),
+            html: false,
+            ps: true,
+            extract: gh_api,
+            ct: 8,
+            mt: 15,
+        });
+    }
+    #[cfg(windows)]
+    {
+        sources.push(Src {
+            desc: "PS HTML",
+            url: html_url.clone(),
+            html: true,
+            ps: true,
+            extract: gh_api,
+            ct: 8,
+            mt: 15,
+        });
+    }
 
     let n = sources.len();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -567,7 +688,21 @@ fn fetch_latest_release() -> (String, Option<String>) {
             if done.load(Ordering::Relaxed) {
                 return; // 已有源胜出，本线程不再发消息
             }
-            let tag = if s.html {
+            let tag = if s.ps {
+                #[cfg(windows)]
+                {
+                    if s.html {
+                        ps_fetch_html_tag(&s.url, s.mt)
+                    } else {
+                        ps_fetch_tag(&s.url, s.mt)
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    // 非 Windows 无 PS 源（构造时不会插入）。
+                    Err("PS 源仅在 Windows 可用".to_string())
+                }
+            } else if s.html {
                 fetch_tag_html(&s.url, s.ct, s.mt)
             } else {
                 fetch_tag_from_url(&s.url, s.ct, s.mt, s.extract)
@@ -746,33 +881,38 @@ fn download_update(
             0,
         ),
     };
-    // ── 候选下载链：常见加速镜像 + 原始直链，逐个尝试 ──
-    // 与检查更新一致，默认先走国内镜像（CDN 缓存热文件、大陆延迟低）；
-    // 每个文件名候选先打各镜像，全部失败才打原始直链，再交给上层
-    // 3 秒重试。GitHub 直链对未知文件名返回 404，先试真实名（必中）。
-    let mut attempts: Vec<(String, String)> = Vec::new();
+    // ── 候选下载链：PS WinHTTP 直连（本机实测可用）→ 国内镜像 → curl 直链 ──
+    // PS 通道独立于 curl（curl 在这台机器上反复失败/崩溃，而 PS 直连实测
+    // 1.1s 返回）；镜像 CDN 缓存热文件、大陆延迟低；curl 直链保底。
+    let mut attempts: Vec<(String, String, bool)> = Vec::new(); // (url, 文件名, 走 PS)
     for (url, name) in fallback {
+        #[cfg(windows)]
+        attempts.push((url.clone(), name.clone(), true));
+        #[cfg(not(windows))]
+        attempts.push((url.clone(), name.clone(), false));
         for mirror in GH_MIRRORS {
-            attempts.push((format!("{mirror}{url}"), name.clone()));
+            attempts.push((format!("{mirror}{url}"), name.clone(), false));
         }
-        attempts.push((url.clone(), name.clone()));
+        // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
+        #[cfg(windows)]
+        attempts.push((url.clone(), name.clone(), false));
     }
     log_update(&format!(
         "下载 开始尝试 {} 个候选链（tag={tag}，total={total}）：{}",
         attempts.len(),
         attempts
             .iter()
-            .map(|(u, _)| u.as_str())
+            .map(|(u, _, _)| u.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     ));
     let mut errors: Vec<String> = Vec::new();
-    for (url, name) in attempts {
+    for (url, name, ps) in attempts {
         // 用户取消时立即停止所有候选链
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("下载已取消".to_string());
         }
-        match download_one(&url, &name, total, dest_dir, &progress_tx, cancel) {
+        match download_one(&url, &name, ps, total, dest_dir, &progress_tx, cancel) {
             Ok(p) => {
                 log_update(&format!("下载 成功：{url} → {p}"));
                 return Ok(p);
@@ -807,11 +947,12 @@ const GH_MIRRORS: &[&str] = &[
     "https://gh-proxy.net/",     // 备用
 ];
 
-/// 用 curl 把单个 URL 下载到 dest_dir/{asset_name}.new，轮询文件大小报告进度。
-/// 返回 Ok(下载文件路径) 或 Err(具体失败原因)。
+/// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset_name}.new，
+/// 轮询文件大小报告进度。返回 Ok(下载文件路径) 或 Err(具体失败原因)。
 fn download_one(
     url: &str,
     asset_name: &str,
+    ps: bool,
     total: u64,
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
@@ -821,21 +962,38 @@ fn download_one(
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
 
-    // 断点续传：若 .new 文件已存在，记录已下载字节数，用 curl -C - 续传。
+    // 断点续传：若 .new 文件已存在，记录已下载字节数。curl 用 -C - 续传；
+    // PS 无续传（Invoke-WebRequest 直接覆盖重下）。
     let downloaded_before = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+    let dest_str = dest_path.to_str().unwrap_or("update.exe.new").replace('\'', "''");
 
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args([
-        "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
-        "-H", "User-Agent: TUIProjectManager",
-        "-o", dest_path.to_str().unwrap_or("update.exe.new"),
-    ]);
-    // 已有部分文件时续传；否则从头下载。
-    if downloaded_before > 0 {
-        cmd.arg("-C").arg("-");
-    }
-    cmd.arg(url);
+    let mut cmd = if ps {
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command"]);
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
+             -TimeoutSec 300 -OutFile '{dest}' -UseBasicParsing",
+            url = url.replace('\'', "''"),
+            dest = dest_str,
+        );
+        c.arg(script);
+        c
+    } else {
+        let mut c = std::process::Command::new("curl");
+        c.args([
+            "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+            "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
+            "-H", "User-Agent: TUIProjectManager",
+            "-o", dest_path.to_str().unwrap_or("update.exe.new"),
+        ]);
+        // 已有部分文件时续传；否则从头下载。
+        if downloaded_before > 0 {
+            c.arg("-C").arg("-");
+        }
+        c.arg(url);
+        c
+    };
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -862,7 +1020,7 @@ fn download_one(
                     return Ok(dest_path.to_string_lossy().into_owned());
                 } else {
                     // 失败时保留 .new 文件以供下次续传，不删除
-                    return Err(format!("curl 退出码 {}", status.code().unwrap_or(-1)));
+                    return Err(format!("下载进程退出码 {}", status.code().unwrap_or(-1)));
                 }
             }
             Ok(None) => continue,
@@ -2091,14 +2249,19 @@ impl ClientApp {
                     // 的静默阈值换准确性。仅当「当前页签且应用在前台」（用户正
                     // 盯着）才静默；当前页签但应用在后台（焦点在别的窗口）→ 用户
                     // 没在看，照常计时弹通知 + 闪烁，与 update_exited 的「运行
-                    // 结束」语义一致。图标离开 ✅ 时重置，下一轮输出结束再提示。
+                    // 结束」语义一致。图标离开 ✅ 只清零计时、不复位已通知标记：
+                    // 一次完成只响一次，用户点开页签后才为下一轮重新武装——否则
+                    // 后台运行 top/watch/编译间歇等横跳 🔄↔✅ 时会每轮轰炸通知。
+                    // icon 状态由上一分支计算；动作照旧。真正防轰炸的关键在 else
+                    // 分支不再复位 done_notified（见下方注释）。
                     if icon == Some("✅") {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
                         if i == self.current && app_fg {
                             s.done_since_ms.store(0, Ordering::Relaxed);
-                            // 用户正看着 ✅（当前页签且前台），视为已知晓，
-                            // 切走时不弹重复通知。
-                            s.done_notified.store(true, Ordering::Relaxed);
+                            // 用户正盯着 ✅：视为已知晓，并**重新武装**（下轮完成
+                            // 还会提示）。done_notified=false 而非 true——旧代码这里
+                            // 置 true，配合 else 分支复位，后台轮询输出会每轮轰炸。
+                            s.done_notified.store(false, Ordering::Relaxed);
                         } else if since == 0 {
                             s.done_since_ms.store(now_ms, Ordering::Relaxed);
                         } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
@@ -2115,8 +2278,12 @@ impl ClientApp {
                             }
                         }
                     } else {
+                        // 离开 ✅ 只清零计时（下轮完成重新计 DONE_STABLE_MS），
+                        // **不复位 done_notified**：一次完成只响一次；后台轮询输出
+                        // （top/watch/编译间歇）在 🔄↔✅ 间横跳时，旧逻辑每轮都弹
+                        // 系统通知 = 后台疯狂轰炸。只有用户点开页签（上个分支）才
+                        // 重新武装，下一轮完成才再提示一次。
                         s.done_since_ms.store(0, Ordering::Relaxed);
-                        s.done_notified.store(false, Ordering::Relaxed);
                     }
                     // 本页签当前启动命令（切换菜单里勾选当前项）。
                     let tab_cmd = s.cmd.clone();
