@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -71,13 +70,6 @@ fn latency_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
 }
-
-/// 逐格渲染的 Galley 缓存类型：键 = (字符, 前景色, 窄格下划线, 宽字符)，
-/// 值 = (galley, 淘汰代数)。
-type GalleyCache = std::collections::HashMap<
-    (char, egui::Color32, bool, bool),
-    (std::sync::Arc<egui::epaint::Galley>, u64),
->;
 
 /// 一个在应用内页签中运行的终端会话。
 pub struct Session {
@@ -204,24 +196,11 @@ pub struct Session {
     /// 静止帧缓存：完整渲染结果（bg_shapes + GPU mesh + fg_shapes），
     /// snapshot_changed=false 时直接重放，跳过逐格渲染循环。
     pub cached_render_shapes: Option<Vec<egui::Shape>>,
-    /// 逐格渲染的 Galley 缓存：键 = (字符, 前景色, 窄格下划线, 宽字符)。
-    /// 同一格式每帧只排版一次；上限 8192 条，超出按 generation 淘汰最旧 25%，
-    /// 避免整表清空后首帧全量重建的卡顿峰值。
-    pub galley_cache: GalleyCache,
-    /// galley_cache 淘汰代数：每次淘汰 +1，新插入继承当前代数。
-    pub galley_gen: u64,
     /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
     pub gpu: Option<crate::term_gl::TermGpu>,
     /// 会话是否仍在启动中（首次有实际输出后置 false）。
     /// UI 线程据此显示旋转 ⚙️ 加载动画。
     pub loading: Arc<AtomicBool>,
-    /// loading 结束后是否已做过 ConPTY 重新同步：首次检测到 loading→false 时触发 resize，
-    /// 强制 ConPTY 重新同步输入管道。解决 OMP 等 TUI 加载完成后输入无响应的问题。
-    /// 95 个可打印 ASCII × 8 种颜色量化 × 2 种下划线 = 最多 1520 条，
-    /// 固定数组 O(1) 查找，跳过 HashMap 的哈希+比较开销。
-    pub ascii_galley_slots:
-        Option<[(u64, Option<std::sync::Arc<egui::epaint::Galley>>); 1520]>,
-
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -1242,8 +1221,6 @@ pub fn spawn(
         parse_gen: parse_gen.clone(),
         caret_scan: None,
         snapshot_scratch: Vec::new(),
-        galley_cache: HashMap::new(),
-        galley_gen: 0,
         gpu: None,
         last_input_ms,
         drag_press_pos: None,
@@ -1257,7 +1234,6 @@ pub fn spawn(
         last_snapshot_gen: 0,
         last_snapshot_offset: 0,
         loading,
-        ascii_galley_slots: None,
 
     })
 }

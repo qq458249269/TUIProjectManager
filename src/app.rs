@@ -2586,13 +2586,8 @@ impl ClientApp {
             if let Tab::Session(s) = tab {
                 s.theme_dark
                     .store(dark, std::sync::atomic::Ordering::Relaxed);
-                // 强制全量重绘：galley 里烘焙的是旧主题适配后的字形颜色；
-                // 自绘光标扫描缓存也一并作废。否则出现汉字颜色错乱、
-                // 光标块停在旧位置的残留。
-                s.galley_cache.clear();
-                // ASCII 快捷 galley 槽用 ver==galley_gen 判断有效性，
-                // 主题切换必须递增使其全部过期，否则浅色下文本残留白色。
-                s.galley_gen = s.galley_gen.wrapping_add(1);
+                // 无布局缓存后可免清理：galley 每帧现排（见 terminal.rs 渲染循环），
+                // 只作废帧重放与 ANSI 回写缓存。
                 s.caret_scan = None;
                 s.cached_render_shapes = None;
                 s.cached_ansi_rgb = None;
@@ -3833,7 +3828,6 @@ impl eframe::App for ClientApp {
                 self.theme_settle_at = None;
                 for tab in &mut self.tabs {
                     if let Tab::Session(s) = tab {
-                        s.galley_cache.clear();
                         s.caret_scan = None;
                         s.cached_render_shapes = None;
                         s.cached_ansi_rgb = None;
