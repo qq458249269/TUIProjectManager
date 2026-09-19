@@ -58,16 +58,17 @@
 配置自动保存到 exe 同级的 `config/config.json`，首次运行会自动生成。
 
 ```json
-{
-  "projects": [
-    { "name": "my-project", "path": "D:\\code\\my-project" }
-  ],
-  "settings": {
-    "tui_commands": ["nvim", "lazygit", "cmd"],
-    "tui_command": "nvim"
+"tui_commands": ["nvim", "lazygit", "cmd"],
+    "tui_command": "nvim",
+    "history_lines": 1000
   }
 }
 ```
+
+`settings.history_lines`：终端回看历史行数上限（100..=5000，默认 1000）。每行 ≈ 32B/格，120 列时 1000 行 ≈ 3.8MB/页签，按需调大（如 2000 ≈ 7.7MB）。
+
+渲染后端自动选择：AMD/NVIDIA 用 OpenGL（glow，内存省 ~200MB），Intel iGPU 用 DX12（wgpu，绕老 GL/Vulkan 驱动闪退）；`TPM_RENDERER=glow|wgpu` 可强制。
+
 
 ## 从源码构建
 

@@ -10,7 +10,8 @@ clipboard-win = "5.4"
 # 渲染后端：默认 wgpu（Windows 走 DX12），Intel 老 iGPU 的 OpenGL/Vulkan 驱动
 # 会闪退（ig9icd64.dll / igvk64.dll），必须 DX12；AMD/NVIDIA 由 main.rs 启动时
 # 自动选 glow（OpenGL，内存比 DX12 省 ~200MB），TPM_RENDERER=glow|wgpu 可强制。
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
+# 不启 default_fonts（省 Ubuntu+NotoEmoji ~15MB）：基础字体用内嵌 HACK，见 setup_fonts。
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "wgpu"] }
 fontdue = "0.9"
 portable-pty = "0.9"
 raw-window-handle = "0.6"
@@ -19,6 +20,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9"
 pollster = "1" # 已在 eframe 依赖树内，零新增编译：wgpu 30 enumerate_adapters 是 async，仅启动时 block_on 一次查显卡厂商
+epaint_default_fonts = "0.36.1" # 内嵌 HACK 作为基础字体（替代 egui default_fonts，无 emoji，省 ~15MB）
 
 [build-dependencies]
 winres = "0.1"
@@ -46,4 +48,3 @@ strip = true
 getrandom = { path = "vendor/getrandom-0.4.3" }
 
 [dev-dependencies]
-epaint_default_fonts = "0.36.1"

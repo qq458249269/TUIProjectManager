@@ -146,12 +146,30 @@ enum ProjectAction {
 }
 
 /// 加载中文字体作为 Proportional 与 Monospace 的 fallback。
+/// 基础字体用内嵌 HACK（替代 egui 默认 Ubuntu+NotoEmoji，省 ~15MB，UI 无 emoji
+/// 需求）；CJK 优先 simhei.ttf（~9MB 单 face，比 msyh.ttc 20MB 省 11MB 且解析快，
+/// 终端渲染效果稍逊雅黑）。
 fn setup_fonts(ctx: &egui::Context) {
+    // 基础等宽字体：UI 菜单/按钮/列表与终端共用，中文回落到 cjk。
+    ctx.add_font(egui::epaint::text::FontInsert::new(
+        "hack",
+        egui::epaint::text::FontData::from_static(epaint_default_fonts::HACK_REGULAR),
+        vec![
+            egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: egui::epaint::text::FontPriority::Lowest,
+            },
+            egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: egui::epaint::text::FontPriority::Lowest,
+            },
+        ],
+    ));
     let candidates = [
+        r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
         r"C:\Windows\Fonts\msyhbd.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
     ];
     for path in candidates {
@@ -3978,6 +3996,7 @@ impl eframe::App for ClientApp {
                 let (cols, rows) = geom.unwrap_or((80, 24));
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.spawn_rx = Some(rx);
+                let history_lines = self.config.settings.history_lines;
                 for p in pending {
                     let title = p.title.clone();
                     let ctx = self.ctx.clone();
@@ -3988,6 +4007,7 @@ impl eframe::App for ClientApp {
                         let result = session::spawn(
                             &p.title, &p.dir, &p.cmd,
                             cols as u16, rows as u16,
+                            history_lines,
                             ctx,
                         );
                         let _ = tx.send((result, false, None));
@@ -4009,6 +4029,7 @@ impl eframe::App for ClientApp {
                         let result = session::spawn(
                             &p.title, &p.dir, &p.cmd,
                             cols as u16, rows as u16,
+                            history_lines,
                             ctx,
                         );
                         let _ = tx.send((result, false, Some(tab_idx)));
@@ -4103,11 +4124,13 @@ impl eframe::App for ClientApp {
                     let ctx = self.ctx.clone();
                     let wake_ctx = ctx.clone();
                     let tx = tx.clone();
+                    let history_lines = self.config.settings.history_lines;
                     self.spawning.push((title.clone(), true, Some(save_i)));
                     std::thread::spawn(move || {
                         let result = session::spawn(
                             &title, &dir, &cmd,
                             cols as u16, rows as u16,
+                            history_lines,
                             ctx,
                         );
                         // saved_index：恢复时按保存时的原序插入，保证页签顺序不因

@@ -253,9 +253,30 @@ fn titles(a: &App) -> Vec<String> {
         .collect()
 }
 
+/// headless 测试上下文：注入 HACK 基础字体（Cargo.toml 已关 eframe default_fonts，
+/// egui 裸 Context 无字体时文字宽度为 0、布局塌缩）。
+fn font_ctx() -> Context {
+    let ctx = Context::default();
+    ctx.add_font(eframe::egui::epaint::text::FontInsert::new(
+        "hack",
+        eframe::egui::epaint::text::FontData::from_static(epaint_default_fonts::HACK_REGULAR),
+        vec![
+            eframe::egui::epaint::text::InsertFontFamily {
+                family: eframe::egui::FontFamily::Proportional,
+                priority: eframe::egui::epaint::text::FontPriority::Lowest,
+            },
+            eframe::egui::epaint::text::InsertFontFamily {
+                family: eframe::egui::FontFamily::Monospace,
+                priority: eframe::egui::epaint::text::FontPriority::Lowest,
+            },
+        ],
+    ));
+    ctx
+}
+
 #[test]
 fn click_close_drag_cursor() {
-    let ctx = Context::default();
+    let ctx = font_ctx();
     let mut app = new_app();
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(10.0, 10.0))], &mut app);
     // 第二帧才有真实的 rect（ui.response() 基于上一帧）

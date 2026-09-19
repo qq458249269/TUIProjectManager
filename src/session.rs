@@ -732,6 +732,7 @@ pub fn spawn(
     tui_command: &str,
     cols: u16,
     rows: u16,
+    history_lines: u32,
     ctx: eframe::egui::Context,
 ) -> Result<Session, String> {
     #[cfg(windows)]
@@ -845,7 +846,7 @@ pub fn spawn(
     // ponytail: 需要更长的历史时，把 scrolling_history 移入 config.json 设置项。
     let term_config = Config {
         kitty_keyboard: true,
-        scrolling_history: 2000,
+        scrolling_history: history_lines.clamp(100, 5000) as usize,
         ..Default::default()
     };
     let term = Term::new(
@@ -1440,7 +1441,7 @@ mod tests {
         use alacritty_terminal::event::VoidListener;
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::term::Config as TermConfig;
-        let cfg = TermConfig { scrolling_history: 2000, ..Default::default() };
+        let cfg = TermConfig { scrolling_history: 1000, ..Default::default() };
         let mut term = Term::new(cfg, &TermSize::new(120, 40), VoidListener);
         let mut p: alacritty_terminal::vte::ansi::Processor = Default::default();
         // 灌入远超历史的输出：120 列 × 12000 行（每行「A」+ 换行）。
@@ -1455,8 +1456,8 @@ mod tests {
         }
         // 历史行数 = 总行数 − 屏高，必须被 scrolling_history 钳住。
         let hist = term.grid().total_lines() - 40;
-        assert!(hist <= 2000, "历史行数未受 scrolling_history 限制: {hist}");
-        assert!(hist > 1000, "历史应保留相当数量（{hist}）");
+        assert!(hist <= 1000, "历史行数未受 scrolling_history 限制: {hist}");
+        assert!(hist >= 900, "历史应钳到接近上限（{hist}/1000）");
     }
 
     /// 回归：仿真器自发 PtyWrite 应答只放行主 DA（\x1b[?6c，conpty 握手必需），

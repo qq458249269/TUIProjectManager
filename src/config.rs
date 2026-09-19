@@ -81,6 +81,12 @@ fn default_follow_system() -> bool {
     false
 }
 
+/// 终端回看历史行数上限：2000 → 默认 1000（每页签约 -5.5MB，见 session.rs）。
+/// 回看依赖终端自身 scrollback 操作，与渲染缓存无关。
+fn default_history_lines() -> u32 {
+    1000
+}
+
 /// 程序设置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
@@ -98,6 +104,9 @@ pub struct Settings {
     /// 跟随系统主题：true 时按系统深浅动态切换（覆盖 dark_mode）。
     #[serde(default = "default_follow_system")]
     pub follow_system: bool,
+    /// 终端回看历史行数上限（100..=5000）。默认 1000。
+    #[serde(default = "default_history_lines")]
+    pub history_lines: u32,
 }
 
 impl Default for Settings {
@@ -108,6 +117,7 @@ impl Default for Settings {
             refresh_fps: DEFAULT_REFRESH_FPS,
             dark_mode: true,
             follow_system: false,
+            history_lines: default_history_lines(),
         }
     }
 }

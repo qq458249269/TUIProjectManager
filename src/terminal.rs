@@ -1942,10 +1942,10 @@ mod tests {
         let ctx = egui::Context::default();
         // 与 crate::app::setup_fonts 相同的候选字体加载逻辑。
         let candidates = [
+            r"C:\Windows\Fonts\simhei.ttf",
             r"C:\Windows\Fonts\msyh.ttc",
             r"C:\Windows\Fonts\msyh.ttf",
             r"C:\Windows\Fonts\msyhbd.ttc",
-            r"C:\Windows\Fonts\simhei.ttf",
             r"C:\Windows\Fonts\simsun.ttc",
         ];
         for path in candidates {
@@ -1961,6 +1961,16 @@ mod tests {
                 break;
             }
         }
+        // 与 app::setup_fonts 一致：先注入 HACK 基础字体，避免 egui 空字体族报错。
+        // （insert 顺序即优先级：hack 先入，cjk 后入作 fallback）
+        ctx.add_font(egui::epaint::text::FontInsert::new(
+            "hack",
+            egui::epaint::text::FontData::from_static(epaint_default_fonts::HACK_REGULAR),
+            vec![egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: egui::epaint::text::FontPriority::Lowest,
+            }],
+        ));
         let font_id = FontId::monospace(super::TERM_FONT_SIZE);
         ctx.begin_pass(egui::RawInput::default());
         ctx.fonts_mut(|f| {
