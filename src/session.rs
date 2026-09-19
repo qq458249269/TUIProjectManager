@@ -80,158 +80,6 @@ type GalleyCache = std::collections::HashMap<
 >;
 
 /// 一个在应用内页签中运行的终端会话。
-/// 独立输入框的本地编辑缓冲（仅 UI 线程访问，回车整行一次性提交）。
-#[derive(Default)]
-pub struct InputBuffer {
-    /// 输入内容。
-    pub buf: String,
-    /// 光标（字节偏移，恒在字符边界）。
-    pub cursor: usize,
-    /// Ctrl+A 全选态：开启后首次键入/粘贴/删除替换整个缓冲。
-    pub sel_all: bool,
-    /// 撤销栈（最近 50 步），每步存（内容, 光标）。
-    pub undo: Vec<(String, usize)>,
-}
-
-impl InputBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    // ── 独立输入框编辑原语（仅 UI 线程调用；字符键经 Event::Text 插入）──
-
-    /// 编辑前压撤销栈（深度 50，超限丢最旧）。
-    pub fn push_undo(&mut self) {
-        if self.undo.len() >= 50 {
-            self.undo.remove(0);
-        }
-        self.undo.push((self.buf.clone(), self.cursor));
-    }
-
-    pub fn text(&self) -> &str {
-        &self.buf
-    }
-
-    /// 光标左侧文本（渲染光标位置用）。
-    pub fn prefix(&self) -> &str {
-        &self.buf[..self.cursor]
-    }
-
-    /// 插入文本（字符键/IME 提交/粘贴/文件路径）。全选态下先替换整串。
-    pub fn insert(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.push_undo();
-        if self.sel_all {
-            self.buf.clear();
-            self.cursor = 0;
-            self.sel_all = false;
-        }
-        self.buf.insert_str(self.cursor, text);
-        self.cursor += text.len();
-    }
-
-    pub fn backspace(&mut self) {
-        if self.sel_all {
-            self.push_undo();
-            self.buf.clear();
-            self.cursor = 0;
-            self.sel_all = false;
-            return;
-        }
-        if self.cursor == 0 {
-            return;
-        }
-        self.push_undo();
-        let prefix = &self.buf[..self.cursor];
-        let start = prefix.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-        self.buf.replace_range(start..self.cursor, "");
-        self.cursor = start;
-    }
-
-    pub fn delete(&mut self) {
-        if self.sel_all {
-            self.push_undo();
-            self.buf.clear();
-            self.cursor = 0;
-            self.sel_all = false;
-            return;
-        }
-        if self.cursor >= self.buf.len() {
-            return;
-        }
-        self.push_undo();
-        let tail = &self.buf[self.cursor..];
-        let end_rel = tail
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| i)
-            .unwrap_or(tail.len());
-        self.buf
-            .replace_range(self.cursor..self.cursor + end_rel, "");
-    }
-
-    pub fn left(&mut self) {
-        self.sel_all = false;
-        if self.cursor == 0 {
-            return;
-        }
-        let prefix = &self.buf[..self.cursor];
-        self.cursor = prefix.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-    }
-
-    pub fn right(&mut self) {
-        self.sel_all = false;
-        if self.cursor >= self.buf.len() {
-            return;
-        }
-        let tail = &self.buf[self.cursor..];
-        self.cursor += tail
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| i)
-            .unwrap_or(tail.len());
-    }
-
-    pub fn home(&mut self) {
-        self.sel_all = false;
-        self.cursor = 0;
-    }
-
-    pub fn end(&mut self) {
-        self.sel_all = false;
-        self.cursor = self.buf.len();
-    }
-
-    pub fn select_all(&mut self) {
-        self.sel_all = true;
-    }
-
-    pub fn undo(&mut self) {
-        if let Some((buf, cur)) = self.undo.pop() {
-            self.buf = buf;
-            self.cursor = cur;
-            self.sel_all = false;
-        }
-    }
-
-    /// 清空输入框（Esc）：不留撤销记录。
-    pub fn clear(&mut self) {
-        self.buf.clear();
-        self.cursor = 0;
-        self.sel_all = false;
-    }
-
-    /// Enter 提交：整行（含 \r）一次性发给终端，随后清空。
-    pub fn commit(&mut self) -> Vec<u8> {
-        let mut bytes = self.buf.clone().into_bytes();
-        bytes.push(b'\r');
-        self.clear();
-        self.undo.clear();
-        bytes
-    }
-}
-
 pub struct Session {
     /// 页签标题（默认取项目名）。
     pub title: String,
@@ -346,15 +194,6 @@ pub struct Session {
     pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
     /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
     pub snapshot_scratch: Vec<(Point, Cell)>,
-    /// ── 底部独立输入框（本地编辑缓冲，回车整行一次性提交）──
-    /// 仅 UI 线程访问。非全屏 TUI（!alt_screen）时显示于终端底部；
-    /// 全屏 TUI（nvim/htop/opencode 等）时隐藏、恢复逐键直播。
-    /// 支持 Ctrl+A 全选 / Ctrl+Z 撤销 / Ctrl+C 复制 / Ctrl+X 剪切 /
-    /// Ctrl+V 粘贴 + 光标编辑（方向键/Home/End/Backspace/Delete）。
-    pub input: InputBuffer,
-    /// 输入框是否为当前输入目的地（默认 true：打字即进输入框；
-    /// 点击终端区离开、点击输入框或新页签回到输入框）。
-    pub input_focused: bool,
     /// 上一帧快照对应的 parse_gen：用于检测 snapshot 是否有新内容，跳过无变化帧的 clone。
     pub last_snapshot_gen: u64,
     /// 上一帧快照偏移：仅 offset 变化时做 O(rows) 的 point.line 平移，
@@ -1402,8 +1241,6 @@ pub fn spawn(
         parse_gen: parse_gen.clone(),
         caret_scan: None,
         snapshot_scratch: Vec::new(),
-        input: InputBuffer::new(),
-        input_focused: true,
         galley_cache: HashMap::new(),
         galley_gen: 0,
         gpu: None,
@@ -1446,8 +1283,6 @@ impl Session {
             });
         }
     }
-
-
 }
 
 /// UI 线程滚动后立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
@@ -1695,58 +1530,6 @@ mod tests {
         assert_eq!(strip_orphan_csi_u_bytes(b"[123"), b"[123");
         // 冒号分隔但无 u 结尾且后接其它字符 → 保留。
         assert_eq!(strip_orphan_csi_u_bytes(b"a[1:2b"), b"a[1:2b");
-    }
-
-    /// 独立输入框编辑原语：插入/光标/退格/删除/撤销/全选替换/提交。
-    #[test]
-    fn input_bar_editing_primitives() {
-        let mut e = InputBuffer::new();
-        e.insert("abc");
-        assert_eq!(e.text(), "abc");
-        assert_eq!(e.cursor, 3);
-
-        e.left();
-        e.left();
-        assert_eq!(e.cursor, 1);
-        e.insert("XYZ");
-        assert_eq!(e.text(), "aXYZbc");
-        assert_eq!(e.cursor, 4);
-
-        e.home();
-        assert_eq!(e.cursor, 0);
-        e.backspace();
-        assert_eq!(e.text(), "aXYZbc"); // 光标在首，退格无效
-        e.right();
-        e.delete();
-        assert_eq!(e.text(), "aYZbc");
-
-        // 全选态：首次键入替换整串。
-        e.select_all();
-        e.insert("q");
-        assert_eq!(e.text(), "q");
-        assert!(!e.sel_all);
-
-        // 撤销：退格导致的删除可回退。
-        e.insert("efg");
-        e.backspace(); // 删 'g'
-        assert_eq!(e.text(), "qef");
-        e.undo();
-        assert_eq!(e.text(), "qefg");
-        assert_eq!(e.cursor, 4);
-
-        // Enter 提交：整行 + \r 单次发出，随后清空（含撤销栈）。
-        assert_eq!(e.commit(), b"qefg\r");
-        assert!(e.text().is_empty());
-        assert!(e.undo.is_empty());
-
-        // 多字节字符边界：光标恒落在字符边界。
-        e.insert("中");
-        e.insert("文");
-        e.left();
-        assert_eq!(e.cursor, 3); // '中' 占 3 字节
-        e.backspace();
-        assert_eq!(e.text(), "文");
-        assert_eq!(e.cursor, 0);
     }
 }
 

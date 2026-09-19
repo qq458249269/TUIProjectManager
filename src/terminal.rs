@@ -28,8 +28,6 @@ fn color_key(c: Color32) -> u64 {
 /// 深浅主题下的终端画布底色。
 const TERM_BG_DARK: Color32 = Color32::from_rgb(22, 22, 26);
 const TERM_BG_LIGHT: Color32 = Color32::WHITE;
-/// 底部独立输入框高度（非全屏 TUI 时占用的像素行）。
-const INPUT_BAR_H: f32 = 34.0;
 
 fn color_for(dark: bool, dark_c: Color32, light_c: Color32) -> Color32 {
     if dark { dark_c } else { light_c }
@@ -599,17 +597,7 @@ pub fn show_terminal(
             g.atlas.glyph(ch);
         }
     }
-    // 非全屏 TUI 时终端底部显示独立输入框：本地编辑缓冲、回车整行一次性
-    // 提交。alt_screen 由本函数每帧写入，用上帧值控制可见性（1 帧延迟无感）；
-    // 全屏 TUI（nvim/htop/opencode 等）时输入框隐藏、恢复逐键直播。
-    let input_visible = !sess.alt_screen.load(Ordering::Relaxed);
     let avail = ui.available_size();
-    // 减掉输入框高度后再算终端行数：输入框画在终端矩形下方。
-    let avail = if input_visible {
-        egui::vec2(avail.x, (avail.y - INPUT_BAR_H).max(cell_h * 2.0))
-    } else {
-        avail
-    };
     let cols = ((avail.x / cell_w).floor().max(1.0)) as usize;
     let rows = ((avail.y / cell_h).floor().max(1.0)) as usize;
 
@@ -641,10 +629,6 @@ pub fn show_terminal(
     if resp.clicked() {
         *term_focused = true;
         resp.request_focus();
-        // 点击终端网格 → 离开输入框（想继续本地编辑就点回输入框）。
-        if input_visible {
-            sess.input_focused = false;
-        }
     }
 
     // IME 归属：终端聚焦，且没有其他 egui 控件（如输入弹窗里的 TextEdit）
@@ -1006,8 +990,6 @@ pub fn show_terminal(
 
     let mut bytes_out: Vec<Vec<u8>> = Vec::new();
     let mut preedit = String::new();
-    // 输入框模式：此帧按键路由到本地输入缓冲（Enter 一次性整行提交）。
-    let input_mode = input_visible && sess.input_focused;
 
     // 拖放文件到终端区域：把文件的相对路径粘贴到当前输入行（不要求终端已聚焦）。
     // 合并 dropped_files / hovered_files / latest_pos 为单次 input 调用。
@@ -1069,26 +1051,14 @@ pub fn show_terminal(
             for ev in &i.events {
                 match ev {
                     egui::Event::Text(text) => {
-                        if input_mode {
-                            // 输入框：字符直接进本地缓冲，不回显到终端。
-                            if !text.is_empty() {
-                                sess.input.insert(text);
-                                ui.ctx().request_repaint();
-                            }
-                            continue;
-                        }
                         if alt_down || text.is_empty() {
                             continue;
                         }
                         bytes_out.push(text.as_bytes().to_vec());
                     }
                     egui::Event::Ime(ime) if owns_ime => match ime {
-                        egui::ImeEvent::Commit(text) if !text.is_empty() => {
-                            if input_mode {
-                                sess.input.insert(text);
-                            } else if !alt_down {
-                                bytes_out.push(text.as_bytes().to_vec());
-                            }
+                        egui::ImeEvent::Commit(text) if !alt_down && !text.is_empty() => {
+                            bytes_out.push(text.as_bytes().to_vec());
                         }
                         egui::ImeEvent::Preedit { text, .. } => {
                             preedit.clone_from(text);
@@ -1110,43 +1080,6 @@ pub fn show_terminal(
                         // 写进 PTY。
                         if ctrl && *key == egui::Key::C {
                             continue;
-                        }
-
-                        // ── 输入框模式：编辑键全部本地处理，不落终端 ──
-                        // Enter 一次性整行提交；Ctrl+A/Z 全选/撤销（复制/剪切/粘贴
-                        // 由下方 Event::Copy/Cut/Paste 分支处理）；其余键（如
-                        // PageUp/PageDown 滚动）落到现有逻辑照常处理。
-                        if input_mode {
-                            let mut handled = true;
-                            match key {
-                                egui::Key::Enter => bytes_out.push(sess.input.commit()),
-                                egui::Key::Backspace => sess.input.backspace(),
-                                egui::Key::Delete => sess.input.delete(),
-                                egui::Key::ArrowLeft => sess.input.left(),
-                                egui::Key::ArrowRight => sess.input.right(),
-                                egui::Key::Home => sess.input.home(),
-                                egui::Key::End => sess.input.end(),
-                                egui::Key::Escape => sess.input.clear(),
-                                egui::Key::Tab => sess.input.insert("\t"),
-                                _ => {
-                                    handled = false;
-                                    if ctrl && !alt && *key == egui::Key::A {
-                                        sess.input.select_all();
-                                        handled = true;
-                                    } else if ctrl && !alt && *key == egui::Key::Z {
-                                        sess.input.undo();
-                                        handled = true;
-                                    } else if *key == egui::Key::V || *key == egui::Key::X {
-                                        // 粘贴/剪切交给下方 Paste/Cut 事件分支（塞入本地缓冲），
-                                        // 这里拦截 encode_key 的控制字节（0x16/0x18）防侧漏到终端。
-                                        handled = true;
-                                    }
-                                }
-                            }
-                            if handled {
-                                ui.ctx().request_repaint();
-                                continue;
-                            }
                         }
 
                         // Esc 清除文本选择（按键仍转发给终端，兼容 vim 等应用）。
@@ -1198,17 +1131,6 @@ pub fn show_terminal(
                         }
                     }
                     egui::Event::Copy => {
-                        // 输入框模式：复制输入缓冲全部内容（无选区概念时复制整行）。
-                        if input_mode {
-                            if !sess.input.buf.is_empty() {
-                                let t = sess.input.buf.clone();
-                                std::thread::spawn(move || {
-                                    let _ = set_clipboard_string(&t);
-                                });
-                                *status = Some("已复制输入框内容".to_string());
-                            }
-                            continue;
-                        }
                         // Ctrl+C / Ctrl+Insert → 复制选区并清除选中。剪贴板写入在后台线程，
                         // 规避 Windows 剪贴板被占用时 OpenClipboard 无限阻塞 UI 线程。
                         if let Ok(mut t) = sess.term.write() {
@@ -1219,42 +1141,9 @@ pub fn show_terminal(
                         }
                     }
                     egui::Event::Cut => {
-                        // 输入框模式：剪切 = 复制 + 清空。
-                        if input_mode {
-                            if !sess.input.buf.is_empty() {
-                                let t = sess.input.buf.clone();
-                                std::thread::spawn(move || {
-                                    let _ = set_clipboard_string(&t);
-                                });
-                                sess.input.clear();
-                                *status = Some("已剪切输入框内容".to_string());
-                            }
-                            continue;
-                        }
                         bytes_out.push(vec![0x18]); // Ctrl+X
                     }
                     egui::Event::Paste(text) => {
-                        // 输入框模式：粘贴进本地缓冲（文件路径串优先），回车提交。
-                        if input_mode {
-                            let files = clipboard_files();
-                            if !files.is_empty() {
-                                let joined = files
-                                    .iter()
-                                    .map(|f| path_for_input(&rel_to_cwd(f, &sess.dir)))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                sess.input.insert(&joined);
-                            } else {
-                                let cleaned = strip_ansi(text);
-                                if !cleaned.is_empty() {
-                                    sess.input.insert(&cleaned);
-                                }
-                            }
-                            if !sess.input.buf.is_empty() {
-                                *status = Some("已粘贴到输入框（回车提交）".to_string());
-                            }
-                            continue;
-                        }
                         // 剪贴板中是文件 → 粘贴文件相对路径（优先于文本粘贴）。
                         if paste_file_paths(sess, &clipboard_files(), status) {
                             continue;
@@ -1946,8 +1835,7 @@ pub fn show_terminal(
         });
 
         // 把输入法组合（拼音预编辑）画在光标处，带下划线，便于确认候选内容。
-        // 输入框模式下 preedit 已画在输入框内，终端处不再重复绘制。
-        if !preedit.is_empty() && !input_mode {
+        if !preedit.is_empty() {
             let preedit_color = color_for(dark, Color32::WHITE, Color32::BLACK);
             let preedit_bg = color_for(dark, Color32::from_gray(64), Color32::from_gray(225));
             let fmt = egui::TextFormat {
@@ -1972,133 +1860,6 @@ pub fn show_terminal(
 
     // 记录本帧 preedit 状态，供下一帧 snapshot skip 判断是否需要刷新。
     sess.last_preedit.clone_from(&preedit);
-
-    // ── 底部独立输入框：本地编辑缓冲，回车一次性整行提交 ──
-    // 点击输入框聚焦（点击终端区已在上方 resp.clicked() 分支离开）；
-    // 全屏 TUI（alt_screen）时 input_visible=false，此段直接跳过。
-    if input_visible {
-        let (bar_rect, bar_resp) = ui.allocate_exact_size(
-            egui::vec2(avail.x, INPUT_BAR_H),
-            egui::Sense::click(),
-        );
-        if bar_resp.clicked() {
-            sess.input_focused = true;
-            ui.ctx().request_repaint();
-        }
-        let bar_painter = ui.painter_at(bar_rect);
-        let bar_bg = color_for(
-            dark,
-            Color32::from_rgb(26, 28, 36),
-            Color32::from_rgb(244, 245, 248),
-        );
-        let bar_border = if sess.input_focused {
-            color_for(dark, Color32::from_rgb(80, 130, 255), Color32::from_rgb(40, 90, 190))
-        } else {
-            color_for(dark, Color32::from_gray(70), Color32::from_gray(175))
-        };
-        bar_painter.rect_filled(bar_rect, 4.0, bar_bg);
-        bar_painter.rect_stroke(
-            bar_rect,
-            4.0,
-            egui::Stroke::new(1.0, bar_border),
-            egui::StrokeKind::Inside,
-        );
-
-        let bar_gap = 10.0;
-        let fg = color_for(dark, Color32::WHITE, Color32::BLACK);
-        let text = sess.input.text();
-        let caret_x;
-        if text.is_empty() && preedit.is_empty() {
-            // 占位提示（无内容时）。
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                "在此输入，回车一次性提交 · Ctrl+A 全选 · Ctrl+Z 撤销 · Ctrl+C 复制 · Ctrl+V 粘贴",
-                0.0,
-                egui::TextFormat {
-                    font_id: font_id.clone(),
-                    color: color_for(dark, Color32::from_gray(115), Color32::from_gray(150)),
-                    ..Default::default()
-                },
-            );
-            let galley = bar_painter.layout_job(job);
-            bar_painter.galley(
-                Pos2::new(
-                    bar_rect.left() + bar_gap,
-                    bar_rect.center().y - galley.size().y / 2.0,
-                ),
-                galley,
-                fg,
-            );
-            caret_x = bar_rect.left() + bar_gap;
-        } else {
-            // 边界合法：光标恒在字符边界（session 侧维护）。
-            caret_x = if text.is_empty() {
-                bar_rect.left() + bar_gap
-            } else {
-                let prefix = sess.input.prefix();
-                let w = bar_painter
-                    .layout_no_wrap(prefix.to_string(), font_id.clone(), fg)
-                    .size()
-                    .x;
-                bar_rect.left() + bar_gap + w
-            };
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                text,
-                0.0,
-                egui::TextFormat {
-                    font_id: font_id.clone(),
-                    color: fg,
-                    ..Default::default()
-                },
-            );
-            if !preedit.is_empty() {
-                let ph = color_for(dark, Color32::from_gray(210), Color32::from_gray(60));
-                job.append(
-                    &preedit,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: font_id.clone(),
-                        color: ph,
-                        background: color_for(dark, Color32::from_gray(64), Color32::from_gray(225)),
-                        underline: egui::Stroke::new(1.0, ph),
-                        ..Default::default()
-                    },
-                );
-            }
-            let galley = bar_painter.layout_job(job);
-            bar_painter.galley(
-                Pos2::new(
-                    bar_rect.left() + bar_gap,
-                    bar_rect.center().y - galley.size().y / 2.0,
-                ),
-                galley,
-                fg,
-            );
-        }
-        // 光标竖线（仅聚焦时显示）。
-        if sess.input_focused {
-            let cy = bar_rect.center().y;
-            bar_painter.line_segment(
-                [
-                    Pos2::new(caret_x, cy - cell_h * 0.42),
-                    Pos2::new(caret_x, cy + cell_h * 0.42),
-                ],
-                egui::Stroke::new(1.5, fg),
-            );
-        }
-        // 全选态提示（Ctrl+A 后）。
-        if sess.input.sel_all {
-            let hint = color_for(dark, Color32::from_rgb(80, 130, 255), Color32::from_rgb(40, 90, 190));
-            bar_painter.text(
-                Pos2::new(bar_rect.right() - 10.0, bar_rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                "全选 ✓",
-                egui::FontId::proportional(11.0),
-                hint,
-            );
-        }
-    }
 
     // 会话活跃时由 SessionListener 的后台解析线程通过 redraw 信号触发重绘；
     // 这里不需要无条件 request_repaint，避免空闲时满帧空转。
