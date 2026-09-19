@@ -839,8 +839,13 @@ pub fn spawn(
     // 开启 kitty 键盘协议跟踪：应用推 CSI > flags u 时仿真器记下 DISAMBIGUATE 位，
     // terminal.rs 据此决定组合回车是否发 CSI-u（协商过了才发，避免对端不认识
     // 被当字面文本插进输入框）。
+    // 滚动历史行数：默认 10000 → 2000。历史是每页签内存大头：
+    // 列宽 × 行数 × ~32B/格，120 列时 10000 行 ≈ 38MB，多页签线性翻倍。
+    // 2000 行（≈7.7MB/页签）对本工具场景（nvim/lazygit/htop/回看日志）足够；
+    // ponytail: 需要更长的历史时，把 scrolling_history 移入 config.json 设置项。
     let term_config = Config {
         kitty_keyboard: true,
+        scrolling_history: 2000,
         ..Default::default()
     };
     let term = Term::new(
@@ -1425,6 +1430,33 @@ mod tests {
         // DSR 应答不应标记 OSC 颜色（否则主题广播会误推给不响 OSC 的会话）。
         let (_, osc2) = reply_to_queries(&term, b"\x1b[6n", true).unwrap();
         assert!(!osc2, "DSR 应答不应标记 OSC 颜色");
+    }
+
+    /// 回归：滚动历史上限必须生效——默认 scrollback 10000 行时每页签
+    /// 占用 ≈列宽×10000×32B（120 列 ≈ 38MB），页签开多内存线性爆炸。
+    /// 收紧后历史行数 ≤ scrolling_history，总占用降至 ~7.7MB/页签。
+    #[test]
+    fn scrollback_history_bounded() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::term::Config as TermConfig;
+        let cfg = TermConfig { scrolling_history: 2000, ..Default::default() };
+        let mut term = Term::new(cfg, &TermSize::new(120, 40), VoidListener);
+        let mut p: alacritty_terminal::vte::ansi::Processor = Default::default();
+        // 灌入远超历史的输出：120 列 × 12000 行（每行「A」+ 换行）。
+        let mut line = Vec::new();
+        for _ in 0..120 {
+            line.push(b'A');
+        }
+        line.push(b'\r');
+        line.push(b'\n');
+        for _ in 0..12000 {
+            p.advance(&mut term, &line);
+        }
+        // 历史行数 = 总行数 − 屏高，必须被 scrolling_history 钳住。
+        let hist = term.grid().total_lines() - 40;
+        assert!(hist <= 2000, "历史行数未受 scrolling_history 限制: {hist}");
+        assert!(hist > 1000, "历史应保留相当数量（{hist}）");
     }
 
     /// 回归：仿真器自发 PtyWrite 应答只放行主 DA（\x1b[?6c，conpty 握手必需），
