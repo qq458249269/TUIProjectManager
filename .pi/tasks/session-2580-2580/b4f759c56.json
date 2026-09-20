@@ -1,0 +1,21 @@
+{
+  "id": "b4f759c56",
+  "name": "release 构建",
+  "command": "cd /d/AI/TUIProjectManager && cargo build --release 2>&1 | tail -5",
+  "description": "Release 构建（LTO 全量链接，含 eframe/wgpu/alacritty 依赖首次编译，预计 10-20 分钟）",
+  "status": "failed",
+  "outputPath": ".pi\\tasks\\session-2580-2580\\b4f759c56.output",
+  "cwd": "D:\\AI\\TUIProjectManager",
+  "startTime": 1789531444541,
+  "endTime": 1789531444634,
+  "exitCode": 1,
+  "signal": null,
+  "pid": 44960,
+  "bytesWritten": 18,
+  "isAgent": false,
+  "error": "Exited with code 1",
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 2400
+}

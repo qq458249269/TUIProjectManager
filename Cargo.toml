@@ -19,7 +19,6 @@ rfd = "0.15"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9"
-pollster = "1" # 已在 eframe 依赖树内，零新增编译：wgpu 30 enumerate_adapters 是 async，仅启动时 block_on 一次查显卡厂商
 epaint_default_fonts = "0.36.1" # 内嵌 HACK 作为基础字体（替代 egui default_fonts，无 emoji，省 ~15MB）
 
 [build-dependencies]

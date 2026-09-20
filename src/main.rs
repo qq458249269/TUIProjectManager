@@ -234,20 +234,25 @@ fn prefer_glow() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // 纯设备枚举：不建窗口/渲染上下文，只查 DX12+Vulkan 后端（Intel iGPU
-        // 必然由 DXGI 列出），不触 GL 枚举，规避老 Intel GL 驱动闪退触发面。
-        let has_intel = std::panic::catch_unwind(|| {
-            let instance = eframe::wgpu::Instance::new(
-                eframe::wgpu::InstanceDescriptor::new_without_display_handle(),
-            );
-            let adapters = pollster::block_on(instance.enumerate_adapters(
-                eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::VULKAN,
-            ));
-            adapters
-                .iter()
-                .any(|a| a.get_info().name.to_ascii_lowercase().contains("intel"))
-        })
-        .unwrap_or(true); // 枚举异常时当 Intel 处理，走老 wgpu/DX12 路径
+        // wgpu::Instance::new() 在本机（Intel UHD 630 + AMD 混合）无窗口句柄下建即崩
+        // （0xc0000005），枚举更会加载老 Intel igvk64.dll 闪退，catch_unwind 都抓不住。
+        // 改用 WMI 纯文本查询（与 toast 同款 powershell 调用）：只读系统信息，
+        // 不加载任何 GPU 驱动。Intel 现像卡 → wgpu/DX12，否则 glow。
+        // 检测失败 → 当 Intel 处理 → 老 wgpu/DX12 稳妥路径（glow 只是省内存的优化，
+        // 拿不准时宁能不优化不能崩）。
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let script = "Get-CimInstance Win32_VideoController | %{ $_.Name }";
+        let has_intel = match std::process::Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .to_ascii_lowercase()
+                .contains("intel"),
+            Err(_) => true,
+        };
         !has_intel
     }
     #[cfg(not(target_os = "windows"))]
