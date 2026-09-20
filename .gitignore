@@ -6,3 +6,6 @@
 /.cargo_home/
 /.rustup_home/
 /Continue=silentlycontinue
+
+# pi 会话产物
+/.pi/
