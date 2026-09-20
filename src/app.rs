@@ -2122,7 +2122,8 @@ impl ClientApp {
         // 图标槽与 × 的宽度对所有页签相同；标题宽度按字符串缓存，标题
         // 不变时零排版成本。
         let tab_font = egui::TextStyle::Body.resolve(ui.style());
-        // 应用是否前台：每帧取一次（update_exited 的「运行结束」通知同样用它判断）。
+        // 应用是否前台：每帧取一次。通知静默判据：仅当前页签且前台激活才算
+        // „盯着"（update_exited 的「运行结束」通知用 crate::app_is_foreground 直接判）。
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd);
         let slot_w = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap("🔄".to_string(), tab_font.clone(), Color32::TRANSPARENT)
@@ -2216,12 +2217,17 @@ impl ClientApp {
                         Some("🔄")
                     } else if count > 0
                         && !viewed
+                        // TUI 静止等输入不算完成：界面没有任何改变的静态菜单/提示符
+                        // 几秒内 🔄→✅ 纯属假完成，还连带误弹「任务完成」通知。该态
+                        // 由下方「TUI 等输入」分支给空。剩下（非 TUI 静态/真结束）
+                        // 才按未查看判 ✅；用户是否盯着由通知块的 app_fg 判据管。
+                        && !(is_tui && cursor_vis && any_silent)
                         // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
                         // CPU 已在前置分支挡住静默思考，3s 够判定
                         // 「输出确实停了」→ 真实完成通知延迟压回 3 秒级。
                         && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
                     {
-                        // 输出已结束（连续 3s 零输出且 CPU 静默）+ 未查看 → ✅
+                        // 输出已结束（连续 3s 零输出且 CPU 静默）+ 排除等输入 + 未查看 → ✅
                         Some("✅")
                     } else if count > 0 && is_tui && cursor_vis && any_silent {
                         // TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止（前置分支已
@@ -2245,22 +2251,20 @@ impl ClientApp {
                     // 输出等进程在 🔄↔✅ 间横跳时重置计时；「还在跑」由前置的
                     // 进程树 CPU 判据（cpu_busy）挡在 🔄，所以短稳定窗口就够区分
                     // 真实完成与周期性输出——通知延迟保持在 3 秒级，不再用十几秒
-                    // 的静默阈值换准确性。仅当「当前页签且应用在前台」（用户正
-                    // 盯着）才静默；当前页签但应用在后台（焦点在别的窗口）→ 用户
-                    // 没在看，照常计时弹通知 + 闪烁，与 update_exited 的「运行
-                    // 结束」语义一致。图标离开 ✅ 只清零计时、不复位已通知标记：
-                    // 一次完成只响一次，用户点开页签后才为下一轮重新武装——否则
-                    // 后台运行 top/watch/编译间歇等横跳 🔄↔✅ 时会每轮轰炸通知。
-                    // icon 状态由上一分支计算；动作照旧。真正防轰炸的关键在 else
-                    // 分支不再复位 done_notified（见下方注释）。
+                    // 的静默阈值换准确性。假完成已在图标分支挡住（TUI 静止等输入
+                    // 不翻 ✅）——界面无任何改变的静态会话不再误推。静默判据：
+                    // 仅「当前页签且应用在前台」（用户正盯着）才清零计时不打扰；
+                    // 当前页签但应用在后台（焦点在别的窗口）= 用户没在看，照常
+                    // 计时弹通知 + 闪烁，与 update_exited 的「运行结束」语义一致。
+                    // 图标离开 ✅ 只清零计时、不复位已通知标记：一次完成只响一次；
+                    // 同轮反复切前/后台也不重复推（静默分支不再重武装 done_notified
+                    // ——旧代码每帧重武装，盯着时一切后台就再计 2s 又弹一次）。
                     if icon == Some("✅") {
                         let since = s.done_since_ms.load(Ordering::Relaxed);
                         if i == self.current && app_fg {
+                            // 用户正盯着 ✅：视为已知晓，清零计时（切走后再重新
+                            // 计 DONE_STABLE_MS）——不重武装，防同轮反复误推。
                             s.done_since_ms.store(0, Ordering::Relaxed);
-                            // 用户正盯着 ✅：视为已知晓，并**重新武装**（下轮完成
-                            // 还会提示）。done_notified=false 而非 true——旧代码这里
-                            // 置 true，配合 else 分支复位，后台轮询输出会每轮轰炸。
-                            s.done_notified.store(false, Ordering::Relaxed);
                         } else if since == 0 {
                             s.done_since_ms.store(now_ms, Ordering::Relaxed);
                         } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
@@ -2280,8 +2284,8 @@ impl ClientApp {
                         // 离开 ✅ 只清零计时（下轮完成重新计 DONE_STABLE_MS），
                         // **不复位 done_notified**：一次完成只响一次；后台轮询输出
                         // （top/watch/编译间歇）在 🔄↔✅ 间横跳时，旧逻辑每轮都弹
-                        // 系统通知 = 后台疯狂轰炸。只有用户点开页签（上个分支）才
-                        // 重新武装，下一轮完成才再提示一次。
+                        // 系统通知 = 后台疯狂轰炸。而静默分支也不再重武装（旧代码
+                        // 盯着时每帧置 false → 一切后台又弹一次 = 反复误推）。
                         s.done_since_ms.store(0, Ordering::Relaxed);
                     }
                     // 本页签当前启动命令（切换菜单里勾选当前项）。
@@ -3637,7 +3641,7 @@ impl ClientApp {
                 .small(),
         );
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（点击页签后消失），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知；周期输出横跳会重置计时。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（点击页签后消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知；周期输出横跳会重置计时。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
