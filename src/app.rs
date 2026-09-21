@@ -51,6 +51,16 @@ const IDLE_HEARTBEAT_MS: u64 = 500;
 const INPUT_ACTIVE_MS: u64 = 1_500;
 const OUTPUT_END_MS: u64 = 3_000;
 const DONE_STABLE_MS: u64 = 2_000;
+/// 后台 TUI 忙碌锁存（不延长完成通知）：对「后台 + TUI + 光标隐藏」
+/// （Agent/opencode/nano 等接管屏面、正在干活）的会话，自最后一次切实
+/// 活动（CPU 增量 / 网格变化 / 字节输出，会话级 last_busy_ms）起
+/// BG_LATCH_MS 内即使全静默也保持 🔄——覆盖 LLM 思考：批量推理 / 网络
+/// 等待间隙可达 3s~1min，输出宽限远不够。其余会话（前台、普通 shell、
+/// 光标可见的 TUI）不消费锁存，维持 3s 严格判定：完成通知延迟不受影响
+/// （约 5s，见 OUTPUT_END_MS/DONE_STABLE_MS），不拉长静默阈值。
+/// 60s 只是「宁可晚判定」的上限：光标隐藏本就意味着「屏面被接管、在
+/// 干活」，等输入态由光标可见分支表示，不会把 waiting 误判成运行。
+const BG_LATCH_MS: u64 = 60_000;
 
 /// 通知过滤阈值：会话累计实质输出字节数（非动画块的可打印字节，见
 /// session.rs out_bytes）不足此值时，「运行结束」/「任务完成」一律不弹通知。
@@ -1368,6 +1378,51 @@ pub struct ClientApp {
     pending_relaunch: Vec<PendingRelaunch>,
 }
 
+
+/// 页签状态图标判定（纯函数，便于测试）。
+/// 返回 '❌'/'🔄'/'✅'/None（None = 空/等待输入或空闲）。
+fn tab_icon(
+    exited: bool,
+    loading: bool,
+    count: u32,
+    typing: bool,
+    content_silent: bool,
+    cpu_busy: bool,
+    bg_latch: bool,
+    viewed: bool,
+    is_tui: bool,
+    cursor_vis: bool,
+    any_silent: bool,
+    last_out: u64,
+    now_ms: u64,
+) -> Option<&'static str> {
+    if exited {
+        return Some("❌");
+    }
+    if loading {
+        return Some("🔄");
+    }
+    // 🔄：正在输出 / 进程树在计算 / 后台忙碌锁存（bg_latch）
+    // bg_latch：后台 TUI 光标隐藏会话，最近 BG_LATCH_MS 内切实活动过
+    // （last_busy_ms）→ 避免 LLM 思考间隙被误判为「等待输入/空闲」。
+    // 调用方仅在「后台 TUI 光标隐藏」时置真 bg_latch，故前台/普通 shell 的
+    // ✅ 与完成通知路径不受扰动，仍按 ≤3s 判定；该态下 ✅ 本就分不清
+    // 思考与真完成，宁保持 🔄 也不假报完成。
+    if count > 0 && !typing && (!content_silent || cpu_busy || bg_latch) {
+        return Some("🔄");
+    }
+    // ✅：输出已结束 + 非 TUI 静止等输入 + 未查看 → 待查看
+    if count > 0
+        && !viewed
+        && !(is_tui && cursor_vis && any_silent)
+        && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
+    {
+        return Some("✅");
+    }
+    // 空：TUI 静止等输入 / 输入中 / 其余静默
+    None
+}
+
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
@@ -2211,42 +2266,37 @@ impl ClientApp {
                     let typing = s.last_input_ms.load(Ordering::Relaxed) != 0
                         && now_ms.saturating_sub(s.last_input_ms.load(Ordering::Relaxed))
                             < INPUT_ACTIVE_MS;
-                    let icon: Option<&str> = if s.exited.load(Ordering::Relaxed) {
-                        Some("❌")
-                    } else if s.loading.load(Ordering::Relaxed) {
-                        Some("🔄")
-                    } else if count > 0 && !typing && (!content_silent || cpu_busy) {
-                        // 网格内容在变化，或进程树最近 3s 在消耗 CPU（Agent 静默
-                        // 思考/长编译/搜索）→ 正在运行 🔄。旧版只认网格变化：
-                        // 静默期（思考/链接）被误判完成。用户刚输入时除外 → 空。
-                        Some("🔄")
-                    } else if count > 0
-                        && !viewed
-                        // TUI 静止等输入不算完成：界面没有任何改变的静态菜单/提示符
-                        // 几秒内 🔄→✅ 纯属假完成，还连带误弹「任务完成」通知。该态
-                        // 由下方「TUI 等输入」分支给空。剩下（非 TUI 静态/真结束）
-                        // 才按未查看判 ✅；用户是否盯着由通知块的 app_fg 判据管。
-                        && !(is_tui && cursor_vis && any_silent)
-                        // 输出真正结束判据：最近 OUTPUT_END_MS 内没有任何字节。
-                        // CPU 已在前置分支挡住静默思考，3s 够判定
-                        // 「输出确实停了」→ 真实完成通知延迟压回 3 秒级。
-                        && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
-                    {
-                        // 输出已结束（连续 3s 零输出且 CPU 静默）+ 排除等输入 + 未查看 → ✅
-                        Some("✅")
-                    } else if count > 0 && is_tui && cursor_vis && any_silent {
-                        // TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止（前置分支已
-                        // 筛掉 CPU 忙与网格动）= 在等用户输入/选择 → 空。无
-                        // 「内容新鲜度」时间窗：等到任何时候都保持空，不翻 ✅。
-                        // any_silent 挡动画与周期重绘：进程只要还在输出就不算等待。
-                        // （排除会话结束后 shell 空闲停在提示符的情况）
-                        None
-                    } else if count > 0 && typing {
-                        // 空白 shell / 无回显场景下刚输入过 → 空，不误判 🔄/✅。
-                        None
-                    } else {
-                        None
-                    };
+                    // 会话级「切实活动」锁存写入：CPU 在算 / 网格在动 / 有字节输出
+                    // 任一发生即刷新 last_busy_ms（所有页签都写，前台不消费）。
+                    if cpu_busy || !content_silent || !any_silent {
+                        s.last_busy_ms.store(now_ms, Ordering::Relaxed);
+                    }
+                    // 锁存消费：仅「后台 + TUI + 光标隐藏」（Agent 之类接管屏面、
+                    // 正在干活）的会话。光标可见的 TUI（vim 空闲、pi 等输入）不
+                    // 进锁存——等输入态照旧由「TUI 静止等输入」分支判空，不被
+                    // 误报运行；普通 shell/前台不消费，✅ 与完成通知仍按 3s 严格
+                    // 判定、零延迟变化（后台 TUI 隐藏光标真结束时最多晚 60s 亮 ✅，
+                    // 该态本就无法区分思考与完成，宁错判运行不假报完成）。
+                    let bg_latched = i != self.current
+                        && is_tui
+                        && s.cursor_hidden.load(Ordering::Relaxed)
+                        && now_ms.saturating_sub(s.last_busy_ms.load(Ordering::Relaxed))
+                            < BG_LATCH_MS;
+                    let icon = tab_icon(
+                        s.exited.load(Ordering::Relaxed),
+                        s.loading.load(Ordering::Relaxed),
+                        count,
+                        typing,
+                        content_silent,
+                        cpu_busy,
+                        bg_latched,
+                        viewed,
+                        is_tui,
+                        cursor_vis,
+                        any_silent,
+                        last_out,
+                        now_ms,
+                    );
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
@@ -4425,6 +4475,80 @@ impl eframe::App for ClientApp {
         self.confirm_dialog(ui);
     }
 }
+#[cfg(test)]
+mod tab_icon_tests {
+    use super::tab_icon;
+
+    // 后台 TUI 光标隐藏（Agent 正在干活）会话：CPU/网格长时间静默（LLM
+    // 思考，>3s 窗口）但锁存期内 → 仍 🔄（本次修复的回归点：此前误判为空）。
+    #[test]
+    fn bg_latch_keeps_running_during_long_think() {
+        let (now, last_out) = (100_000u64, 90_000u64); // 10s 无新字节
+        let icon = tab_icon(
+            false, false, 10, false, // exited, loading, count, typing
+            true, false, true,       // content_silent, cpu_busy, bg_latch
+            false, false, false, true, // viewed, is_tui, cursor_vis, any_silent
+            last_out, now,
+        );
+        assert_eq!(icon, Some("🔄"));
+    }
+
+    // 前台页签不消费锁存：同样静默按 3s 严格判定落回空（完成通知不被后延）。
+    #[test]
+    fn foreground_keeps_tight_classification() {
+        let (now, last_out) = (100_000u64, 90_000u64);
+        let icon = tab_icon(
+            false, false, 10, false,
+            true, false, false, // bg_latch = false（当前页签）
+            false, true, true, true, // TUI 空闲、光标可见 → 等输入
+            last_out, now,
+        );
+        assert_eq!(icon, None);
+    }
+
+    // 锁存过期（>60s 无活动、CPU/网格静默）→ 不再 🔄；已查看 → 空。
+    #[test]
+    fn bg_latch_expires_after_window() {
+        let (now, last_out) = (100_000u64, 30_000u64); // 70s 无输出
+        // bg_latch 由调用方算出并传入：70s > BG_LATCH_MS(60s) → false
+        let bg_latch = now.saturating_sub(last_out) < 60_000;
+        let icon = tab_icon(
+            false, false, 10, false,
+            true, false, bg_latch,
+            true, false, false, true, // viewed=true
+            last_out, now,
+        );
+        assert_eq!(icon, None);
+    }
+
+    // CPU 活跃仍是硬判据：静默思考（无输出、网格静止）靠进程树 CPU 保持 🔄。
+    #[test]
+    fn cpu_busy_keeps_running() {
+        let (now, last_out) = (100_000u64, 90_000u64);
+        let icon = tab_icon(
+            false, false, 10, false,
+            true, true, false, // cpu_busy=true
+            false, false, false, true,
+            last_out, now,
+        );
+        assert_eq!(icon, Some("🔄"));
+    }
+
+    // 「完成通知 ≤3s」保障（含锁存场景）：普通 shell/非 TUI 不消费锁存，
+    // 输出停止 3s 即亮 ✅——锁存机制不把真实完成的通知拖慢。
+    #[test]
+    fn latch_does_not_delay_script_done() {
+        let (now, last_out) = (100_000u64, 96_000u64); // 4s 无输出 > OUTPUT_END_MS
+        let icon = tab_icon(
+            false, false, 10, false,
+            true, false, false, // bg_latch=false（非 TUI 会话拿不到锁存）
+            false /*viewed*/, false /*is_tui*/, true /*cursor_vis*/, true /*any_silent*/,
+            last_out, now,
+        );
+        assert_eq!(icon, Some("✅"));
+    }
+}
+
 #[cfg(all(test, windows))]
 mod vscode_tests {
     use super::ClientApp;

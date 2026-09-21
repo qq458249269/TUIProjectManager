@@ -139,6 +139,11 @@ pub struct Session {
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     pub last_output_ms: Arc<AtomicU64>,
+    /// 最近一次「确实在干活」的时刻（毫秒）：进程树 CPU 在算 / 网格在动 /
+    /// 有字节输出任一发生时，UI 线程每帧刷新（app.rs 页签图标循环）。后台
+    /// 页签据此做长锁存：LLM 思考（批量推理 / 网络等待间隙可达 3s~1min）
+    /// 期间即使长时间无输出无 CPU 增量也保持 🔄，见 app.rs BG_LATCH_MS。
+    pub last_busy_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 累计实质输出字节数（非动画块的可打印字节，读取线程写、UI 线程读）。
@@ -898,6 +903,7 @@ pub fn spawn(
         .unwrap_or_default()
         .as_millis() as u64;
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
+    let last_busy_ms = Arc::new(AtomicU64::new(now_ts));
     // 初始用 spawn 时刻：新会话尚无内容，首块输出（或 TUI 首屏）到来时
     // 与空快照比较必然不同 → 更新为实际内容变化时刻。
     let last_grid_change_ms = Arc::new(AtomicU64::new(now_ts));
@@ -1230,6 +1236,7 @@ pub fn spawn(
         output_count,
         out_bytes,
         last_output_ms,
+        last_busy_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
         alt_screen: Arc::new(AtomicBool::new(false)),
         cursor_hidden: Arc::new(AtomicBool::new(true)),
