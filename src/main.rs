@@ -243,17 +243,22 @@ fn prefer_glow() -> bool {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let script = "Get-CimInstance Win32_VideoController | %{ $_.Name }";
-        let has_intel = match std::process::Command::new("powershell")
+        let names = match std::process::Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
             .output()
         {
-            Ok(o) => String::from_utf8_lossy(&o.stdout)
-                .to_ascii_lowercase()
-                .contains("intel"),
-            Err(_) => true,
+            Ok(o) => String::from_utf8_lossy(&o.stdout).to_ascii_lowercase(),
+            Err(_) => String::new(),
         };
-        !has_intel
+        let has_intel = names.contains("intel");
+        let has_discrete =
+            names.contains("nvidia") || names.contains("geforce") || names.contains("amd")
+                || names.contains("radeon");
+        // 有独显（AMD/NVIDIA）→ glow：独显 OGL 驱动稳定，兼省显存。
+        // 纯 Intel / 未知 → wgpu/DX12：集显老 OGL 驱动会闪退（ig9icd64.dll），
+        // DX12 用微软运行时+厂商驱动绕开；检测失败宁可不优化不能崩。
+        !has_intel || has_discrete
     }
     #[cfg(not(target_os = "windows"))]
     {

@@ -576,9 +576,18 @@ struct FILETIME {
     dw_high_date_time: u32,
 }
 
-/// CPU 采样缓存：采样时刻 + pid -> (父 pid, CPU 累计 ticks, 最近活跃时刻)。
+/// CPU 采样缓存：采样时刻 + pid -> (父 pid, CPU 累计 ticks, 最近活跃时刻)
+/// + 本次采样窗口内的子树活跃结果缓存（pid -> bool）。
+/// 进程表快照每 500ms 重建一次，但子树扫描此前每次调用都全跑：
+/// 页签图标循环每帧对每个页签调一次 tree_cpu_active，O(进程数×树深×seen 线性扫)
+/// 全在帧内重复 → 空闲时也是主要 CPU 开销。放在同一采样窗口里缓存结果，
+/// 窗口内重复查询直接命中（last_active 只在换快照时变，窗口内答案恒定）。
 #[cfg(windows)]
-type CpuSample = (u64, std::collections::HashMap<u32, (u32, u64, u64)>);
+type CpuSample = (
+    u64,
+    std::collections::HashMap<u32, (u32, u64, u64)>,
+    std::collections::HashMap<u32, bool>,
+);
 
 /// 全进程表快照：pid -> (父 pid, user+kernel CPU 累计 ticks（100ns 单位）)。
 #[cfg(windows)]
@@ -627,10 +636,10 @@ pub fn tree_cpu_active(pid: u64, now_ms: u64) -> bool {
     let mut guard = CACHE.lock().unwrap();
     let stale = guard
         .as_ref()
-        .is_none_or(|(at, _)| now_ms.saturating_sub(*at) >= CPU_SAMPLE_INTERVAL_MS);
+        .is_none_or(|(at, _, _)| now_ms.saturating_sub(*at) >= CPU_SAMPLE_INTERVAL_MS);
     if stale {
         let snap = unsafe { snapshot_cpu_ticks() };
-        let prev = guard.take().map(|(_, m)| m).unwrap_or_default();
+        let prev = guard.take().map(|(_, m, _)| m).unwrap_or_default();
         let mut procs = std::collections::HashMap::with_capacity(snap.len());
         for (p, (pp, ticks)) in snap {
             // 无增量（ticks 相等）→ 沿用上次活跃时刻；有增量、新出现，或
@@ -641,10 +650,13 @@ pub fn tree_cpu_active(pid: u64, now_ms: u64) -> bool {
             };
             procs.insert(p, (pp, ticks, last_active));
         }
-        *guard = Some((now_ms, procs));
+        *guard = Some((now_ms, procs, std::collections::HashMap::new()));
     }
-    let (_, procs) = guard.as_ref().unwrap();
+    let (_, procs, memo) = &mut *guard.as_mut().unwrap();
     let root = pid as u32;
+    if let Some(&hit) = memo.get(&root) {
+        return hit; // 本采样窗口内已算过 → 直接命中，不再扫树。
+    }
     if !procs.contains_key(&root) {
         return false; // 顶层进程已不在进程表 → 树不存在
     }
@@ -659,8 +671,11 @@ pub fn tree_cpu_active(pid: u64, now_ms: u64) -> bool {
             }
         }
     }
-    seen.into_iter()
-        .any(|p| now_ms.saturating_sub(procs[&p].2) < CPU_ACTIVE_WINDOW_MS)
+    let active = seen
+        .into_iter()
+        .any(|p| now_ms.saturating_sub(procs[&p].2) < CPU_ACTIVE_WINDOW_MS);
+    memo.insert(root, active);
+    active
 }
 
 #[cfg(not(windows))]

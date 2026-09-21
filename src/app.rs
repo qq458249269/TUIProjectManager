@@ -3601,9 +3601,9 @@ impl ClientApp {
         ui.separator();
         ui.add_space(6.0);
         // ── 帧率预设 ──
-        ui.label(RichText::new("终端页签刷新帧率（10–60 FPS）").strong());
+        ui.label(RichText::new("终端页签刷新帧率（10–30 FPS）").strong());
         ui.add_space(4.0);
-        let presets = [10u64, 30, 60];
+        let presets = [10u64, 30];
         let cur_fps = self.config.settings.refresh_fps;
         ui.horizontal(|ui| {
             for &preset in &presets {
@@ -3623,20 +3623,20 @@ impl ClientApp {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.settings_refresh_fps)
                     .desired_width(50.0)
-                    .hint_text("10-60"),
+                    .hint_text("10-30"),
             );
             if resp.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                 && let Ok(v) = self.settings_refresh_fps.parse::<u64>()
             {
-                let clamped = v.clamp(10, 60);
+                let clamped = v.clamp(10, 30);
                 self.config.settings.refresh_fps = clamped;
                 self.settings_refresh_fps = clamped.to_string();
                 self.save_config(format!("帧率已设为 {clamped} FPS"));
             }
         });
         ui.label(
-            RichText::new("有输出/交互时按此帧率刷新，全部静止自动降为 2 FPS 慢心跳省电")
+            RichText::new("有输出/交互时按此帧率刷新（动画上限 30 FPS，交互即时帧不受限），全部静止自动降为 2 FPS 慢心跳省电")
                 .weak()
                 .small(),
         );
@@ -4042,10 +4042,11 @@ impl eframe::App for ClientApp {
             }
         }
         let delay_ms = if busy {
-            // busy 帧间隔下限钳 100ms（10fps）：TUI 动画节拍 ≈100-250ms 足够；
-            // 30/60fps 档只服务交互（egui 交互路径自行 request_repaint 立即帧），
-            // 纯输出/动画不跑满，留出悬停判定窗口。
-            (1000 / self.config.settings.refresh_fps.clamp(10, 60)).max(100)
+            // 帧率档位真实生效：10→100ms、30→33ms；上限封 30fps（33ms）。
+            // 不放开 60：持续 60fps 连续重绘会顶满 CPU 并干扰 winit hover 跟踪
+            // （悬停激活失效，见 921f062）；交互即时帧不走该定时器（egui
+            // 交互路径自行 request_repaint，不受上限约束）。
+            (1000 / self.config.settings.refresh_fps.clamp(10, 60)).max(33)
         } else {
             IDLE_HEARTBEAT_MS
         };
