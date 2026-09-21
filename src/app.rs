@@ -4027,27 +4027,25 @@ impl eframe::App for ClientApp {
             if s.redraw_rx.try_recv().is_ok() {
                 busy = true;
             }
-        }
-        if !busy {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            for tab in &self.tabs {
-                if let Tab::Session(s) = tab {
-                    // 最近 300ms 有输出或仍在启动 → 持续刷新（TUI 动画/top/watch 等
-                    // 周期性进程依赖持续帧；加载态也需帧渲染启动画面）。
-                    if now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed)) < 300
-                        || s.loading.load(Ordering::Relaxed)
-                    {
-                        busy = true;
-                        break;
-                    }
+            if !busy {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                // 仅前台页签的近期输出/加载态拉高整窗帧率；后台页签输出只更新
+                // 图标（1s 基线轮询），不再连带全窗刷新（连带刷=悬停激活干扰源）。
+                if now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed)) < 300
+                    || s.loading.load(Ordering::Relaxed)
+                {
+                    busy = true;
                 }
             }
         }
         let delay_ms = if busy {
-            1000 / self.config.settings.refresh_fps.clamp(10, 60)
+            // busy 帧间隔下限钳 100ms（10fps）：TUI 动画节拍 ≈100-250ms 足够；
+            // 30/60fps 档只服务交互（egui 交互路径自行 request_repaint 立即帧），
+            // 纯输出/动画不跑满，留出悬停判定窗口。
+            (1000 / self.config.settings.refresh_fps.clamp(10, 60)).max(100)
         } else {
             IDLE_HEARTBEAT_MS
         };
