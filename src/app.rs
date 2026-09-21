@@ -1371,6 +1371,11 @@ pub struct ClientApp {
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
+        // 移除 egui 默认的 Ctrl+Q（Cmd-Q）退出快捷键：它在首页等无消费控件处
+        // 会发送 ViewportCommand::Close 关闭整个应用。清空后仅剩系统级关闭
+        // （标题栏 × / Alt+F4），终端页签内 Ctrl+Q 仍照常转发给子进程（0x11）。
+        cc.egui_ctx
+            .options_mut(|o| o.quit_shortcuts.clear());
         let config = config::load();
         let initial_dark = config.settings.dark_mode;
         apply_theme(
