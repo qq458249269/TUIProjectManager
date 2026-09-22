@@ -819,8 +819,13 @@ pub fn show_terminal(
             };
             if resp.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
+                    // 起点边界不能写死 Side::Left：从右往左拖时 Left 边界落在
+                    // 按下格的左缘，交换 anchor 后最右格被 range_simple 减一列漏选。
+                    // 按下瞬间的格内半侧才决定该边界（用 click_press_pos，比
+                    // drag_started 帧的当前坐标更接近真实落点）。
+                    let press_side = sess.click_press_pos.map(side_at).unwrap_or(Side::Left);
                     t.selection =
-                        Some(TermSelection::new(SelectionType::Simple, pos, Side::Left));
+                        Some(TermSelection::new(SelectionType::Simple, pos, press_side));
                     // 本地选区手势认领：吞掉这对按下/释放，不给 TUI 发幽灵点击。
                     sess.mouse_gesture_sel = true;
                     sess.mouse_press_pending = None;
@@ -873,8 +878,11 @@ pub fn show_terminal(
                             ))
                         };
                         if let Some(start) = point_at(p0) {
-                            t.selection =
-                                Some(TermSelection::new(SelectionType::Simple, start, Side::Left));
+                            t.selection = Some(TermSelection::new(
+                                SelectionType::Simple,
+                                start,
+                                side_at(p0),
+                            ));
                             if let Some(end) = point_at(p1)
                                 && let Some(sel) = t.selection.as_mut()
                             {
