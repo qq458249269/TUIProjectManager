@@ -1251,8 +1251,13 @@ pub fn show_terminal(
     let canvas_bg = color_for(dark, TERM_BG_DARK, TERM_BG_LIGHT);
     // 启动占位：会话启动中且快照还没有任何格子（子进程首屏未渲染）时，
     // 终端区显示「正在启动会话…」，避免纯黑屏让用户以为页签没打开。
-    // 子进程一旦画出内容（snap.cells 非空）或 loading 清除，提示自动消失。
-    if sess.loading.load(Ordering::Relaxed) && snap.cells.is_empty() {
+    // 子进程一旦画出内容（snap.cells 非空）或 loading 超墙钟窗（loading_active，
+    // 零输出会话不依赖 reader 自清）提示自动消失。
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if sess.loading_active(now_ms) && snap.cells.is_empty() {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,

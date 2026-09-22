@@ -1413,7 +1413,10 @@ fn tab_icon(
     // 调用方仅在「后台 TUI 光标隐藏」时置真 bg_latch，故前台/普通 shell 的
     // ✅ 与完成通知路径不受扰动，仍按 ≤3s 判定；该态下 ✅ 本就分不清
     // 思考与真完成，宁保持 🔄 也不假报完成。
-    if count > 0 && !typing && (!content_silent || cpu_busy || bg_latch) {
+    // 不再要求 count>0：转义序列密集的 TUI（全屏重绘/动画）大部分块会被
+    // 判为动画而不计入 output_count → count 长期为 0，旧门槛把它们堵在 🔄
+    // 外：「网格确实在动、进程确实在跑」却显示空白（后台页签尤甚）。
+    if !typing && (!content_silent || cpu_busy || bg_latch) {
         return Some("🔄");
     }
     // ✅：输出已结束 + 非 TUI 静止等输入 + 未查看 → 待查看
@@ -2287,7 +2290,7 @@ impl ClientApp {
                             < BG_LATCH_MS;
                     let icon = tab_icon(
                         s.exited.load(Ordering::Relaxed),
-                        s.loading.load(Ordering::Relaxed),
+                        s.loading_active(now_ms),
                         count,
                         typing,
                         content_silent,
@@ -4056,7 +4059,7 @@ impl eframe::App for ClientApp {
                 // 仅前台页签的近期输出/加载态拉高整窗帧率；后台页签输出只更新
                 // 图标（1s 基线轮询），不再连带全窗刷新（连带刷=悬停激活干扰源）。
                 if now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed)) < 300
-                    || s.loading.load(Ordering::Relaxed)
+                    || s.loading_active(now_ms)
                 {
                     busy = true;
                 }
@@ -4481,6 +4484,35 @@ mod tab_icon_tests {
             false, false, 10, false,
             true, false, bg_latch,
             true, false, false, true, // viewed=true
+            last_out, now,
+        );
+        assert_eq!(icon, None);
+    }
+
+    // 转义序列密集的 TUI（全屏重绘/动画，大多块被 reader 判为动画而不计
+    // count）count 常年为 0、网格却持续重绘 → 必须 🔄。本次修复的回归点：
+    // 旧 `count>0` 门槛把这类运行中会话堵在 🔄 外，后台页签显示空白。
+    #[test]
+    fn grid_active_with_zero_count_shows_running() {
+        let (now, last_out) = (100_000u64, 97_000u64); // 字节静默，网格在动
+        let icon = tab_icon(
+            false, false, 0, false, // exited, loading, count=0, typing
+            false, false, false,    // content_silent=false, cpu_busy=false, bg_latch=false
+            false, false, false, false, // viewed, is_tui, cursor_vis, any_silent
+            last_out, now,
+        );
+        assert_eq!(icon, Some("🔄"));
+    }
+
+    // 同场景但网格静止（动画结束、进程尽显空闲）→ 空，不翻 🔄：网格静默时
+    // 必须回落到 CPU/锁存/字节判据，防止动画判别放宽后误报运行。
+    #[test]
+    fn grid_idle_with_zero_count_is_blank() {
+        let (now, last_out) = (100_000u64, 97_000u64);
+        let icon = tab_icon(
+            false, false, 0, false,
+            true /*content_silent*/, false, false,
+            false, false, false, false,
             last_out, now,
         );
         assert_eq!(icon, None);

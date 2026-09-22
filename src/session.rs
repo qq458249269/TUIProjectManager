@@ -539,6 +539,12 @@ const CPU_SAMPLE_INTERVAL_MS: u64 = 500;
 #[cfg(windows)]
 const CPU_ACTIVE_WINDOW_MS: u64 = 3000;
 
+/// loading 标志的墙钟上限（见 Session::loading_active）。reader 线程只在「有
+/// 输出」时才会清 loading（首个非动画块 / 3s 兜底）；零输出会话（sleep、静默
+/// 命令、后台 daemon）永远不会触发清理 → 页签 🔄 常驻、误报「加载中」。消费侧
+/// 统一走 loading_active()：超过窗口后无论标志是否仍为 true 都不再显示加载态。
+const LOADING_MAX_MS: u64 = 5_000;
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -912,6 +918,10 @@ pub fn spawn(
     // 读取子进程输出的线程。
     let term = Arc::new(RwLock::new(term));
     let parse_gen = Arc::new(AtomicU64::new(0));
+    // TUI 状态（备用屏/隐藏光标）由 reader 每次输出后实时写，供页签图标/
+    // latch 判定：后台页签不渲染，terminal.rs 的写入只发生在切到前台时。
+    let alt_screen = Arc::new(AtomicBool::new(false));
+    let cursor_hidden = Arc::new(AtomicBool::new(true));
     {
         let term = term.clone();
         let theme_dark = theme_dark.clone();
@@ -924,6 +934,8 @@ pub fn spawn(
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
+        let reader_alt_screen = alt_screen.clone();
+        let reader_cursor_hidden = cursor_hidden.clone();
         let parse_gen = parse_gen.clone();
         let reader_snapshot = snapshot.clone();
         let reader_cmd_rx = cmd_rx;
@@ -1147,6 +1159,13 @@ pub fn spawn(
                                 let selected_text = t.selection_to_string();
                                 let show = t.mode().contains(TermMode::SHOW_CURSOR);
                                 let mode = *t.mode();
+                                // 实时写 TUI 状态：reader 每次处理输出后更新，
+                                // 后台页签不再依赖最近一次前台渲染留下的旧值
+                                // (terminal.rs 只渲染当前页签，切走后这些标志
+                                // 冻结 → 后台页签图标/长锁存判反)。
+                                reader_alt_screen
+                                    .store(mode.contains(TermMode::ALT_SCREEN), Ordering::Relaxed);
+                                reader_cursor_hidden.store(!show, Ordering::Relaxed);
                                 let cpoint = cursor.point;
                                 let (cc, cf) = {
                                     let cell = &t.grid()[cpoint];
@@ -1238,8 +1257,8 @@ pub fn spawn(
         last_output_ms,
         last_busy_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
-        alt_screen: Arc::new(AtomicBool::new(false)),
-        cursor_hidden: Arc::new(AtomicBool::new(true)),
+        alt_screen,
+        cursor_hidden,
         parse_gen: parse_gen.clone(),
         caret_scan: None,
         snapshot_scratch: Vec::new(),
@@ -1261,6 +1280,15 @@ pub fn spawn(
 }
 
 impl Session {
+    /// 页签「加载中」判定：loading 标志 + 墙钟双条件。reader 只在「有输出」时
+    /// 才自清 loading（首个非动画块 / 3s 兜底），零输出会话（sleep、静默命令）
+    /// 会常驻 true → 墙钟兜底，超时后不再显示加载态，杜绝「🔄常驻但没在跑」。
+    /// 页签图标 / 终端区启动占位 / 帧率调度三处统一走这里，口径一致。
+    pub fn loading_active(&self, now_ms: u64) -> bool {
+        self.loading.load(Ordering::Relaxed)
+            && now_ms.saturating_sub(self.started_ms.load(Ordering::Relaxed)) < LOADING_MAX_MS
+    }
+
     /// 将 child 和 master 都移到后台线程异步清理，避免 Child::drop / MasterPty::drop
     /// 在 UI 线程阻塞（Windows 上调用 WaitForSingleObject 等待进程退出，
     /// 100-500ms 冻结 UI）。
