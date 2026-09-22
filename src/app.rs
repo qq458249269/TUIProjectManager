@@ -32,41 +32,16 @@ const IDLE_HEARTBEAT_MS: u64 = 500;
 /// 回归 3 次，见 921f062/0ae5904）。根治 = 锁死 10 FPS，杜绝再被调高。
 const BUSY_FRAME_MS: u64 = 100;
 
-/// TUI 状态检测阈值（页签图标 / 完成通知判定）。准确性优先，但拒绝
-/// 「拉长静默阈值」式消误报——那会把真实完成的通知推迟到十几秒。
-/// 「还在运行」的正确证据是进程树在消耗 CPU（session::tree_cpu_active）：
-/// Agent 静默思考/编译/搜索/打包都是 CPU 活跃，只是终端没输出。
-///
-/// 误报成因复盘：
-/// - 旧 ✅ 分支只有 `count>0 && !viewed`，无「输出确实停止」时间判据，
-///   字节一静 500ms 就亮 ✅。
-/// - 旧 DONE_STABLE_MS=2s：周期输出间隙 >2s 就弹「任务完成」，实为还在跑。
-/// - 旧 content_fresh=3s：TUI 静默 >3s（思考/链接）掉出「活跃」落 ✅。
-///
-/// 现方案（页签运行态图标只保留 空 / 🔄 / ✅ 三态，原 ✏️「等待输入」并入空；
-/// ❌ 已退出单独保留、不随此判断改变）：
-/// - 🔄 判定为「网格在变 或 进程树近 3s 有 CPU 增量」——静默思考期间
-///   保持 🔄，绝不误落 ✅（CPU 判据见 session.rs tree_cpu_active）。
-/// - 🔄 的唯一例外：用户刚在终端里输入（按键/粘贴/IME，last_input_ms 距今
-///   不足 INPUT_ACTIVE_MS）→ 回显与格内刷新是输入驱动，不是任务在跑 → 空，
-///   修复「输入时被误判成 🔄」。
-/// - TUI 空闲 + 光标可见 + 字节/网格/CPU 三静止 → 空，且无「内容新鲜度」
-///   时间窗：TUI 挂着等待多久都保持空，不会因长时间静默翻成 ✅。
-/// - OUTPUT_END_MS=3s：✅ 需连续 3s 零字节输出 + CPU 静默 + 网格静止。
-/// - DONE_STABLE_MS=2s：通知/闪烁需在 ✅ 稳定停留 2 秒；实际通知延迟约 5s。
-const INPUT_ACTIVE_MS: u64 = 1_500;
+/// 页签状态判定：仅凭终端内容（last_output_ms，reader 每收到一块输出即
+/// 刷新）。最近 3 秒内有输出 → 运行中；3 秒无内容 → 视为「输出结束/完成」。
+/// 不做进程树 CPU 采样，不做网格/光标/锁存启发——后台任何「固定刷新」
+/// （周期重绘、CPU 轮询、TUI 思考间隙）都不再影响判定；滚动/翻页/裁窗只改
+/// 视口、不产生内容 → 天然不计更新状态。
+/// 代价即本方案：后台 TUI 静默思考 / 网络等待（>3s 无输出）会被判为完成；
+/// 用户要求以终端内容为准，出现该情况即 3s 后亮 ✅/弹通知（后果已知晓）。
 const OUTPUT_END_MS: u64 = 3_000;
+/// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
-/// 后台 TUI 忙碌锁存（不延长完成通知）：对「后台 + TUI + 光标隐藏」
-/// （Agent/opencode/nano 等接管屏面、正在干活）的会话，自最后一次切实
-/// 活动（CPU 增量 / 网格变化 / 字节输出，会话级 last_busy_ms）起
-/// BG_LATCH_MS 内即使全静默也保持 🔄——覆盖 LLM 思考：批量推理 / 网络
-/// 等待间隙可达 3s~1min，输出宽限远不够。其余会话（前台、普通 shell、
-/// 光标可见的 TUI）不消费锁存，维持 3s 严格判定：完成通知延迟不受影响
-/// （约 5s，见 OUTPUT_END_MS/DONE_STABLE_MS），不拉长静默阈值。
-/// 60s 只是「宁可晚判定」的上限：光标隐藏本就意味着「屏面被接管、在
-/// 干活」，等输入态由光标可见分支表示，不会把 waiting 误判成运行。
-const BG_LATCH_MS: u64 = 60_000;
 
 /// 通知过滤阈值：会话累计实质输出字节数（非动画块的可打印字节，见
 /// session.rs out_bytes）不足此值时，「运行结束」/「任务完成」一律不弹通知。
@@ -1384,20 +1359,16 @@ pub struct ClientApp {
 }
 
 
-/// 页签状态图标判定（纯函数，便于测试）。
-/// 返回 '❌'/'🔄'/'✅'/None（None = 空/等待输入或空闲）。
+/// 页签状态图标判定（纯函数，便于测试）。仅凭终端内容判定：
+/// 已退出 → ❌；启动加载中 → 🔄；最近 OUTPUT_END_MS（3s）内有输出 → 🔄；
+/// 输出停止 ≥3s 且有可查看内容且未查看 → ✅（完成/待查看）；否则空。
+/// 滚动/翻页只改视口、不写 last_output_ms → 不计更新状态；周期重绘、CPU
+/// 采样、锁存等后台「固定刷新」全部退出判定，3 秒无内容即完成。
 fn tab_icon(
     exited: bool,
     loading: bool,
     count: u32,
-    typing: bool,
-    content_silent: bool,
-    cpu_busy: bool,
-    bg_latch: bool,
     viewed: bool,
-    is_tui: bool,
-    cursor_vis: bool,
-    any_silent: bool,
     last_out: u64,
     now_ms: u64,
 ) -> Option<&'static str> {
@@ -1407,27 +1378,16 @@ fn tab_icon(
     if loading {
         return Some("🔄");
     }
-    // 🔄：正在输出 / 进程树在计算 / 后台忙碌锁存（bg_latch）
-    // bg_latch：后台 TUI 光标隐藏会话，最近 BG_LATCH_MS 内切实活动过
-    // （last_busy_ms）→ 避免 LLM 思考间隙被误判为「等待输入/空闲」。
-    // 调用方仅在「后台 TUI 光标隐藏」时置真 bg_latch，故前台/普通 shell 的
-    // ✅ 与完成通知路径不受扰动，仍按 ≤3s 判定；该态下 ✅ 本就分不清
-    // 思考与真完成，宁保持 🔄 也不假报完成。
-    // 不再要求 count>0：转义序列密集的 TUI（全屏重绘/动画）大部分块会被
-    // 判为动画而不计入 output_count → count 长期为 0，旧门槛把它们堵在 🔄
-    // 外：「网格确实在动、进程确实在跑」却显示空白（后台页签尤甚）。
-    if !typing && (!content_silent || cpu_busy || bg_latch) {
+    // 有内容（最近一块输出距今 ≤3s）→ 运行中。动画块也刷新 last_output_ms，
+    // spinner/周期重绘期间保持 🔄；本地滚动/翻页不产生输出，不会点亮它。
+    if now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
         return Some("🔄");
     }
-    // ✅：输出已结束 + 非 TUI 静止等输入 + 未查看 → 待查看
-    if count > 0
-        && !viewed
-        && !(is_tui && cursor_vis && any_silent)
-        && now_ms.saturating_sub(last_out) > OUTPUT_END_MS
-    {
+    // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
+    if count > 0 && !viewed {
         return Some("✅");
     }
-    // 空：TUI 静止等输入 / 输入中 / 其余静默
+    // 空：无内容可看 / 已查看过。
     None
 }
 
@@ -2242,78 +2202,30 @@ impl ClientApp {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    // ── TUI 状态检测（准确性优先：宁可晚判定，不误报） ──
-                    let is_tui = s.alt_screen.load(Ordering::Relaxed);
-                    let cursor_vis = !s.cursor_hidden.load(Ordering::Relaxed);
-                    let last_content = s.last_grid_change_ms.load(Ordering::Relaxed);
-                    // 网格内容级静止：reader 每块输出后比较新旧可见格子（见
-                    // session.rs），动画/spinner/周期重绘（top/watch）都改变格子
-                    // → 内容新鲜；只有真正静止等待输入时才静默。比字节级可打印内容
-                    // 判据更接近真值，思考动画期不再被误判为「等待你的选择」。
-                    let content_silent = now_ms.saturating_sub(last_content) > 500;
-                    // 无「内容新鲜度」时间窗：TUI 在等输入/选择时挂多久都是「在等」
-                    // → 空，不会因长时间静默而翻成 ✅（CPU 判据已挡静默思考）。
+                    // ── 状态判定：仅凭终端内容 ──
+                    // last_output_ms 由 reader 每收一块输出刷新；滚动/翻页只改
+                    // 视口不产生输出 → 不计更新状态。周期重绘/CPU 采样/锁存等
+                    // 后台固定刷新全部退出判定（见 tab_icon）：有内容 → 🔄，
+                    // 3s 无内容 → 完成（✅/空）。
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
-                    let any_silent = now_ms.saturating_sub(last_out) > 500;
-                    // ── 进程树 CPU 活动：Agent 静默思考/编译/搜索等「无输出但
-                    //    仍在计算」的硬判据（session::tree_cpu_active，Toolhelp32
-                    //    快照采样会话进程树 CPU 增量）。它才是「还在运行」的
-                    //    证据——有它就不需要靠十几秒的静默阈值换准确性。 ──
-                    let cpu_busy = session::tree_cpu_active(s.pid, now_ms);
-                    // 图标逻辑（仅 空 / 🔄 / ✅ 三态；❌ 已退出独立于状态判断）：
-                    //   🔄 会话启动中 / 正在输出 / 进程树在计算（静默思考等）
-                    //   空  TUI 空闲等待输入、用户正在输入（原 ✏️ 状态并入空）
-                    //   ✅ 输出结束（本轮对话完成，点击页签后消失）
-                    // 输入驱动判据：最近 INPUT_ACTIVE_MS 内用户向终端输过键。
-                    // last_input_ms 仅键盘/IME/粘贴路径更新（terminal.rs 投递
-                    // bytes_out 时记录），鼠标上报走独立写入不触碰它，悬停/滚动
-                    // 不会误伤。输入期的回显与格内刷新是输入引发、不是任务在跑。
-                    let typing = s.last_input_ms.load(Ordering::Relaxed) != 0
-                        && now_ms.saturating_sub(s.last_input_ms.load(Ordering::Relaxed))
-                            < INPUT_ACTIVE_MS;
-                    // 会话级「切实活动」锁存写入：CPU 在算 / 网格在动 / 有字节输出
-                    // 任一发生即刷新 last_busy_ms（所有页签都写，前台不消费）。
-                    if cpu_busy || !content_silent || !any_silent {
-                        s.last_busy_ms.store(now_ms, Ordering::Relaxed);
-                    }
-                    // 锁存消费：仅「后台 + TUI + 光标隐藏」（Agent 之类接管屏面、
-                    // 正在干活）的会话。光标可见的 TUI（vim 空闲、pi 等输入）不
-                    // 进锁存——等输入态照旧由「TUI 静止等输入」分支判空，不被
-                    // 误报运行；普通 shell/前台不消费，✅ 与完成通知仍按 3s 严格
-                    // 判定、零延迟变化（后台 TUI 隐藏光标真结束时最多晚 60s 亮 ✅，
-                    // 该态本就无法区分思考与完成，宁错判运行不假报完成）。
-                    let bg_latched = i != self.current
-                        && is_tui
-                        && s.cursor_hidden.load(Ordering::Relaxed)
-                        && now_ms.saturating_sub(s.last_busy_ms.load(Ordering::Relaxed))
-                            < BG_LATCH_MS;
                     let icon = tab_icon(
                         s.exited.load(Ordering::Relaxed),
                         s.loading_active(now_ms),
                         count,
-                        typing,
-                        content_silent,
-                        cpu_busy,
-                        bg_latched,
                         viewed,
-                        is_tui,
-                        cursor_vis,
-                        any_silent,
                         last_out,
                         now_ms,
                     );
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
-                    // 「执行完成」提醒：页签进入 ✅（输出结束待查看）后需稳定停留
-                    // DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁（done_notified
-                    // 去重，只提示一次）。稳定窗口过滤误触发：top/watch/编译间歇
-                    // 输出等进程在 🔄↔✅ 间横跳时重置计时；「还在跑」由前置的
-                    // 进程树 CPU 判据（cpu_busy）挡在 🔄，所以短稳定窗口就够区分
-                    // 真实完成与周期性输出——通知延迟保持在 3 秒级，不再用十几秒
-                    // 的静默阈值换准确性。假完成已在图标分支挡住（TUI 静止等输入
-                    // 不翻 ✅）——界面无任何改变的静态会话不再误推。静默判据：
+                    // 「执行完成」提醒：页签进入 ✅（3s 无内容 = 输出结束待查看）后
+                    // 需稳定停留 DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁
+                    // （done_notified 去重，只提示一次）。稳定窗口过滤误触发：周期
+                    // 输出在 🔄↔✅ 间横跳时重置计时。判定仅凭终端内容、无其它启发：
+                    // 周期间隙 ≤3s 不翻 ✅，>3s 即视为完成（含 TUI 寂静思考期，
+                    // 用户要求以终端内容为准）。静默判据：
                     // 仅「当前页签且应用在前台」（用户正盯着）才清零计时不打扰；
                     // 当前页签但应用在后台（焦点在别的窗口）= 用户没在看，照常
                     // 计时弹通知 + 闪烁，与 update_exited 的「运行结束」语义一致。
@@ -4447,104 +4359,61 @@ impl eframe::App for ClientApp {
 mod tab_icon_tests {
     use super::tab_icon;
 
-    // 后台 TUI 光标隐藏（Agent 正在干活）会话：CPU/网格长时间静默（LLM
-    // 思考，>3s 窗口）但锁存期内 → 仍 🔄（本次修复的回归点：此前误判为空）。
-    #[test]
-    fn bg_latch_keeps_running_during_long_think() {
-        let (now, last_out) = (100_000u64, 90_000u64); // 10s 无新字节
-        let icon = tab_icon(
-            false, false, 10, false, // exited, loading, count, typing
-            true, false, true,       // content_silent, cpu_busy, bg_latch
-            false, false, false, true, // viewed, is_tui, cursor_vis, any_silent
-            last_out, now,
-        );
-        assert_eq!(icon, Some("🔄"));
+    fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
+        let now = 100_000u64;
+        tab_icon(false, false, count, viewed, now.saturating_sub(silent_ms), now)
     }
 
-    // 前台页签不消费锁存：同样静默按 3s 严格判定落回空（完成通知不被后延）。
+    // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
+    // 期间保持运行；count=0（纯动画会话）只要有输出照样 🔄。
     #[test]
-    fn foreground_keeps_tight_classification() {
-        let (now, last_out) = (100_000u64, 90_000u64);
-        let icon = tab_icon(
-            false, false, 10, false,
-            true, false, false, // bg_latch = false（当前页签）
-            false, true, true, true, // TUI 空闲、光标可见 → 等输入
-            last_out, now,
-        );
-        assert_eq!(icon, None);
+    fn content_within_3s_shows_running() {
+        assert_eq!(icon(10, false, 2_000), Some("🔄"));
+        assert_eq!(icon(0, false, 2_000), Some("🔄"));
     }
 
-    // 锁存过期（>60s 无活动、CPU/网格静默）→ 不再 🔄；已查看 → 空。
+    // 边界：恰好 3s 内仍有内容 → 🔄；超过 3s → 完成。
     #[test]
-    fn bg_latch_expires_after_window() {
-        let (now, last_out) = (100_000u64, 30_000u64); // 70s 无输出
-        // bg_latch 由调用方算出并传入：70s > BG_LATCH_MS(60s) → false
-        let bg_latch = now.saturating_sub(last_out) < 60_000;
-        let icon = tab_icon(
-            false, false, 10, false,
-            true, false, bg_latch,
-            true, false, false, true, // viewed=true
-            last_out, now,
-        );
-        assert_eq!(icon, None);
+    fn three_sec_boundary() {
+        assert_eq!(icon(10, false, 3_000), Some("🔄"));
+        assert_eq!(icon(10, false, 3_001), Some("✅"));
     }
 
-    // 转义序列密集的 TUI（全屏重绘/动画，大多块被 reader 判为动画而不计
-    // count）count 常年为 0、网格却持续重绘 → 必须 🔄。本次修复的回归点：
-    // 旧 `count>0` 门槛把这类运行中会话堵在 🔄 外，后台页签显示空白。
+    // 3s 无内容 + 有实质输出 + 未查看 → ✅（完成/待查看）。
     #[test]
-    fn grid_active_with_zero_count_shows_running() {
-        let (now, last_out) = (100_000u64, 97_000u64); // 字节静默，网格在动
-        let icon = tab_icon(
-            false, false, 0, false, // exited, loading, count=0, typing
-            false, false, false,    // content_silent=false, cpu_busy=false, bg_latch=false
-            false, false, false, false, // viewed, is_tui, cursor_vis, any_silent
-            last_out, now,
-        );
-        assert_eq!(icon, Some("🔄"));
+    fn content_stopped_3s_shows_done() {
+        assert_eq!(icon(10, false, 10_000), Some("✅"));
     }
 
-    // 同场景但网格静止（动画结束、进程尽显空闲）→ 空，不翻 🔄：网格静默时
-    // 必须回落到 CPU/锁存/字节判据，防止动画判别放宽后误报运行。
+    // 已查看（点击过页签）→ ✅ 消失；viewed 不复位，后续不再重复亮 ✅。
     #[test]
-    fn grid_idle_with_zero_count_is_blank() {
-        let (now, last_out) = (100_000u64, 97_000u64);
-        let icon = tab_icon(
-            false, false, 0, false,
-            true /*content_silent*/, false, false,
-            false, false, false, false,
-            last_out, now,
-        );
-        assert_eq!(icon, None);
+    fn done_clears_after_viewed() {
+        assert_eq!(icon(10, true, 10_000), None);
     }
 
-    // CPU 活跃仍是硬判据：静默思考（无输出、网格静止）靠进程树 CPU 保持 🔄。
+    // 从未有实质输出（count=0，纯动画/零输出会话）→ 3s 无内容后落空，不亮 ✅。
     #[test]
-    fn cpu_busy_keeps_running() {
-        let (now, last_out) = (100_000u64, 90_000u64);
-        let icon = tab_icon(
-            false, false, 10, false,
-            true, true, false, // cpu_busy=true
-            false, false, false, true,
-            last_out, now,
-        );
-        assert_eq!(icon, Some("🔄"));
+    fn no_content_never_shows_done() {
+        assert_eq!(icon(0, false, 10_000), None);
     }
 
-    // 「完成通知 ≤3s」保障（含锁存场景）：普通 shell/非 TUI 不消费锁存，
-    // 输出停止 3s 即亮 ✅——锁存机制不把真实完成的通知拖慢。
+    // 已退出 / 启动加载具有最高优先级。
     #[test]
-    fn latch_does_not_delay_script_done() {
-        let (now, last_out) = (100_000u64, 96_000u64); // 4s 无输出 > OUTPUT_END_MS
-        let icon = tab_icon(
-            false, false, 10, false,
-            true, false, false, // bg_latch=false（非 TUI 会话拿不到锁存）
-            false /*viewed*/, false /*is_tui*/, true /*cursor_vis*/, true /*any_silent*/,
-            last_out, now,
-        );
-        assert_eq!(icon, Some("✅"));
+    fn exited_and_loading_override() {
+        let now = 100_000u64;
+        assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now), Some("❌"));
+        assert_eq!(tab_icon(false, true, 10, false, now - 10_000, now), Some("🔄"));
+    }
+
+    // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
+    // 仍按内容判据落 ✅/空，滚动本身不点亮 🔄（见 app.rs 图标循环注释）。
+    #[test]
+    fn scrolling_does_not_count_as_update() {
+        assert_eq!(icon(10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
+        assert_eq!(icon(10, true, 10_000), None); // 已查看：滚动后仍空
     }
 }
+
 
 #[cfg(all(test, windows))]
 mod vscode_tests {

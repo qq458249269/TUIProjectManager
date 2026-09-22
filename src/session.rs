@@ -94,10 +94,6 @@ pub struct Session {
     pub master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// 子进程（Option 包装：take() 后移入后台线程异步 kill，避免 Child::drop 在 UI 线程阻塞）。
     pub child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    /// 子进程 PID（spawn 时经 Child::process_id() 获取；拿不到则为 0）。
-    /// UI 线程配合 session::tree_cpu_active 采样会话进程树 CPU 活动：静默思考/
-    /// 编译等「终端零输出但仍在计算」的阶段据此保持 🔄，不误报「任务完成」。
-    pub pid: u64,
     /// 上次渲染的网格尺寸，用于检测是否需要 resize。
     pub grid_size: (u16, u16),
     /// 新会话首次帧需要强制 resize：解决 ConPTY 初始化时序问题。
@@ -130,20 +126,10 @@ pub struct Session {
     /// 稳定停留 DONE_STABLE_MS 才提醒，过滤 top/watch/编译间歇输出等周期性
     /// 进程在 🔄↔✅ 间横跳造成的重复误报。
     pub done_since_ms: Arc<AtomicU64>,
-    /// 网格内容最后一次实质性变化的时刻（毫秒）。reader 线程每次生成快照时
-    /// 比较新旧可见格子：相同则内容未变。TUI 动画/spinner/周期重绘（top/watch）
-    /// 都会改变格子，只有真正静止等待输入时才不变化。UI 用它区分「忙碌」与
-    /// 「等待选择」，比字节级可打印内容判据更接近真值。
-    pub last_grid_change_ms: Arc<AtomicU64>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     pub last_output_ms: Arc<AtomicU64>,
-    /// 最近一次「确实在干活」的时刻（毫秒）：进程树 CPU 在算 / 网格在动 /
-    /// 有字节输出任一发生时，UI 线程每帧刷新（app.rs 页签图标循环）。后台
-    /// 页签据此做长锁存：LLM 思考（批量推理 / 网络等待间隙可达 3s~1min）
-    /// 期间即使长时间无输出无 CPU 增量也保持 🔄，见 app.rs BG_LATCH_MS。
-    pub last_busy_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 累计实质输出字节数（非动画块的可打印字节，读取线程写、UI 线程读）。
@@ -525,19 +511,8 @@ static CONPTY_DLL: &[u8] = include_bytes!("../assets/conpty/conpty.dll");
 #[cfg(windows)]
 static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe");
 
-// ── 会话进程树 CPU 活动采样 ──
-// tree_cpu_active(pid, now_ms)：判定「会话进程树最近是否真的在干活」。
-// 用 Toolhelp32 快照枚举全进程表，按 ppid 收集会话 pid 的全部子孙（含自身），
-// 累加各进程 user+kernel CPU 时间；与上次采样比较，有增量且发生在
-// CPU_ACTIVE_WINDOW_MS 内 → 在计算。
-// 作用：✅「任务完成」的硬判据之一——Agent 静默思考、编译、
-// 搜索、打包等「终端零输出但 CPU 在烧」的阶段靠它保持 🔄，避免靠拉长静默
-// 阈值换准确性（那会把真实完成的通知延迟到十几秒，见 app.rs 注释复盘）。
-// 采样全局节流：全表快照不便宜，所有页签共用一份缓存，最多每 500ms 一次。
-#[cfg(windows)]
-const CPU_SAMPLE_INTERVAL_MS: u64 = 500;
-#[cfg(windows)]
-const CPU_ACTIVE_WINDOW_MS: u64 = 3000;
+// 页签状态判定已改纯内容制（见 app.rs tab_icon）：进程树 CPU 采样与后台
+// 锁存全量移除——间隔输出/静默间隙一律按「3s 无内容即完成」判定。
 
 /// loading 标志的墙钟上限（见 Session::loading_active）。reader 线程只在「有
 /// 输出」时才会清 loading（首个非动画块 / 3s 兜底）；零输出会话（sleep、静默
@@ -545,154 +520,13 @@ const CPU_ACTIVE_WINDOW_MS: u64 = 3000;
 /// 统一走 loading_active()：超过窗口后无论标志是否仍为 true 都不再显示加载态。
 const LOADING_MAX_MS: u64 = 5_000;
 
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
-    fn Process32FirstW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
-    fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
-    fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32) -> isize;
-    fn GetProcessTimes(
-        h_process: isize,
-        lp_creation_time: *mut FILETIME,
-        lp_exit_time: *mut FILETIME,
-        lp_kernel_time: *mut FILETIME,
-        lp_user_time: *mut FILETIME,
-    ) -> i32;
-    fn CloseHandle(h_object: isize) -> i32;
-}
 
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PROCESSENTRY32W {
-    dw_size: u32,
-    cnt_usage: u32,
-    th32_process_id: u32,
-    th32_default_heap_id: usize,
-    th32_module_id: u32,
-    cnt_threads: u32,
-    th32_parent_process_id: u32,
-    pc_pri_class_base: i32,
-    dw_flags: u32,
-    sz_exe_file: [u16; 260],
-}
 
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(clippy::upper_case_acronyms)]
-struct FILETIME {
-    dw_low_date_time: u32,
-    dw_high_date_time: u32,
-}
 
-/// CPU 采样缓存：采样时刻 + pid -> (父 pid, CPU 累计 ticks, 最近活跃时刻)
-/// + 本次采样窗口内的子树活跃结果缓存（pid -> bool）。
-/// 进程表快照每 500ms 重建一次，但子树扫描此前每次调用都全跑：
-/// 页签图标循环每帧对每个页签调一次 tree_cpu_active，O(进程数×树深×seen 线性扫)
-/// 全在帧内重复 → 空闲时也是主要 CPU 开销。放在同一采样窗口里缓存结果，
-/// 窗口内重复查询直接命中（last_active 只在换快照时变，窗口内答案恒定）。
-#[cfg(windows)]
-type CpuSample = (
-    u64,
-    std::collections::HashMap<u32, (u32, u64, u64)>,
-    std::collections::HashMap<u32, bool>,
-);
 
-/// 全进程表快照：pid -> (父 pid, user+kernel CPU 累计 ticks（100ns 单位）)。
-#[cfg(windows)]
-unsafe fn snapshot_cpu_ticks() -> std::collections::HashMap<u32, (u32, u64)> {
-    let mut out = std::collections::HashMap::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(0x2 /* TH32CS_SNAPPROCESS */, 0);
-        if snap == -1 {
-            return out;
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut ok = Process32FirstW(snap, &mut entry);
-        while ok != 0 {
-            // PROCESS_QUERY_LIMITED_INFORMATION=0x1000：Vista+ 对同权限进程可查；
-            // 无权限（系统进程等）时 GetProcessTimes 失败 → 跳过（不影响本会话树）。
-            let h = OpenProcess(0x1000, 0, entry.th32_process_id);
-            if h != 0 {
-                let mut ct = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
-                let mut et = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
-                let mut kt = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
-                let mut ut = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
-                if GetProcessTimes(h, &mut ct, &mut et, &mut kt, &mut ut) != 0 {
-                    let ticks = ((kt.dw_high_date_time as u64) << 32 | kt.dw_low_date_time as u64)
-                        + ((ut.dw_high_date_time as u64) << 32 | ut.dw_low_date_time as u64);
-                    out.insert(entry.th32_process_id, (entry.th32_parent_process_id, ticks));
-                }
-                CloseHandle(h);
-            }
-            ok = Process32NextW(snap, &mut entry);
-        }
-        CloseHandle(snap);
-    }
-    out
-}
 
-/// 会话进程树最近 CPU_ACTIVE_WINDOW_MS（3s）内是否「真的在干活」。
-/// 带缓存 + 全局节流：UI 线程每帧对每个页签调用一次，共享同一份快照。
-#[cfg(windows)]
-pub fn tree_cpu_active(pid: u64, now_ms: u64) -> bool {
-    use std::sync::Mutex;
-    static CACHE: Mutex<Option<CpuSample>> = Mutex::new(None);
-    if pid == 0 {
-        return false; // 拿不到 PID（非 Windows）→ 退回纯输出判据
-    }
-    let mut guard = CACHE.lock().unwrap();
-    let stale = guard
-        .as_ref()
-        .is_none_or(|(at, _, _)| now_ms.saturating_sub(*at) >= CPU_SAMPLE_INTERVAL_MS);
-    if stale {
-        let snap = unsafe { snapshot_cpu_ticks() };
-        let prev = guard.take().map(|(_, m, _)| m).unwrap_or_default();
-        let mut procs = std::collections::HashMap::with_capacity(snap.len());
-        for (p, (pp, ticks)) in snap {
-            // 无增量（ticks 相等）→ 沿用上次活跃时刻；有增量、新出现，或
-            // ticks 变小（PID 被复用/进程重启）→ 此刻视为活跃。
-            let last_active = match prev.get(&p) {
-                Some(&(_, old_ticks, la)) if old_ticks == ticks => la,
-                _ => now_ms,
-            };
-            procs.insert(p, (pp, ticks, last_active));
-        }
-        *guard = Some((now_ms, procs, std::collections::HashMap::new()));
-    }
-    let (_, procs, memo) = &mut *guard.as_mut().unwrap();
-    let root = pid as u32;
-    if let Some(&hit) = memo.get(&root) {
-        return hit; // 本采样窗口内已算过 → 直接命中，不再扫树。
-    }
-    if !procs.contains_key(&root) {
-        return false; // 顶层进程已不在进程表 → 树不存在
-    }
-    // 收集子孙 pid（含自身）；任一在窗口内有 CPU 增量 → 活跃。
-    let mut stack = vec![root];
-    let mut seen = vec![root];
-    while let Some(p) = stack.pop() {
-        for (&c, &(pp, _, _)) in procs.iter() {
-            if pp == p && !seen.contains(&c) {
-                seen.push(c);
-                stack.push(c);
-            }
-        }
-    }
-    let active = seen
-        .into_iter()
-        .any(|p| now_ms.saturating_sub(procs[&p].2) < CPU_ACTIVE_WINDOW_MS);
-    memo.insert(root, active);
-    active
-}
 
-#[cfg(not(windows))]
-pub fn tree_cpu_active(_pid: u64, _now_ms: u64) -> bool {
-    false
-}
+
 
 #[cfg(windows)]
 fn ensure_bundled_conpty() {
@@ -778,10 +612,6 @@ pub fn spawn(
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("启动进程失败: {e}"))?;
-    // Agent 静默思考/编译时终端可能长时间零输出，输出级判据会误判「完成」；
-    // PID 在 spawn 后即固定，UI 线程据此采样进程树 CPU 活动兜底（见
-    // tree_cpu_active）。
-    let pid = child.process_id().map(u64::from).unwrap_or(0);
     drop(pair.slave);
 
     let writer: Box<dyn Write + Send> = pair
@@ -909,10 +739,6 @@ pub fn spawn(
         .unwrap_or_default()
         .as_millis() as u64;
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
-    let last_busy_ms = Arc::new(AtomicU64::new(now_ts));
-    // 初始用 spawn 时刻：新会话尚无内容，首块输出（或 TUI 首屏）到来时
-    // 与空快照比较必然不同 → 更新为实际内容变化时刻。
-    let last_grid_change_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
@@ -930,7 +756,6 @@ pub fn spawn(
         let output_count = output_count.clone();
         let reader_out_bytes = out_bytes.clone();
         let last_output_ms = last_output_ms.clone();
-        let last_grid_change_ms = last_grid_change_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
@@ -1180,17 +1005,6 @@ pub fn spawn(
                                         cells.push((p, indexed.cell.clone()));
                                     }
                                 }
-                                // ── 内容级静止检测 ──
-                                // 与上一张快照的可见格子逐项比较：相同说明网格内容
-                                // 未变。TUI 动画/spinner/周期重绘（top/watch）会改变
-                                // 格子 → 内容新鲜；真正静止等待输入时格子不变 → 静默。
-                                // 光标移动/显示隐藏类 escape 重绘不改格子，不打断静止。
-                                let prev_ptr = reader_snapshot.load(Ordering::Acquire);
-                                let grid_unchanged = !prev_ptr.is_null()
-                                    && unsafe { (&*prev_ptr).cells == cells };
-                                if !grid_unchanged {
-                                    last_grid_change_ms.store(now_ms, Ordering::Relaxed);
-                                }
                                 let new_snap = Box::into_raw(Box::new(TermSnapshot {
                                     cells,
                                     offset: offset_val,
@@ -1238,7 +1052,6 @@ pub fn spawn(
         writer: writer_tx,
         master: Some(pair.master),
         child: Some(child),
-        pid,
         grid_size: (cols, rows),
         needs_resize: true,
         theme_dark,
@@ -1250,12 +1063,10 @@ pub fn spawn(
         started_ms: Arc::new(AtomicU64::new(now_ts)),
         done_notified: Arc::new(AtomicBool::new(false)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
-        last_grid_change_ms,
         last_clipboard_seq: None,
         output_count,
         out_bytes,
         last_output_ms,
-        last_busy_ms,
         has_been_viewed: Arc::new(AtomicBool::new(false)),
         alt_screen,
         cursor_hidden,
@@ -1392,36 +1203,10 @@ pub fn refresh_snapshot(sess: &mut Session) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alacritty_terminal::term::cell::Flags;
+use super::*;
+use alacritty_terminal::term::cell::Flags;
 
-    /// pid 未知（非 Windows / process_id 拿不到）时绝不能报「活跃」——
-    /// 否则会把还在静默思考的会话误判成完成。
-    #[cfg(windows)]
-    #[test]
-    fn tree_cpu_zero_pid_is_never_active() {
-        assert!(!tree_cpu_active(0, 1_000_000));
-    }
-
-    /// 自身进程忙等 60ms（超过 Windows 进程时间记账粒度约 15.6ms）后，
-    /// 采样必须报活跃；这是「还在跑」硬判据的最小验证。
-    #[cfg(windows)]
-    #[test]
-    fn tree_cpu_detects_then_clears_busy_process() {
-        let pid = std::process::id() as u64;
-        let t0 = 1_000_000u64;
-        let _ = tree_cpu_active(pid, t0); // 建立基线（首次采样）
-        let start = std::time::Instant::now();
-        let mut x = 0u64;
-        while start.elapsed() < std::time::Duration::from_millis(60) {
-            x = x.wrapping_add(1);
-        }
-        std::hint::black_box(x);
-        // 越过 500ms 节流 → 强制重采样，此时距上次采样已有 CPU 增量。
-        assert!(tree_cpu_active(pid, t0 + 1000), "忙等后应判为活跃");
-    }
-
-    /// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
+/// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
     /// 终端是否交互）。
     #[test]
     fn reply_to_queries_standard() {
