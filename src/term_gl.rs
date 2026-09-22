@@ -10,9 +10,10 @@
 //! 内存控制（实测驱动）：
 //! - 分页图集：单页 1024² RGBA ≈ 4MB，满页开新页渐进，不做整体清空重灌
 //!   （整体清空曾造成汉字输入 ~400ms 卡顿）。
-//! - 懒加载字体链：fontdue::from_bytes 是全字形 eager 解析，CJK ~30K 字形
-//!   几何 ≈ +127MB/字体。默认只解析链首等宽字体（ASCII 场景省 ~170MB）；
-//!   首个缺字形（如汉字）出现时一次性补全整条链并缓存，之后所有会话零重解析。
+//! - 常驻字体链：fontdue::from_bytes 是全字形 eager 解析，CJK ~30K 字形
+//!   几何 ≈ +127MB/字体。首次建图集即整条链拉满（含汉字字符集，进程级
+//!   缓存 Arc 共享，多页签零重复解析）；首个缺字形不再中途补链 → 渲染/输入
+//!   永无卡顿峰值。代价：CJK 解析结果常驻内存（用户明确要求常驻加载）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -82,8 +83,9 @@ fn parse_fonts(sources: &[FontSource], px: f32, full: bool) -> Vec<Arc<fontdue::
 /// 从进程级缓存取（或解析后缓存）fontdue 解析结果。
 /// 命中条件：字体列表字节级全等 + 物理字号一致。
 ///
-/// `full=false`：只解析链首等宽字体（懒加载：ASCII 场景不碰 CJK/emoji 的
-/// ~170MB eager 解析）；`full=true`：整条链，缓存条目就地升级为全量。
+/// `full=false` 已无调用方（曾用于懒加载：先只解析链首，见 GlyphAtlas::new）；
+/// 现恒以 `full=true` 全量解析整条链进缓存，条目就地升级为全量。
+/// ponytail: 参数与升级分支可随懒加载机制一并移除。
 fn cached_fonts(sources: &[FontSource], px: f32, full: bool) -> Vec<Arc<fontdue::Font>> {
     let cache = FONT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     let mut guard = cache.lock().unwrap();
@@ -170,9 +172,10 @@ impl GlyphAtlas {
     /// `font_data`：(字体文件字节的 Arc，ttc 子索引)。解析失败的字体跳过。
     pub fn new(font_data: &[FontSource], font_size_pt: f32, ppp: f32) -> Self {
         let px = font_size_pt * ppp;
-        // 懒加载：先只解析链首等宽字体。CJK/emoji 的 eager 解析（~170MB）
-        // 推迟到首个缺字形时（cached_fonts full=true，进程级缓存跨会话共享）。
-        let fonts = cached_fonts(font_data, px, false);
+        // 常驻加载：建图集即整条链拉满（Hack + CJK/emoji），进程级 FONT_CACHE
+        // Arc 复用，多页签不重复解析。首个缺字形不再中途补链 → 渲染/输入永无
+        // 卡顿峰值。代价：CJK ~127MB 解析结果常驻内存（用户要求常驻）。
+        let fonts = cached_fonts(font_data, px, true);
         let mut ascent_px = px * 0.8;
         let mut descent_px = -px * 0.2;
         if let Some(f) = fonts.first()
@@ -184,7 +187,9 @@ impl GlyphAtlas {
         let mut atlas = Self {
             fonts,
             lazy_sources: font_data.to_vec(),
-            lazy_done: font_data.len() <= 1,
+            // 常驻后永远无需补链：懒加载触发路径（glyph() 内）与 swap_fonts
+            // 成为死代码，保留待清理。
+            lazy_done: true,
             px,
             ppp,
             ascent_px,
@@ -605,16 +610,18 @@ mod tests {
         assert_ne!(h1, h3);
     }
 
-    /// 懒加载：只有链首等宽字体的图集，缺字形（CJK）应触发一次性补链尝试，
-    /// 之后不再重复（负缓存生效）。
+    /// 缺字形行为：全链缺字形（如 😀 Hack/链路都不含）应得空槽（负缓存），
+    /// 调用方回落 galley 路径；版本号不变（常驻加载后不得再有补链动作）。
+    /// 懒加载机制已由常驻加载取代（GlyphAtlas::new 即全量解析），此测试守住
+    /// 缺字形的空槽契约与「不重复触发」防抖。
     #[test]
-    fn lazy_font_chain_attempted_once() {
+    fn missing_glyph_empty_slot_no_retry() {
         let mut a = test_atlas(1.0);
+        assert!(a.lazy_done, "常驻加载：构造即完成补链语义（lazy_done=true）");
         let s = a.glyph('\u{6C49}'); // 汉：Hack 无此字形
         assert_eq!(s.w, 0.0, "Hack 缺 CJK 字形应回落空槽");
-        assert!(a.lazy_done, "缺字形应触发懒加载补链");
         let v = a.version;
-        a.glyph('\u{8BD5}'); // 试：补链后（无 CJK 字体可用）仍空槽，且不重复补链
+        assert_eq!(a.glyph('\u{8BD5}').w, 0.0); // 试：仍空槽
         assert_eq!(a.version, v, "补链后不得再重复触发（lazy_done 置位）");
     }
 }

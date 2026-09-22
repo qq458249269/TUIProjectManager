@@ -818,12 +818,13 @@ pub fn show_terminal(
                 if frac - frac.floor() < 0.5 { Side::Left } else { Side::Right }
             };
             if resp.drag_started_by(egui::PointerButton::Primary) {
-                if let Some(pos) = resp.interact_pointer_pos().and_then(point_at) {
-                    // 起点边界不能写死 Side::Left：从右往左拖时 Left 边界落在
-                    // 按下格的左缘，交换 anchor 后最右格被 range_simple 减一列漏选。
-                    // 按下瞬间的格内半侧才决定该边界（用 click_press_pos，比
-                    // drag_started 帧的当前坐标更接近真实落点）。
-                    let press_side = sess.click_press_pos.map(side_at).unwrap_or(Side::Left);
+                // 起点格与半侧必须同源真实按下点：interact_pointer_pos() 是
+                // drag_started 帧的当前坐标，已越过 egui 拖拽阈值（数像素），
+                // 按在格界附近时已跨进相邻格——用它与按下半侧拼装会错一列。
+                // click_press_pos 在按下帧捕获（见上），同一手势内恒定。
+                let press_pos = sess.click_press_pos.unwrap_or(latest_pos.unwrap_or(Pos2::ZERO));
+                if let Some(pos) = point_at(press_pos) {
+                    let press_side = side_at(press_pos);
                     t.selection =
                         Some(TermSelection::new(SelectionType::Simple, pos, press_side));
                     // 本地选区手势认领：吞掉这对按下/释放，不给 TUI 发幽灵点击。

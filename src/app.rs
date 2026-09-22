@@ -12,10 +12,10 @@ use crate::config;
 use crate::session::{self, Session};
 use crate::terminal;
 
-/// 启动宽限期：会话创建后一分钟内不弹「运行结束」/「执行完成」系统通知与
+/// 启动宽限期：会话创建后 10 秒内不弹「运行结束」/「执行完成」系统通知与
 /// 任务栏闪烁。刚启动的会话 shell 初始化/命令首屏输出会制造大量看似「完成」
 /// 的瞬间，宽限期过滤误报（进度型命令会在宽限期后再按正常规则提示）。
-const STARTUP_GRACE_MS: u64 = 60_000;
+const STARTUP_GRACE_MS: u64 = 10_000;
 
 /// 配置节流落盘间隔：仅窗口位置/尺寸变化（拖动/resize 每帧连续变化）时
 /// 最多每 CONFIG_SAVE_INTERVAL 写盘一次；页签结构变化、显式保存都立即落盘。
@@ -40,6 +40,11 @@ const BUSY_FRAME_MS: u64 = 100;
 /// 代价即本方案：后台 TUI 静默思考 / 网络等待（>3s 无输出）会被判为完成；
 /// 用户要求以终端内容为准，出现该情况即 3s 后亮 ✅/弹通知（后果已知晓）。
 const OUTPUT_END_MS: u64 = 3_000;
+/// 输入驱动例外窗口：用户刚在终端里输入（按键/IME/粘贴，last_input_ms 距今
+/// 不足此值）→ 回显与格内刷新是输入引发、不是任务在跑，跳过 🔄 判定。仅
+/// 键盘/IME/粘贴路径更新 last_input_ms（terminal.rs 投递 bytes_out 时记录），
+/// 鼠标上报/悬停/滚动不触碰它。慢输入/长命令后输出仍按 last_out 正常判 🔄。
+const INPUT_ACTIVE_MS: u64 = 1_500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
 
@@ -1364,6 +1369,9 @@ pub struct ClientApp {
 /// 输出停止 ≥3s 且有可查看内容且未查看 → ✅（完成/待查看）；否则空。
 /// 滚动/翻页只改视口、不写 last_output_ms → 不计更新状态；周期重绘、CPU
 /// 采样、锁存等后台「固定刷新」全部退出判定，3 秒无内容即完成。
+/// 唯一例外：输入驱动（last_input 距今 <INPUT_ACTIVE_MS）——用户刚打字，
+/// 回显是输入引发、不是任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新内容）与
+/// 空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
 fn tab_icon(
     exited: bool,
     loading: bool,
@@ -1371,6 +1379,7 @@ fn tab_icon(
     viewed: bool,
     last_out: u64,
     now_ms: u64,
+    last_input: u64,
 ) -> Option<&'static str> {
     if exited {
         return Some("❌");
@@ -1378,13 +1387,18 @@ fn tab_icon(
     if loading {
         return Some("🔄");
     }
+    // 输入驱动例外：用户刚在终端里输入（≤INPUT_ACTIVE_MS），回显/格内刷新
+    // 是输入引发、不是任务在跑 → 跳过运行中判定。命令真实输出晚于窗口即
+    // 照常判 🔄（慢命令几乎总是超出 1.5s 窗口）。
+    let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
     // 有内容（最近一块输出距今 ≤3s）→ 运行中。动画块也刷新 last_output_ms，
     // spinner/周期重绘期间保持 🔄；本地滚动/翻页不产生输出，不会点亮它。
-    if now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
+    if !typing && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
         return Some("🔄");
     }
     // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
-    if count > 0 && !viewed {
+    // 陈旧判据与 🔄 互补：打字期内新鲜回显不落 ✅，只能走空（旧代码语义）。
+    if count > 0 && !viewed && now_ms.saturating_sub(last_out) > OUTPUT_END_MS {
         return Some("✅");
     }
     // 空：无内容可看 / 已查看过。
@@ -1994,7 +2008,7 @@ impl ClientApp {
                     && !s.notified.swap(true, Ordering::Relaxed)
                     && !(i == self.current && crate::app_is_foreground(self.titlebar_hwnd))
                 {
-            // 启动宽限期：创建后一分钟内退出也静默（刚启动就崩/秒退
+            // 启动宽限期：创建后 10 秒内退出也静默（刚启动就崩/秒退
             // 不打扰），notified 已置位因此宽限期后也不会补弹。
             if s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
                 && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
@@ -2206,9 +2220,12 @@ impl ClientApp {
                     // last_output_ms 由 reader 每收一块输出刷新；滚动/翻页只改
                     // 视口不产生输出 → 不计更新状态。周期重绘/CPU 采样/锁存等
                     // 后台固定刷新全部退出判定（见 tab_icon）：有内容 → 🔄，
-                    // 3s 无内容 → 完成（✅/空）。
+                    // 3s 无内容 → 完成（✅/空）。输入驱动例外：最近 1.5s 内用户
+                    // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）则
+                    // 回显不算任务在跑 → 跳过 🔄，修「输入时被误判成 🔄」。
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
+                    let last_input = s.last_input_ms.load(Ordering::Relaxed);
                     let icon = tab_icon(
                         s.exited.load(Ordering::Relaxed),
                         s.loading_active(now_ms),
@@ -2216,6 +2233,7 @@ impl ClientApp {
                         viewed,
                         last_out,
                         now_ms,
+                        last_input,
                     );
                     let title = s.title.clone();
                     let selected = self.current == i;
@@ -4361,7 +4379,7 @@ mod tab_icon_tests {
 
     fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, count, viewed, now.saturating_sub(silent_ms), now)
+        tab_icon(false, false, count, viewed, now.saturating_sub(silent_ms), now, 0)
     }
 
     // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
@@ -4401,8 +4419,30 @@ mod tab_icon_tests {
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, now - 10_000, now), Some("🔄"));
+        assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, 10, false, now - 10_000, now, 0), Some("🔄"));
+    }
+
+    // 输入驱动例外：最近 1.5s 内用户输过键，回显即使刷新 last_output_ms
+    // 也不判运行中 → 空；窗口过期（或从未输入）后按内容判 🔄。
+    #[test]
+    fn typing_echo_not_running() {
+        let now = 100_000u64;
+        // 1s 前刚输入过（回显新鲜）→ 不亮 🔄，落空。
+        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, now - 1_000), None);
+        // 输入窗口边界：不敢 1.5s 整（< INPUT_ACTIVE_MS 才算），恰过期即恢复。
+        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, now - 1_501), Some("🔄"));
+        // 无输入历史（last_input=0，鼠标选择/拖拽等）→ 正常判 🔄。
+        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, 0), Some("🔄"));
+    }
+
+    // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、但内容已停
+    // ≥3s）→ ✅ 保持可见，不因打字闪空。
+    #[test]
+    fn typing_keeps_done_visible() {
+        let now = 100_000u64;
+        assert_eq!(tab_icon(false, false, 10, false, now - 10_000, now, now - 500), Some("✅"));
+        assert_eq!(tab_icon(false, false, 10, true, now - 10_000, now, now - 500), None);
     }
 
     // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
