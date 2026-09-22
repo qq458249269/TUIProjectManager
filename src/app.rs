@@ -26,6 +26,12 @@ const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// 兜底捕获无事件干系的状态推进（任务完成通知稳定窗口、状态栏倒计时等）。
 const IDLE_HEARTBEAT_MS: u64 = 500;
 
+/// 忙时的固定帧间隔：输出/加载期间按 10 FPS 重绘。
+/// ponytail: 可调帧率档（30/60）已整体移除——持续高帧率重绘干扰 Windows
+/// 悬停激活窗口（焦点随鼠标）：10 FPS 正常、30 FPS 输出中实测失效（反复
+/// 回归 3 次，见 921f062/0ae5904）。根治 = 锁死 10 FPS，杜绝再被调高。
+const BUSY_FRAME_MS: u64 = 100;
+
 /// TUI 状态检测阈值（页签图标 / 完成通知判定）。准确性优先，但拒绝
 /// 「拉长静默阈值」式消误报——那会把真实完成的通知推迟到十几秒。
 /// 「还在运行」的正确证据是进程树在消耗 CPU（session::tree_cpu_active）：
@@ -1291,7 +1297,6 @@ pub struct ClientApp {
     /// 编辑命令时的索引和缓冲区（Some(i) = 内联编辑第 i 行）。
     pub settings_edit_idx: Option<usize>,
     pub settings_edit_buffer: String,
-    pub settings_refresh_fps: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
     pub term_focused: bool,
@@ -1471,7 +1476,6 @@ impl ClientApp {
             settings_new_command: String::new(),
             settings_edit_idx: None,
             settings_edit_buffer: String::new(),
-            settings_refresh_fps: config::DEFAULT_REFRESH_FPS.to_string(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
             term_focused: false,
@@ -1625,7 +1629,6 @@ impl ClientApp {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
-        self.settings_refresh_fps = self.config.settings.refresh_fps.to_string();
         // 如果已有一个设置页签，跳转过去而不是重复添加。
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
             self.current = idx;
@@ -3655,46 +3658,9 @@ impl ClientApp {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
-        // ── 帧率预设 ──
-        ui.label(RichText::new("终端页签刷新帧率（10–30 FPS）").strong());
-        ui.add_space(4.0);
-        let presets = [10u64, 30];
-        let cur_fps = self.config.settings.refresh_fps;
-        ui.horizontal(|ui| {
-            for &preset in &presets {
-                let label = format!("{preset} FPS");
-                let selected = cur_fps == preset;
-                if ui
-                    .add(egui::Button::selectable(selected, &label))
-                    .clicked()
-                {
-                    self.config.settings.refresh_fps = preset;
-                    self.settings_refresh_fps = preset.to_string();
-                    self.save_config(format!("帧率已设为 {preset} FPS"));
-                }
-            }
-            ui.separator();
-            ui.label("自定义:");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.settings_refresh_fps)
-                    .desired_width(50.0)
-                    .hint_text("10-30"),
-            );
-            if resp.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                && let Ok(v) = self.settings_refresh_fps.parse::<u64>()
-            {
-                let clamped = v.clamp(10, 30);
-                self.config.settings.refresh_fps = clamped;
-                self.settings_refresh_fps = clamped.to_string();
-                self.save_config(format!("帧率已设为 {clamped} FPS"));
-            }
-        });
-        ui.label(
-            RichText::new("有输出/交互时按此帧率刷新（动画上限 30 FPS，交互即时帧不受限），全部静止自动降为 2 FPS 慢心跳省电")
-                .weak()
-                .small(),
-        );
+        // 帧率设置已整体移除（曾可调 30 FPS）：持续高帧率重绘会干扰 Windows
+        // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
+        // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
         ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（点击页签后消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知；周期输出横跳会重置计时。").weak());
         ui.add_space(12.0);
@@ -4097,11 +4063,10 @@ impl eframe::App for ClientApp {
             }
         }
         let delay_ms = if busy {
-            // 帧率档位真实生效：10→100ms、30→33ms；上限封 30fps（33ms）。
-            // 不放开 60：持续 60fps 连续重绘会顶满 CPU 并干扰 winit hover 跟踪
-            // （悬停激活失效，见 921f062）；交互即时帧不走该定时器（egui
-            // 交互路径自行 request_repaint，不受上限约束）。
-            (1000 / self.config.settings.refresh_fps.clamp(10, 60)).max(33)
+            // 固定 10 FPS（100ms）。ponytail: 曾开放 30/60 FPS 档，但高帧率持续
+            // 重绘实测干扰 Windows 悬停激活窗口（10 FPS 正常、30 失效）；如需
+            // 更高帧率先根治该干扰源，再放开这里。
+            BUSY_FRAME_MS
         } else {
             IDLE_HEARTBEAT_MS
         };

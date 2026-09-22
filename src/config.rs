@@ -11,13 +11,6 @@ pub struct Project {
     pub hidden: bool,
 }
 
-/// 界面基线刷新帧率的默认值（帧/秒），对应默认 10 帧/秒。
-pub(crate) const DEFAULT_REFRESH_FPS: u64 = 10;
-
-fn default_refresh_fps() -> u64 {
-    DEFAULT_REFRESH_FPS
-}
-
 fn default_dark_mode() -> bool {
     // 首次运行（无配置文件）时检测 Windows 系统主题偏好。
     // 注册表 AppsUseLightTheme：1=浅色（false），0=深色（true），读取失败兜底深色。
@@ -96,9 +89,6 @@ pub struct Settings {
     /// 当前选中的 TUI 命令（启动项目时使用）。
     #[serde(default)]
     pub tui_command: String,
-    /// 界面基线刷新帧率（10..=60；数字越大越流畅、CPU 占用越高）。默认 10。
-    #[serde(default = "default_refresh_fps")]
-    pub refresh_fps: u64,
     /// 深浅主题：true=深色（默认），false=浅色。
     #[serde(default = "default_dark_mode")]
     pub dark_mode: bool,
@@ -115,7 +105,6 @@ impl Default for Settings {
         Self {
             tui_commands: vec!["nvim".to_string()],
             tui_command: "nvim".to_string(),
-            refresh_fps: DEFAULT_REFRESH_FPS,
             dark_mode: true,
             follow_system: false,
             history_lines: default_history_lines(),
