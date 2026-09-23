@@ -1,5 +1,4 @@
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -391,6 +390,13 @@ fn encode_char_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option
             return Some(vec![0]);
         }
         let lc = b.to_ascii_lowercase();
+        // Ctrl+Shift+Z → ^Y(0x19)：PSReadLine 的 Redo（Ctrl+Z = Undo 的反功能，
+        // Windows 默认绑定实测 Ctrl+z Undo / Ctrl+y Redo）。终端字节流无法
+        // 表达 shift+ctrl 字母，子进程只认 ^Y；Ctrl+Z 照旧发 ^Z（0x1a）。
+        // ponytail: bash/readline 无默认 redo，^Y 在那里是 yank（无害）。
+        if shift && lc == b'z' {
+            return Some(vec![0x19]);
+        }
         if lc.is_ascii_lowercase() {
             return Some(vec![lc - b'a' + 1]);
         }
@@ -1196,13 +1202,7 @@ pub fn show_terminal(
         let sent = sess.writer.try_send(all).is_ok();
         // 回显延迟探针：记录输入时间戳（读取线程比对首块回显）。
         if sent {
-            sess.last_input_ms.store(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                Ordering::Relaxed,
-            );
+            sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
         }
     }
 
@@ -1254,10 +1254,7 @@ pub fn show_terminal(
     // 终端区显示「正在启动会话…」，避免纯黑屏让用户以为页签没打开。
     // 子进程一旦画出内容（snap.cells 非空）或 loading 超墙钟窗（loading_active，
     // 零输出会话不依赖 reader 自清）提示自动消失。
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::now_ms();
     if sess.loading_active(now_ms) && snap.cells.is_empty() {
         painter.text(
             rect.center(),
@@ -2005,6 +2002,8 @@ mod tests {
         assert_eq!(key_bytes(egui::Key::A, true, false, false), Some(vec![0x01]));
         assert_eq!(key_bytes(egui::Key::C, true, false, false), Some(vec![0x03]));
         assert_eq!(key_bytes(egui::Key::Z, true, false, false), Some(vec![0x1a]));
+        // Ctrl+Shift+Z → ^Y（Redo = Ctrl+Z Undo 的反功能，PSReadLine 绑定）。
+        assert_eq!(key_bytes(egui::Key::Z, true, false, true), Some(vec![0x19]));
         assert_eq!(key_bytes(egui::Key::Space, true, false, false), Some(vec![0x00]));
         // ctrl+shift+M -> \r
         assert_eq!(key_bytes(egui::Key::M, true, false, true), Some(vec![0x0d]));

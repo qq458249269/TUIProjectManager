@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use std::sync::atomic::Ordering;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -47,6 +47,12 @@ const OUTPUT_END_MS: u64 = 3_000;
 const INPUT_ACTIVE_MS: u64 = 1_500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
+/// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
+/// 随 ✅ 离开复位），靠 10s 节流防周期输出/退出-完成连发轰炸（用户拍板）。
+const TOAST_MIN_INTERVAL_MS: u64 = 10_000;
+/// 后台页签收割子进程（try_wait）的低频间隔：孙进程继承 ConPTY 句柄时管道
+/// 不 EOF，reader 判不了退出，只能低频轮询进程状态（每帧 syscall 不值得）。
+const BG_REAP_MS: u64 = 3_000;
 
 /// 通知过滤阈值：会话累计实质输出字节数（非动画块的可打印字节，见
 /// session.rs out_bytes）不足此值时，「运行结束」/「任务完成」一律不弹通知。
@@ -1405,6 +1411,66 @@ fn tab_icon(
     None
 }
 
+/// Tab 的轻量投影（Tab 持有 Session，坐标换算只需这四类）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabKind {
+    Home,
+    /// 未退出的会话：会持久化并恢复。
+    Alive,
+    /// 已退出的会话 / 重启占位：不恢复，坐标中不占位。
+    Gone,
+    Settings,
+}
+
+/// 计算持久化的 (active, settings_pos)，坐标系 = 恢复后的页签数组：
+/// 先推 [Home] + 存活会话，再在 settings_pos 处插入 Settings，最后
+/// current = active（见 ui() 恢复流程）。已退出页签不恢复，直接存
+/// self.current / 满页签索引会整体左移错位（active 落到隔壁页签）。
+/// settings_pos 是**插入前**坐标，active 是**插入后**最终坐标。
+fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
+    let settings_pos = kinds
+        .iter()
+        .position(|k| *k == TabKind::Settings)
+        .map(|pos| {
+            1 + kinds
+                .iter()
+                .skip(1)
+                .take(pos.saturating_sub(1))
+                .filter(|k| **k == TabKind::Alive)
+                .count()
+        })
+        .unwrap_or(1);
+    let settings_open = kinds.contains(&TabKind::Settings);
+    let mut pre = 1usize; // 下一个「插入前」槽位（1 = Home 之后）
+    let mut active = 0usize; // 0 = Home / 无匹配
+    for (i, k) in kinds.iter().enumerate() {
+        if i == current && *k != TabKind::Home {
+            active = if *k == TabKind::Settings {
+                settings_pos
+            } else if settings_open && pre >= settings_pos {
+                pre + 1
+            } else {
+                pre
+            };
+        }
+        if *k == TabKind::Alive {
+            pre += 1;
+        }
+    }
+    (active, settings_pos)
+}
+
+/// 同页签 10s 一条的通知节流（TOAST_MIN_INTERVAL_MS）。通过即占位时间戳——
+/// 后续被「用户正盯着」「启动宽限」「已通知」分支静默吞掉也照占，宁可少弹。
+fn allow_toast(s: &Session, now_ms: u64) -> bool {
+    let last = s.last_toast_ms.load(Ordering::Relaxed);
+    let allowed = last == 0 || now_ms.saturating_sub(last) >= TOAST_MIN_INTERVAL_MS;
+    if allowed {
+        s.last_toast_ms.store(now_ms, Ordering::Relaxed);
+    }
+    allowed
+}
+
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
@@ -1530,6 +1596,9 @@ impl ClientApp {
             app.restore_settings_pos = Some(saved_tabs.settings_pos.max(1));
         }
         if !app.pending_restore.is_empty() || app.restore_settings_pos.is_some() {
+            // 注意：升级前的旧配置坐标含退出页签/设置页签偏移，首启可能落错
+            // 一格——旧值无法换算（配置没存退出标记），落错时切回正确页签后
+            // 第一次保存即写入 restore_coords 新格式，此后恢复正确（一次性）。
             app.restore_active = Some(saved_active);
         }
         // 每次启动自动检查一次更新。
@@ -1548,20 +1617,26 @@ impl ClientApp {
             .iter()
             .skip(1)
             .filter_map(|t| match t {
-                Tab::Session(s) if !s.exited.load(Ordering::Relaxed) => Some(s.as_ref()),
+                Tab::Session(s) if !s.exited.load(Ordering::Acquire) => Some(s.as_ref()),
                 _ => None,
             })
             .collect();
         let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
         let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
-        let active = self.current;
         // 设置页签也记录：退出时开着则启动时在相同位置恢复（见构造器 restore_settings_pos）。
         let settings_open = self.tabs.iter().any(|t| matches!(t, Tab::Settings));
-        let settings_pos = self
+        let kinds: Vec<TabKind> = self
             .tabs
             .iter()
-            .position(|t| matches!(t, Tab::Settings))
-            .unwrap_or(1);
+            .map(|t| match t {
+                Tab::Home => TabKind::Home,
+                Tab::Settings => TabKind::Settings,
+                Tab::Placeholder { .. } => TabKind::Gone,
+                Tab::Session(s) if s.exited.load(Ordering::Acquire) => TabKind::Gone,
+                Tab::Session(_) => TabKind::Alive,
+            })
+            .collect();
+        let (active, settings_pos) = restore_coords(&kinds, self.current);
         config::TabsState {
             dirs,
             cmds,
@@ -1781,7 +1856,7 @@ impl ClientApp {
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab
                 && s.dir == project.path
-                && !s.exited.load(Ordering::Relaxed)
+                && !s.exited.load(Ordering::Acquire)
             {
                 self.current = i;
                 self.term_focused = true;
@@ -1896,6 +1971,11 @@ impl ClientApp {
             s.kill_in_background();
         }
         self.tabs.remove(idx);
+        // 关的是当前页签**前面**的页签 → 后面元素左移，current 须同步减一；
+        // 否则选中位/前台标记/输入路由整体错位一格，后台状态判定跟着错。
+        if idx < self.current {
+            self.current -= 1;
+        }
         if self.current >= self.tabs.len() {
             self.current = self.tabs.len().saturating_sub(1);
         }
@@ -1976,44 +2056,106 @@ impl ClientApp {
         };
     }
 
-    fn update_exited(&mut self) -> bool {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+    /// 「✅ 稳定计时 + 执行完成通知」状态机：原在 tab_bar() 渲染路径，挪进
+    /// logic() 与退出判定（update_exited）同源同帧执行——不再依赖页签栏渲染，
+    /// 最小化/遮挡时也随 IDLE_HEARTBEAT_MS 心跳走，恢复后按已过时长补判。
+    /// ponytail: 若系统挂起最小化时的 repaint 心跳，通知会延迟到唤醒后 500ms。
+    fn update_done_states(&mut self, ctx: &egui::Context) {
+        let now_ms = crate::now_ms();
+        let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if let Tab::Session(s) = tab {
+                let icon = tab_icon(
+                    s.exited.load(Ordering::Acquire),
+                    s.loading_active(now_ms),
+                    s.output_count.load(Ordering::Relaxed),
+                    s.has_been_viewed.load(Ordering::Relaxed),
+                    s.last_output_ms.load(Ordering::Relaxed),
+                    now_ms,
+                    s.last_input_ms.load(Ordering::Relaxed),
+                );
+                // 「执行完成」提醒：页签进入 ✅（3s 无内容 = 输出结束待查看）后
+                // 需稳定停留 DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁。
+                // 稳定窗口过滤误触发：周期输出在 🔄↔✅ 间横跳时重置计时。判定仅凭
+                // 终端内容；含 TUI 寂静思考期（用户要求以终端内容为准）。静默判据：
+                // 仅「当前页签且应用在前台」（用户正盯着）才清零计时不打扰；切走
+                // 后重新计时，与 update_exited 的「运行结束」语义一致。
+                if icon == Some("✅") {
+                    let since = s.done_since_ms.load(Ordering::Relaxed);
+                    if i == self.current && app_fg {
+                        // 用户正盯着 ✅：视为已知晓，清零计时（切走后再重新
+                        // 计 DONE_STABLE_MS）。done_notified 不动——本轮已看见
+                        // 图标，不再弹窗。
+                        s.done_since_ms.store(0, Ordering::Relaxed);
+                    } else if since == 0 {
+                        s.done_since_ms.store(now_ms, Ordering::Relaxed);
+                    } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
+                        && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
+                        // 10s 节流先过（不通过则每帧重试，不消耗本轮 done_notified）。
+                        && allow_toast(s, now_ms)
+                        && !s.done_notified.swap(true, Ordering::Relaxed)
+                        // 启动宽限期：刚启动的会话（含首轮输出）静默；
+                        // done_notified 已置位，宽限期结束后不为这一轮补弹。
+                        && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
+                            >= STARTUP_GRACE_MS
+                    {
+                        crate::notify_run_finished(&s.title, "任务完成");
+                        crate::flash_taskbar(self.titlebar_hwnd);
+                    }
+                } else {
+                    // 离开 ✅（新一轮输出/🔄/❌/图标空）→ 清稳定计时并复位
+                    // done_notified：每一轮完成都可再弹，防轰炸靠同页签 10s 节流
+                    //（TOAST_MIN_INTERVAL_MS，含退出/完成共用一条限流）。
+                    s.done_since_ms.store(0, Ordering::Relaxed);
+                    s.done_notified.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn update_exited(&mut self, ctx: &egui::Context) -> bool {
+        let now_ms = crate::now_ms();
+        let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
         let mut changed = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if let Tab::Session(s) = tab {
-                if !s.exited.load(Ordering::Relaxed) {
-                    // reader 线程退出时设置 exited 标志（无需 term 锁）。
-                    // 兜底：子进程也已退出时同样标记。
-                    // 后台会话跳过 try_wait()：不可见的会话不需要每帧 syscall,
-                    // reader 线程会在 PTY 管道断裂时设置 exited 标志。
-                    if s.foreground.load(Ordering::Relaxed) {
+                if !s.exited.load(Ordering::Acquire) {
+                    // exited 由 try_wait 权威判定（reader 不再自置，见 session.rs
+                    // 读循环：瞬时读错曾被当退出置永久 ❌）。前台每帧收割；后台
+                    // 每 BG_REAP_MS 一次——孙进程继承 ConPTY 句柄时管道不 EOF，
+                    // reader 判不了退出，只能低频轮询进程状态。
+                    let fg = s.foreground.load(Ordering::Relaxed);
+                    if fg
+                        || now_ms.saturating_sub(s.last_reap_ms.load(Ordering::Relaxed))
+                            >= BG_REAP_MS
+                    {
+                        s.last_reap_ms.store(now_ms, Ordering::Relaxed);
                         let child_exited = s.child
                             .as_deref_mut()
                             .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
                         if child_exited {
-                            s.exited.store(true, Ordering::Relaxed);
+                            s.exited.store(true, Ordering::Release);
                         }
                     }
-                    if s.exited.load(Ordering::Relaxed) {
+                    if s.exited.load(Ordering::Acquire) {
                         changed = true;
                     }
                 }
                 // 运行结束提醒：不管谁先置位 exited 都只处理一次（notified 去重）。
-                // 用户正盯着该页签（当前页签且本应用在前台）时不打扰；
-                // kill_in_background 已提前置位 notified，程序化终止（重启/切命令/关闭）不弹。
-                if s.exited.load(Ordering::Relaxed)
+                // 10s 节流放最前（不通过则每帧重试，不消耗 notified）；用户正盯着
+                // 该页签（当前页签且本应用在前台）时不打扰；kill_in_background
+                // 已提前置位 notified，程序化终止（重启/切命令/关闭）不弹。
+                if s.exited.load(Ordering::Acquire)
+                    && allow_toast(s, now_ms)
                     && !s.notified.swap(true, Ordering::Relaxed)
-                    && !(i == self.current && crate::app_is_foreground(self.titlebar_hwnd))
+                    && !(i == self.current && app_fg)
                 {
-            // 启动宽限期：创建后 10 秒内退出也静默（刚启动就崩/秒退
-            // 不打扰），notified 已置位因此宽限期后也不会补弹。
-            if s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
-                && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
-                    >= STARTUP_GRACE_MS
-            {
+                    // 启动宽限期：创建后 10 秒内退出也静默（刚启动就崩/秒退
+                    // 不打扰），notified 已置位因此宽限期后也不会补弹。
+                    if s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
+                        && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
+                            >= STARTUP_GRACE_MS
+                    {
                         crate::notify_run_finished(&s.title, "运行结束");
                         crate::flash_taskbar(self.titlebar_hwnd);
                     }
@@ -2162,9 +2304,7 @@ impl ClientApp {
         // 图标槽与 × 的宽度对所有页签相同；标题宽度按字符串缓存，标题
         // 不变时零排版成本。
         let tab_font = egui::TextStyle::Body.resolve(ui.style());
-        // 应用是否前台：每帧取一次。通知静默判据：仅当前页签且前台激活才算
-        // „盯着"（update_exited 的「运行结束」通知用 crate::app_is_foreground 直接判）。
-        let app_fg = crate::app_is_foreground(self.titlebar_hwnd);
+
         let slot_w = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap("🔄".to_string(), tab_font.clone(), Color32::TRANSPARENT)
                 .size()
@@ -2212,10 +2352,7 @@ impl ClientApp {
                     ui.add_space(4.0);
                     // 状态图标：固定宽度单字符。
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    let now_ms = crate::now_ms();
                     // ── 状态判定：仅凭终端内容 ──
                     // last_output_ms 由 reader 每收一块输出刷新；滚动/翻页只改
                     // 视口不产生输出 → 不计更新状态。周期重绘/CPU 采样/锁存等
@@ -2227,7 +2364,7 @@ impl ClientApp {
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let last_input = s.last_input_ms.load(Ordering::Relaxed);
                     let icon = tab_icon(
-                        s.exited.load(Ordering::Relaxed),
+                        s.exited.load(Ordering::Acquire),
                         s.loading_active(now_ms),
                         count,
                         viewed,
@@ -2238,47 +2375,8 @@ impl ClientApp {
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
-                    // 「执行完成」提醒：页签进入 ✅（3s 无内容 = 输出结束待查看）后
-                    // 需稳定停留 DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁
-                    // （done_notified 去重，只提示一次）。稳定窗口过滤误触发：周期
-                    // 输出在 🔄↔✅ 间横跳时重置计时。判定仅凭终端内容、无其它启发：
-                    // 周期间隙 ≤3s 不翻 ✅，>3s 即视为完成（含 TUI 寂静思考期，
-                    // 用户要求以终端内容为准）。静默判据：
-                    // 仅「当前页签且应用在前台」（用户正盯着）才清零计时不打扰；
-                    // 当前页签但应用在后台（焦点在别的窗口）= 用户没在看，照常
-                    // 计时弹通知 + 闪烁，与 update_exited 的「运行结束」语义一致。
-                    // 图标离开 ✅ 只清零计时、不复位已通知标记：一次完成只响一次；
-                    // 同轮反复切前/后台也不重复推（静默分支不再重武装 done_notified
-                    // ——旧代码每帧重武装，盯着时一切后台就再计 2s 又弹一次）。
-                    if icon == Some("✅") {
-                        let since = s.done_since_ms.load(Ordering::Relaxed);
-                        if i == self.current && app_fg {
-                            // 用户正盯着 ✅：视为已知晓，清零计时（切走后再重新
-                            // 计 DONE_STABLE_MS）——不重武装，防同轮反复误推。
-                            s.done_since_ms.store(0, Ordering::Relaxed);
-                        } else if since == 0 {
-                            s.done_since_ms.store(now_ms, Ordering::Relaxed);
-                        } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
-                            && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
-                            && !s.done_notified.swap(true, Ordering::Relaxed)
-                        {
-                            // 启动宽限期：刚启动的会话（含其首轮输出）不弹通知/闪烁，
-                            // done_notified 已置位，宽限期结束后不会为这一轮补弹。
-                            if now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
-                                >= STARTUP_GRACE_MS
-                            {
-                                crate::notify_run_finished(&title, "任务完成");
-                                crate::flash_taskbar(self.titlebar_hwnd);
-                            }
-                        }
-                    } else {
-                        // 离开 ✅ 只清零计时（下轮完成重新计 DONE_STABLE_MS），
-                        // **不复位 done_notified**：一次完成只响一次；后台轮询输出
-                        // （top/watch/编译间歇）在 🔄↔✅ 间横跳时，旧逻辑每轮都弹
-                        // 系统通知 = 后台疯狂轰炸。而静默分支也不再重武装（旧代码
-                        // 盯着时每帧置 false → 一切后台又弹一次 = 反复误推）。
-                        s.done_since_ms.store(0, Ordering::Relaxed);
-                    }
+                    // 「执行完成」通知状态机已挪入 logic()（update_done_states）：
+                    // 渲染路径只算图标、只读状态，不再产生副作用。
                     // 本页签当前启动命令（切换菜单里勾选当前项）。
                     let tab_cmd = s.cmd.clone();
                     // 刚拖起的帧里画底色需要 Noop 在内容之前插入，所以先占位。
@@ -2755,7 +2853,7 @@ impl ClientApp {
                 // 只推给应答过 OSC 10/11/4 颜色查询的会话（opencode 等）。
                 // shell/cmd 从不查询这类序列，收到 `ESC]10;...ESC\` 会把 OSC 终止符
                 // 的 `\` 直接回显成“自动输入了反斜杠”，不能广播。
-                if !s.exited.load(Ordering::Relaxed)
+                if !s.exited.load(Ordering::Acquire)
                     && s.osc_theme_aware
                         .load(std::sync::atomic::Ordering::Relaxed)
                 {
@@ -3940,11 +4038,22 @@ impl eframe::App for ClientApp {
         }
 
         // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
+        // 当前页签同时置「已查看」→ ✅ 图标只属于后台页签，一处覆盖所有切换
+        // 路径。done_notified 的复位/武装在 update_done_states 的 ✅ 分支。
         for (i, t) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = t {
-                s.foreground.store(i == self.current, Ordering::Relaxed);
+                if i == self.current {
+                    s.has_been_viewed.store(true, Ordering::Relaxed);
+                    s.foreground.store(true, Ordering::Relaxed);
+                } else {
+                    s.foreground.store(false, Ordering::Relaxed);
+                }
             }
         }
+
+        // ✅ 稳定计时 / 「执行完成」通知状态机（原在 tab_bar 渲染路径）：
+        // 与退出判定同在 logic() 跑，UI 只读图标。
+        self.update_done_states(ctx);
 
         // 主题切换后的延迟全量重绘：到点后把所有会话缓存再清一遍并强制整帧。
         if let Some(t) = self.theme_settle_at {
@@ -3982,12 +4091,10 @@ impl eframe::App for ClientApp {
                 busy = true;
             }
             if !busy {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now_ms = crate::now_ms();
                 // 仅前台页签的近期输出/加载态拉高整窗帧率；后台页签输出只更新
-                // 图标（1s 基线轮询），不再连带全窗刷新（连带刷=悬停激活干扰源）。
+                // 图标（IDLE_HEARTBEAT_MS=500ms 心跳轮询），不再连带全窗刷新
+                // （连带刷=悬停激活干扰源）。
                 if now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed)) < 300
                     || s.loading_active(now_ms)
                 {
@@ -4049,7 +4156,7 @@ impl eframe::App for ClientApp {
             self.download_progress_rx = None;
             ctx.request_repaint();
         }
-        let exited = self.update_exited();
+        let exited = self.update_exited(ctx);
         if exited {
             self.status = Some("有会话已退出".to_string());
             ctx.request_repaint();
@@ -4451,6 +4558,29 @@ mod tab_icon_tests {
     fn scrolling_does_not_count_as_update() {
         assert_eq!(icon(10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
         assert_eq!(icon(10, true, 10_000), None); // 已查看：滚动后仍空
+    }
+}
+#[cfg(test)]
+mod restore_coords_tests {
+    use super::{restore_coords, TabKind};
+
+    #[test]
+    fn restore_indices_skip_exited_and_settings() {
+        use TabKind::*;
+        // 恢复数组 = [Home, B, Settings, D]（A 已退出不恢复）。
+        let kinds = [Home, Gone, Alive, Settings, Alive];
+        assert_eq!(restore_coords(&kinds, 4), (3, 2)); // D → 3
+        assert_eq!(restore_coords(&kinds, 2), (1, 2)); // B → 1
+        assert_eq!(restore_coords(&kinds, 3), (2, 2)); // Settings 自身 → 2
+        assert_eq!(restore_coords(&kinds, 1), (1, 2)); // 已退出 → 邻位
+        assert_eq!(restore_coords(&kinds, 0), (0, 2)); // Home → 0
+        // 无设置页签：坐标 = Home + 存活会话序。
+        let kinds = [Home, Alive, Alive];
+        assert_eq!(restore_coords(&kinds, 2), (2, 1));
+        // 设置页签排在会话前：插入后会话右移一格。
+        let kinds = [Home, Settings, Alive];
+        assert_eq!(restore_coords(&kinds, 2), (2, 1));
+        assert_eq!(restore_coords(&kinds, 1), (1, 1));
     }
 }
 

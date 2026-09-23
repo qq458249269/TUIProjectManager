@@ -2,7 +2,6 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -116,12 +115,17 @@ pub struct Session {
     /// 是否已发送过「运行结束」提醒：正常退出置位后只提醒一次；
     /// kill_in_background 提前置位，重启/切命令/关闭页签等程序化终止不弹通知。
     pub notified: Arc<AtomicBool>,
-    /// 会话创建时刻（毫秒时间戳）。UI 用它做启动宽限期判定：启动后一分钟内
-    /// 不弹「运行结束」/「执行完成」通知，过滤启动瞬间输出高峰的误报。
+    /// 会话创建时刻（单调毫秒，见 crate::now_ms）。UI 用它做启动宽限期判定：
+    /// 启动后 10 秒内（STARTUP_GRACE_MS）不弹通知，过滤启动瞬间输出高峰的误报。
     pub started_ms: Arc<AtomicU64>,
-    /// 是否已发送过「输出结束」提醒（✅ 图标首次出现时提示一次；用户点开
-    /// 页签后重新武装（置 false），下轮输出结束再提示；后台横跳不反复弹）。
+    /// 是否已发送过本轮 ✅ 的「任务完成」提醒：进入 ✅ 稳定后提示一次，
+    /// 离开 ✅ 复位（每轮完成都可再弹，见 app.rs update_done_states）。
     pub done_notified: Arc<AtomicBool>,
+    /// 本页签最近一次系统通知的单调毫秒（0 = 从未）。同页签 10s 内最多一条
+    /// （完成/退出共用，TOAST_MIN_INTERVAL_MS）。
+    pub last_toast_ms: Arc<AtomicU64>,
+    /// 后台上次收割子进程（try_wait）的时刻：后台每 BG_REAP_MS 轮一次退出。
+    pub last_reap_ms: Arc<AtomicU64>,
     /// 进入 ✅ 状态的时刻（毫秒）。0 = 不在该状态。UI 页签检测到状态后需
     /// 稳定停留 DONE_STABLE_MS 才提醒，过滤 top/watch/编译间歇输出等周期性
     /// 进程在 🔄↔✅ 间横跳造成的重复误报。
@@ -734,10 +738,8 @@ pub fn spawn(
     let output_count = Arc::new(AtomicU32::new(0));
     let out_bytes = Arc::new(AtomicU64::new(0));
     let loading = Arc::new(AtomicBool::new(true));
-    let now_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let has_been_viewed = Arc::new(AtomicBool::new(false));
+    let now_ts = crate::now_ms();
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     let exited = Arc::new(AtomicBool::new(false));
@@ -759,6 +761,7 @@ pub fn spawn(
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
+        let reader_viewed = has_been_viewed.clone();
         let reader_alt_screen = alt_screen.clone();
         let reader_cursor_hidden = cursor_hidden.clone();
         let parse_gen = parse_gen.clone();
@@ -772,6 +775,11 @@ pub fn spawn(
             let mut parser: Processor = Processor::default();
             let mut buf = [0u8; 0x10_000];
             let mut last_counted_ms: u64 = 0;
+            // 动画分类累计窗口：一轮连续输出（空闲 >500ms 重置），不看单次
+            // read 块大小（块切分抖动是旧分类误判源）。
+            let mut class_esc: u64 = 0;
+            let mut class_bytes: u64 = 0;
+            let mut last_chunk_ms: u64 = 0;
             // 跨块拼接缓冲：OMP 等程序的终端查询序列可能被 read() 切分到相邻块，
             // reply_to_queries 逐块扫描会漏掉。保留尾部未完成的转义序列，
             // 下一块拼接后重扫。
@@ -792,16 +800,21 @@ pub fn spawn(
                             }
                             query_leftover.clear();
                         }
-                        reader_exited.store(true, Ordering::Relaxed);
-                        reader_ctx.request_repaint();
-                        break;
+                        // 读失败/EOF 不再直接置 exited：瞬时读错曾被当退出
+                        // （永久 ❌），子进程活着时管道异常也误判。退出与否由
+                        // UI 线程 try_wait 权威判定（前台每帧、后台每 BG_REAP_MS，
+                        // 见 app.rs update_exited）；这里退避重试，exited 置位后
+                        // 下一轮退出读循环。
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        if reader_exited.load(Ordering::Acquire) {
+                            reader_ctx.request_repaint();
+                            break;
+                        }
+                        continue;
                     },
                     Ok(n) => {
                         parse_gen.fetch_add(1, Ordering::Relaxed);
-                        let now_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
+                        let now_ms = crate::now_ms();
                         if latency_debug() {
                             let since = now_ms.saturating_sub(reader_input_ms.load(Ordering::Relaxed));
                             if since > 0 && since <= 500 {
@@ -853,15 +866,30 @@ pub fn spawn(
                                 i += 1;
                             }
                         }
-                        let total = (esc_bytes + printable) as f64;
-                        let esc_ratio = if total > 0.0 { esc_bytes as f64 / total } else { 0.0 };
-                        let is_animation = total == 0.0
-                            || (esc_ratio > 0.5 && n < 200)
-                            || esc_ratio > 0.8;
+                        // 动画分类按「一轮连续输出」累计（空闲 >500ms 重置）：
+                        // 旧规则 (ratio>0.5 && n<200) 依赖单次 read 块大小，同一
+                        // 程序前块判动画、后块判文本，纯 ANSI 页签被误判成动画 →
+                        // out_bytes 不累计 → 永远不亮 ✅/不弹通知。>0.5 覆盖旧的
+                        // 0.8 强动画分支。ponytail: 高转义率非动画内容（ANSI 图）
+                        // 仍会当动画跳过计数，升级到显式帧头判定才能根治。
+                        if now_ms.saturating_sub(last_chunk_ms) > 500 {
+                            class_esc = 0;
+                            class_bytes = 0;
+                        }
+                        last_chunk_ms = now_ms;
+                        class_esc += esc_bytes as u64;
+                        class_bytes += (esc_bytes + printable) as u64;
+                        let is_animation = class_bytes == 0
+                            || class_esc as f64 / class_bytes as f64 > 0.5;
                         if !is_animation {
                             // 累计实质输出字节（非动画块的可打印字节）：
                             // 「任务完成」/「运行结束」通知的过滤判据。
                             reader_out_bytes.fetch_add(printable as u64, Ordering::Relaxed);
+                            // 新一轮实质输出 → 清「已查看」：本轮输出停止 3s 后
+                            // ✅ 才重新亮起（图标只属于后台新输出）。done_notified
+                            // 在离开 ✅ 时复位（app.rs update_done_states），重复
+                            // 弹窗由同页签 10s 节流兜底（TOAST_MIN_INTERVAL_MS）。
+                            reader_viewed.store(false, Ordering::Relaxed);
                             // 首次有实际内容输出 → 标记加载完成，停止旋转动画。
                             if reader_loading.load(Ordering::Relaxed) {
                                 reader_loading.store(false, Ordering::Relaxed);
@@ -1062,12 +1090,14 @@ pub fn spawn(
         notified: Arc::new(AtomicBool::new(false)),
         started_ms: Arc::new(AtomicU64::new(now_ts)),
         done_notified: Arc::new(AtomicBool::new(false)),
+        last_toast_ms: Arc::new(AtomicU64::new(0)),
+        last_reap_ms: Arc::new(AtomicU64::new(0)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
         last_clipboard_seq: None,
         output_count,
         out_bytes,
         last_output_ms,
-        has_been_viewed: Arc::new(AtomicBool::new(false)),
+        has_been_viewed,
         alt_screen,
         cursor_hidden,
         parse_gen: parse_gen.clone(),

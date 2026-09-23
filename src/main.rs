@@ -7,6 +7,17 @@ mod term_gl;
 mod terminal;
 
 use eframe::egui;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+/// 进程单调毫秒钟（自进程启动起经过的毫秒）。页签状态判定的全部时间戳——
+/// 🔄/✅ 图标、完成稳定计时（DONE_STABLE_MS）、加载超时、输入例外窗口——
+/// 统一用它：墙钟（SystemTime）被 NTP 同步或手动调时回拨时会瞬间大面积
+/// 误判页签状态。崩溃日志等需要真实墙钟的场景继续用 SystemTime。
+pub fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 /// 版本号：GitHub Actions 构建前把发布版本号写入 version.txt，由 build.rs 注入
 /// APP_VERSION；本地开发没有该文件时回退到 Cargo.toml 的版本。
@@ -57,8 +68,13 @@ fn unlock_exe() {
     }
  
 /// 顶层窗口是否为给定 hwnd（判断本应用是否在前台：用户正盯着看就不弹提醒）。
-pub fn app_is_foreground(hwnd: isize) -> bool {
-    hwnd != 0 && unsafe { GetForegroundWindow() } == hwnd
+/// hwnd 未捕获到（0）时退回调用方给的窗口焦点状态：拿不到句柄不能一律当
+/// 后台（旧实现恒 false → 盯着看也弹通知）。
+pub fn app_is_foreground(hwnd: isize, focused_fallback: bool) -> bool {
+    if hwnd == 0 {
+        return focused_fallback;
+    }
+    unsafe { GetForegroundWindow() == hwnd }
 }
 
 /// 运行结束系统通知：PowerShell WinRT toast，免安装器（无 AUMID 注册）也能显示。
