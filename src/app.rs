@@ -459,8 +459,27 @@ fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
 #[allow(unused_variables)]
 fn log_update(_msg: &str) {}
 
+/// 取 curl 可执行文件：Windows 钉死系统版（C:\Windows\System32\curl.exe）。
+/// PATH 里常见的 MSYS2/mingw 版 curl 依赖运行时 DLL，由 GUI 进程裸 spawn 时
+/// 启动即崩（ACCESS_VIOLATION，rc=0xC0000005，本机实测）→ 所有 curl 源集体
+/// 失败、检查更新/下载"链接都访问不上"。System32 版静态依赖 Schannel，任意
+/// 机器可控；精简系统无此文件时回退 PATH 查找。非 Windows 直接用 curl。
+#[cfg(windows)]
+fn curl_bin() -> &'static str {
+    const SYS_CURL: &str = "C:\\Windows\\System32\\curl.exe";
+    if std::path::Path::new(SYS_CURL).exists() {
+        SYS_CURL
+    } else {
+        "curl"
+    }
+}
+#[cfg(not(windows))]
+fn curl_bin() -> &'static str {
+    "curl"
+}
+
 /// 用 curl 请求 URL 并解析 JSON 中的 tag。extract 决定取哪个字段：GitHub
-/// API 用 tag_name，jsDelivr 数据 API 用 tags[0]。
+/// API 用 tag_name，jsDelivr 数据 API 用 versions[0].version。
 /// 通用性说明：`-q` 让 curl 完全不读 ~/.curlrc（曾有残留 Clash 127.0.0.1:7897
 /// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误）——任何机器上的
 /// 用户残留配置都不影响；`--noproxy *` 连 http_proxy 等环境代理一并禁用，
@@ -471,7 +490,7 @@ fn fetch_tag_from_url(
     max_time: u64,
     extract: fn(&serde_json::Value) -> Option<String>,
 ) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("curl");
+    let mut cmd = std::process::Command::new(curl_bin());
     let ct = connect_timeout.to_string();
     let mt = max_time.to_string();
     cmd.args([
@@ -499,7 +518,7 @@ fn fetch_tag_from_url(
 /// HTML 302 重定向取 tag（github.com /releases/latest 重定向到
 /// /releases/tag/<tag>，免 API 限流）。同样 -q 直连、无代理无端口。
 fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("curl");
+    let mut cmd = std::process::Command::new(curl_bin());
     let ct = connect_timeout.to_string();
     let mt = max_time.to_string();
     cmd.args([
@@ -554,13 +573,15 @@ fn ps_run(script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// PowerShell Invoke-RestMethod 拉 JSON 取 tag。独立网络栈（WinHTTP/Schannel，
-/// 走系统代理设置）——curl 在这个目标机上反复失败（含 ACCESS_VIOLATION），
-/// PS 通道实测直连 api.github.com ~1.1s 返回 tag，是「别的办法绕过」的主力源。
+/// PowerShell Invoke-RestMethod 拉 JSON 取 tag。独立网络栈（WinHTTP/Schannel），
+/// 脚本首句 DefaultWebProxy=$null 强制直连、绝不吃系统代理——curl 在这个
+/// 目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「别的办法绕过」的主力源
+/// （实测直连 api.github.com ~1.1s 返回 tag）。
 #[cfg(windows)]
 fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+         [System.Net.WebRequest]::DefaultWebProxy=$null; \
          $ErrorActionPreference='Stop'; \
          $r = Invoke-RestMethod -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t}; \
          $r | ConvertTo-Json -Depth 10",
@@ -581,7 +602,7 @@ fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
 #[cfg(windows)]
 fn ps_fetch_html_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
-        "$ErrorActionPreference='Stop'; \
+        "[System.Net.WebRequest]::DefaultWebProxy=$null; $ErrorActionPreference='Stop'; \
          (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing).Content",
         url = url,
         t = timeout_secs,
@@ -638,14 +659,21 @@ fn fetch_latest_release() -> (String, Option<String>) {
             mt: 6,
         });
     }
-    // jsDelivr 数据 API：JSON 是 {"tags":[…]}}，最新 tag 在数组首位。
+    // jsDelivr 数据 API：实返回 {"tags":{},"versions":[{version,…}]}——tags 恒为空
+    // 对象（只收 semver 标签），最新版在 versions[0].version。旧实现读 tags[]
+    // 永远取不到 → 该源静默必败，等于少一个 CDN 主力源。
     sources.push(Src {
         desc: "jsDelivr",
         url: jd_url,
         html: false,
         ps: false,
         extract: |v: &serde_json::Value| -> Option<String> {
-            v["tags"].as_array()?.first()?.as_str().map(str::to_string)
+            v["versions"]
+                .as_array()?
+                .first()?["version"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| v["tags"].as_array()?.first()?.as_str().map(str::to_string))
         },
         ct: 4,
         mt: 8,
@@ -769,7 +797,7 @@ fn download_update(
     let page_url = format!(
         "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
     );
-    let mut page_cmd = std::process::Command::new("curl");
+    let mut page_cmd = std::process::Command::new(curl_bin());
     page_cmd.args([
         "-q", "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
         "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
@@ -809,7 +837,7 @@ fn download_update(
         let api_url = format!(
             "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
         );
-        let mut api_cmd = std::process::Command::new("curl");
+        let mut api_cmd = std::process::Command::new(curl_bin());
         api_cmd.args([
             "-q", "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
             "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
@@ -937,15 +965,13 @@ fn download_update(
 /// 慢/被墙，镜像 CDN 缓存、延迟低；检查更新时所有镜像**并发**探查、先到
 /// 先得（挂了零成本跳过）；下载仍逐链尝试、挂了自动跳到下一个，全挂才回退
 /// 原始直链。列表换成当前可用即可，多放几个零成本、坏节点自动跳过。
+// 镜像列表已实测汰换（2026-09，本机 python 直连验证）：ghfast.top/ghproxy.net
+// 403、moeyy 超时、gh.ddlc.top 404、ghproxy.cc TLS 证书已过期——全部剔除；
+// 只留当前可达三项，下载/查询失败会自动跳到下一链。日后失效再照此换。
 const GH_MIRRORS: &[&str] = &[
-    "https://ghfast.top/",       // ghproxy 继任（v2），CDN 缓存，延迟低
-    "https://gh-proxy.com/",     // 热门前缀代理，带缓存
-    "https://ghproxy.net/",      // ghproxy 系实例
-    "https://ghps.cc/",          // 极速代理
-    "https://github.moeyy.xyz/", // moeyy CDN
-    "https://gh.ddlc.top/",      // moeyy CDN 备用节点
-    "https://ghproxy.cc/",       // 备用
-    "https://gh-proxy.net/",     // 备用
+    "https://gh-proxy.com/", // 热门前缀代理，实测 API 1.0s / 下载 1.1s
+    "https://gh-proxy.net/", // 同系备用，实测可达
+    "https://ghps.cc/",      // 极速代理，实测可达但偏慢（~12s）
 ];
 
 /// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset_name}.new，
@@ -972,7 +998,7 @@ fn download_one(
         let mut c = std::process::Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-Command"]);
         let script = format!(
-            "$ErrorActionPreference='Stop'; \
+            "[System.Net.WebRequest]::DefaultWebProxy=$null; $ErrorActionPreference='Stop'; \
              Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
              -TimeoutSec 300 -OutFile '{dest}' -UseBasicParsing",
             url = url.replace('\'', "''"),
@@ -981,7 +1007,7 @@ fn download_one(
         c.arg(script);
         c
     } else {
-        let mut c = std::process::Command::new("curl");
+        let mut c = std::process::Command::new(curl_bin());
         c.args([
             "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
             "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口

@@ -18,7 +18,6 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::sync::atomic::AtomicPtr;
 
 // ── 无锁快照：reader 线程生成，UI 线程通过 AtomicPtr 加载，零锁竞争 ──
 
@@ -80,8 +79,10 @@ pub struct Session {
     pub cmd: String,
     /// 终端仿真状态（仅 reader 线程写入）。
     pub term: Arc<RwLock<Term<SessionListener>>>,
-    /// 无锁渲染快照：reader 线程生成，UI 线程通过 load() 零锁读取。
-    pub snapshot: Arc<AtomicPtr<TermSnapshot>>,
+    /// 渲染快照：reader 线程生成新 Arc 替换（旧 Arc 由持引用方释放，UI 渲染期
+    /// 全程持有自己的 Arc，旧快照不会被并发 drop——替代旧 AtomicPtr 方案的每块
+    /// 输出 O(rows×cols) clone + 双份常驻 cells。
+    pub snapshot: Arc<std::sync::Mutex<Arc<TermSnapshot>>>,
     /// UI → reader 命令通道：滚动/调整大小/选区更新。
     #[allow(dead_code)]
     pub cmd_tx: std::sync::mpsc::Sender<TermCommand>,
@@ -179,9 +180,7 @@ pub struct Session {
     pub last_preedit: String,
     /// 静止帧缓存：跳过 clone 时复用上一帧的 ANSI 查找表（256 项 Color32）。
     pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
-    /// 渲染帧的网格快照缓冲：跨帧复用避免每帧 rows×cols 次 Vec 分配。
-    pub snapshot_scratch: Vec<(Point, Cell)>,
-    /// 上一帧快照对应的 parse_gen：用于检测 snapshot 是否有新内容，跳过无变化帧的 clone。
+    /// 上一帧快照对应的 parse_gen：用于检测 snapshot 是否有新内容，跳过无变化帧的重渲染。
     pub last_snapshot_gen: u64,
     /// 上一帧快照偏移：仅 offset 变化时做 O(rows) 的 point.line 平移，
     /// 避免 O(rows×cols) 的全量 clone。
@@ -524,14 +523,6 @@ static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe
 /// 统一走 loading_active()：超过窗口后无论标志是否仍为 true 都不再显示加载态。
 const LOADING_MAX_MS: u64 = 5_000;
 
-
-
-
-
-
-
-
-
 #[cfg(windows)]
 fn ensure_bundled_conpty() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -718,8 +709,8 @@ pub fn spawn(
         let msg = format!("\x1b]10;rgb:{fg}/{fg}/{fg}\x1b\\\x1b]11;rgb:{bg}\x1b\\").into_bytes();
         let _ = writer_tx.try_send(msg);
     }
-    // 无锁快照 + 命令通道
-    let snapshot = Arc::new(AtomicPtr::new(Box::into_raw(Box::new(TermSnapshot {
+    // 快照 + 命令通道
+    let snapshot = Arc::new(std::sync::Mutex::new(Arc::new(TermSnapshot {
         cells: Vec::new(),
         offset: 0,
         cursor_point: Point::new(Line(0), Column(0)),
@@ -732,7 +723,7 @@ pub fn spawn(
         mode: TermMode::empty(),
         cursor_cell_char: ' ',
         cursor_cell_flags: alacritty_terminal::term::cell::Flags::empty(),
-    }))));
+    })));
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<TermCommand>();
 
     let output_count = Arc::new(AtomicU32::new(0));
@@ -1033,7 +1024,9 @@ pub fn spawn(
                                         cells.push((p, indexed.cell.clone()));
                                     }
                                 }
-                                let new_snap = Box::into_raw(Box::new(TermSnapshot {
+                                // Arc 替换：旧 Arc 由持引用方（UI 渲染帧）释放，零深拷贝。
+                                // 静止检测不再做 grid 比较：纯内容制靠 last_output_ms。
+                                *reader_snapshot.lock().unwrap() = Arc::new(TermSnapshot {
                                     cells,
                                     offset: offset_val,
                                     cursor_point: cursor.point,
@@ -1046,12 +1039,7 @@ pub fn spawn(
                                     mode,
                                     cursor_cell_char: cc,
                                     cursor_cell_flags: cf,
-                                }));
-                                // 原子交换：UI 线程下一帧 load() 即可拿到最新快照
-                                let old = reader_snapshot.swap(new_snap, Ordering::AcqRel);
-                                if !old.is_null() {
-                                    unsafe { drop(Box::from_raw(old)); }
-                                }
+                                });
                             }
                         }
                         if is_fg {
@@ -1102,7 +1090,6 @@ pub fn spawn(
         cursor_hidden,
         parse_gen: parse_gen.clone(),
         caret_scan: None,
-        snapshot_scratch: Vec::new(),
         gpu: None,
         last_input_ms,
         drag_press_pos: None,
@@ -1160,10 +1147,6 @@ impl Session {
 pub fn refresh_snapshot(sess: &mut Session) {
     let snapshot = &sess.snapshot;
     let term = &sess.term;
-    let cur_ptr = snapshot.load(Ordering::Acquire);
-    if cur_ptr.is_null() {
-        return;
-    }
     let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
     // 从终端 grid 直接读 display_offset：旧 snapshot 的 offset 未随滚动更新，
     // 用它检测不到纯滚动变化。
@@ -1175,10 +1158,9 @@ pub fn refresh_snapshot(sess: &mut Session) {
         return;
     }
 
-    // 任何变化（gen 或 offset）都需重新 clone cells：
+    // 任何变化（gen 或 offset）都需从 term grid 重建 cells：
     // - gen 变化：新 PTY 输出改变了内容
     // - offset 变化：滚动改变了可见区域
-    // 合并为统一路径，避免 offset-only 分支的陈旧 snapshot 问题。
     if let Ok(t) = term.read() {
         let content = t.renderable_content();
         let offset_val = content.display_offset;
@@ -1202,11 +1184,10 @@ pub fn refresh_snapshot(sess: &mut Session) {
                 cells.push((p, indexed.cell.clone()));
             }
         }
-        // cells 先存 snapshot_scratch，再 clone 一份给 snapshot：
-        // render_cells 在 gen_changed=false 时 take scratch，避免再 clone。
-        sess.snapshot_scratch = cells;
-        let new_snap = Box::into_raw(Box::new(TermSnapshot {
-            cells: sess.snapshot_scratch.clone(),
+        // 单份数据进 Arc 快照：UI 渲染期持 Arc，零额外副本（旧 AtomicPtr 方案
+        // 这里同时持有 snapshot_scratch + snapshot.cells 两份全屏格）。
+        *snapshot.lock().unwrap() = Arc::new(TermSnapshot {
+            cells,
             offset: offset_val,
             cursor_point: cursor.point,
             cursor_shape: cursor.shape,
@@ -1218,13 +1199,7 @@ pub fn refresh_snapshot(sess: &mut Session) {
             mode,
             cursor_cell_char: cc,
             cursor_cell_flags: cf,
-        }));
-        let old = snapshot.swap(new_snap, Ordering::AcqRel);
-        if !old.is_null() {
-            unsafe {
-                drop(Box::from_raw(old));
-            }
-        }
+        });
         sess.last_snapshot_gen = cur_gen;
         sess.last_snapshot_offset = offset_val;
         sess.cached_render_shapes = None;

@@ -12,6 +12,7 @@ use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
 use crate::session::{Session, SessionListener, TermCommand};
+use crate::session::TermSnapshot;
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
 use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw, set_clipboard_string};
@@ -1235,14 +1236,11 @@ pub fn show_terminal(
     // 静止帧优化：parse_gen 未变时跳过 cell clone（最大开销），复用上一帧快照；
     // 光标/选区/颜色等元数据仍每帧读取（它们可能独立变化）。
     // 注意：IME 活跃时不跳过，因为输入法组合/提交会改变终端内容。
-    // ── 从原子快照加载渲染数据：零锁竞争 ──
-    // reader 线程处理 PTY 输出后生成快照并通过 AtomicPtr 原子交换。
-    // UI 线程 load() 时无需获取任何锁，彻底消除渲染卡顿。
-    let snap_ptr = sess.snapshot.load(Ordering::Acquire);
-    if snap_ptr.is_null() {
-        return; // 首帧快照尚未生成
-    }
-    let snap = unsafe { &*snap_ptr };
+    // ── 从快照加载渲染数据：Arc clone（原子计数，非深拷贝）──
+    // reader 线程替换快照时旧 Arc 由本帧自持的引用保活，渲染期无并发 drop；
+    // 帧末 Arc 释放，旧快照数据随之回收（旧方案每输出块 O(rows×cols) clone）。
+    let snap_arc = { let g = sess.snapshot.lock().unwrap(); g.clone() };
+    let snap: &TermSnapshot = &snap_arc;
     let offset = snap.offset;
     let cursor_point = snap.cursor_point;
     let cursor_shape = snap.cursor_shape;
@@ -1279,19 +1277,11 @@ pub fn show_terminal(
         sess.cached_render_shapes = None;
     }
 
-    // ── parse_gen 驱动的静止帧优化：内容未变时跳过颜色重建 ──
+    // ── parse_gen 驱动的静止帧优化：内容未变时跳过逐格重渲染 ──
     let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
     let gen_changed = cur_gen != sess.last_snapshot_gen;
-    let snapshot_cells: Vec<(Point, Cell)> = if gen_changed {
-        // 快照有新内容：复用 scratch buffer 的容量做 clone_from，
-        // 避免 collect() 的独立分配（切换页签首帧的主要卡顿源）。
-        sess.snapshot_scratch.clone_from(&snap.cells);
-        std::mem::take(&mut sess.snapshot_scratch)
-    } else {
-        // 内容未变（纯滚动/空闲帧）：上帧 render_cells 已归还 scratch，
-        // 直接 take 复用，零 clone。
-        std::mem::take(&mut sess.snapshot_scratch)
-    };
+    // 直接借用快照内 cells（Arc 自持，无并发 drop），零 clone。
+    let snapshot_cells = &snap.cells;
 
     // ── 预计算 ANSI 256 色查找表：parse_gen 未变时复用缓存，跳过 256 次循环 ──
     let ansi_rgb = if gen_changed {
@@ -1337,7 +1327,7 @@ pub fn show_terminal(
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
     // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
     //
-    for (point, cell) in &snapshot_cells {
+    for (point, cell) in snapshot_cells {
         let vline = point.line.0 + offset as i32;
         if vline < 0 || vline >= rows as i32 {
             continue;
@@ -1720,7 +1710,7 @@ pub fn show_terminal(
             );
         }
         let mut dumped = 0;
-        for (point, cell) in &snapshot_cells {
+        for (point, cell) in snapshot_cells {
             if cell.c == '\0' || cell.c == ' ' || dumped >= 12 {
                 continue;
             }
@@ -1746,8 +1736,7 @@ pub fn show_terminal(
         );
     }
 
-    // 归还快照缓冲供下一帧复用（见上方 take 处注释）。
-    sess.snapshot_scratch = snapshot_cells;
+    // 归还逻辑已随 snapshot_scratch 移除：渲染借用快照内 cells（Arc 自持）。
 
     // 记录终端状态标志，供 app 页签图标判定 TUI 运行状态。
     sess.alt_screen.store(alt_screen, Ordering::Relaxed);

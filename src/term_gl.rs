@@ -36,7 +36,11 @@ const GLYPH_PAD: u32 = 1;
 type FontSource = (Arc<Vec<u8>>, u32);
 type FontCacheEntry = (Vec<FontSource>, u32, Vec<Arc<fontdue::Font>>);
 static FONT_CACHE: OnceLock<Mutex<Vec<FontCacheEntry>>> = OnceLock::new();
-const FONT_CACHE_MAX: usize = 4;
+// 全链 fontdue 解析（CJK）≈130-170MB/条（字体轮廓 eager 解析），且按物理字号
+// （px）各存一条：窗口拖动跨 DPI 显示器缩放时会叠出多条。上限 4 条 = 潜在
+// 500MB+ 白吃；同进程 DPI 稳定时实际只有 1 条，降为 2 只牺牲极端场景下的
+// 跨 px 复用，保住内存上限。
+const FONT_CACHE_MAX: usize = 2;
 
 /// 进程级字体字节缓存：egui 的 FontData 是 Cow::Owned，`definitions().clone()`
 /// 会深拷贝整份字体，而 TermGpu::new 每次新页签都调一次 → 每页签白吃
