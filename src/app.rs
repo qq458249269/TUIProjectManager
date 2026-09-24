@@ -40,12 +40,18 @@ const BUSY_FRAME_MS: u64 = 100;
 /// 代价即本方案：后台 TUI 静默思考 / 网络等待（>3s 无输出）会被判为完成；
 /// 用户要求以终端内容为准，出现该情况即 3s 后亮 ✅/弹通知（后果已知晓）。
 const OUTPUT_END_MS: u64 = 3_000;
-/// 输入/视口驱动例外窗口：用户刚在终端里输入或滚动（键盘/IME/粘贴写
-/// last_input_ms，terminal.rs 投递 bytes_out 时记录；滚轮转发 TUI 重绘也写，
-/// terminal.rs 滚动处理处记录）→ 回显与格内刷新是用户驱动、不是任务在跑，
-/// 跳过 🔄 判定。滚动查看历史不再误亮运行中。慢输入/长命令后真实输出仍
-/// 按 last_out 正常判 🔄（窗口仅 1.5s，长输出几乎总是超出）。
+/// 用户驱动回显例外（✂ 不吞任务真实输出）：键盘/IME/粘贴写 last_input_ms
+/// （terminal.rs 投递 bytes_out 时记录）→ 直接引发的回显是用户驱动、不是任务
+/// 在跑，其窗口内跳过 🔄 判定；滚动转发的 TUI 重绘回显记 last_scroll_ms 走
+/// 自己的 500ms 短窗（见 SCROLL_ECHO_MS）。真实输出晚于各自窗口仍按
+/// last_out 正常判 🔄——输入/滚动看日志期间页签照常实时刷新运行状态。
 const INPUT_ACTIVE_MS: u64 = 1_500;
+/// 滚动转发回显例外窗口：鼠标上报/备用屏路径滚轮转发 TUI 后，TUI 立即整屏
+/// 重绘回显 → 刷新 last_output_ms → 若不加例外会误亮 🔄 3s。记 last_scroll_ms
+/// 专用短窗（terminal.rs 滚动处理处写），只吞滚动驱动的这一下重绘；真实任务
+/// 输出晚于窗口即照常判 🔄——持续滚动看日志时页签仍实时显示运行中。
+/// 本地缓冲滚动（普通 shell）不产生 PTY 输出，不写此字段，完全不影响图标。
+const SCROLL_ECHO_MS: u64 = 500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
 /// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
@@ -1507,9 +1513,12 @@ pub struct ClientApp {
 /// 输出停止 ≥3s 且有可查看内容且未查看 → ✅（完成/待查看）；否则空。
 /// 滚动/翻页只改视口、不写 last_output_ms → 不计更新状态；周期重绘、CPU
 /// 采样、锁存等后台「固定刷新」全部退出判定，3 秒无内容即完成。
-/// 唯一例外：输入驱动（last_input 距今 <INPUT_ACTIVE_MS）——用户刚打字，
-/// 回显是输入引发、不是任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新内容）与
-/// 空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
+/// 唯一例外：用户驱动回显（last_input/last_scroll 距现在窗口内）——最近
+/// 1.5s 内输过键（last_input_ms）或 500ms 内转发过滚轮（last_scroll_ms）给
+/// TUI，其直接引发的重绘回显不算任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新
+/// 内容）与空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
+/// 两个窗口互不兼容：键盘输入回显给 1.5s（打字可能持续），滚动重绘是
+/// 一次性输出给 500ms；真实输出晚于各自窗口即照常判 🔄。
 /// ever_output：是否有任何输出块（含动画）。零输出会话不因 last_output_ms
 /// 初始化为 spawn 时刻而假闪 🔄，🔄 只属于真实内容驱动/加载态。
 fn tab_icon(
@@ -1521,6 +1530,7 @@ fn tab_icon(
     last_out: u64,
     now_ms: u64,
     last_input: u64,
+    last_scroll: u64,
 ) -> Option<&'static str> {
     if exited {
         return Some("❌");
@@ -1528,15 +1538,20 @@ fn tab_icon(
     if loading {
         return Some("🔄");
     }
-    // 输入驱动例外：用户刚在终端里输入（≤INPUT_ACTIVE_MS），回显/格内刷新
-    // 是输入引发、不是任务在跑 → 跳过运行中判定。命令真实输出晚于窗口即
-    // 照常判 🔄（慢命令几乎总是超出 1.5s 窗口）。
+    // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——其直接引发
+    // 的回显/整屏重绘是用户操作引起、不是任务在跑 → 跳过运行中判定。命令
+    // 真实输出晚于窗口即照常判 🔄（慢命令几乎总是超出窗口）。
     let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
+    let scroll_echo = last_scroll != 0 && now_ms.saturating_sub(last_scroll) < SCROLL_ECHO_MS;
     // 有内容（最近一块输出距今 ≤3s）→ 运行中。动画块也刷新 last_output_ms，
     // spinner/周期重绘期间保持 🔄；本地滚动/翻页不产生输出，不会点亮它。
     // ever_output 门：从未收到任何输出的会话（last_output_ms 仍是 spawn 的
     // 初始值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
-    if !typing && ever_output && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
+    if !typing
+        && !scroll_echo
+        && ever_output
+        && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS
+    {
         return Some("🔄");
     }
     // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
@@ -2533,12 +2548,14 @@ impl ClientApp {
                     // last_output_ms 由 reader 每收一块输出刷新；滚动/翻页只改
                     // 视口不产生输出 → 不计更新状态。周期重绘/CPU 采样/锁存等
                     // 后台固定刷新全部退出判定（见 tab_icon）：有内容 → 🔄，
-                    // 3s 无内容 → 完成（✅/空）。输入驱动例外：最近 1.5s 内用户
-                    // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）则
-                    // 回显不算任务在跑 → 跳过 🔄，修「输入时被误判成 🔄」。
+                    // 3s 无内容 → 完成（✅/空）。用户驱动例外：最近 1.5s 内
+                    // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）或
+                    // 500ms 内转发过滚轮（last_scroll_ms）→ 直接引发的回显不
+                    // 算任务在跑 → 跳过 🔄；真实输出晚于窗口照常判 🔄。
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let last_input = s.last_input_ms.load(Ordering::Relaxed);
+                    let last_scroll = s.last_scroll_ms.load(Ordering::Relaxed);
                     let icon = tab_icon(
                         s.exited.load(Ordering::Acquire),
                         s.loading_active(now_ms),
@@ -2548,6 +2565,7 @@ impl ClientApp {
                         last_out,
                         now_ms,
                         last_input,
+                        last_scroll,
                     );
                     let title = s.title.clone();
                     let selected = self.current == i;
@@ -4704,7 +4722,7 @@ mod tab_icon_tests {
 
     fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0)
+        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0, 0)
     }
 
     // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
@@ -4746,16 +4764,16 @@ mod tab_icon_tests {
     fn never_output_never_flashes_running() {
         let now = 100_000u64;
         // loading 未结束 → 🔄 由加载态负责（正常）；加载结束后零输出 → 空。
-        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0), None);
-        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0), None);
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0, 0), None);
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0, 0), Some("🔄"));
     }
 
     // 输入驱动例外：最近 1.5s 内用户输过键，回显即使刷新 last_output_ms
@@ -4764,11 +4782,11 @@ mod tab_icon_tests {
     fn typing_echo_not_running() {
         let now = 100_000u64;
         // 1s 前刚输入过（回显新鲜）→ 不亮 🔄，落空。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000, 0), None);
         // 输入窗口边界：不敢 1.5s 整（< INPUT_ACTIVE_MS 才算），恰过期即恢复。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501, 0), Some("🔄"));
         // 无输入历史（last_input=0，鼠标选择/拖拽等）→ 正常判 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0, 0), Some("🔄"));
     }
 
     // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、但内容已停
@@ -4776,8 +4794,8 @@ mod tab_icon_tests {
     #[test]
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500), Some("✅"));
-        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500, 0), Some("✅"));
+        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500, 0), None);
     }
 
     // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
@@ -4786,6 +4804,25 @@ mod tab_icon_tests {
     fn scrolling_does_not_count_as_update() {
         assert_eq!(icon(true, 10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
         assert_eq!(icon(true, 10, true, 10_000), None); // 已查看：滚动后仍空
+    }
+
+    // 滚动转发回显例外（last_scroll_ms 专用 500ms 短窗）：滚动转发 TUI 后立即
+    // 到达的重绘回显（last_out 新）→ 不亮 🔄（滚动查看历史不误亮运行中）；
+    // 窗口过期后真实输出照常判 🔄（持续滚动看日志时页签仍实时刷新运行状态）。
+    // 本地缓冲滚动不写 last_scroll（=0）→ 不产生例外，滚不滚动都不影响判定。
+    #[test]
+    fn scroll_echo_window_only_swallows_prompt_redraw() {
+        let now = 100_000u64;
+        // 500ms 内转发过滚轮 + 输出新鲜（TUI 重绘回显）→ 吞掉，不亮 🔄。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 100), None);
+        // 滚动窗口边界：恰过期（501ms）即按内容恢复 🔄。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 501), Some("🔄"));
+        // 无滚动记录（本地缓冲滚动 / 从未转发，last_scroll=0）→ 输出新鲜照常 🔄。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, 0), Some("🔄"));
+        // 滚动例外不吞 ✅：滚动时内容早已停、未查看 → 仍按内容判完成。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, 0, now - 100), Some("✅"));
+        // 滚动窗口与输入窗口互不干扰：输入回声例外只由 last_input 触发。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100), None);
     }
 }
 #[cfg(test)]
@@ -4885,11 +4922,19 @@ mod update_tests {
     fn looks_like_exe_checks_mz_header() {
         let dir = std::env::temp_dir();
         let p = dir.join("tpm_test_mz_check.bin");
-        std::fs::write(&p, b"MZ\x90\x00\x03\x00").unwrap();
+        // 真实 exe ≥256KB 才过体积门（volume gate 2026-09 后加的，旧 6 字节桩恒败）；
+        // 构造带 DOS 头（0x3C 处 e_lfanew=0x40）→ "PE\0\0" 的合法最小夹具。
+        let mut ok = vec![0u8; 256 * 1024 + 8];
+        ok[0..2].copy_from_slice(b"MZ");
+        ok[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        ok[0x40..0x44].copy_from_slice(b"PE\0\0");
+        std::fs::write(&p, &ok).unwrap();
         assert!(super::looks_like_exe(&p));
-        std::fs::write(&p, b"<html>404 Not Found</html>").unwrap();
+        // 同体积但纯 HTML：不判 exe。
+        std::fs::write(&p, vec![b'<'; 256 * 1024]).unwrap();
         assert!(!super::looks_like_exe(&p));
-        std::fs::write(&p, b"MXZ").unwrap();
+        // 体积不够（历史 6 字节桩场景）恒判否。
+        std::fs::write(&p, b"MZ\x90\x00\x03\x00").unwrap();
         assert!(!super::looks_like_exe(&p));
         let _ = std::fs::remove_file(&p);
     }

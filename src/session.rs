@@ -177,6 +177,12 @@ pub struct Session {
     /// 回显延迟探针：最近一次向 PTY 写入输入字节的毫秒时间戳。
     /// 读取线程据此计算「按键 → 首块回显」延迟（TUIPM_LATENCY_DEBUG=1 打印）。
     pub last_input_ms: Arc<AtomicU64>,
+    /// 最近一次**转发**滚轮给子进程的毫秒时间戳（鼠标上报/备用屏路径才写）。
+    /// TUI 收到滚轮后立即整屏重绘回显 → reader 刷新 last_output_ms → 页签
+    /// 误亮 🔄。记入专用短窗口（app.rs SCROLL_ECHO_MS，仅 500ms）：只吞滚动
+    /// 驱动的这一下重绘回显；真实任务输出晚于窗口即照常判 🔄。
+    /// 本地缓冲滚动（普通 shell）不产生 PTY 输出，不写此字段。
+    pub last_scroll_ms: Arc<AtomicU64>,
     /// 主键按下时的位置（仅 UI 线程用）：快速拖选兜底判定用。
     /// 低帧率下按下/拖动/释放全落在同一帧时，egui 既不判 click 也不判
     /// drag，drag_started_by 永不触发 —— 这里自己记按下点。
@@ -752,6 +758,7 @@ pub fn spawn(
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_real_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
+    let last_scroll_ms = Arc::new(AtomicU64::new(0));
     let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
     let term = Arc::new(RwLock::new(term));
@@ -1125,6 +1132,7 @@ pub fn spawn(
         caret_scan: None,
         gpu: None,
         last_input_ms,
+        last_scroll_ms,
         drag_press_pos: None,
         click_press_pos: None,
         mouse_press_pending: None,

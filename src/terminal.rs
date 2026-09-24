@@ -686,10 +686,11 @@ pub fn show_terminal(
     if over_term {
         // 滚轮即「用户驱动视口操作」：转发给 TUI（鼠标上报/备用屏分支）后 TUI
         // 会重绘回显新输出 → reader 刷新 last_output_ms → 页签误亮 🔄。记入
-        // last_input_ms 输入例外窗口（tab_icon 最近 1.5s 内用户驱动输出不算
-        // 任务在跑），滚动查看历史不再触发「运行中」误判。本地缓冲滚动不
-        // 产生输出，记下也无害（键盘路径本来就会在随后覆盖它）。
-        sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
+        // last_scroll_ms 滚动回显短窗口（app.rs SCROLL_ECHO_MS=500ms，不共用
+        // 键盘输入 1.5s 窗口）：只吞滚动引起的这一下重绘，真实任务输出晚于
+        // 窗口即照常判 🔄——持续滚动看日志时页签仍实时显示运行中。
+        // 本地缓冲滚动（else 分支）不产生 PTY 输出、不写任何时间戳：滚动
+        // 完全不影响图标状态（非输出态滚动不触发图标刷新）。
         let delta = scroll_delta;
         ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
         let mut lines = (delta / cell_h).round() as i32;
@@ -699,7 +700,7 @@ pub fn show_terminal(
         if mouse_reporting {
             // 子进程开了鼠标上报（opencode/nvim 等）→ 滚轮作为真实滚轮事件转发，
             // 编码与应用声明一致（SGR/X10）。优先于 alt_screen PgUp/PgDn 分支。
-            let pos = ui
+            sess.last_scroll_ms.store(crate::now_ms(), Ordering::Relaxed);            let pos = ui
                 .input(|i| i.pointer.latest_pos())
                 .unwrap_or(rect.center());
             let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
@@ -712,6 +713,7 @@ pub fn show_terminal(
             }
         } else if alt_screen {
             // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
+            sess.last_scroll_ms.store(crate::now_ms(), Ordering::Relaxed);
             let count = lines.unsigned_abs().div_ceil(3).clamp(1, 8);
             let key: &[u8] = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
             for _ in 0..count {
