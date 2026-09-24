@@ -1467,9 +1467,12 @@ pub struct ClientApp {
 /// 唯一例外：输入驱动（last_input 距今 <INPUT_ACTIVE_MS）——用户刚打字，
 /// 回显是输入引发、不是任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新内容）与
 /// 空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
+/// ever_output：是否有任何输出块（含动画）。零输出会话不因 last_output_ms
+/// 初始化为 spawn 时刻而假闪 🔄，🔄 只属于真实内容驱动/加载态。
 fn tab_icon(
     exited: bool,
     loading: bool,
+    ever_output: bool,
     count: u32,
     viewed: bool,
     last_out: u64,
@@ -1488,7 +1491,9 @@ fn tab_icon(
     let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
     // 有内容（最近一块输出距今 ≤3s）→ 运行中。动画块也刷新 last_output_ms，
     // spinner/周期重绘期间保持 🔄；本地滚动/翻页不产生输出，不会点亮它。
-    if !typing && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
+    // ever_output 门：从未收到任何输出的会话（last_output_ms 仍是 spawn 的
+    // 初始值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
+    if !typing && ever_output && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
         return Some("🔄");
     }
     // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
@@ -2153,13 +2158,17 @@ impl ClientApp {
     /// !viewed——当前正查看的页签任务完成后图标落空，永进不了完成分支，失焦
     /// 也不弹通知）。改用独立判据：未退出、非加载中、内容停止超 OUTPUT_END_MS、
     /// 有实质输出——当前页签且应用前台（用户正盯着）才清零静默，否则照弹。
+    /// 弹窗门槛补「未查看」：启动即 viewed=true，闲置页签（仅 shell 提示符、
+    /// 无新输出轮）永不弹「任务完成」+ 任务栏闪烁；只有用户没看过的真任务
+    /// 输出轮（阅读循环在加载期后复位 viewed）才提醒。
     fn update_done_states(&mut self, ctx: &egui::Context) {
         let now_ms = crate::now_ms();
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
                 // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
-                // 非启动加载中、最近一块输出停止 ≥3s 且从未查看要求。
+                // 非启动加载中、最近一块输出停止 ≥3s。未查看门槛在弹窗条件里
+                //（viewed 语义：启动即已见，仅新输出轮复位，见下）。
                 let done = !s.exited.load(Ordering::Acquire)
                     && !s.loading_active(now_ms)
                     && now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed))
@@ -2182,7 +2191,11 @@ impl ClientApp {
                         s.done_since_ms.store(now_ms, Ordering::Relaxed);
                     } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
                         && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
-                        // 10s 节流先过（不通过则每帧重试，不消耗本轮 done_notified）。
+                        // 未查看门槛：启动即 viewed=true，闲置页签（无新输出轮）
+                        // 不提醒；用户没看过的真任务输出轮才弹（阅读循环在加载
+                        // 期后每轮新输出复位 viewed）。「任务完成」只属于主页签
+                        // 之外、用户还没看过的新内容，消除「没任何输出却弹」误报。
+                        && !s.has_been_viewed.load(Ordering::Relaxed)
                         && allow_toast(s, now_ms)
                         && !s.done_notified.swap(true, Ordering::Relaxed)
                         // 启动宽限期：刚启动的会话（含首轮输出）静默；
@@ -2457,6 +2470,7 @@ impl ClientApp {
                     let icon = tab_icon(
                         s.exited.load(Ordering::Acquire),
                         s.loading_active(now_ms),
+                        s.ever_output.load(Ordering::Relaxed),
                         count,
                         viewed,
                         last_out,
@@ -3784,7 +3798,7 @@ impl ClientApp {
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（点击页签后消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知；周期输出横跳会重置计时。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
@@ -4126,6 +4140,35 @@ impl eframe::App for ClientApp {
         {
             self.titlebar_restore_at = None;
             set_dwm_dark(self.titlebar_hwnd);
+        }
+
+        // ── Ctrl+(Shift+)Tab 循环切换页签 ──
+        // 在 logic() 用 consume_key 消费：事件从流里移除，ui() 里终端输入循环
+        // 收不到 → 不会当作 \t/\x1b[Z 转发给子进程。egui matches_logically 忽略
+        // 多余的 Shift/Alt，必须先判 Ctrl+Shift+Tab（后退）再判 Ctrl+Tab
+        // （前进），否则 Ctrl+Shift+Tab 会被前进分支吞掉（见 egui 0.36
+        // input_state::consume_key 文档）。
+        let (tab_back, tab_fwd) = ctx.input_mut(|i| {
+            let back = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            );
+            let fwd = !back && i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab);
+            (back, fwd)
+        });
+        if tab_back || tab_fwd {
+            let n = self.tabs.len();
+            if n > 1 {
+                // 后退 = 逆序一步（(current + n - 1) % n）。
+                let step = if tab_fwd { 1 } else { n - 1 };
+                self.current = (self.current + step) % n;
+                self.refresh_focus();
+                // 切入口即视为已查看（✅/`任务完成`通知清零，与点击页签一致；
+                // 前台每帧同步与 update_done_states 随本帧随后生效）。
+                if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
+                    s.has_been_viewed.store(true, Ordering::Relaxed);
+                }
+            }
         }
 
         // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
@@ -4575,50 +4618,60 @@ impl eframe::App for ClientApp {
 mod tab_icon_tests {
     use super::tab_icon;
 
-    fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
+    fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, count, viewed, now.saturating_sub(silent_ms), now, 0)
+        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0)
     }
 
     // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
     // 期间保持运行；count=0（纯动画会话）只要有输出照样 🔄。
     #[test]
     fn content_within_3s_shows_running() {
-        assert_eq!(icon(10, false, 2_000), Some("🔄"));
-        assert_eq!(icon(0, false, 2_000), Some("🔄"));
+        assert_eq!(icon(true, 10, false, 2_000), Some("🔄"));
+        assert_eq!(icon(true, 0, false, 2_000), Some("🔄"));
     }
 
     // 边界：恰好 3s 内仍有内容 → 🔄；超过 3s → 完成。
     #[test]
     fn three_sec_boundary() {
-        assert_eq!(icon(10, false, 3_000), Some("🔄"));
-        assert_eq!(icon(10, false, 3_001), Some("✅"));
+        assert_eq!(icon(true, 10, false, 3_000), Some("🔄"));
+        assert_eq!(icon(true, 10, false, 3_001), Some("✅"));
     }
 
     // 3s 无内容 + 有实质输出 + 未查看 → ✅（完成/待查看）。
     #[test]
     fn content_stopped_3s_shows_done() {
-        assert_eq!(icon(10, false, 10_000), Some("✅"));
+        assert_eq!(icon(true, 10, false, 10_000), Some("✅"));
     }
 
-    // 已查看（点击过页签）→ ✅ 消失；viewed 不复位，后续不再重复亮 ✅。
+    // 已查看（点击过页签/切走前台同步）→ ✅ 消失；viewed 不复位，后续不再重复亮 ✅。
     #[test]
     fn done_clears_after_viewed() {
-        assert_eq!(icon(10, true, 10_000), None);
+        assert_eq!(icon(true, 10, true, 10_000), None);
     }
 
     // 从未有实质输出（count=0，纯动画/零输出会话）→ 3s 无内容后落空，不亮 ✅。
     #[test]
     fn no_content_never_shows_done() {
-        assert_eq!(icon(0, false, 10_000), None);
+        assert_eq!(icon(true, 0, false, 10_000), None);
+    }
+
+    // 零输出会话（spawn 后从未读到任何数据块）不假闪 🔄：last_output_ms 仍是
+    // spawn 时刻（对 now 而言“新鲜”），若没有 ever_output 门会在前 3s 闪 🔄。
+    #[test]
+    fn never_output_never_flashes_running() {
+        let now = 100_000u64;
+        // loading 未结束 → 🔄 由加载态负责（正常）；加载结束后零输出 → 空。
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0), None);
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, now - 10_000, now, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0), Some("🔄"));
     }
 
     // 输入驱动例外：最近 1.5s 内用户输过键，回显即使刷新 last_output_ms
@@ -4627,11 +4680,11 @@ mod tab_icon_tests {
     fn typing_echo_not_running() {
         let now = 100_000u64;
         // 1s 前刚输入过（回显新鲜）→ 不亮 🔄，落空。
-        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, now - 1_000), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000), None);
         // 输入窗口边界：不敢 1.5s 整（< INPUT_ACTIVE_MS 才算），恰过期即恢复。
-        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, now - 1_501), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501), Some("🔄"));
         // 无输入历史（last_input=0，鼠标选择/拖拽等）→ 正常判 🔄。
-        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, 0), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0), Some("🔄"));
     }
 
     // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、但内容已停
@@ -4639,16 +4692,16 @@ mod tab_icon_tests {
     #[test]
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, 10, false, now - 10_000, now, now - 500), Some("✅"));
-        assert_eq!(tab_icon(false, false, 10, true, now - 10_000, now, now - 500), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500), Some("✅"));
+        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500), None);
     }
 
     // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
     // 仍按内容判据落 ✅/空，滚动本身不点亮 🔄（见 app.rs 图标循环注释）。
     #[test]
     fn scrolling_does_not_count_as_update() {
-        assert_eq!(icon(10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
-        assert_eq!(icon(10, true, 10_000), None); // 已查看：滚动后仍空
+        assert_eq!(icon(true, 10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
+        assert_eq!(icon(true, 10, true, 10_000), None); // 已查看：滚动后仍空
     }
 }
 #[cfg(test)]

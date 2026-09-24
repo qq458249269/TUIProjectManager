@@ -142,7 +142,14 @@ pub struct Session {
     /// 动画不属于可打印字节）时，「运行结束」/「任务完成」都不弹通知
     /// （见 app.rs MIN_OUTPUT_BYTES）。
     pub out_bytes: Arc<AtomicU64>,
-    /// 该页签是否已显示过「输出结束」对号（点击页签后清除）。
+    /// 是否收到过任何输出块（含动画/转义块；读取线程写、UI 线程读）。
+    /// 页签判定「内容驱动 🔄」的门：零输出会话（spawn 后从未读到数据）不因
+    /// last_output_ms 初始化为 spawn 时刻而假闪 🔄 3 秒。
+    pub ever_output: Arc<AtomicBool>,
+    /// 「已查看」标记：true = 用户已经看过当前内容（见 = 空状态）。
+    /// 启动即 true（spawn 产物不需要提醒）；读取线程在「加载期之后」的每轮
+    /// 新实质输出时复位 false → 完成通知/✅ 只属于用户没看过的真任务输出轮；
+    /// 点击页签 / 切换 / 终端内任何操作（前台每帧同步）置回 true。
     pub has_been_viewed: Arc<AtomicBool>,
     /// 终端是否处于备用屏（ALT_SCREEN / DECSET 1049）。
     /// htop/vim/opencode/nano 等全屏 TUI 启用，普通 shell 不启用。
@@ -729,7 +736,10 @@ pub fn spawn(
     let output_count = Arc::new(AtomicU32::new(0));
     let out_bytes = Arc::new(AtomicU64::new(0));
     let loading = Arc::new(AtomicBool::new(true));
-    let has_been_viewed = Arc::new(AtomicBool::new(false));
+    // 启动即「已查看」：启动属下的 shell 提示符/横幅不算需要提醒的新内容，
+    // 之后每轮新实质输出由 reader 复位成未查看（见读循环 loading 分支）。
+    let has_been_viewed = Arc::new(AtomicBool::new(true));
+    let ever_output = Arc::new(AtomicBool::new(false));
     let now_ts = crate::now_ms();
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
@@ -753,6 +763,7 @@ pub fn spawn(
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
         let reader_viewed = has_been_viewed.clone();
+        let reader_ever_output = ever_output.clone();
         let reader_alt_screen = alt_screen.clone();
         let reader_cursor_hidden = cursor_hidden.clone();
         let parse_gen = parse_gen.clone();
@@ -823,6 +834,7 @@ pub fn spawn(
                             }
                         }
                         last_output_ms.store(now_ms, Ordering::Relaxed);
+                        reader_ever_output.store(true, Ordering::Relaxed);
                         // 兜底：启动超时后强制退出加载态。TUI 首屏若整块几乎全是
                         // 转义序列（ConPTY 握手/清屏/定位），启发式会把它误判为
                         // 「动画」而永不置 false → 页签 🔄 常驻，即使终端画面早已
@@ -880,7 +892,13 @@ pub fn spawn(
                             // ✅ 才重新亮起（图标只属于后台新输出）。done_notified
                             // 在离开 ✅ 时复位（app.rs update_done_states），重复
                             // 弹窗由同页签 10s 节流兜底（TOAST_MIN_INTERVAL_MS）。
-                            reader_viewed.store(false, Ordering::Relaxed);
+                            // 加载期内不清：启动即 viewed=true，首块提示符若也复位
+                            // 成 false，纯闲置页签会永远「未查看」→ 无人查看也弹
+                            // 「任务完成」通知+闪烁（用户报告：没任何输出却弹）。
+                            // 加载结束（首次实质输出清 loading）后的输出才复位。
+                            if !reader_loading.load(Ordering::Relaxed) {
+                                reader_viewed.store(false, Ordering::Relaxed);
+                            }
                             // 首次有实际内容输出 → 标记加载完成，停止旋转动画。
                             if reader_loading.load(Ordering::Relaxed) {
                                 reader_loading.store(false, Ordering::Relaxed);
@@ -1085,6 +1103,7 @@ pub fn spawn(
         output_count,
         out_bytes,
         last_output_ms,
+        ever_output,
         has_been_viewed,
         alt_screen,
         cursor_hidden,
