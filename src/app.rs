@@ -2145,36 +2145,38 @@ impl ClientApp {
         };
     }
 
-    /// 「✅ 稳定计时 + 执行完成通知」状态机：原在 tab_bar() 渲染路径，挪进
-    /// logic() 与退出判定（update_exited）同源同帧执行——不再依赖页签栏渲染，
-    /// 最小化/遮挡时也随 IDLE_HEARTBEAT_MS 心跳走，恢复后按已过时长补判。
+    /// 「内容停止稳定计时 + 执行完成通知」状态机：原在 tab_bar() 渲染路径，
+    /// 挪进 logic() 与退出判定（update_exited）同源同帧执行——不再依赖页签栏
+    /// 渲染，最小化/遮挡时也随 IDLE_HEARTBEAT_MS 心跳走，恢复后按已过时长补判。
     /// ponytail: 若系统挂起最小化时的 repaint 心跳，通知会延迟到唤醒后 500ms。
+    /// 触发判定**不靠 ✅ 图标**（旧实现以 icon==Some("✅") 为门，而图标要求
+    /// !viewed——当前正查看的页签任务完成后图标落空，永进不了完成分支，失焦
+    /// 也不弹通知）。改用独立判据：未退出、非加载中、内容停止超 OUTPUT_END_MS、
+    /// 有实质输出——当前页签且应用前台（用户正盯着）才清零静默，否则照弹。
     fn update_done_states(&mut self, ctx: &egui::Context) {
         let now_ms = crate::now_ms();
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
-                let icon = tab_icon(
-                    s.exited.load(Ordering::Acquire),
-                    s.loading_active(now_ms),
-                    s.output_count.load(Ordering::Relaxed),
-                    s.has_been_viewed.load(Ordering::Relaxed),
-                    s.last_output_ms.load(Ordering::Relaxed),
-                    now_ms,
-                    s.last_input_ms.load(Ordering::Relaxed),
-                );
-                // 「执行完成」提醒：页签进入 ✅（3s 无内容 = 输出结束待查看）后
-                // 需稳定停留 DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁。
-                // 稳定窗口过滤误触发：周期输出在 🔄↔✅ 间横跳时重置计时。判定仅凭
-                // 终端内容；含 TUI 寂静思考期（用户要求以终端内容为准）。静默判据：
-                // 仅「当前页签且应用在前台」（用户正盯着）才清零计时不打扰；切走
-                // 后重新计时，与 update_exited 的「运行结束」语义一致。
-                if icon == Some("✅") {
+                // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
+                // 非启动加载中、最近一块输出停止 ≥3s 且从未查看要求。
+                let done = !s.exited.load(Ordering::Acquire)
+                    && !s.loading_active(now_ms)
+                    && now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed))
+                        > OUTPUT_END_MS;
+                // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
+                // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在
+                // 🔄↔边界横跳时（再有输出 → done=false → 清零）重置计时。
+                // 静默判据：仅「当前页签且应用在前台」（用户正盯着）才清零
+                // 计时不打扰；失焦/切走后重新计时，与 update_exited 的「运行
+                // 结束」语义一致——用户报告的现象（当前页签任务完成、窗口
+                // 失焦不推通知）即由旧图标门 + viewed 耦合导致，已解耦。
+                if done {
                     let since = s.done_since_ms.load(Ordering::Relaxed);
                     if i == self.current && app_fg {
-                        // 用户正盯着 ✅：视为已知晓，清零计时（切走后再重新
+                        // 用户正盯着：视为已知晓，清零计时（切走/失焦后再重新
                         // 计 DONE_STABLE_MS）。done_notified 不动——本轮已看见
-                        // 图标，不再弹窗。
+                        // 内容，不再弹窗。
                         s.done_since_ms.store(0, Ordering::Relaxed);
                     } else if since == 0 {
                         s.done_since_ms.store(now_ms, Ordering::Relaxed);
@@ -2192,9 +2194,9 @@ impl ClientApp {
                         crate::flash_taskbar(self.titlebar_hwnd);
                     }
                 } else {
-                    // 离开 ✅（新一轮输出/🔄/❌/图标空）→ 清稳定计时并复位
-                    // done_notified：每一轮完成都可再弹，防轰炸靠同页签 10s 节流
-                    //（TOAST_MIN_INTERVAL_MS，含退出/完成共用一条限流）。
+                    // 离开完成态（新一轮输出/启动加载中/已退出）→ 清稳定计时并
+                    // 复位 done_notified：每一轮完成都可再弹，防轰炸靠同页签 10s
+                    // 节流（TOAST_MIN_INTERVAL_MS，含退出/完成共用一条限流）。
                     s.done_since_ms.store(0, Ordering::Relaxed);
                     s.done_notified.store(false, Ordering::Relaxed);
                 }
