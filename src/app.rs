@@ -959,13 +959,21 @@ fn download_update(
 /// 慢/被墙，镜像 CDN 缓存、延迟低；检查更新时所有镜像**并发**探查、先到
 /// 先得（挂了零成本跳过）；下载仍逐链尝试、挂了自动跳到下一个，全挂才回退
 /// 原始直链。列表换成当前可用即可，多放几个零成本、坏节点自动跳过。
-// 镜像列表已实测汰换（2026-09，本机 python 直连验证）：ghfast.top/ghproxy.net
-// 403、moeyy 超时、gh.ddlc.top 404、ghproxy.cc TLS 证书已过期——全部剔除；
-// 只留当前可达三项，下载/查询失败会自动跳到下一链。日后失效再照此换。
+// 镜像列表为「加速前缀池」而非命运列表：检查更新/下载全部**并发**批量发起、
+// 先到先得，连接失败与坏文件（错误页/截断）都会被即时剔除记错并继续等其余
+// 源——所以越多越稳，坏节点零成本，谁响应快谁胜出，天然满足「实时性高」。
+// 池内包含踩点验证过数量级的常见国内加速：热门前缀代理、jsDelivr CDN 之外的
+// 各家 gh-proxy 系。个别历史 403/超时/证书过期的源保留在池里：连通状态随时
+// 变化，竞速机制下不必人工汰换，哪家活了立即自动启用。
 const GH_MIRRORS: &[&str] = &[
-    "https://gh-proxy.com/", // 热门前缀代理，实测 API 1.0s / 下载 1.1s
-    "https://gh-proxy.net/", // 同系备用，实测可达
-    "https://ghps.cc/",      // 极速代理，实测可达但偏慢（~12s）
+    "https://gh-proxy.com/",   // 热门前缀代理
+    "https://gh-proxy.net/",   // 同系备用
+    "https://ghps.cc/",        // 极速代理
+    "https://ghfast.top/",     // gh-proxy 系，状态多变，竞速下自动甄别
+    "https://mirror.ghproxy.com/", // ghproxy 系老牌
+    "https://ghproxy.net/",    // ghproxy 系
+    "https://gh.llkk.cc/",     // 备用代理
+    "https://github.moeyy.xyz/", // moeyy 加速
 ];
 
 /// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset_name}.new，
@@ -1064,6 +1072,17 @@ fn download_race(
             let Some(ch) = slot.as_mut() else { continue };
             match ch.try_wait() {
                 Ok(Some(st)) if st.success() => {
+                    let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+                    // 源返回了非 exe 产物（错误页 HTML / 截断文件）：视作该候选失败，
+                    // 删其临时文件后继续等其余候选——坏源永不胜出，杜绝
+                    // 「替换失败: 下载文件损坏」反复出现（原本错误页体积小、下载最快，
+                    // 总是抢在真源前面 promote 成功）。
+                    if !looks_like_exe(&tmp) {
+                        let _ = std::fs::remove_file(&tmp);
+                        errs.push(format!("{}: 文件损坏（缺失 MZ/PE 头，疑似错误页）", candidates[i].0));
+                        *slot = None;
+                        continue;
+                    }
                     // kill 其余所有候选，删除其残留临时文件（本次已废弃）。
                     for (j, other) in children.iter_mut().enumerate() {
                         if j == i { continue; }
@@ -1073,7 +1092,6 @@ fn download_race(
                         other.take();
                         let _ = std::fs::remove_file(dest_dir.join(format!("{asset_name}.c{j}.new")));
                     }
-                    let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
                     // promote：rename 被杀软/Defender 短持有（os error 5）时退避重试。
                     let mut wait_ms = 300u64;
                     loop {
@@ -1171,23 +1189,32 @@ fn retry_rename(
 /// 2) 慢路径：正式名仍被占用时，先 rename(正式名 → .old) 腾名（运行中的
 ///    映像也可 rename，.old 兼作旧版备份），再放入新文件——最后一步是
 ///    最常失败处（刚下载完的 .new 正被 Defender 扫描），给足 ~20s 重试；
-/// 失败自动回滚，正式名始终可用。返回是否安装成功。
+/// 失败自动回滚，正式名始终可用。返回安装结果：Done 已装上；BadDownload
+/// 产物损坏（可自动换源重下，并非重试 rename 能救）；Occupied 被占（只能稍后重试）。
+#[derive(PartialEq)]
+enum InstallOutcome {
+    Done,
+    BadDownload,
+    Occupied,
+}
+
 fn install_update(
     new_file: &Path,
     final_path: &Path,
     old_path: &Path,
     status_tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
     redraw_tx: &std::sync::mpsc::SyncSender<()>,
-) -> bool {
-    // 0) 校验下载产物（MZ 头）：镜像偶发返回错误页/空文件，装上就无法启动。
+) -> InstallOutcome {
+    // 0) 校验下载产物（MZ+PE 头）：镜像偶发返回错误页/截断文件，装上就无法启动。
+    //    竞速层已前置剔除坏源，这里双保险；失败上层会自动换源重下，无需用户手动干预。
     if !looks_like_exe(new_file) {
-        let _ = std::fs::remove_file(new_file); // 删掉坏的，下次重新下载
+        let _ = std::fs::remove_file(new_file); // 删掉坏的，避免被 -C - 续传拼坏
         let msg = format!(
-            "替换失败: 下载文件损坏或不是可执行文件（{new_file:?}），已删除，请重新下载"
+            "下载到损坏文件，已自动换源重新下载（{new_file:?} 非有效 exe）"
         );
         let _ = status_tx.send((msg, None));
         let _ = redraw_tx.try_send(());
-        return false;
+        return InstallOutcome::BadDownload;
     }
     // 1) 快路径：正式名空闲 → 直接替换。~10s 重试窗口：杀软/Defender 扫描
     //    刚下载完的 .new 或正式名副本（拒绝访问 os error 5），等它释放。
@@ -1200,9 +1227,9 @@ fn install_update(
         "正在替换 exe",
         4,
     )
-    .is_ok()
+        .is_ok()
     {
-        return true;
+        return InstallOutcome::Done;
     }
     // 2) 慢路径：正式名仍被占用。先清掉旧 .old（避免 rename 目标被占，
     //    遇到杀软持有旧 .old 时也带重试等待），再把正式名 rename 走腾出
@@ -1232,7 +1259,7 @@ fn install_update(
         );
         let _ = status_tx.send((msg, None));
         let _ = redraw_tx.try_send(());
-        return false;
+        return InstallOutcome::Occupied;
     }
     // 3) 最后一步：把 .new 放进腾出的正式名。这是最常失败的一步——刚下载
     //    完的 .new 正被 Defender 实时扫描，给它 ~20s 重试窗口。
@@ -1245,7 +1272,7 @@ fn install_update(
         "正在放入新版本",
         4,
     ) {
-        Ok(()) => true,
+        Ok(()) => InstallOutcome::Done,
         Err(e) => {
             // 回滚：把挪走的旧映像放回正式名，确保目录里始终有可用 exe。
             let _ = retry_rename(
@@ -1274,20 +1301,36 @@ fn install_update(
             };
             let _ = status_tx.send((msg, None));
             let _ = redraw_tx.try_send(());
-            false
+            InstallOutcome::Occupied
         }
     }
 }
 
-/// 粗略校验文件是否为 Windows PE 可执行文件（MZ 头）。
+/// 校验下载产物是完整的 Windows PE 可执行文件：MZ 头 + e_lfanew（0x3C 偏移）
+/// → "PE\0\0" 头 + 体积下限。错误页 HTML / 空文件 / 只下载到前几 KB 的截断
+/// 文件（带 MZ 头但无 PE 上下文）一律判否，防止装坏 exe。
 fn looks_like_exe(p: &Path) -> bool {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(p) else {
         return false;
     };
-    let mut buf = [0u8; 2];
-    let n = f.read(&mut buf).unwrap_or(0);
-    n == 2 && &buf == b"MZ"
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    // 真实 exe 至少数百 KB；错误页/未知 200 响应通常只有 `config.json` 大小级别。
+    if meta.len() < 256 * 1024 {
+        return false;
+    }
+    let mut dos = [0u8; 0x40]; // DOS 头（含 0x3C 处的 e_lfanew 偏移）
+    if f.read(&mut dos).unwrap_or(0) < 0x40 {
+        return false;
+    }
+    let e_lfanew = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]) as u64;
+    if e_lfanew + 4 > meta.len() || f.seek(SeekFrom::Start(e_lfanew)).is_err() {
+        return false;
+    }
+    let mut pe = [0u8; 4];
+    f.read(&mut pe).unwrap_or(0) == 4 && &pe == b"PE\0\0"
 }
 
 /// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
@@ -1852,17 +1895,20 @@ impl ClientApp {
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| PathBuf::from("."));
-            // 失败后 3 秒自动重试，直到下载成功为止。
+            // 失败后 3 秒自动重试，直到下载成功为止。坏源在 download_race 内已被
+            // 剔除、install 校验失败（BadDownload）也会清掉续传残留换源重下，
+            // 不会再出现「替换失败: 下载文件损坏…请重新下载」的僵局。
             let mut attempt = 1u32;
-            let new_path = loop {
+            let mut installed_new: PathBuf; // 成功装入的 .new（供完成日志）
+            loop {
                 // 用户取消时跳出重试循环
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = status_tx.send(("下载已取消".to_string(), None));
                     let _ = redraw_tx.try_send(());
                     return;
                 }
-                match download_update(&tag, &exe_path, ptx.clone(), &cancel) {
-                    Ok(p) => break p,
+                let new_path = match download_update(&tag, &exe_path, ptx.clone(), &cancel) {
+                    Ok(p) => p,
                     Err(e) => {
                         let _ = status_tx.send((
                             format!("下载失败（第 {attempt} 次）: {e}，3 秒后自动重试…"),
@@ -1870,27 +1916,50 @@ impl ClientApp {
                         ));
                         std::thread::sleep(std::time::Duration::from_secs(3));
                         attempt += 1;
+                        continue;
+                    }
+                };
+                let new_file = PathBuf::from(&new_path);
+                installed_new = new_file.clone();
+                // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，最终都落到
+                // 正式名（unlock_exe 启动时把运行映像挪成 .running 腾出的空闲名）。
+                let old_path = final_path.with_extension("exe.old");
+                // copy 目标已存在则直接覆盖（.old 始终保留最新旧版），失败不阻断替换。
+                // 注意该提示不能含「失败」字样：UI 按关键字把 downloading 复位，避免干扰安装。
+                if let Err(e) = std::fs::copy(&final_path, &old_path) {
+                    let _ = status_tx.send((
+                        format!("提示: 旧版备份 {old_path:?} 未完成（{e}），不影响替换"),
+                        None,
+                    ));
+                    let _ = redraw_tx.try_send(());
+                }
+                match install_update(&new_file, &final_path, &old_path, &status_tx, &redraw_tx) {
+                    InstallOutcome::Done => break,
+                    InstallOutcome::Occupied => {
+                        // 安装失败：保留 .new 与 .old 供排查/手动处理，稍后可重新下载。
+                        return;
+                    }
+                    InstallOutcome::BadDownload => {
+                        // 清掉全部 .c{i}.new 续传残留，避免下一轮 -C - 把坏文件续传
+                        // 拼成残缺 exe；3 秒后整链重新并发下载（坏源已被剔除）。
+                        if let Some(dir) = new_file.parent() {
+                            if let Ok(rd) = std::fs::read_dir(dir) {
+                                for e in rd.flatten() {
+                                    let n = e.file_name().to_string_lossy().into_owned();
+                                    if n.ends_with(".new") {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        attempt += 1;
                     }
                 }
-            };
-            let new_file = PathBuf::from(&new_path);
-            // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，最终都落到
-            // 正式名（unlock_exe 启动时把运行映像挪成 .running 腾出的空闲名）。
-            let old_path = final_path.with_extension("exe.old");
-            // copy 目标已存在则直接覆盖（.old 始终保留最新旧版），失败不阻断替换。
-            // 注意该提示不能含「失败」字样：UI 按关键字把 downloading 复位，避免干扰安装。
-            if let Err(e) = std::fs::copy(&final_path, &old_path) {
-                let _ = status_tx.send((
-                    format!("提示: 旧版备份 {old_path:?} 未完成（{e}），不影响替换"),
-                    None,
-                ));
-                let _ = redraw_tx.try_send(());
             }
-            if !install_update(&new_file, &final_path, &old_path, &status_tx, &redraw_tx) {
-                // 安装失败：保留 .new 与 .old 供排查/手动处理，稍后可重新下载。
-                return;
-            }
-            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}（旧版本备份 → {old_path:?}）"));
+            log_update(&format!(
+                "下载 替换完成：{installed_new:?} → {final_path:?}（旧版已备份 .exe.old）"
+            ));
             let _ = status_tx.send((
                 format!("下载完成！请手动重启应用以使用新版本 {tag}"),
                 None,
@@ -3025,8 +3094,20 @@ impl ClientApp {
             let color = forced_contrast_color(color, bg);
             let saved_override = ui.visuals().override_text_color;
             ui.visuals_mut().override_text_color = None;
-            ui.label(RichText::new(text).color(color));
+            let copy_snapshot = text.clone(); // 渲染前快照，供右键复制（label 会 move text）
+            let label_resp = ui.label(RichText::new(text).color(color));
             ui.visuals_mut().override_text_color = saved_override;
+            // 右键快速复制整条状态栏消息（错误/提示可直接复制去反馈或贴给 AI）。
+            label_resp.context_menu(|ui| {
+                if ui
+                    .button("📋 复制")
+                    .on_hover_text("复制整条状态栏消息到剪贴板")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(copy_snapshot.clone());
+                    ui.close();
+                }
+            });
             if let Some(tag) = self.update_latest.clone() {
                 ui.separator();
                 if self.downloading {
