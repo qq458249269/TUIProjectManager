@@ -2167,11 +2167,14 @@ impl ClientApp {
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
                 // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
-                // 非启动加载中、最近一块输出停止 ≥3s。未查看门槛在弹窗条件里
-                //（viewed 语义：启动即已见，仅新输出轮复位，见下）。
+                // 非启动加载中、最近一块**实质内容**输出停止 ≥3s。last_real_output_ms
+                // 只看非动画块：周期转义重绘（tmux 状态栏/光标/屏幕刷新）不会让它
+                // 刷新 → 这类会话不会因 done 横跳而循环弹「任务完成」+ 闪烁。
+                // 未查看门槛在弹窗条件里（viewed 语义：启动即已见，仅新输出轮
+                // 复位，见下）。
                 let done = !s.exited.load(Ordering::Acquire)
                     && !s.loading_active(now_ms)
-                    && now_ms.saturating_sub(s.last_output_ms.load(Ordering::Relaxed))
+                    && now_ms.saturating_sub(s.last_real_output_ms.load(Ordering::Relaxed))
                         > OUTPUT_END_MS;
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
                 // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在

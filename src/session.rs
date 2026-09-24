@@ -134,7 +134,15 @@ pub struct Session {
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
+    /// 含转义/动画块：页签 🔄 图标用——动画重绘也算在跑（spinner/状态栏
+    /// 刷新保持旋转）。
     pub last_output_ms: Arc<AtomicU64>,
+    /// 最近一块**实质内容**输出的绝对时间戳：仅非动画块刷新。完成/通知判据
+    /// 用这个而非 last_output_ms——周期转义重绘（tmux 状态栏、光标/屏幕刷新）
+    /// 只刷 last_output_ms 不产生内容，若完成判定用全量输出，这类会话会周期
+    /// 横跳 done → 复位 done_notified → 每 ~10s 弹一次「任务完成」（用户报告：
+    /// 失焦后无内容却循环弹通知）。
+    pub last_real_output_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 累计实质输出字节数（非动画块的可打印字节，读取线程写、UI 线程读）。
@@ -742,6 +750,7 @@ pub fn spawn(
     let ever_output = Arc::new(AtomicBool::new(false));
     let now_ts = crate::now_ms();
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
+    let last_real_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
@@ -759,6 +768,7 @@ pub fn spawn(
         let output_count = output_count.clone();
         let reader_out_bytes = out_bytes.clone();
         let last_output_ms = last_output_ms.clone();
+        let reader_last_real_output = last_real_output_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
@@ -885,6 +895,9 @@ pub fn spawn(
                         let is_animation = class_bytes == 0
                             || class_esc as f64 / class_bytes as f64 > 0.5;
                         if !is_animation {
+                            // 实质内容块：刷「最近实质内容」时间戳——完成/通知判据
+                            // 只认它（周期转义重绘不产生实质内容 → 永不误判完成）。
+                            reader_last_real_output.store(now_ms, Ordering::Relaxed);
                             // 累计实质输出字节（非动画块的可打印字节）：
                             // 「任务完成」/「运行结束」通知的过滤判据。
                             reader_out_bytes.fetch_add(printable as u64, Ordering::Relaxed);
@@ -1104,6 +1117,7 @@ pub fn spawn(
         out_bytes,
         last_output_ms,
         ever_output,
+        last_real_output_ms,
         has_been_viewed,
         alt_screen,
         cursor_hidden,
