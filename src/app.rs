@@ -40,10 +40,11 @@ const BUSY_FRAME_MS: u64 = 100;
 /// 代价即本方案：后台 TUI 静默思考 / 网络等待（>3s 无输出）会被判为完成；
 /// 用户要求以终端内容为准，出现该情况即 3s 后亮 ✅/弹通知（后果已知晓）。
 const OUTPUT_END_MS: u64 = 3_000;
-/// 输入驱动例外窗口：用户刚在终端里输入（按键/IME/粘贴，last_input_ms 距今
-/// 不足此值）→ 回显与格内刷新是输入引发、不是任务在跑，跳过 🔄 判定。仅
-/// 键盘/IME/粘贴路径更新 last_input_ms（terminal.rs 投递 bytes_out 时记录），
-/// 鼠标上报/悬停/滚动不触碰它。慢输入/长命令后输出仍按 last_out 正常判 🔄。
+/// 输入/视口驱动例外窗口：用户刚在终端里输入或滚动（键盘/IME/粘贴写
+/// last_input_ms，terminal.rs 投递 bytes_out 时记录；滚轮转发 TUI 重绘也写，
+/// terminal.rs 滚动处理处记录）→ 回显与格内刷新是用户驱动、不是任务在跑，
+/// 跳过 🔄 判定。滚动查看历史不再误亮运行中。慢输入/长命令后真实输出仍
+/// 按 last_out 正常判 🔄（窗口仅 1.5s，长输出几乎总是超出）。
 const INPUT_ACTIVE_MS: u64 = 1_500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
@@ -482,8 +483,10 @@ fn curl_bin() -> &'static str {
 /// API 用 tag_name，jsDelivr 数据 API 用 versions[0].version。
 /// 通用性说明：`-q` 让 curl 完全不读 ~/.curlrc（曾有残留 Clash 127.0.0.1:7897
 /// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误）——任何机器上的
-/// 用户残留配置都不影响；`--noproxy *` 连 http_proxy 等环境代理一并禁用，
-/// 全程直连、不依赖任何代理与端口。connect_timeout / max_time（秒）由调用方决定。
+/// 残留配置都不影响；环境 http_proxy/https_proxy 代理仍读（用户明确配置的
+/// 代理放行，配合 PS/WinHTTP 系统代理通道，直连/代理双栈互补——全禁代理
+/// 曾导致有加速器的机器下载不了）。connect_timeout / max_time（秒）由调用方
+/// 决定。
 fn fetch_tag_from_url(
     url: &str,
     connect_timeout: u64,
@@ -496,7 +499,6 @@ fn fetch_tag_from_url(
     cmd.args([
         "-q", // 忽略 .curlrc / _curlrc，防用户机器上的残留代理端口
         "-s", "-f", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
-        "--noproxy", "*", // 直连，不读环境变量里的代理
         "-H", "User-Agent: TUIProjectManager",
         url,
     ]);
@@ -526,7 +528,6 @@ fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<Stri
         "-o", "NUL", // 丢弃响应体，只要重定向头
         "-w", "%{redirect_url}",
         "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
-        "--noproxy", "*",
         "-H", "User-Agent: TUIProjectManager",
         url,
     ]);
@@ -574,14 +575,13 @@ fn ps_run(script: &str) -> Result<String, String> {
 }
 
 /// PowerShell Invoke-RestMethod 拉 JSON 取 tag。独立网络栈（WinHTTP/Schannel），
-/// 脚本首句 DefaultWebProxy=$null 强制直连、绝不吃系统代理——curl 在这个
-/// 目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「别的办法绕过」的主力源
-/// （实测直连 api.github.com ~1.1s 返回 tag）。
+/// 吃系统代理（Steam++/加速器系统代理模式可救直连被墙；不设 DefaultWebProxy=$null）
+/// ——curl 在这个目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「别的办法绕过」
+/// 的主力源（实测直连 api.github.com ~1.1s 返回 tag）。
 #[cfg(windows)]
 fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
-         [System.Net.WebRequest]::DefaultWebProxy=$null; \
          $ErrorActionPreference='Stop'; \
          $r = Invoke-RestMethod -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t}; \
          $r | ConvertTo-Json -Depth 10",
@@ -602,7 +602,7 @@ fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
 #[cfg(windows)]
 fn ps_fetch_html_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
-        "[System.Net.WebRequest]::DefaultWebProxy=$null; $ErrorActionPreference='Stop'; \
+        "$ErrorActionPreference='Stop'; \
          (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing).Content",
         url = url,
         t = timeout_secs,
@@ -800,7 +800,6 @@ fn download_update(
     let mut page_cmd = std::process::Command::new(curl_bin());
     page_cmd.args([
         "-q", "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
         "-H", "User-Agent: TUIProjectManager",
         &page_url,
     ]);
@@ -840,7 +839,6 @@ fn download_update(
         let mut api_cmd = std::process::Command::new(curl_bin());
         api_cmd.args([
             "-q", "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-            "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
             "-H", "User-Agent: TUIProjectManager",
             &api_url,
         ]);
@@ -911,49 +909,45 @@ fn download_update(
             0,
         ),
     };
-    // ── 候选下载链：国内镜像优先 → PS WinHTTP 直连 → curl 直链兜底 ──
-    // 镜像 CDN 缓存热文件、大陆延迟低；PS 通道独立于 curl 作补充；curl 直链保底。
-    let mut attempts: Vec<(String, String, bool)> = Vec::new(); // (url, 文件名, 走 PS)
+    // ── 候选下载链：国内镜像 + PS WinHTTP + curl 直链，每个文件名下全量并发 ──
+    // 竞速第一个到达（见 download_race）：坏源/停滞源零成本跳过，速度地板判死
+    // 僵尸源；旧实现逐链串行（镜像×8 → PS → curl 直连按序等待），8 个死镜像
+    // 的 connect 超时（8s 各）累计 64s+ 才轮到直链——正是「镜像源下载缓慢」
+    // 的根因，已由并发取代。单个 fallback 失败再试下一个候选文件名。
+    let mut parts: Vec<String> = Vec::new();
     for (url, name) in fallback {
+        let mut candidates: Vec<(String, bool)> = Vec::new(); // (url, 走 PS)
         for mirror in GH_MIRRORS {
-            attempts.push((format!("{mirror}{url}"), name.clone(), false));
+            candidates.push((format!("{mirror}{url}"), false));
         }
         #[cfg(windows)]
-        attempts.push((url.clone(), name.clone(), true));
+        candidates.push((url.clone(), true));
         #[cfg(not(windows))]
-        attempts.push((url.clone(), name.clone(), false));
+        candidates.push((url.clone(), false));
         // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
         #[cfg(windows)]
-        attempts.push((url.clone(), name.clone(), false));
-    }
-    log_update(&format!(
-        "下载 开始尝试 {} 个候选链（tag={tag}，total={total}）：{}",
-        attempts.len(),
-        attempts
-            .iter()
-            .map(|(u, _, _)| u.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-    let mut errors: Vec<String> = Vec::new();
-    for (url, name, ps) in attempts {
-        // 用户取消时立即停止所有候选链
+        candidates.push((url.clone(), false));
+        log_update(&format!(
+            "下载 {} 并发尝试 {} 个候选链（tag={tag}，total={total}）",
+            name,
+            candidates.len()
+        ));
+        // 用户取消时立即停止本轮竞速。
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("下载已取消".to_string());
         }
-        match download_one(&url, &name, ps, total, dest_dir, &progress_tx, cancel) {
+        match download_race(&name, candidates, total, dest_dir, &progress_tx, cancel) {
             Ok(p) => {
-                log_update(&format!("下载 成功：{url} → {p}"));
+                log_update(&format!("下载 成功：{name} → {p}"));
                 return Ok(p);
             }
             Err(e) => {
-                log_update(&format!("下载 失败：{url}：{e}"));
-                errors.push(format!("{url}: {e}"));
+                log_update(&format!("下载 失败：{name}：{e}"));
+                parts.push(format!("{name}: {e}"));
             }
         }
     }
     // API 失败的真实原因（限流 403 等）并入汇总，不再被直拼兜底掩盖。
-    let mut parts = errors;
     if let Some(e) = &api_err {
         parts.push(format!("源① API: {e}"));
     }
@@ -976,85 +970,154 @@ const GH_MIRRORS: &[&str] = &[
 
 /// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset_name}.new，
 /// 轮询文件大小报告进度。返回 Ok(下载文件路径) 或 Err(具体失败原因)。
-fn download_one(
-    url: &str,
+/// 单个文件名下的候选链**并发竞速**下载（与 fetch_latest_release 同思路）：
+/// 全部候选（国内镜像 + PS WinHTTP + curl 直链）同时发起，各自写独立临时
+/// 文件 dest_dir/{name}.c{idx}.new，第一个成功完成的胜出并 promote 为
+/// {name}.new，其余就地 kill。坏源/停滞源零成本跳过：--connect-timeout 8 挡
+/// 连接挂死，--speed-limit 4096 --speed-time 8 判死持续 <4KB/s 达 8s 的僵尸
+/// 源（不再让一个死镜像独占整条串行下载）。失败/取消保留 .c{idx}.new 供
+/// 下次 -C - 续传；胜出 promote 若被杀软短持有则退避重试。
+/// 返回 Ok(下载文件路径) 或 Err(所有候选失败的聚合)。
+/// ponytail: 若 release 数日后镜像纷纷清缓存变慢，可给镜像档位降权或按历史
+/// 延迟排序重试；触及率低，暂不加。
+fn download_race(
     asset_name: &str,
-    ps: bool,
+    candidates: Vec<(String, bool)>, // (url, 走 PS WinHTTP)
     total: u64,
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
-    // 下载到 .new 文件，完成后由调用方替换旧 exe。
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
-
-    // 断点续传：若 .new 文件已存在，记录已下载字节数。curl 用 -C - 续传；
-    // PS 无续传（Invoke-WebRequest 直接覆盖重下）。
-    let downloaded_before = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-    let dest_str = dest_path.to_str().unwrap_or("update.exe.new").replace('\'', "''");
-
-    let mut cmd = if ps {
-        let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command"]);
-        let script = format!(
-            "[System.Net.WebRequest]::DefaultWebProxy=$null; $ErrorActionPreference='Stop'; \
-             Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
-             -TimeoutSec 300 -OutFile '{dest}' -UseBasicParsing",
-            url = url.replace('\'', "''"),
-            dest = dest_str,
-        );
-        c.arg(script);
-        c
-    } else {
-        let mut c = std::process::Command::new(curl_bin());
-        c.args([
-            "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-            "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
-            "-H", "User-Agent: TUIProjectManager",
-            "-o", dest_path.to_str().unwrap_or("update.exe.new"),
-        ]);
-        // 已有部分文件时续传；否则从头下载。
-        if downloaded_before > 0 {
-            c.arg("-C").arg("-");
+    let mut children: Vec<Option<std::process::Child>> = Vec::new();
+    let mut errs: Vec<String> = Vec::new();
+    for (i, (url, ps)) in candidates.iter().enumerate() {
+        let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+        let tmp_str = tmp.to_str().unwrap_or("update.exe.new").replace('\'', "''");
+        let mut cmd = if *ps {
+            let mut c = std::process::Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command"]);
+            // PS/WinHTTP 通道吃系统代理（Steam++/Clash 系统代理模式可救大陆
+            // 直连被墙；不设 DefaultWebProxy=$null——远端曾禁代理导致下载不了）。
+            let script = format!(
+                "$ErrorActionPreference='Stop'; \
+                 Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
+                 -TimeoutSec 120 -OutFile '{dest}' -UseBasicParsing",
+                url = url.replace('\'', "''"),
+                dest = tmp_str,
+            );
+            c.arg(script);
+            c
+        } else {
+            let mut c = std::process::Command::new(curl_bin());
+            c.args([
+                "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+                // 传输停滞判死：持续 <4KB/s 达 8s 中止本候选，让位其余候选。
+                "--speed-limit", "4096", "--speed-time", "8",
+                // 不带 --noproxy：-q 已禁 .curlrc 残留代理（历史坑 3a70473），
+                // 依仍读环境 http_proxy/https_proxy 与 PS 系统代理互补。
+                "-H", "User-Agent: TUIProjectManager",
+                "-o", tmp.to_str().unwrap_or("update.exe.new"),
+            ]);
+            // 断点续传：上次遗留的 .c{i}.new 非空则续传（PS 无续传，直接覆盖重下）。
+            if std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) > 0 {
+                c.arg("-C").arg("-");
+            }
+            c.arg(url);
+            c
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW，不闪黑窗
         }
-        c.arg(url);
-        c
-    };
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        match cmd.spawn() {
+            Ok(ch) => children.push(Some(ch)),
+            Err(e) => {
+                errs.push(format!("{url}: 启动下载失败 {e}"));
+                children.push(None);
+            }
+        }
     }
-    let mut child = cmd.spawn().map_err(|e| format!("启动下载失败: {e}"))?;
-
-    // 轮询文件大小报告进度：每 200ms 检查一次。
     loop {
-        // 检查取消信号
+        // 取消：kill 全部，保留 .c{idx}.new 供下次续传。
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = std::fs::remove_file(&dest_path);
+            for c in children.iter_mut().flatten() {
+                let _ = c.kill();
+            }
             return Err("下载已取消".to_string());
         }
+        // 进度 = 各临时文件当前大小的最大值（领先者即竞速胜出者的身形）。
+        let mut reported = 0u64;
+        for i in 0..children.len() {
+            reported = reported.max(
+                std::fs::metadata(dest_dir.join(format!("{asset_name}.c{i}.new")))
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            );
+        }
+        let _ = progress_tx.send((reported, total));
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let downloaded = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-        let _ = progress_tx.send((downloaded, total));
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
+        // 扫描已结束的子进程：首个成功者胜出。
+        for (i, slot) in children.iter_mut().enumerate() {
+            let Some(ch) = slot.as_mut() else { continue };
+            match ch.try_wait() {
+                Ok(Some(st)) if st.success() => {
+                    // kill 其余所有候选，删除其残留临时文件（本次已废弃）。
+                    for (j, other) in children.iter_mut().enumerate() {
+                        if j == i { continue; }
+                        if let Some(o) = other.as_mut() {
+                            let _ = o.kill();
+                        }
+                        other.take();
+                        let _ = std::fs::remove_file(dest_dir.join(format!("{asset_name}.c{j}.new")));
+                    }
+                    let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+                    // promote：rename 被杀软/Defender 短持有（os error 5）时退避重试。
+                    let mut wait_ms = 300u64;
+                    loop {
+                        match std::fs::rename(&tmp, &dest_path) {
+                            Ok(()) => break,
+                            Err(e) => {
+                                log_update(&format!("下载 promote rename 失败: {e}"));
+                                if wait_ms > 4000 {
+                                    let _ = std::fs::copy(&tmp, &dest_path);
+                                    let _ = std::fs::remove_file(&tmp);
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                                wait_ms = (wait_ms * 2).min(4000);
+                            }
+                        }
+                    }
                     let final_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
                     let _ = progress_tx.send((final_size, total));
                     return Ok(dest_path.to_string_lossy().into_owned());
-                } else {
-                    // 失败时保留 .new 文件以供下次续传，不删除
-                    return Err(format!("下载进程退出码 {}", status.code().unwrap_or(-1)));
+                }
+                Ok(Some(st)) => {
+                    // 失败（HTTP 非零、限流、停滞判死）→ 记错误，临时文件保留供续传。
+                    let code = st.code().map(|c| c.to_string()).unwrap_or_else(|| "信号终止".to_string());
+                    errs.push(if candidates[i].1 {
+                        format!("PS 通道失败（{code}）")
+                    } else {
+                        format!("镜像/直链失败（{code}）")
+                    });
+                    slot.take();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    errs.push(format!("{e}"));
+                    slot.take();
                 }
             }
-            Ok(None) => continue,
-            Err(e) => {
-                let _ = std::fs::remove_file(&dest_path);
-                return Err(format!("{e}"));
-            }
+        }
+        if children.iter().all(Option::is_none) {
+            return Err(if errs.is_empty() {
+                "无候选可启动".to_string()
+            } else {
+                errs.join("；")
+            });
         }
     }
 }

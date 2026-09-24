@@ -684,6 +684,12 @@ pub fn show_terminal(
         (sd, over)
     });
     if over_term {
+        // 滚轮即「用户驱动视口操作」：转发给 TUI（鼠标上报/备用屏分支）后 TUI
+        // 会重绘回显新输出 → reader 刷新 last_output_ms → 页签误亮 🔄。记入
+        // last_input_ms 输入例外窗口（tab_icon 最近 1.5s 内用户驱动输出不算
+        // 任务在跑），滚动查看历史不再触发「运行中」误判。本地缓冲滚动不
+        // 产生输出，记下也无害（键盘路径本来就会在随后覆盖它）。
+        sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
         let delta = scroll_delta;
         ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
         let mut lines = (delta / cell_h).round() as i32;
