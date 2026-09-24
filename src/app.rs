@@ -1495,6 +1495,11 @@ pub struct ClientApp {
     omp_models: config::ModelsConfig,
     /// 模型设置当前页签：0=pi 模型配置，1=oh-my-pi 模型配置。
     model_settings_tab: usize,
+    /// 供应商名编辑缓冲（页签, 当前键, 输入缓冲）：失焦前不重命名、不落盘。
+    provider_name_edit: Option<(usize, String, String)>,
+    /// 模型 context/max 数字编辑缓冲（页签, 供应商键, 模型行号, context, max）：
+    /// 失焦前不写回，避免清空后重打拼接出错误数值。
+    model_num_edit: Option<(usize, String, usize, String, String)>,
     /// 后台重绘跳帧计数器：后台页签收到 redraw 信号时累计，达到跳帧阈值才真正重绘。
     bg_frame: u64,
     /// 首页项目列表搜索过滤文本。
@@ -1709,6 +1714,8 @@ impl ClientApp {
             pi_models: config::load_pi_models(),
             omp_models: config::load_omp_models(),
             model_settings_tab: 0,
+            provider_name_edit: None,
+            model_num_edit: None,
             bg_frame: 0,
             search_query: String::new(),
             show_hidden: false,
@@ -3882,12 +3889,17 @@ impl ClientApp {
         ui.add_space(6.0);
         // ── 模型配置（页签：pi / oh-my-pi） ──
         ui.horizontal(|ui| {
-            ui.label(RichText::new("模型配置:").strong());
-            for (i, name) in ["pi 模型配置", "oh-my-pi 模型配置"].iter().enumerate() {
+            ui.label(RichText::new("供应商配置:").strong());
+            for (i, name) in ["pi 供应商配置", "oh-my-pi 供应商配置"].iter().enumerate() {
                 if ui
                     .add(egui::Button::selectable(self.model_settings_tab == i, *name))
                     .clicked()
+                    && self.model_settings_tab != i
                 {
+                    // 切页签前提交原页签里未失焦的供应商改名/数字编辑（失焦事件只在字段被
+                    // 渲染的帧里能捕捉，切页签的点击发生在对方页签渲染之前，会漏）避免丢失。
+                    self.flush_provider_rename(self.model_settings_tab);
+                    self.flush_model_num_edit(self.model_settings_tab);
                     self.model_settings_tab = i;
                 }
             }
@@ -3906,16 +3918,72 @@ impl ClientApp {
     }
 
     /// provider/models 编辑表单（pi / oh-my-pi 共用），返回是否有改动。
-    fn provider_list_ui(ui: &mut egui::Ui, models: &mut config::ModelsConfig) -> bool {
+    fn provider_list_ui(
+        ui: &mut egui::Ui,
+        tab: usize,
+        name_edit: &mut Option<(usize, String, String)>,
+        num_edit: &mut Option<(usize, String, usize, String, String)>,
+        models: &mut config::ModelsConfig,
+    ) -> bool {
         let mut dirty = false;
+        // 名称编辑缓冲只对当前页签、仍存在的键有效；键被删掉后丢弃。
+        // （切到别的页签不清空：那只代表该页签本轮没渲染，缓冲仍在，由切页签处 flush。）
+        if let Some((t, k, _)) = name_edit.as_ref() {
+            if *t == tab && !models.providers.contains_key(k) {
+                *name_edit = None;
+            }
+        }
+        // 数字编辑缓冲同理：供应商/模型行被删除后丢弃，切页签不清。
+        if let Some((t, k, i, _, _)) = num_edit.as_ref() {
+            let stale = *t != tab
+                || models.providers.get(k).map_or(true, |p| p.models.get(*i).is_none());
+            if stale {
+                *num_edit = None;
+            }
+        }
         let keys: Vec<String> = models.providers.keys().cloned().collect();
+        let mut provider_remove: Option<String> = None;
+        let mut provider_rename: Option<(String, String)> = None;
         for key in &keys {
             if let Some(provider) = models.providers.get_mut(key) {
+                // 正在编辑该供应商名：沿用缓冲，避免每敲一个字就把行重建导致丢焦点；
+                // 否则回填当前键。
+                let editing = match name_edit.as_ref() {
+                    Some((t, k, _)) => *t == tab && *k == *key,
+                    None => false,
+                };
+                let mut key_name = if editing {
+                    name_edit.as_ref().unwrap().2.clone()
+                } else {
+                    key.clone()
+                };
+                let mut commit_name = false;
                 ui.indent(key, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Provider:");
-                        ui.label(RichText::new(key).strong());
+                        ui.label("供应商:");
+                        let resp = ui
+                            .add(egui::TextEdit::singleline(&mut key_name).desired_width(120.0));
+                        if resp.changed() {
+                            // 只更新缓冲不重命名：重命名延迟到失焦才提交（避免每次输入就失焦/落盘）。
+                            *name_edit = Some((tab, key.clone(), key_name.clone()));
+                        }
+                        if resp.lost_focus() {
+                            commit_name = true;
+                        }
+                        if ui.small_button("删除供应商").clicked() {
+                            provider_remove = Some(key.clone());
+                        }
                     });
+                    if commit_name {
+                        let new = key_name.trim().to_string();
+                        if new.is_empty() || new == *key {
+                            // 空名/未变：保留缓冲供继续修改，不落盘。
+                            *name_edit = Some((tab, key.clone(), key_name.clone()));
+                        } else {
+                            provider_rename = Some((key.clone(), new));
+                            *name_edit = None;
+                        }
+                    }
                     ui.horizontal(|ui| {
                         ui.label("baseUrl:");
                         if ui
@@ -3943,8 +4011,26 @@ impl ClientApp {
                     // models 列表
                     let mut model_remove: Option<usize> = None;
                     for (mi, model) in provider.models.iter_mut().enumerate() {
+                        // context/max 数字编辑缓冲：正在编辑本行则沿用缓冲，失焦才写回，
+                        // 避免清空后重打把旧值拼接出新数值。
+                        let editing_num = matches!(
+                            num_edit.as_ref(),
+                            Some((t, k, i, _, _)) if *t == tab && *k == *key && *i == mi
+                        );
+                        let mut ctx_buf = if editing_num {
+                            num_edit.as_ref().unwrap().3.clone()
+                        } else {
+                            model.context_window.to_string()
+                        };
+                        let mut max_buf = if editing_num {
+                            num_edit.as_ref().unwrap().4.clone()
+                        } else {
+                            model.max_tokens.to_string()
+                        };
+                        let mut commit_ctx = false;
+                        let mut commit_max = false;
                         ui.horizontal(|ui| {
-                            ui.label(format!("Model[{}]:", mi));
+                            ui.label(format!("模型[{}]:", mi));
                             ui.label("id:");
                             if ui
                                 .add(
@@ -3965,35 +4051,60 @@ impl ClientApp {
                                 dirty = true;
                             }
                             ui.label("context:");
-                            let mut ctx_str = model.context_window.to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut ctx_str)
-                                        .desired_width(80.0),
-                                )
-                                .changed()
-                                && let Ok(v) = ctx_str.parse()
-                            {
-                                model.context_window = v;
-                                dirty = true;
+                            let resp_ctx = ui.add(
+                                egui::TextEdit::singleline(&mut ctx_buf).desired_width(80.0),
+                            );
+                            if resp_ctx.changed() {
+                                *num_edit = Some((
+                                    tab,
+                                    key.clone(),
+                                    mi,
+                                    ctx_buf.clone(),
+                                    max_buf.clone(),
+                                ));
+                            }
+                            if resp_ctx.lost_focus() {
+                                commit_ctx = true;
                             }
                             ui.label("max:");
-                            let mut max_str = model.max_tokens.to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut max_str)
-                                        .desired_width(80.0),
-                                )
-                                .changed()
-                                && let Ok(v) = max_str.parse()
-                            {
-                                model.max_tokens = v;
-                                dirty = true;
+                            let resp_max = ui.add(
+                                egui::TextEdit::singleline(&mut max_buf).desired_width(80.0),
+                            );
+                            if resp_max.changed() {
+                                *num_edit = Some((
+                                    tab,
+                                    key.clone(),
+                                    mi,
+                                    ctx_buf.clone(),
+                                    max_buf.clone(),
+                                ));
                             }
-                            if ui.small_button("×").clicked() {
+                            if resp_max.lost_focus() {
+                                commit_max = true;
+                            }
+                            if ui.small_button("删除模型").clicked() {
                                 model_remove = Some(mi);
                             }
                         });
+                        // 失焦提交：解析成功才写回；失败则丢缓冲、字段回显原值。
+                        if commit_ctx {
+                            if let Ok(v) = ctx_buf.trim().parse() {
+                                model.context_window = v;
+                                dirty = true;
+                            }
+                            if editing_num {
+                                *num_edit = None;
+                            }
+                        }
+                        if commit_max {
+                            if let Ok(v) = max_buf.trim().parse() {
+                                model.max_tokens = v;
+                                dirty = true;
+                            }
+                            if editing_num {
+                                *num_edit = None;
+                            }
+                        }
                     }
                     if let Some(mi) = model_remove {
                         provider.models.remove(mi);
@@ -4006,32 +4117,144 @@ impl ClientApp {
                 });
             }
         }
+        if let Some(key) = provider_remove {
+            models.providers.remove(&key);
+            dirty = true;
+        }
+        if let Some((old, new)) = provider_rename {
+            if !new.is_empty()
+                && new != old
+                && !models.providers.contains_key(&new)
+                && let Some(entry) = models.providers.remove(&old)
+            {
+                models.providers.insert(new, entry);
+                dirty = true;
+            } else {
+                // 重名冲突等：恢复编辑缓冲，保留用户输入供修改。
+                *name_edit = Some((tab, old, new));
+            }
+        }
+        if ui.button("+ 添加供应商").clicked() {
+            let mut n = 1;
+            while models.providers.contains_key(&n.to_string()) {
+                n += 1;
+            }
+            models.providers.insert(n.to_string(), config::ProviderEntry::default());
+            dirty = true;
+        }
         dirty
+    }
+
+    /// 提交某个页签里未落盘的供应商改名（切页签时调用；失焦提交走 provider_list_ui）。
+    /// 改名无效/重名冲突时保留编辑缓冲供用户修正。
+    fn flush_provider_rename(&mut self, tab: usize) {
+        let Some((t, old, new)) = self.provider_name_edit.take() else {
+            return;
+        };
+        if t != tab {
+            self.provider_name_edit = Some((t, old, new));
+            return;
+        }
+        let new = new.trim().to_string();
+        let ok = if t == 0 {
+            if new.is_empty() || new == old || self.pi_models.providers.contains_key(&new) {
+                false
+            } else if let Some(entry) = self.pi_models.providers.remove(&old) {
+                self.pi_models.providers.insert(new.clone(), entry);
+                config::save_pi_models(&self.pi_models).is_ok()
+            } else {
+                false
+            }
+        } else {
+            if new.is_empty() || new == old || self.omp_models.providers.contains_key(&new) {
+                false
+            } else if let Some(entry) = self.omp_models.providers.remove(&old) {
+                self.omp_models.providers.insert(new.clone(), entry);
+                config::save_omp_models(&self.omp_models).is_ok()
+            } else {
+                false
+            }
+        };
+        if !ok {
+            // 改名无效/重名冲突/删除失败：保留编辑缓冲供用户修正。
+            self.provider_name_edit = Some((t, old, new));
+        }
+    }
+
+    /// 切页签时提交未失焦的模型 context/max 数字编辑（与改名同一漏帧问题）。
+    fn flush_model_num_edit(&mut self, tab: usize) {
+        let Some((t, key, idx, ctx, max)) = self.model_num_edit.take() else {
+            return;
+        };
+        if t != tab {
+            self.model_num_edit = Some((t, key, idx, ctx, max));
+            return;
+        }
+        let provider = if t == 0 {
+            self.pi_models.providers.get_mut(&key)
+        } else {
+            self.omp_models.providers.get_mut(&key)
+        };
+        let Some(provider) = provider else {
+            return; // 供应商已删除：丢弃缓冲
+        };
+        let Some(model) = provider.models.get_mut(idx) else {
+            return; // 模型行已删：丢弃缓冲
+        };
+        let mut applied = false;
+        if let Ok(v) = ctx.trim().parse::<u64>() {
+            model.context_window = v;
+            applied = true;
+        }
+        if let Ok(v) = max.trim().parse::<u64>() {
+            model.max_tokens = v;
+            applied = true;
+        }
+        if applied {
+            let res = if t == 0 {
+                config::save_pi_models(&self.pi_models)
+            } else {
+                config::save_omp_models(&self.omp_models)
+            };
+            if let Err(e) = res {
+                self.status = Some(format!("供应商配置保存失败: {e}"));
+            }
+        }
     }
 
     /// 模型配置页签内容：0=pi，1=oh-my-pi。
     fn model_settings_ui(&mut self, ui: &mut egui::Ui, tab: usize) {
         if tab == 0 {
-            ui.label(RichText::new("pi 模型配置").strong());
+            ui.label(RichText::new("pi 供应商配置").strong());
             ui.label(
                 RichText::new(format!("路径: {}", config::pi_models_path().display()))
                     .weak()
                     .small(),
             );
-            if Self::provider_list_ui(ui, &mut self.pi_models)
-                && let Err(e) = config::save_pi_models(&self.pi_models)
+            if Self::provider_list_ui(
+                ui,
+                0,
+                &mut self.provider_name_edit,
+                &mut self.model_num_edit,
+                &mut self.pi_models,
+            ) && let Err(e) = config::save_pi_models(&self.pi_models)
             {
                 self.status = Some(format!("pi 配置保存失败: {e}"));
             }
         } else {
-            ui.label(RichText::new("oh-my-pi 模型配置").strong());
+            ui.label(RichText::new("oh-my-pi 供应商配置").strong());
             ui.label(
                 RichText::new(format!("路径: {}", config::omp_models_path().display()))
                     .weak()
                     .small(),
             );
-            if Self::provider_list_ui(ui, &mut self.omp_models)
-                && let Err(e) = config::save_omp_models(&self.omp_models)
+            if Self::provider_list_ui(
+                ui,
+                1,
+                &mut self.provider_name_edit,
+                &mut self.model_num_edit,
+                &mut self.omp_models,
+            ) && let Err(e) = config::save_omp_models(&self.omp_models)
             {
                 self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
             }
