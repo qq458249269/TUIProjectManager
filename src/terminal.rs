@@ -566,6 +566,109 @@ fn send_mouse_event(
     send_mouse_bytes(writer, mouse_event_bytes(sgr, code, col, row, release));
 }
 
+/// 一帧内的滚轮输入（由 `ClientApp::raw_input_hook` 在 egui 平滑前统计）。
+///
+/// 必须在原始事件上统计，不能用 `InputState::smooth_scroll_delta`：
+/// egui 的 `WheelState` 会把一次拨轮用 ~0.9s 渐进下发（每帧只给 4% 残量，
+/// 8 点的档位要 50 帧才发完）。若按「每帧位移」换算行数、再把不足一格的
+/// 残量兜底成 1 行，一次拨轮会被放大成几十行——用户可见的现象就是
+/// 「滚一下翻过好几屏」。平滑增量只适合 ScrollArea 连续拖动，不适合终端翻页。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Wheel {
+    /// 鼠标滚轮档位（winit Line 单位：每格 1.0，正 = 向上/看更早的内容）。
+    pub notches: f32,
+    /// 触摸板/高精度滚轮的连续位移（egui Point 单位，需按格高换算成行）。
+    pub pad: f32,
+}
+
+impl Wheel {
+    /// 本帧是否有滚轮输入。
+    pub fn has_scroll(&self) -> bool {
+        self.notches != 0.0 || self.pad != 0.0
+    }
+}
+
+/// 从一帧的原始事件里统计滚轮输入（纯函数，见 [`Wheel`]）。
+///
+/// 量纲：winit 给鼠标滚轮的是 Line 单位（每格 1.0），触摸板/高精度滚轮
+/// 给的是 Point 单位（点）；两类量纲不同，混算会失真，所以分开记。
+/// Page 单位（如某些合成器的「按页滚」）按档位处理。
+pub fn collect_wheel(events: &[egui::Event]) -> Wheel {
+    let mut w = Wheel::default();
+    for ev in events {
+        if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+            match unit {
+                egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => w.notches += delta.y,
+                egui::MouseWheelUnit::Point => w.pad += delta.y,
+            }
+        }
+    }
+    w
+}
+
+/// 一次滚轮输入折算出的终端滚动动作（纯函数 [`wheel_scroll_action`] 的输出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelScroll {
+    /// 无动作。
+    None,
+    /// 转发 N 个滚轮事件给子进程（N>0 向上，N<0 向下）。仅鼠标上报模式。
+    ForwardMouse(i32),
+    /// 发 N 个 PgUp(N>0)/PgDn(N<0)。alt_screen 且子进程不要鼠标上报。
+    PageKey(i32),
+    /// 翻仿真器显示偏移：N>0 向上翻一页，N<0 向下翻一页（普通屏，鼠标档位）。
+    PageScroll(i32),
+    /// 仿真器按行滚 N 行（N 可正可负，触摸板连续位移）。
+    LineScroll(i32),
+}
+
+/// 单帧滚轮步数上限：一次物理拨轮最多几格，防御异常输入（伪造的
+/// WM_MOUSEWHEEL 洪泛）把一帧变成几十次翻页。
+const MAX_WHEEL_STEPS: i32 = 8;
+
+/// 滚轮输入 → 终端滚动动作（纯函数，便于测试）。
+///
+/// 量纲约定（见 [`Wheel`]）：
+/// - 鼠标滚轮是**离散档位**，一格 = 一次翻页，与 PageUp/PageDown 完全同量
+///   （alacritty 的 `Scroll::PageUp` 就是 +一屏行数）；
+/// - 触摸板是**连续位移**，按格高折算成行：连续量若也按翻页处理，手指一动
+///   就跨过整屏，手感突兀。
+///
+/// 派发优先级：鼠标上报 > alt_screen PgUp/PgDn > 普通屏翻仿真器缓冲。
+pub fn wheel_scroll_action(
+    wheel: Wheel,
+    cell_h: f32,
+    mouse_reporting: bool,
+    alt_screen: bool,
+) -> WheelScroll {
+    let notches = wheel.notches.round() as i32;
+    // 格高为 0 只会出现在布局尚未稳定的首帧，此时不做换算（避免除零放大）。
+    let lines = if cell_h > 0.0 {
+        (wheel.pad / cell_h).round() as i32
+    } else {
+        0
+    };
+    if notches == 0 && lines == 0 {
+        return WheelScroll::None;
+    }
+    // 鼠标上报：协议语义优先，一格拨轮/一行位移 = 一个滚轮事件，子进程按自己的
+    // `scroll` 设置决定滚多少，宿主不替它放大。
+    if mouse_reporting {
+        let n = (notches + lines).clamp(-MAX_WHEEL_STEPS, MAX_WHEEL_STEPS);
+        return WheelScroll::ForwardMouse(n);
+    }
+    let clamped = |n: i32| n.clamp(-MAX_WHEEL_STEPS, MAX_WHEEL_STEPS);
+    if alt_screen {
+        // 全屏 TUI 不要鼠标上报时只有翻页键可用：鼠标档位一格一次翻页；
+        // 触摸板是连续量 → 每帧至多一次翻页（方向随手指）。
+        return WheelScroll::PageKey(clamped(if notches != 0 { notches } else { lines.signum() }));
+    }
+    if notches != 0 {
+        WheelScroll::PageScroll(clamped(notches))
+    } else {
+        WheelScroll::LineScroll(lines)
+    }
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
 pub fn show_terminal(
     ui: &mut egui::Ui,
@@ -573,6 +676,7 @@ pub fn show_terminal(
     dark: bool,
     status: &mut Option<String>,
     term_focused: &mut bool,
+    wheel: &Wheel,
 ) {
     // 字体度量缓存：字号/DPI 不变时跳过 fonts_mut 锁查询。
     let font_id = FontId::monospace(TERM_FONT_SIZE);
@@ -660,57 +764,73 @@ pub fn show_terminal(
     };
 
     // ── 鼠标滚轮 ──
+    // 档位来自 raw_input_hook 统计的原始事件（见 Wheel），不用 egui 的
+    // smooth_scroll_delta：那份位移被摊到 ~50 帧，按帧换算会把一次拨轮放大
+    // 成几十行（滚一下翻过好几屏）。这里只做命中判定与动作派发。
     // 用 pointer_hover_pos() + latest_pos() 双重检测：
     // hover_pos() 在 click_and_drag 感知下某些帧返回 None；
     // latest_pos() 在纯滚轮操作（无鼠标移动）时也可能返回 None。
     // 合并为单次 input 调用，减少锁获取。
-    let (scroll_delta, over_term) = ui.input(|i| {
-        let sd = i.smooth_scroll_delta.y;
-        let over = sd != 0.0 && (
+    // 未被终端消费的帧（指针在别处）直接丢弃：滚轮不排队，否则会攒成延迟滚动。
+    let over_term = wheel.has_scroll()
+        && ui.input(|i| {
             i.pointer.hover_pos().is_some_and(|p| rect.contains(p))
                 || i.pointer.latest_pos().is_some_and(|p| rect.contains(p))
-        );
-        (sd, over)
-    });
+        });
     if over_term {
-        let delta = scroll_delta;
+        // 清掉 egui 的平滑增量：终端自己按档位滚动，同一份位移不能再流向
+        // 其他 ScrollArea（页签栏/设置页），否则滚终端会连带滚别的滚动区。
         ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
-        let mut lines = (delta / cell_h).round() as i32;
-        if lines == 0 {
-            lines = if delta > 0.0 { 1 } else { -1 };
-        }
-        if mouse_reporting {
-            // 子进程开了鼠标上报（opencode/nvim 等）→ 滚轮作为真实滚轮事件转发，
-            // 编码与应用声明一致（SGR/X10）。优先于 alt_screen PgUp/PgDn 分支。
-            let pos = ui
-                .input(|i| i.pointer.latest_pos())
-                .unwrap_or(rect.center());
-            let col = (((pos.x - rect.left()).max(0.0) / cell_w) as usize + 1)
-                .clamp(1, cols);
-            let row = (((pos.y - rect.top()).max(0.0) / cell_h) as usize + 1)
-                .clamp(1, rows);
-            let b = if lines > 0 { 64u16 } else { 65 }; // xterm 滚轮上/下事件码
-            for _ in 0..lines.abs().clamp(1, 32) {
-                send_mouse_event(&sess.writer, sgr_mouse, b, col, row, false);
+        match wheel_scroll_action(*wheel, cell_h, mouse_reporting, alt_screen) {
+            WheelScroll::None => {}
+            WheelScroll::ForwardMouse(n) => {
+                // 子进程开了鼠标上报（opencode/nvim 等）→ 滚轮作为真实滚轮事件转发，
+                // 编码与应用声明一致（SGR/X10）。优先于 alt_screen PgUp/PgDn 分支。
+                let pos = ui
+                    .input(|i| i.pointer.latest_pos())
+                    .unwrap_or(rect.center());
+                let (col, row) = to_col_row(pos);
+                let b = if n > 0 { 64u16 } else { 65 }; // xterm 滚轮上/下事件码
+                for _ in 0..n.unsigned_abs() {
+                    send_mouse_event(&sess.writer, sgr_mouse, b, col, row, false);
+                }
             }
-        } else if alt_screen {
-            // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
-            let count = lines.unsigned_abs().div_ceil(3).clamp(1, 8);
-            let key: &[u8] = if lines > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
-            for _ in 0..count {
-                let _ = sess.writer.try_send(key.to_vec());
+            WheelScroll::PageKey(n) => {
+                // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
+                // 应用自己管滚屏（不吐滚轮序列），只能改用翻页键：
+                // 一格拨轮 = 一次翻页（与 PageUp 键同量）。
+                for _ in 0..n.unsigned_abs() {
+                    let key: &[u8] = if n > 0 { b"\x1b[5~" } else { b"\x1b[6~" }; // PgUp / PgDn
+                    let _ = sess.writer.try_send(key.to_vec());
+                }
             }
-        } else {
-            // 普通 shell / 主屏 TUI（pi 等）→ 滚仿真器缓冲。
-            if let Ok(mut t) = sess.term.write() {
-                t.scroll_display(Scroll::Delta(lines));
+            WheelScroll::PageScroll(n) => {
+                // 普通 shell / 主屏 TUI → 翻仿真器缓冲里的历史显示偏移，
+                // 一格拨轮 = 一次翻页（Scroll::PageUp 即 +一屏行数，与 PageUp 键同量）。
+                if let Ok(mut t) = sess.term.write() {
+                    for _ in 0..n.unsigned_abs() {
+                        t.scroll_display(if n > 0 {
+                            Scroll::PageUp
+                        } else {
+                            Scroll::PageDown
+                        });
+                    }
+                }
+                // 立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
+                // 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
+                crate::session::refresh_snapshot(sess);
             }
-            // 立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
-            // 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
-            crate::session::refresh_snapshot(sess);
+            WheelScroll::LineScroll(n) => {
+                // 触摸板连续位移 → 按行滚（一次 Scroll::Delta 即可）。
+                if let Ok(mut t) = sess.term.write() {
+                    t.scroll_display(Scroll::Delta(n));
+                }
+                crate::session::refresh_snapshot(sess);
+            }
         }
         ui.ctx().request_repaint();
-    } // end over_term
+    }
+
     // ── 鼠标点击 / 拖拽：按下/释放转发给子进程，拖拽与右键留给本地 ──
     // 通用策略（对任何子进程一致，不区分是否 mouse reporting）：
     // - 左/中键按下、释放照常转发 → TUI 内点击按钮/切换焦点仍可用；
@@ -2122,4 +2242,112 @@ mod tests {
         assert_eq!(rel_to_cwd(r"D:\a.txt", ""), r"D:\a.txt");
     }
 
+    /// 一格拨轮 = 一次翻页（三种终端形态各自的动作），且不再被放大。
+    /// 这是「滚一下翻过好几屏」的回归锁：放大来自把 egui 平滑位移
+    /// 按帧换算 + 不足一格兜底成 1 行，现在按档位整份消费。
+    #[test]
+    fn wheel_one_notch_is_one_page() {
+        let up = Wheel { notches: 1.0, pad: 0.0 };
+        let down = Wheel { notches: -1.0, pad: 0.0 };
+        let h = 18.0;
+        // 普通屏（shell / 主屏 TUI）：翻仿真器缓冲，一格一页。
+        assert_eq!(wheel_scroll_action(up, h, false, false), WheelScroll::PageScroll(1));
+        assert_eq!(wheel_scroll_action(down, h, false, false), WheelScroll::PageScroll(-1));
+        // alt_screen 无鼠标上报：发翻页键，一格一次。
+        assert_eq!(wheel_scroll_action(up, h, false, true), WheelScroll::PageKey(1));
+        assert_eq!(wheel_scroll_action(down, h, false, true), WheelScroll::PageKey(-1));
+        // 鼠标上报：转发一个真实滚轮事件（子进程自己决定滚多少）。
+        assert_eq!(wheel_scroll_action(up, h, true, true), WheelScroll::ForwardMouse(1));
+        assert_eq!(wheel_scroll_action(down, h, true, true), WheelScroll::ForwardMouse(-1));
+        // 鼠标上报优先于 alt_screen 翻页键。
+        assert_eq!(wheel_scroll_action(up, h, true, false), WheelScroll::ForwardMouse(1));
+    }
+
+    /// 连拨多格按格数翻页，但有单帧上限（防御伪造输入洪泛）。
+    #[test]
+    fn wheel_multi_notch_scales_but_capped() {
+        let h = 18.0;
+        let three = Wheel { notches: 3.0, pad: 0.0 };
+        assert_eq!(wheel_scroll_action(three, h, false, false), WheelScroll::PageScroll(3));
+        assert_eq!(wheel_scroll_action(three, h, false, true), WheelScroll::PageKey(3));
+        assert_eq!(wheel_scroll_action(three, h, true, false), WheelScroll::ForwardMouse(3));
+        let flood = Wheel { notches: 100.0, pad: 0.0 };
+        assert_eq!(
+            wheel_scroll_action(flood, h, false, false),
+            WheelScroll::PageScroll(MAX_WHEEL_STEPS)
+        );
+        assert_eq!(
+            wheel_scroll_action(flood, h, false, true),
+            WheelScroll::PageKey(MAX_WHEEL_STEPS)
+        );
+    }
+
+    /// 触摸板是连续位移：按格高折算成行；普通屏按行滚，不按页（否则手指
+    /// 一动就跨过整屏）。不足半格当无输入，不做「最小 1 行」兜底。
+    #[test]
+    fn wheel_trackpad_scrolls_by_lines() {
+        let h = 20.0;
+        let pad = Wheel { notches: 0.0, pad: 60.0 };
+        assert_eq!(wheel_scroll_action(pad, h, false, false), WheelScroll::LineScroll(3));
+        assert!(pad.has_scroll());
+        // 半格以下（慢速拖动）不滚，也不得退化成每帧 1 行的持续滚动。
+        let tiny = Wheel { notches: 0.0, pad: 4.0 };
+        assert_eq!(wheel_scroll_action(tiny, h, false, false), WheelScroll::None);
+        assert_eq!(wheel_scroll_action(tiny, h, false, true), WheelScroll::None);
+        // 仍是「本帧有滚轮输入」：终端要吃掉 egui 的平滑增量（不外泄给别的
+        // ScrollArea），只是折算后不足半格而不出手。
+        assert!(tiny.has_scroll());
+        // alt_screen 无鼠标上报时只有翻页键可用 → 每帧至多一次翻页。
+        assert_eq!(wheel_scroll_action(pad, h, false, true), WheelScroll::PageKey(1));
+        // 鼠标上报：连续位移也按滚轮事件转发（子进程按自己的 scroll 决定幅度）。
+        assert_eq!(wheel_scroll_action(pad, h, true, false), WheelScroll::ForwardMouse(3));
+        // 格高未就绪（首帧布局前）时不做换算，避免除零放大成天文数字。
+        assert_eq!(wheel_scroll_action(pad, 0.0, false, false), WheelScroll::None);
+    }
+
+    /// 无输入时无动作（不该发空事件、不该 request_repaint）。
+    #[test]
+    fn wheel_no_input_is_noop() {
+        assert_eq!(wheel_scroll_action(Wheel::default(), 18.0, false, false), WheelScroll::None);
+        assert!(!Wheel::default().has_scroll());
+        // 不足半格的档位（某些驱动会送 0.4 这种）也视为无输入。
+        let sub = Wheel { notches: 0.4, pad: 0.0 };
+        assert_eq!(wheel_scroll_action(sub, 18.0, false, false), WheelScroll::None);
+    }
+
+    /// 原始事件统计：鼠标档位（Line）与触摸板位移（Point）分开累加，
+    /// 一帧多个事件合并成一份（本帧输入，不排队）。
+    #[test]
+    fn collect_wheel_splits_line_and_point_units() {
+        use egui::{Event, MouseWheelUnit, TouchPhase, Vec2};
+        let ev = |unit, y| Event::MouseWheel {
+            unit,
+            delta: Vec2::new(0.0, y),
+            phase: TouchPhase::Move,
+            modifiers: Default::default(),
+        };
+        // 鼠标滚轮：winit 的 Line 单位一格正好 1.0。
+        let one = |unit, y| collect_wheel(&[ev(unit, y)]);
+        assert_eq!(one(MouseWheelUnit::Line, 1.0), Wheel { notches: 1.0, pad: 0.0 });
+        assert_eq!(one(MouseWheelUnit::Line, -1.0), Wheel { notches: -1.0, pad: 0.0 });
+        // 一帧多格（快速连拨）合并。
+        assert_eq!(
+            collect_wheel(&[ev(MouseWheelUnit::Line, 1.0), ev(MouseWheelUnit::Line, 1.0)]),
+            Wheel { notches: 2.0, pad: 0.0 }
+        );
+        // Page 单位（按页滚）也按档位处理。
+        assert_eq!(one(MouseWheelUnit::Page, 1.0), Wheel { notches: 1.0, pad: 0.0 });
+        // 触摸板：Point 单位单独记，不与档位混算。
+        assert_eq!(one(MouseWheelUnit::Point, 12.5), Wheel { notches: 0.0, pad: 12.5 });
+        // 无滚轮事件 → 零值（has_scroll 为假，终端这一帧不碰滚轮）。
+        let key = Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        assert_eq!(collect_wheel(&[key]), Wheel::default());
+        assert!(!collect_wheel(&[]).has_scroll());
+    }
 }

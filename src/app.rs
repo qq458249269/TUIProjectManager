@@ -1393,6 +1393,9 @@ pub struct ClientApp {
     project_sort: ProjectSort,
     /// 待异步重新启动/切换命令的页签。
     pending_relaunch: Vec<PendingRelaunch>,
+    /// 本帧的滚轮输入（raw_input_hook 统计原始事件，见 terminal::Wheel）。
+    /// 跨帧不保留：指针不在终端上就该丢弃，否则会攒成延迟滚动。
+    wheel: terminal::Wheel,
 }
 
 
@@ -1588,6 +1591,7 @@ impl ClientApp {
             show_hidden: false,
             project_sort: ProjectSort::Default,
             pending_relaunch: Vec::new(),
+            wheel: terminal::Wheel::default(),
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -4022,6 +4026,19 @@ impl Drop for ClientApp {
 }
 
 impl eframe::App for ClientApp {
+    /// egui 消费输入之前的钩子：在这里统计滚轮档位。
+    ///
+    /// 终端滚动必须按「档位」而不是 egui 的 `smooth_scroll_delta` 走：
+    /// 后者把一次拨轮摊到 ~50 帧渐进下发（WheelState::after_events），
+    /// 按每帧位移换算行数会把一次拨轮放大成几十行（滚一下翻过好几屏）。
+    /// 原始事件里档位是干净的：winit 给鼠标滚轮的 Line 单位一格正好 1.0。
+    ///
+    /// 每帧重置：本字段是「本帧输入」而非队列，没被终端消费的部分直接丢弃
+    /// （滚轮不排队——指针在页签栏/设置页上滚就不该留到终端上）。
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.wheel = terminal::collect_wheel(&raw_input.events);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // 清理启动时创建的 .running 标记文件。
         if let Ok(exe) = std::env::current_exe()
@@ -4448,13 +4465,14 @@ impl eframe::App for ClientApp {
                         &mut self.status,
                         &mut self.term_focused,
                     );
+                    let wheel = &self.wheel;
                     let sess = match self.tabs.get_mut(self.current) {
                         Some(Tab::Session(s)) => s,
                         _ => unreachable!(),
                     };
                     let crashed = match std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| {
-                            terminal::show_terminal(ui, sess, dark, status, term_focused);
+                            terminal::show_terminal(ui, sess, dark, status, term_focused, wheel);
                         }),
                     ) {
                         Ok(()) => None,
