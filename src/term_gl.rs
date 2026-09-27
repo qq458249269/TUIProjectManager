@@ -713,11 +713,16 @@ impl TermFrame<'_> {
     }
 
     /// 往指定页收一个 quad（跨帧复用分配）。
+    ///
+    /// 桶随页号自增：帧缓冲是页签私有的，与共享图集的页数没有同步机制，
+    /// 而新页由 `glyph()` 在末页满时按需开出（页号可越过桶的现有长度）。
+    /// 缺失即 `get_mut` 落空会把整格字形静默丢掉（表现为「终端整片白」）。
     #[inline]
     pub fn push_quad(&mut self, pg: usize, q: CellQuad) {
-        if let Some(bucket) = self.buf.quads.get_mut(pg) {
-            bucket.push(q);
+        if pg >= self.buf.quads.len() {
+            self.buf.quads.resize_with(pg + 1, Vec::new);
         }
+        self.buf.quads[pg].push(q);
     }
 
     /// 帧尾判定 + 网格组装。返回本帧应提交的 (纹理, Mesh) 列表；静止帧返回
@@ -922,5 +927,40 @@ mod tests {
         let mut fb = b.begin_frame(&hb, 1, 4);
         assert!(!fb.is_empty(), "共享图集已含 'W'，B 页签无需再预热/重光栅化");
         assert!(fb.glyph('W').1.w > 0.0, "B 页签应命中 A 已光栅化的字形");
+    }
+
+    /// 回归锁：默认（空）帧缓冲下的首帧必须真的产出 mesh。
+    /// 帧缓冲的 quad 桶与共享图集的页数不同步，而页号可能越过桶的现有长度
+    /// （首帧桶为空、图集开新页）。桶缺失时若静默丢 quad，终端会整片白屏
+    /// （只余直接画的网格/光标），但「字形槽位非空」等断言全部照过——
+    /// 这里从 push_quad 一直走到 end_frame，锁住真出网格。
+    #[test]
+    fn empty_frame_buffers_still_build_mesh() {
+        let ctx = egui::Context::default();
+        let src = hack_sources();
+        let mut g = TermGpu {
+            atlas: AtlasHandle(shared_atlas(&src, 16.0, 1.0).unwrap()),
+            sources: src.clone(),
+            font_size_pt: 16.0,
+            params_ppp: 1.0,
+            buf: TabBuffers::default(),
+        };
+        let h = g.atlas_handle();
+        let mut f = g.begin_frame(&h, 1, 1);
+        let (pg, slot) = f.glyph('W');
+        assert!(slot.w > 0.0, "槽位应有可见笔画");
+        f.push_quad(
+            pg,
+            CellQuad {
+                rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(slot.w, slot.h)),
+                uv0: Pos2::new(slot.u0, slot.v0),
+                uv1: Pos2::new(slot.u1, slot.v1),
+                color: Color32::WHITE,
+            },
+        );
+        let meshes = f.end_frame(&ctx).to_vec();
+        assert_eq!(meshes.len(), 1, "首帧（桶为空）也必须提交一个字形网格");
+        assert_eq!(meshes[0].1.vertices.len(), 4, "网格应含一个 quad 的 4 个顶点");
+        ctx.tex_manager().write().take_delta().clear();
     }
 }
