@@ -789,6 +789,12 @@ pub fn show_terminal(
                 let pos = ui
                     .input(|i| i.pointer.latest_pos())
                     .unwrap_or(rect.center());
+                // 滚轮即「用户驱动视口操作」：转发给 TUI 后 TUI 会重绘回显新
+                // 输出 → reader 刷新 last_output_ms → 页签误亮 🔄。记入滚动回显短
+                // 窗口（app.rs SCROLL_ECHO_MS=500ms，不共用键盘输入 1.5s 窗口）：
+                // 只吞滚动引起的这一下重绘，真实任务输出晚于窗口即照常判 🔄。
+                // 本地缓冲滚动分支不产生 PTY 输出，不写任何时间戳。
+                sess.last_scroll_ms.store(crate::now_ms(), Ordering::Relaxed);
                 let (col, row) = to_col_row(pos);
                 let b = if n > 0 { 64u16 } else { 65 }; // xterm 滚轮上/下事件码
                 for _ in 0..n.unsigned_abs() {
@@ -798,7 +804,8 @@ pub fn show_terminal(
             WheelScroll::PageKey(n) => {
                 // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
                 // 应用自己管滚屏（不吐滚轮序列），只能改用翻页键：
-                // 一格拨轮 = 一次翻页（与 PageUp 键同量）。
+                // 一格拨轮 = 一次翻页（与 PageUp 键同量）；同 ForwardMouse，
+                // 转发出去的翻页键会引起 TUI 回显，记滚动回显短窗口。
                 for _ in 0..n.unsigned_abs() {
                     let key: &[u8] = if n > 0 { b"\x1b[5~" } else { b"\x1b[6~" }; // PgUp / PgDn
                     let _ = sess.writer.try_send(key.to_vec());

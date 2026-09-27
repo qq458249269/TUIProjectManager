@@ -40,11 +40,18 @@ const BUSY_FRAME_MS: u64 = 100;
 /// 代价即本方案：后台 TUI 静默思考 / 网络等待（>3s 无输出）会被判为完成；
 /// 用户要求以终端内容为准，出现该情况即 3s 后亮 ✅/弹通知（后果已知晓）。
 const OUTPUT_END_MS: u64 = 3_000;
-/// 输入驱动例外窗口：用户刚在终端里输入（按键/IME/粘贴，last_input_ms 距今
-/// 不足此值）→ 回显与格内刷新是输入引发、不是任务在跑，跳过 🔄 判定。仅
-/// 键盘/IME/粘贴路径更新 last_input_ms（terminal.rs 投递 bytes_out 时记录），
-/// 鼠标上报/悬停/滚动不触碰它。慢输入/长命令后输出仍按 last_out 正常判 🔄。
+/// 用户驱动回显例外（✂ 不吞任务真实输出）：键盘/IME/粘贴写 last_input_ms
+/// （terminal.rs 投递 bytes_out 时记录）→ 直接引发的回显是用户驱动、不是任务
+/// 在跑，其窗口内跳过 🔄 判定；滚动转发的 TUI 重绘回显记 last_scroll_ms 走
+/// 自己的 500ms 短窗（见 SCROLL_ECHO_MS）。真实输出晚于各自窗口仍按
+/// last_out 正常判 🔄——输入/滚动看日志期间页签照常实时刷新运行状态。
 const INPUT_ACTIVE_MS: u64 = 1_500;
+/// 滚动转发回显例外窗口：鼠标上报/备用屏路径滚轮转发 TUI 后，TUI 立即整屏
+/// 重绘回显 → 刷新 last_output_ms → 若不加例外会误亮 🔄 3s。记 last_scroll_ms
+/// 专用短窗（terminal.rs 滚动处理处写），只吞滚动驱动的这一下重绘；真实任务
+/// 输出晚于窗口即照常判 🔄——持续滚动看日志时页签仍实时显示运行中。
+/// 本地缓冲滚动（普通 shell）不产生 PTY 输出，不写此字段，完全不影响图标。
+const SCROLL_ECHO_MS: u64 = 500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
 /// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
@@ -482,8 +489,10 @@ fn curl_bin() -> &'static str {
 /// API 用 tag_name，jsDelivr 数据 API 用 versions[0].version。
 /// 通用性说明：`-q` 让 curl 完全不读 ~/.curlrc（曾有残留 Clash 127.0.0.1:7897
 /// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误）——任何机器上的
-/// 用户残留配置都不影响；`--noproxy *` 连 http_proxy 等环境代理一并禁用，
-/// 全程直连、不依赖任何代理与端口。connect_timeout / max_time（秒）由调用方决定。
+/// 残留配置都不影响；环境 http_proxy/https_proxy 代理仍读（用户明确配置的
+/// 代理放行，配合 PS/WinHTTP 系统代理通道，直连/代理双栈互补——全禁代理
+/// 曾导致有加速器的机器下载不了）。connect_timeout / max_time（秒）由调用方
+/// 决定。
 fn fetch_tag_from_url(
     url: &str,
     connect_timeout: u64,
@@ -496,7 +505,6 @@ fn fetch_tag_from_url(
     cmd.args([
         "-q", // 忽略 .curlrc / _curlrc，防用户机器上的残留代理端口
         "-s", "-f", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
-        "--noproxy", "*", // 直连，不读环境变量里的代理
         "-H", "User-Agent: TUIProjectManager",
         url,
     ]);
@@ -526,7 +534,6 @@ fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<Stri
         "-o", "NUL", // 丢弃响应体，只要重定向头
         "-w", "%{redirect_url}",
         "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
-        "--noproxy", "*",
         "-H", "User-Agent: TUIProjectManager",
         url,
     ]);
@@ -574,14 +581,13 @@ fn ps_run(script: &str) -> Result<String, String> {
 }
 
 /// PowerShell Invoke-RestMethod 拉 JSON 取 tag。独立网络栈（WinHTTP/Schannel），
-/// 脚本首句 DefaultWebProxy=$null 强制直连、绝不吃系统代理——curl 在这个
-/// 目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「别的办法绕过」的主力源
-/// （实测直连 api.github.com ~1.1s 返回 tag）。
+/// 吃系统代理（Steam++/加速器系统代理模式可救直连被墙；不设 DefaultWebProxy=$null）
+/// ——curl 在这个目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「别的办法绕过」
+/// 的主力源（实测直连 api.github.com ~1.1s 返回 tag）。
 #[cfg(windows)]
 fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
-         [System.Net.WebRequest]::DefaultWebProxy=$null; \
          $ErrorActionPreference='Stop'; \
          $r = Invoke-RestMethod -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t}; \
          $r | ConvertTo-Json -Depth 10",
@@ -602,7 +608,7 @@ fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
 #[cfg(windows)]
 fn ps_fetch_html_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
-        "[System.Net.WebRequest]::DefaultWebProxy=$null; $ErrorActionPreference='Stop'; \
+        "$ErrorActionPreference='Stop'; \
          (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing).Content",
         url = url,
         t = timeout_secs,
@@ -800,7 +806,6 @@ fn download_update(
     let mut page_cmd = std::process::Command::new(curl_bin());
     page_cmd.args([
         "-q", "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
         "-H", "User-Agent: TUIProjectManager",
         &page_url,
     ]);
@@ -840,7 +845,6 @@ fn download_update(
         let mut api_cmd = std::process::Command::new(curl_bin());
         api_cmd.args([
             "-q", "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-            "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
             "-H", "User-Agent: TUIProjectManager",
             &api_url,
         ]);
@@ -911,49 +915,45 @@ fn download_update(
             0,
         ),
     };
-    // ── 候选下载链：国内镜像优先 → PS WinHTTP 直连 → curl 直链兜底 ──
-    // 镜像 CDN 缓存热文件、大陆延迟低；PS 通道独立于 curl 作补充；curl 直链保底。
-    let mut attempts: Vec<(String, String, bool)> = Vec::new(); // (url, 文件名, 走 PS)
+    // ── 候选下载链：国内镜像 + PS WinHTTP + curl 直链，每个文件名下全量并发 ──
+    // 竞速第一个到达（见 download_race）：坏源/停滞源零成本跳过，速度地板判死
+    // 僵尸源；旧实现逐链串行（镜像×8 → PS → curl 直连按序等待），8 个死镜像
+    // 的 connect 超时（8s 各）累计 64s+ 才轮到直链——正是「镜像源下载缓慢」
+    // 的根因，已由并发取代。单个 fallback 失败再试下一个候选文件名。
+    let mut parts: Vec<String> = Vec::new();
     for (url, name) in fallback {
+        let mut candidates: Vec<(String, bool)> = Vec::new(); // (url, 走 PS)
         for mirror in GH_MIRRORS {
-            attempts.push((format!("{mirror}{url}"), name.clone(), false));
+            candidates.push((format!("{mirror}{url}"), false));
         }
         #[cfg(windows)]
-        attempts.push((url.clone(), name.clone(), true));
+        candidates.push((url.clone(), true));
         #[cfg(not(windows))]
-        attempts.push((url.clone(), name.clone(), false));
+        candidates.push((url.clone(), false));
         // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
         #[cfg(windows)]
-        attempts.push((url.clone(), name.clone(), false));
-    }
-    log_update(&format!(
-        "下载 开始尝试 {} 个候选链（tag={tag}，total={total}）：{}",
-        attempts.len(),
-        attempts
-            .iter()
-            .map(|(u, _, _)| u.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-    let mut errors: Vec<String> = Vec::new();
-    for (url, name, ps) in attempts {
-        // 用户取消时立即停止所有候选链
+        candidates.push((url.clone(), false));
+        log_update(&format!(
+            "下载 {} 并发尝试 {} 个候选链（tag={tag}，total={total}）",
+            name,
+            candidates.len()
+        ));
+        // 用户取消时立即停止本轮竞速。
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("下载已取消".to_string());
         }
-        match download_one(&url, &name, ps, total, dest_dir, &progress_tx, cancel) {
+        match download_race(&name, candidates, total, dest_dir, &progress_tx, cancel) {
             Ok(p) => {
-                log_update(&format!("下载 成功：{url} → {p}"));
+                log_update(&format!("下载 成功：{name} → {p}"));
                 return Ok(p);
             }
             Err(e) => {
-                log_update(&format!("下载 失败：{url}：{e}"));
-                errors.push(format!("{url}: {e}"));
+                log_update(&format!("下载 失败：{name}：{e}"));
+                parts.push(format!("{name}: {e}"));
             }
         }
     }
     // API 失败的真实原因（限流 403 等）并入汇总，不再被直拼兜底掩盖。
-    let mut parts = errors;
     if let Some(e) = &api_err {
         parts.push(format!("源① API: {e}"));
     }
@@ -965,96 +965,183 @@ fn download_update(
 /// 慢/被墙，镜像 CDN 缓存、延迟低；检查更新时所有镜像**并发**探查、先到
 /// 先得（挂了零成本跳过）；下载仍逐链尝试、挂了自动跳到下一个，全挂才回退
 /// 原始直链。列表换成当前可用即可，多放几个零成本、坏节点自动跳过。
-// 镜像列表已实测汰换（2026-09，本机 python 直连验证）：ghfast.top/ghproxy.net
-// 403、moeyy 超时、gh.ddlc.top 404、ghproxy.cc TLS 证书已过期——全部剔除；
-// 只留当前可达三项，下载/查询失败会自动跳到下一链。日后失效再照此换。
+// 镜像列表为「加速前缀池」而非命运列表：检查更新/下载全部**并发**批量发起、
+// 先到先得，连接失败与坏文件（错误页/截断）都会被即时剔除记错并继续等其余
+// 源——所以越多越稳，坏节点零成本，谁响应快谁胜出，天然满足「实时性高」。
+// 池内包含踩点验证过数量级的常见国内加速：热门前缀代理、jsDelivr CDN 之外的
+// 各家 gh-proxy 系。个别历史 403/超时/证书过期的源保留在池里：连通状态随时
+// 变化，竞速机制下不必人工汰换，哪家活了立即自动启用。
 const GH_MIRRORS: &[&str] = &[
-    "https://gh-proxy.com/", // 热门前缀代理，实测 API 1.0s / 下载 1.1s
-    "https://gh-proxy.net/", // 同系备用，实测可达
-    "https://ghps.cc/",      // 极速代理，实测可达但偏慢（~12s）
+    "https://gh-proxy.com/",   // 热门前缀代理
+    "https://gh-proxy.net/",   // 同系备用
+    "https://ghps.cc/",        // 极速代理
+    "https://ghfast.top/",     // gh-proxy 系，状态多变，竞速下自动甄别
+    "https://mirror.ghproxy.com/", // ghproxy 系老牌
+    "https://ghproxy.net/",    // ghproxy 系
+    "https://gh.llkk.cc/",     // 备用代理
+    "https://github.moeyy.xyz/", // moeyy 加速
 ];
 
 /// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset_name}.new，
 /// 轮询文件大小报告进度。返回 Ok(下载文件路径) 或 Err(具体失败原因)。
-fn download_one(
-    url: &str,
+/// 单个文件名下的候选链**并发竞速**下载（与 fetch_latest_release 同思路）：
+/// 全部候选（国内镜像 + PS WinHTTP + curl 直链）同时发起，各自写独立临时
+/// 文件 dest_dir/{name}.c{idx}.new，第一个成功完成的胜出并 promote 为
+/// {name}.new，其余就地 kill。坏源/停滞源零成本跳过：--connect-timeout 8 挡
+/// 连接挂死，--speed-limit 4096 --speed-time 8 判死持续 <4KB/s 达 8s 的僵尸
+/// 源（不再让一个死镜像独占整条串行下载）。失败/取消保留 .c{idx}.new 供
+/// 下次 -C - 续传；胜出 promote 若被杀软短持有则退避重试。
+/// 返回 Ok(下载文件路径) 或 Err(所有候选失败的聚合)。
+/// ponytail: 若 release 数日后镜像纷纷清缓存变慢，可给镜像档位降权或按历史
+/// 延迟排序重试；触及率低，暂不加。
+fn download_race(
     asset_name: &str,
-    ps: bool,
+    candidates: Vec<(String, bool)>, // (url, 走 PS WinHTTP)
     total: u64,
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
-    // 下载到 .new 文件，完成后由调用方替换旧 exe。
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
-
-    // 断点续传：若 .new 文件已存在，记录已下载字节数。curl 用 -C - 续传；
-    // PS 无续传（Invoke-WebRequest 直接覆盖重下）。
-    let downloaded_before = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-    let dest_str = dest_path.to_str().unwrap_or("update.exe.new").replace('\'', "''");
-
-    let mut cmd = if ps {
-        let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command"]);
-        let script = format!(
-            "[System.Net.WebRequest]::DefaultWebProxy=$null; $ErrorActionPreference='Stop'; \
-             Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
-             -TimeoutSec 300 -OutFile '{dest}' -UseBasicParsing",
-            url = url.replace('\'', "''"),
-            dest = dest_str,
-        );
-        c.arg(script);
-        c
-    } else {
-        let mut c = std::process::Command::new(curl_bin());
-        c.args([
-            "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-            "--noproxy", "*", // 直连：不读 .curlrc/环境代理，零代理零端口
-            "-H", "User-Agent: TUIProjectManager",
-            "-o", dest_path.to_str().unwrap_or("update.exe.new"),
-        ]);
-        // 已有部分文件时续传；否则从头下载。
-        if downloaded_before > 0 {
-            c.arg("-C").arg("-");
+    let mut children: Vec<Option<std::process::Child>> = Vec::new();
+    let mut errs: Vec<String> = Vec::new();
+    for (i, (url, ps)) in candidates.iter().enumerate() {
+        let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+        let tmp_str = tmp.to_str().unwrap_or("update.exe.new").replace('\'', "''");
+        let mut cmd = if *ps {
+            let mut c = std::process::Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command"]);
+            // PS/WinHTTP 通道吃系统代理（Steam++/Clash 系统代理模式可救大陆
+            // 直连被墙；不设 DefaultWebProxy=$null——远端曾禁代理导致下载不了）。
+            let script = format!(
+                "$ErrorActionPreference='Stop'; \
+                 Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
+                 -TimeoutSec 120 -OutFile '{dest}' -UseBasicParsing",
+                url = url.replace('\'', "''"),
+                dest = tmp_str,
+            );
+            c.arg(script);
+            c
+        } else {
+            let mut c = std::process::Command::new(curl_bin());
+            c.args([
+                "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
+                // 传输停滞判死：持续 <4KB/s 达 8s 中止本候选，让位其余候选。
+                "--speed-limit", "4096", "--speed-time", "8",
+                // 不带 --noproxy：-q 已禁 .curlrc 残留代理（历史坑 3a70473），
+                // 依仍读环境 http_proxy/https_proxy 与 PS 系统代理互补。
+                "-H", "User-Agent: TUIProjectManager",
+                "-o", tmp.to_str().unwrap_or("update.exe.new"),
+            ]);
+            // 断点续传：上次遗留的 .c{i}.new 非空则续传（PS 无续传，直接覆盖重下）。
+            if std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) > 0 {
+                c.arg("-C").arg("-");
+            }
+            c.arg(url);
+            c
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW，不闪黑窗
         }
-        c.arg(url);
-        c
-    };
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        match cmd.spawn() {
+            Ok(ch) => children.push(Some(ch)),
+            Err(e) => {
+                errs.push(format!("{url}: 启动下载失败 {e}"));
+                children.push(None);
+            }
+        }
     }
-    let mut child = cmd.spawn().map_err(|e| format!("启动下载失败: {e}"))?;
-
-    // 轮询文件大小报告进度：每 200ms 检查一次。
     loop {
-        // 检查取消信号
+        // 取消：kill 全部，保留 .c{idx}.new 供下次续传。
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = std::fs::remove_file(&dest_path);
+            for c in children.iter_mut().flatten() {
+                let _ = c.kill();
+            }
             return Err("下载已取消".to_string());
         }
+        // 进度 = 各临时文件当前大小的最大值（领先者即竞速胜出者的身形）。
+        let mut reported = 0u64;
+        for i in 0..children.len() {
+            reported = reported.max(
+                std::fs::metadata(dest_dir.join(format!("{asset_name}.c{i}.new")))
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            );
+        }
+        let _ = progress_tx.send((reported, total));
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let downloaded = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-        let _ = progress_tx.send((downloaded, total));
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
+        // 扫描已结束的子进程：首个成功者胜出。
+        for (i, slot) in children.iter_mut().enumerate() {
+            let Some(ch) = slot.as_mut() else { continue };
+            match ch.try_wait() {
+                Ok(Some(st)) if st.success() => {
+                    let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+                    // 源返回了非 exe 产物（错误页 HTML / 截断文件）：视作该候选失败，
+                    // 删其临时文件后继续等其余候选——坏源永不胜出，杜绝
+                    // 「替换失败: 下载文件损坏」反复出现（原本错误页体积小、下载最快，
+                    // 总是抢在真源前面 promote 成功）。
+                    if !looks_like_exe(&tmp) {
+                        let _ = std::fs::remove_file(&tmp);
+                        errs.push(format!("{}: 文件损坏（缺失 MZ/PE 头，疑似错误页）", candidates[i].0));
+                        *slot = None;
+                        continue;
+                    }
+                    // kill 其余所有候选，删除其残留临时文件（本次已废弃）。
+                    for (j, other) in children.iter_mut().enumerate() {
+                        if j == i { continue; }
+                        if let Some(o) = other.as_mut() {
+                            let _ = o.kill();
+                        }
+                        other.take();
+                        let _ = std::fs::remove_file(dest_dir.join(format!("{asset_name}.c{j}.new")));
+                    }
+                    // promote：rename 被杀软/Defender 短持有（os error 5）时退避重试。
+                    let mut wait_ms = 300u64;
+                    loop {
+                        match std::fs::rename(&tmp, &dest_path) {
+                            Ok(()) => break,
+                            Err(e) => {
+                                log_update(&format!("下载 promote rename 失败: {e}"));
+                                if wait_ms > 4000 {
+                                    let _ = std::fs::copy(&tmp, &dest_path);
+                                    let _ = std::fs::remove_file(&tmp);
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                                wait_ms = (wait_ms * 2).min(4000);
+                            }
+                        }
+                    }
                     let final_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
                     let _ = progress_tx.send((final_size, total));
                     return Ok(dest_path.to_string_lossy().into_owned());
-                } else {
-                    // 失败时保留 .new 文件以供下次续传，不删除
-                    return Err(format!("下载进程退出码 {}", status.code().unwrap_or(-1)));
+                }
+                Ok(Some(st)) => {
+                    // 失败（HTTP 非零、限流、停滞判死）→ 记错误，临时文件保留供续传。
+                    let code = st.code().map(|c| c.to_string()).unwrap_or_else(|| "信号终止".to_string());
+                    errs.push(if candidates[i].1 {
+                        format!("PS 通道失败（{code}）")
+                    } else {
+                        format!("镜像/直链失败（{code}）")
+                    });
+                    slot.take();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    errs.push(format!("{e}"));
+                    slot.take();
                 }
             }
-            Ok(None) => continue,
-            Err(e) => {
-                let _ = std::fs::remove_file(&dest_path);
-                return Err(format!("{e}"));
-            }
+        }
+        if children.iter().all(Option::is_none) {
+            return Err(if errs.is_empty() {
+                "无候选可启动".to_string()
+            } else {
+                errs.join("；")
+            });
         }
     }
 }
@@ -1108,23 +1195,32 @@ fn retry_rename(
 /// 2) 慢路径：正式名仍被占用时，先 rename(正式名 → .old) 腾名（运行中的
 ///    映像也可 rename，.old 兼作旧版备份），再放入新文件——最后一步是
 ///    最常失败处（刚下载完的 .new 正被 Defender 扫描），给足 ~20s 重试；
-/// 失败自动回滚，正式名始终可用。返回是否安装成功。
+/// 失败自动回滚，正式名始终可用。返回安装结果：Done 已装上；BadDownload
+/// 产物损坏（可自动换源重下，并非重试 rename 能救）；Occupied 被占（只能稍后重试）。
+#[derive(PartialEq)]
+enum InstallOutcome {
+    Done,
+    BadDownload,
+    Occupied,
+}
+
 fn install_update(
     new_file: &Path,
     final_path: &Path,
     old_path: &Path,
     status_tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
     redraw_tx: &std::sync::mpsc::SyncSender<()>,
-) -> bool {
-    // 0) 校验下载产物（MZ 头）：镜像偶发返回错误页/空文件，装上就无法启动。
+) -> InstallOutcome {
+    // 0) 校验下载产物（MZ+PE 头）：镜像偶发返回错误页/截断文件，装上就无法启动。
+    //    竞速层已前置剔除坏源，这里双保险；失败上层会自动换源重下，无需用户手动干预。
     if !looks_like_exe(new_file) {
-        let _ = std::fs::remove_file(new_file); // 删掉坏的，下次重新下载
+        let _ = std::fs::remove_file(new_file); // 删掉坏的，避免被 -C - 续传拼坏
         let msg = format!(
-            "替换失败: 下载文件损坏或不是可执行文件（{new_file:?}），已删除，请重新下载"
+            "下载到损坏文件，已自动换源重新下载（{new_file:?} 非有效 exe）"
         );
         let _ = status_tx.send((msg, None));
         let _ = redraw_tx.try_send(());
-        return false;
+        return InstallOutcome::BadDownload;
     }
     // 1) 快路径：正式名空闲 → 直接替换。~10s 重试窗口：杀软/Defender 扫描
     //    刚下载完的 .new 或正式名副本（拒绝访问 os error 5），等它释放。
@@ -1137,9 +1233,9 @@ fn install_update(
         "正在替换 exe",
         4,
     )
-    .is_ok()
+        .is_ok()
     {
-        return true;
+        return InstallOutcome::Done;
     }
     // 2) 慢路径：正式名仍被占用。先清掉旧 .old（避免 rename 目标被占，
     //    遇到杀软持有旧 .old 时也带重试等待），再把正式名 rename 走腾出
@@ -1169,7 +1265,7 @@ fn install_update(
         );
         let _ = status_tx.send((msg, None));
         let _ = redraw_tx.try_send(());
-        return false;
+        return InstallOutcome::Occupied;
     }
     // 3) 最后一步：把 .new 放进腾出的正式名。这是最常失败的一步——刚下载
     //    完的 .new 正被 Defender 实时扫描，给它 ~20s 重试窗口。
@@ -1182,7 +1278,7 @@ fn install_update(
         "正在放入新版本",
         4,
     ) {
-        Ok(()) => true,
+        Ok(()) => InstallOutcome::Done,
         Err(e) => {
             // 回滚：把挪走的旧映像放回正式名，确保目录里始终有可用 exe。
             let _ = retry_rename(
@@ -1211,20 +1307,36 @@ fn install_update(
             };
             let _ = status_tx.send((msg, None));
             let _ = redraw_tx.try_send(());
-            false
+            InstallOutcome::Occupied
         }
     }
 }
 
-/// 粗略校验文件是否为 Windows PE 可执行文件（MZ 头）。
+/// 校验下载产物是完整的 Windows PE 可执行文件：MZ 头 + e_lfanew（0x3C 偏移）
+/// → "PE\0\0" 头 + 体积下限。错误页 HTML / 空文件 / 只下载到前几 KB 的截断
+/// 文件（带 MZ 头但无 PE 上下文）一律判否，防止装坏 exe。
 fn looks_like_exe(p: &Path) -> bool {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(p) else {
         return false;
     };
-    let mut buf = [0u8; 2];
-    let n = f.read(&mut buf).unwrap_or(0);
-    n == 2 && &buf == b"MZ"
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    // 真实 exe 至少数百 KB；错误页/未知 200 响应通常只有 `config.json` 大小级别。
+    if meta.len() < 256 * 1024 {
+        return false;
+    }
+    let mut dos = [0u8; 0x40]; // DOS 头（含 0x3C 处的 e_lfanew 偏移）
+    if f.read(&mut dos).unwrap_or(0) < 0x40 {
+        return false;
+    }
+    let e_lfanew = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]) as u64;
+    if e_lfanew + 4 > meta.len() || f.seek(SeekFrom::Start(e_lfanew)).is_err() {
+        return false;
+    }
+    let mut pe = [0u8; 4];
+    f.read(&mut pe).unwrap_or(0) == 4 && &pe == b"PE\0\0"
 }
 
 /// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
@@ -1383,6 +1495,11 @@ pub struct ClientApp {
     omp_models: config::ModelsConfig,
     /// 模型设置当前页签：0=pi 模型配置，1=oh-my-pi 模型配置。
     model_settings_tab: usize,
+    /// 供应商名编辑缓冲（页签, 当前键, 输入缓冲）：失焦前不重命名、不落盘。
+    provider_name_edit: Option<(usize, String, String)>,
+    /// 模型 context/max 数字编辑缓冲（页签, 供应商键, 模型行号, context, max）：
+    /// 失焦前不写回，避免清空后重打拼接出错误数值。
+    model_num_edit: Option<(usize, String, usize, String, String)>,
     /// 后台重绘跳帧计数器：后台页签收到 redraw 信号时累计，达到跳帧阈值才真正重绘。
     bg_frame: u64,
     /// 首页项目列表搜索过滤文本。
@@ -1404,17 +1521,24 @@ pub struct ClientApp {
 /// 输出停止 ≥3s 且有可查看内容且未查看 → ✅（完成/待查看）；否则空。
 /// 滚动/翻页只改视口、不写 last_output_ms → 不计更新状态；周期重绘、CPU
 /// 采样、锁存等后台「固定刷新」全部退出判定，3 秒无内容即完成。
-/// 唯一例外：输入驱动（last_input 距今 <INPUT_ACTIVE_MS）——用户刚打字，
-/// 回显是输入引发、不是任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新内容）与
-/// 空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
+/// 唯一例外：用户驱动回显（last_input/last_scroll 距现在窗口内）——最近
+/// 1.5s 内输过键（last_input_ms）或 500ms 内转发过滚轮（last_scroll_ms）给
+/// TUI，其直接引发的重绘回显不算任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新
+/// 内容）与空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
+/// 两个窗口互不兼容：键盘输入回显给 1.5s（打字可能持续），滚动重绘是
+/// 一次性输出给 500ms；真实输出晚于各自窗口即照常判 🔄。
+/// ever_output：是否有任何输出块（含动画）。零输出会话不因 last_output_ms
+/// 初始化为 spawn 时刻而假闪 🔄，🔄 只属于真实内容驱动/加载态。
 fn tab_icon(
     exited: bool,
     loading: bool,
+    ever_output: bool,
     count: u32,
     viewed: bool,
     last_out: u64,
     now_ms: u64,
     last_input: u64,
+    last_scroll: u64,
 ) -> Option<&'static str> {
     if exited {
         return Some("❌");
@@ -1422,13 +1546,20 @@ fn tab_icon(
     if loading {
         return Some("🔄");
     }
-    // 输入驱动例外：用户刚在终端里输入（≤INPUT_ACTIVE_MS），回显/格内刷新
-    // 是输入引发、不是任务在跑 → 跳过运行中判定。命令真实输出晚于窗口即
-    // 照常判 🔄（慢命令几乎总是超出 1.5s 窗口）。
+    // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——其直接引发
+    // 的回显/整屏重绘是用户操作引起、不是任务在跑 → 跳过运行中判定。命令
+    // 真实输出晚于窗口即照常判 🔄（慢命令几乎总是超出窗口）。
     let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
+    let scroll_echo = last_scroll != 0 && now_ms.saturating_sub(last_scroll) < SCROLL_ECHO_MS;
     // 有内容（最近一块输出距今 ≤3s）→ 运行中。动画块也刷新 last_output_ms，
     // spinner/周期重绘期间保持 🔄；本地滚动/翻页不产生输出，不会点亮它。
-    if !typing && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS {
+    // ever_output 门：从未收到任何输出的会话（last_output_ms 仍是 spawn 的
+    // 初始值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
+    if !typing
+        && !scroll_echo
+        && ever_output
+        && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS
+    {
         return Some("🔄");
     }
     // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
@@ -1586,6 +1717,8 @@ impl ClientApp {
             pi_models: config::load_pi_models(),
             omp_models: config::load_omp_models(),
             model_settings_tab: 0,
+            provider_name_edit: None,
+            model_num_edit: None,
             bg_frame: 0,
             search_query: String::new(),
             show_hidden: false,
@@ -1788,17 +1921,20 @@ impl ClientApp {
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| PathBuf::from("."));
-            // 失败后 3 秒自动重试，直到下载成功为止。
+            // 失败后 3 秒自动重试，直到下载成功为止。坏源在 download_race 内已被
+            // 剔除、install 校验失败（BadDownload）也会清掉续传残留换源重下，
+            // 不会再出现「替换失败: 下载文件损坏…请重新下载」的僵局。
             let mut attempt = 1u32;
-            let new_path = loop {
+            let mut installed_new: PathBuf; // 成功装入的 .new（供完成日志）
+            loop {
                 // 用户取消时跳出重试循环
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = status_tx.send(("下载已取消".to_string(), None));
                     let _ = redraw_tx.try_send(());
                     return;
                 }
-                match download_update(&tag, &exe_path, ptx.clone(), &cancel) {
-                    Ok(p) => break p,
+                let new_path = match download_update(&tag, &exe_path, ptx.clone(), &cancel) {
+                    Ok(p) => p,
                     Err(e) => {
                         let _ = status_tx.send((
                             format!("下载失败（第 {attempt} 次）: {e}，3 秒后自动重试…"),
@@ -1806,27 +1942,50 @@ impl ClientApp {
                         ));
                         std::thread::sleep(std::time::Duration::from_secs(3));
                         attempt += 1;
+                        continue;
+                    }
+                };
+                let new_file = PathBuf::from(&new_path);
+                installed_new = new_file.clone();
+                // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，最终都落到
+                // 正式名（unlock_exe 启动时把运行映像挪成 .running 腾出的空闲名）。
+                let old_path = final_path.with_extension("exe.old");
+                // copy 目标已存在则直接覆盖（.old 始终保留最新旧版），失败不阻断替换。
+                // 注意该提示不能含「失败」字样：UI 按关键字把 downloading 复位，避免干扰安装。
+                if let Err(e) = std::fs::copy(&final_path, &old_path) {
+                    let _ = status_tx.send((
+                        format!("提示: 旧版备份 {old_path:?} 未完成（{e}），不影响替换"),
+                        None,
+                    ));
+                    let _ = redraw_tx.try_send(());
+                }
+                match install_update(&new_file, &final_path, &old_path, &status_tx, &redraw_tx) {
+                    InstallOutcome::Done => break,
+                    InstallOutcome::Occupied => {
+                        // 安装失败：保留 .new 与 .old 供排查/手动处理，稍后可重新下载。
+                        return;
+                    }
+                    InstallOutcome::BadDownload => {
+                        // 清掉全部 .c{i}.new 续传残留，避免下一轮 -C - 把坏文件续传
+                        // 拼成残缺 exe；3 秒后整链重新并发下载（坏源已被剔除）。
+                        if let Some(dir) = new_file.parent() {
+                            if let Ok(rd) = std::fs::read_dir(dir) {
+                                for e in rd.flatten() {
+                                    let n = e.file_name().to_string_lossy().into_owned();
+                                    if n.ends_with(".new") {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        attempt += 1;
                     }
                 }
-            };
-            let new_file = PathBuf::from(&new_path);
-            // 无论资产名是小写 tui-project-manager.exe 还是历史大写名，最终都落到
-            // 正式名（unlock_exe 启动时把运行映像挪成 .running 腾出的空闲名）。
-            let old_path = final_path.with_extension("exe.old");
-            // copy 目标已存在则直接覆盖（.old 始终保留最新旧版），失败不阻断替换。
-            // 注意该提示不能含「失败」字样：UI 按关键字把 downloading 复位，避免干扰安装。
-            if let Err(e) = std::fs::copy(&final_path, &old_path) {
-                let _ = status_tx.send((
-                    format!("提示: 旧版备份 {old_path:?} 未完成（{e}），不影响替换"),
-                    None,
-                ));
-                let _ = redraw_tx.try_send(());
             }
-            if !install_update(&new_file, &final_path, &old_path, &status_tx, &redraw_tx) {
-                // 安装失败：保留 .new 与 .old 供排查/手动处理，稍后可重新下载。
-                return;
-            }
-            log_update(&format!("下载 替换完成：{new_file:?} → {final_path:?}（旧版本备份 → {old_path:?}）"));
+            log_update(&format!(
+                "下载 替换完成：{installed_new:?} → {final_path:?}（旧版已备份 .exe.old）"
+            ));
             let _ = status_tx.send((
                 format!("下载完成！请手动重启应用以使用新版本 {tag}"),
                 None,
@@ -2086,42 +2245,55 @@ impl ClientApp {
         };
     }
 
-    /// 「✅ 稳定计时 + 执行完成通知」状态机：原在 tab_bar() 渲染路径，挪进
-    /// logic() 与退出判定（update_exited）同源同帧执行——不再依赖页签栏渲染，
-    /// 最小化/遮挡时也随 IDLE_HEARTBEAT_MS 心跳走，恢复后按已过时长补判。
+    /// 「内容停止稳定计时 + 执行完成通知」状态机：原在 tab_bar() 渲染路径，
+    /// 挪进 logic() 与退出判定（update_exited）同源同帧执行——不再依赖页签栏
+    /// 渲染，最小化/遮挡时也随 IDLE_HEARTBEAT_MS 心跳走，恢复后按已过时长补判。
     /// ponytail: 若系统挂起最小化时的 repaint 心跳，通知会延迟到唤醒后 500ms。
+    /// 触发判定**不靠 ✅ 图标**（旧实现以 icon==Some("✅") 为门，而图标要求
+    /// !viewed——当前正查看的页签任务完成后图标落空，永进不了完成分支，失焦
+    /// 也不弹通知）。改用独立判据：未退出、非加载中、内容停止超 OUTPUT_END_MS、
+    /// 有实质输出——当前页签且应用前台（用户正盯着）才清零静默，否则照弹。
+    /// 弹窗门槛补「未查看」：启动即 viewed=true，闲置页签（仅 shell 提示符、
+    /// 无新输出轮）永不弹「任务完成」+ 任务栏闪烁；只有用户没看过的真任务
+    /// 输出轮（阅读循环在加载期后复位 viewed）才提醒。
     fn update_done_states(&mut self, ctx: &egui::Context) {
         let now_ms = crate::now_ms();
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
-                let icon = tab_icon(
-                    s.exited.load(Ordering::Acquire),
-                    s.loading_active(now_ms),
-                    s.output_count.load(Ordering::Relaxed),
-                    s.has_been_viewed.load(Ordering::Relaxed),
-                    s.last_output_ms.load(Ordering::Relaxed),
-                    now_ms,
-                    s.last_input_ms.load(Ordering::Relaxed),
-                );
-                // 「执行完成」提醒：页签进入 ✅（3s 无内容 = 输出结束待查看）后
-                // 需稳定停留 DONE_STABLE_MS（2s）才弹系统通知 + 任务栏闪烁。
-                // 稳定窗口过滤误触发：周期输出在 🔄↔✅ 间横跳时重置计时。判定仅凭
-                // 终端内容；含 TUI 寂静思考期（用户要求以终端内容为准）。静默判据：
-                // 仅「当前页签且应用在前台」（用户正盯着）才清零计时不打扰；切走
-                // 后重新计时，与 update_exited 的「运行结束」语义一致。
-                if icon == Some("✅") {
+                // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
+                // 非启动加载中、最近一块**实质内容**输出停止 ≥3s。last_real_output_ms
+                // 只看非动画块：周期转义重绘（tmux 状态栏/光标/屏幕刷新）不会让它
+                // 刷新 → 这类会话不会因 done 横跳而循环弹「任务完成」+ 闪烁。
+                // 未查看门槛在弹窗条件里（viewed 语义：启动即已见，仅新输出轮
+                // 复位，见下）。
+                let done = !s.exited.load(Ordering::Acquire)
+                    && !s.loading_active(now_ms)
+                    && now_ms.saturating_sub(s.last_real_output_ms.load(Ordering::Relaxed))
+                        > OUTPUT_END_MS;
+                // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
+                // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在
+                // 🔄↔边界横跳时（再有输出 → done=false → 清零）重置计时。
+                // 静默判据：仅「当前页签且应用在前台」（用户正盯着）才清零
+                // 计时不打扰；失焦/切走后重新计时，与 update_exited 的「运行
+                // 结束」语义一致——用户报告的现象（当前页签任务完成、窗口
+                // 失焦不推通知）即由旧图标门 + viewed 耦合导致，已解耦。
+                if done {
                     let since = s.done_since_ms.load(Ordering::Relaxed);
                     if i == self.current && app_fg {
-                        // 用户正盯着 ✅：视为已知晓，清零计时（切走后再重新
+                        // 用户正盯着：视为已知晓，清零计时（切走/失焦后再重新
                         // 计 DONE_STABLE_MS）。done_notified 不动——本轮已看见
-                        // 图标，不再弹窗。
+                        // 内容，不再弹窗。
                         s.done_since_ms.store(0, Ordering::Relaxed);
                     } else if since == 0 {
                         s.done_since_ms.store(now_ms, Ordering::Relaxed);
                     } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
                         && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
-                        // 10s 节流先过（不通过则每帧重试，不消耗本轮 done_notified）。
+                        // 未查看门槛：启动即 viewed=true，闲置页签（无新输出轮）
+                        // 不提醒；用户没看过的真任务输出轮才弹（阅读循环在加载
+                        // 期后每轮新输出复位 viewed）。「任务完成」只属于主页签
+                        // 之外、用户还没看过的新内容，消除「没任何输出却弹」误报。
+                        && !s.has_been_viewed.load(Ordering::Relaxed)
                         && allow_toast(s, now_ms)
                         && !s.done_notified.swap(true, Ordering::Relaxed)
                         // 启动宽限期：刚启动的会话（含首轮输出）静默；
@@ -2133,9 +2305,9 @@ impl ClientApp {
                         crate::flash_taskbar(self.titlebar_hwnd);
                     }
                 } else {
-                    // 离开 ✅（新一轮输出/🔄/❌/图标空）→ 清稳定计时并复位
-                    // done_notified：每一轮完成都可再弹，防轰炸靠同页签 10s 节流
-                    //（TOAST_MIN_INTERVAL_MS，含退出/完成共用一条限流）。
+                    // 离开完成态（新一轮输出/启动加载中/已退出）→ 清稳定计时并
+                    // 复位 done_notified：每一轮完成都可再弹，防轰炸靠同页签 10s
+                    // 节流（TOAST_MIN_INTERVAL_MS，含退出/完成共用一条限流）。
                     s.done_since_ms.store(0, Ordering::Relaxed);
                     s.done_notified.store(false, Ordering::Relaxed);
                 }
@@ -2387,20 +2559,24 @@ impl ClientApp {
                     // last_output_ms 由 reader 每收一块输出刷新；滚动/翻页只改
                     // 视口不产生输出 → 不计更新状态。周期重绘/CPU 采样/锁存等
                     // 后台固定刷新全部退出判定（见 tab_icon）：有内容 → 🔄，
-                    // 3s 无内容 → 完成（✅/空）。输入驱动例外：最近 1.5s 内用户
-                    // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）则
-                    // 回显不算任务在跑 → 跳过 🔄，修「输入时被误判成 🔄」。
+                    // 3s 无内容 → 完成（✅/空）。用户驱动例外：最近 1.5s 内
+                    // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）或
+                    // 500ms 内转发过滚轮（last_scroll_ms）→ 直接引发的回显不
+                    // 算任务在跑 → 跳过 🔄；真实输出晚于窗口照常判 🔄。
                     let count = s.output_count.load(Ordering::Relaxed);
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let last_input = s.last_input_ms.load(Ordering::Relaxed);
+                    let last_scroll = s.last_scroll_ms.load(Ordering::Relaxed);
                     let icon = tab_icon(
                         s.exited.load(Ordering::Acquire),
                         s.loading_active(now_ms),
+                        s.ever_output.load(Ordering::Relaxed),
                         count,
                         viewed,
                         last_out,
                         now_ms,
                         last_input,
+                        last_scroll,
                     );
                     let title = s.title.clone();
                     let selected = self.current == i;
@@ -2947,8 +3123,20 @@ impl ClientApp {
             let color = forced_contrast_color(color, bg);
             let saved_override = ui.visuals().override_text_color;
             ui.visuals_mut().override_text_color = None;
-            ui.label(RichText::new(text).color(color));
+            let copy_snapshot = text.clone(); // 渲染前快照，供右键复制（label 会 move text）
+            let label_resp = ui.label(RichText::new(text).color(color));
             ui.visuals_mut().override_text_color = saved_override;
+            // 右键快速复制整条状态栏消息（错误/提示可直接复制去反馈或贴给 AI）。
+            label_resp.context_menu(|ui| {
+                if ui
+                    .button("📋 复制")
+                    .on_hover_text("复制整条状态栏消息到剪贴板")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(copy_snapshot.clone());
+                    ui.close();
+                }
+            });
             if let Some(tag) = self.update_latest.clone() {
                 ui.separator();
                 if self.downloading {
@@ -3705,12 +3893,17 @@ impl ClientApp {
         ui.add_space(6.0);
         // ── 模型配置（页签：pi / oh-my-pi） ──
         ui.horizontal(|ui| {
-            ui.label(RichText::new("模型配置:").strong());
-            for (i, name) in ["pi 模型配置", "oh-my-pi 模型配置"].iter().enumerate() {
+            ui.label(RichText::new("供应商配置:").strong());
+            for (i, name) in ["pi 供应商配置", "oh-my-pi 供应商配置"].iter().enumerate() {
                 if ui
                     .add(egui::Button::selectable(self.model_settings_tab == i, *name))
                     .clicked()
+                    && self.model_settings_tab != i
                 {
+                    // 切页签前提交原页签里未失焦的供应商改名/数字编辑（失焦事件只在字段被
+                    // 渲染的帧里能捕捉，切页签的点击发生在对方页签渲染之前，会漏）避免丢失。
+                    self.flush_provider_rename(self.model_settings_tab);
+                    self.flush_model_num_edit(self.model_settings_tab);
                     self.model_settings_tab = i;
                 }
             }
@@ -3723,22 +3916,78 @@ impl ClientApp {
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（点击页签后消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知；周期输出横跳会重置计时。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
 
     /// provider/models 编辑表单（pi / oh-my-pi 共用），返回是否有改动。
-    fn provider_list_ui(ui: &mut egui::Ui, models: &mut config::ModelsConfig) -> bool {
+    fn provider_list_ui(
+        ui: &mut egui::Ui,
+        tab: usize,
+        name_edit: &mut Option<(usize, String, String)>,
+        num_edit: &mut Option<(usize, String, usize, String, String)>,
+        models: &mut config::ModelsConfig,
+    ) -> bool {
         let mut dirty = false;
+        // 名称编辑缓冲只对当前页签、仍存在的键有效；键被删掉后丢弃。
+        // （切到别的页签不清空：那只代表该页签本轮没渲染，缓冲仍在，由切页签处 flush。）
+        if let Some((t, k, _)) = name_edit.as_ref() {
+            if *t == tab && !models.providers.contains_key(k) {
+                *name_edit = None;
+            }
+        }
+        // 数字编辑缓冲同理：供应商/模型行被删除后丢弃，切页签不清。
+        if let Some((t, k, i, _, _)) = num_edit.as_ref() {
+            let stale = *t != tab
+                || models.providers.get(k).map_or(true, |p| p.models.get(*i).is_none());
+            if stale {
+                *num_edit = None;
+            }
+        }
         let keys: Vec<String> = models.providers.keys().cloned().collect();
+        let mut provider_remove: Option<String> = None;
+        let mut provider_rename: Option<(String, String)> = None;
         for key in &keys {
             if let Some(provider) = models.providers.get_mut(key) {
+                // 正在编辑该供应商名：沿用缓冲，避免每敲一个字就把行重建导致丢焦点；
+                // 否则回填当前键。
+                let editing = match name_edit.as_ref() {
+                    Some((t, k, _)) => *t == tab && *k == *key,
+                    None => false,
+                };
+                let mut key_name = if editing {
+                    name_edit.as_ref().unwrap().2.clone()
+                } else {
+                    key.clone()
+                };
+                let mut commit_name = false;
                 ui.indent(key, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Provider:");
-                        ui.label(RichText::new(key).strong());
+                        ui.label("供应商:");
+                        let resp = ui
+                            .add(egui::TextEdit::singleline(&mut key_name).desired_width(120.0));
+                        if resp.changed() {
+                            // 只更新缓冲不重命名：重命名延迟到失焦才提交（避免每次输入就失焦/落盘）。
+                            *name_edit = Some((tab, key.clone(), key_name.clone()));
+                        }
+                        if resp.lost_focus() {
+                            commit_name = true;
+                        }
+                        if ui.small_button("删除供应商").clicked() {
+                            provider_remove = Some(key.clone());
+                        }
                     });
+                    if commit_name {
+                        let new = key_name.trim().to_string();
+                        if new.is_empty() || new == *key {
+                            // 空名/未变：保留缓冲供继续修改，不落盘。
+                            *name_edit = Some((tab, key.clone(), key_name.clone()));
+                        } else {
+                            provider_rename = Some((key.clone(), new));
+                            *name_edit = None;
+                        }
+                    }
                     ui.horizontal(|ui| {
                         ui.label("baseUrl:");
                         if ui
@@ -3766,8 +4015,26 @@ impl ClientApp {
                     // models 列表
                     let mut model_remove: Option<usize> = None;
                     for (mi, model) in provider.models.iter_mut().enumerate() {
+                        // context/max 数字编辑缓冲：正在编辑本行则沿用缓冲，失焦才写回，
+                        // 避免清空后重打把旧值拼接出新数值。
+                        let editing_num = matches!(
+                            num_edit.as_ref(),
+                            Some((t, k, i, _, _)) if *t == tab && *k == *key && *i == mi
+                        );
+                        let mut ctx_buf = if editing_num {
+                            num_edit.as_ref().unwrap().3.clone()
+                        } else {
+                            model.context_window.to_string()
+                        };
+                        let mut max_buf = if editing_num {
+                            num_edit.as_ref().unwrap().4.clone()
+                        } else {
+                            model.max_tokens.to_string()
+                        };
+                        let mut commit_ctx = false;
+                        let mut commit_max = false;
                         ui.horizontal(|ui| {
-                            ui.label(format!("Model[{}]:", mi));
+                            ui.label(format!("模型[{}]:", mi));
                             ui.label("id:");
                             if ui
                                 .add(
@@ -3788,35 +4055,60 @@ impl ClientApp {
                                 dirty = true;
                             }
                             ui.label("context:");
-                            let mut ctx_str = model.context_window.to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut ctx_str)
-                                        .desired_width(80.0),
-                                )
-                                .changed()
-                                && let Ok(v) = ctx_str.parse()
-                            {
-                                model.context_window = v;
-                                dirty = true;
+                            let resp_ctx = ui.add(
+                                egui::TextEdit::singleline(&mut ctx_buf).desired_width(80.0),
+                            );
+                            if resp_ctx.changed() {
+                                *num_edit = Some((
+                                    tab,
+                                    key.clone(),
+                                    mi,
+                                    ctx_buf.clone(),
+                                    max_buf.clone(),
+                                ));
+                            }
+                            if resp_ctx.lost_focus() {
+                                commit_ctx = true;
                             }
                             ui.label("max:");
-                            let mut max_str = model.max_tokens.to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut max_str)
-                                        .desired_width(80.0),
-                                )
-                                .changed()
-                                && let Ok(v) = max_str.parse()
-                            {
-                                model.max_tokens = v;
-                                dirty = true;
+                            let resp_max = ui.add(
+                                egui::TextEdit::singleline(&mut max_buf).desired_width(80.0),
+                            );
+                            if resp_max.changed() {
+                                *num_edit = Some((
+                                    tab,
+                                    key.clone(),
+                                    mi,
+                                    ctx_buf.clone(),
+                                    max_buf.clone(),
+                                ));
                             }
-                            if ui.small_button("×").clicked() {
+                            if resp_max.lost_focus() {
+                                commit_max = true;
+                            }
+                            if ui.small_button("删除模型").clicked() {
                                 model_remove = Some(mi);
                             }
                         });
+                        // 失焦提交：解析成功才写回；失败则丢缓冲、字段回显原值。
+                        if commit_ctx {
+                            if let Ok(v) = ctx_buf.trim().parse() {
+                                model.context_window = v;
+                                dirty = true;
+                            }
+                            if editing_num {
+                                *num_edit = None;
+                            }
+                        }
+                        if commit_max {
+                            if let Ok(v) = max_buf.trim().parse() {
+                                model.max_tokens = v;
+                                dirty = true;
+                            }
+                            if editing_num {
+                                *num_edit = None;
+                            }
+                        }
                     }
                     if let Some(mi) = model_remove {
                         provider.models.remove(mi);
@@ -3829,32 +4121,144 @@ impl ClientApp {
                 });
             }
         }
+        if let Some(key) = provider_remove {
+            models.providers.remove(&key);
+            dirty = true;
+        }
+        if let Some((old, new)) = provider_rename {
+            if !new.is_empty()
+                && new != old
+                && !models.providers.contains_key(&new)
+                && let Some(entry) = models.providers.remove(&old)
+            {
+                models.providers.insert(new, entry);
+                dirty = true;
+            } else {
+                // 重名冲突等：恢复编辑缓冲，保留用户输入供修改。
+                *name_edit = Some((tab, old, new));
+            }
+        }
+        if ui.button("+ 添加供应商").clicked() {
+            let mut n = 1;
+            while models.providers.contains_key(&n.to_string()) {
+                n += 1;
+            }
+            models.providers.insert(n.to_string(), config::ProviderEntry::default());
+            dirty = true;
+        }
         dirty
+    }
+
+    /// 提交某个页签里未落盘的供应商改名（切页签时调用；失焦提交走 provider_list_ui）。
+    /// 改名无效/重名冲突时保留编辑缓冲供用户修正。
+    fn flush_provider_rename(&mut self, tab: usize) {
+        let Some((t, old, new)) = self.provider_name_edit.take() else {
+            return;
+        };
+        if t != tab {
+            self.provider_name_edit = Some((t, old, new));
+            return;
+        }
+        let new = new.trim().to_string();
+        let ok = if t == 0 {
+            if new.is_empty() || new == old || self.pi_models.providers.contains_key(&new) {
+                false
+            } else if let Some(entry) = self.pi_models.providers.remove(&old) {
+                self.pi_models.providers.insert(new.clone(), entry);
+                config::save_pi_models(&self.pi_models).is_ok()
+            } else {
+                false
+            }
+        } else {
+            if new.is_empty() || new == old || self.omp_models.providers.contains_key(&new) {
+                false
+            } else if let Some(entry) = self.omp_models.providers.remove(&old) {
+                self.omp_models.providers.insert(new.clone(), entry);
+                config::save_omp_models(&self.omp_models).is_ok()
+            } else {
+                false
+            }
+        };
+        if !ok {
+            // 改名无效/重名冲突/删除失败：保留编辑缓冲供用户修正。
+            self.provider_name_edit = Some((t, old, new));
+        }
+    }
+
+    /// 切页签时提交未失焦的模型 context/max 数字编辑（与改名同一漏帧问题）。
+    fn flush_model_num_edit(&mut self, tab: usize) {
+        let Some((t, key, idx, ctx, max)) = self.model_num_edit.take() else {
+            return;
+        };
+        if t != tab {
+            self.model_num_edit = Some((t, key, idx, ctx, max));
+            return;
+        }
+        let provider = if t == 0 {
+            self.pi_models.providers.get_mut(&key)
+        } else {
+            self.omp_models.providers.get_mut(&key)
+        };
+        let Some(provider) = provider else {
+            return; // 供应商已删除：丢弃缓冲
+        };
+        let Some(model) = provider.models.get_mut(idx) else {
+            return; // 模型行已删：丢弃缓冲
+        };
+        let mut applied = false;
+        if let Ok(v) = ctx.trim().parse::<u64>() {
+            model.context_window = v;
+            applied = true;
+        }
+        if let Ok(v) = max.trim().parse::<u64>() {
+            model.max_tokens = v;
+            applied = true;
+        }
+        if applied {
+            let res = if t == 0 {
+                config::save_pi_models(&self.pi_models)
+            } else {
+                config::save_omp_models(&self.omp_models)
+            };
+            if let Err(e) = res {
+                self.status = Some(format!("供应商配置保存失败: {e}"));
+            }
+        }
     }
 
     /// 模型配置页签内容：0=pi，1=oh-my-pi。
     fn model_settings_ui(&mut self, ui: &mut egui::Ui, tab: usize) {
         if tab == 0 {
-            ui.label(RichText::new("pi 模型配置").strong());
+            ui.label(RichText::new("pi 供应商配置").strong());
             ui.label(
                 RichText::new(format!("路径: {}", config::pi_models_path().display()))
                     .weak()
                     .small(),
             );
-            if Self::provider_list_ui(ui, &mut self.pi_models)
-                && let Err(e) = config::save_pi_models(&self.pi_models)
+            if Self::provider_list_ui(
+                ui,
+                0,
+                &mut self.provider_name_edit,
+                &mut self.model_num_edit,
+                &mut self.pi_models,
+            ) && let Err(e) = config::save_pi_models(&self.pi_models)
             {
                 self.status = Some(format!("pi 配置保存失败: {e}"));
             }
         } else {
-            ui.label(RichText::new("oh-my-pi 模型配置").strong());
+            ui.label(RichText::new("oh-my-pi 供应商配置").strong());
             ui.label(
                 RichText::new(format!("路径: {}", config::omp_models_path().display()))
                     .weak()
                     .small(),
             );
-            if Self::provider_list_ui(ui, &mut self.omp_models)
-                && let Err(e) = config::save_omp_models(&self.omp_models)
+            if Self::provider_list_ui(
+                ui,
+                1,
+                &mut self.provider_name_edit,
+                &mut self.model_num_edit,
+                &mut self.omp_models,
+            ) && let Err(e) = config::save_omp_models(&self.omp_models)
             {
                 self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
             }
@@ -4078,6 +4482,35 @@ impl eframe::App for ClientApp {
         {
             self.titlebar_restore_at = None;
             set_dwm_dark(self.titlebar_hwnd);
+        }
+
+        // ── Ctrl+(Shift+)Tab 循环切换页签 ──
+        // 在 logic() 用 consume_key 消费：事件从流里移除，ui() 里终端输入循环
+        // 收不到 → 不会当作 \t/\x1b[Z 转发给子进程。egui matches_logically 忽略
+        // 多余的 Shift/Alt，必须先判 Ctrl+Shift+Tab（后退）再判 Ctrl+Tab
+        // （前进），否则 Ctrl+Shift+Tab 会被前进分支吞掉（见 egui 0.36
+        // input_state::consume_key 文档）。
+        let (tab_back, tab_fwd) = ctx.input_mut(|i| {
+            let back = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            );
+            let fwd = !back && i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab);
+            (back, fwd)
+        });
+        if tab_back || tab_fwd {
+            let n = self.tabs.len();
+            if n > 1 {
+                // 后退 = 逆序一步（(current + n - 1) % n）。
+                let step = if tab_fwd { 1 } else { n - 1 };
+                self.current = (self.current + step) % n;
+                self.refresh_focus();
+                // 切入口即视为已查看（✅/`任务完成`通知清零，与点击页签一致；
+                // 前台每帧同步与 update_done_states 随本帧随后生效）。
+                if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
+                    s.has_been_viewed.store(true, Ordering::Relaxed);
+                }
+            }
         }
 
         // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
@@ -4528,50 +4961,60 @@ impl eframe::App for ClientApp {
 mod tab_icon_tests {
     use super::tab_icon;
 
-    fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
+    fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, count, viewed, now.saturating_sub(silent_ms), now, 0)
+        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0, 0)
     }
 
     // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
     // 期间保持运行；count=0（纯动画会话）只要有输出照样 🔄。
     #[test]
     fn content_within_3s_shows_running() {
-        assert_eq!(icon(10, false, 2_000), Some("🔄"));
-        assert_eq!(icon(0, false, 2_000), Some("🔄"));
+        assert_eq!(icon(true, 10, false, 2_000), Some("🔄"));
+        assert_eq!(icon(true, 0, false, 2_000), Some("🔄"));
     }
 
     // 边界：恰好 3s 内仍有内容 → 🔄；超过 3s → 完成。
     #[test]
     fn three_sec_boundary() {
-        assert_eq!(icon(10, false, 3_000), Some("🔄"));
-        assert_eq!(icon(10, false, 3_001), Some("✅"));
+        assert_eq!(icon(true, 10, false, 3_000), Some("🔄"));
+        assert_eq!(icon(true, 10, false, 3_001), Some("✅"));
     }
 
     // 3s 无内容 + 有实质输出 + 未查看 → ✅（完成/待查看）。
     #[test]
     fn content_stopped_3s_shows_done() {
-        assert_eq!(icon(10, false, 10_000), Some("✅"));
+        assert_eq!(icon(true, 10, false, 10_000), Some("✅"));
     }
 
-    // 已查看（点击过页签）→ ✅ 消失；viewed 不复位，后续不再重复亮 ✅。
+    // 已查看（点击过页签/切走前台同步）→ ✅ 消失；viewed 不复位，后续不再重复亮 ✅。
     #[test]
     fn done_clears_after_viewed() {
-        assert_eq!(icon(10, true, 10_000), None);
+        assert_eq!(icon(true, 10, true, 10_000), None);
     }
 
     // 从未有实质输出（count=0，纯动画/零输出会话）→ 3s 无内容后落空，不亮 ✅。
     #[test]
     fn no_content_never_shows_done() {
-        assert_eq!(icon(0, false, 10_000), None);
+        assert_eq!(icon(true, 0, false, 10_000), None);
+    }
+
+    // 零输出会话（spawn 后从未读到任何数据块）不假闪 🔄：last_output_ms 仍是
+    // spawn 时刻（对 now 而言“新鲜”），若没有 ever_output 门会在前 3s 闪 🔄。
+    #[test]
+    fn never_output_never_flashes_running() {
+        let now = 100_000u64;
+        // loading 未结束 → 🔄 由加载态负责（正常）；加载结束后零输出 → 空。
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0, 0), None);
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, now - 10_000, now, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0, 0), Some("🔄"));
     }
 
     // 输入驱动例外：最近 1.5s 内用户输过键，回显即使刷新 last_output_ms
@@ -4580,11 +5023,11 @@ mod tab_icon_tests {
     fn typing_echo_not_running() {
         let now = 100_000u64;
         // 1s 前刚输入过（回显新鲜）→ 不亮 🔄，落空。
-        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, now - 1_000), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000, 0), None);
         // 输入窗口边界：不敢 1.5s 整（< INPUT_ACTIVE_MS 才算），恰过期即恢复。
-        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, now - 1_501), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501, 0), Some("🔄"));
         // 无输入历史（last_input=0，鼠标选择/拖拽等）→ 正常判 🔄。
-        assert_eq!(tab_icon(false, false, 10, false, now - 1_000, now, 0), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0, 0), Some("🔄"));
     }
 
     // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、但内容已停
@@ -4592,16 +5035,35 @@ mod tab_icon_tests {
     #[test]
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, 10, false, now - 10_000, now, now - 500), Some("✅"));
-        assert_eq!(tab_icon(false, false, 10, true, now - 10_000, now, now - 500), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500, 0), Some("✅"));
+        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500, 0), None);
     }
 
     // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
     // 仍按内容判据落 ✅/空，滚动本身不点亮 🔄（见 app.rs 图标循环注释）。
     #[test]
     fn scrolling_does_not_count_as_update() {
-        assert_eq!(icon(10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
-        assert_eq!(icon(10, true, 10_000), None); // 已查看：滚动后仍空
+        assert_eq!(icon(true, 10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
+        assert_eq!(icon(true, 10, true, 10_000), None); // 已查看：滚动后仍空
+    }
+
+    // 滚动转发回显例外（last_scroll_ms 专用 500ms 短窗）：滚动转发 TUI 后立即
+    // 到达的重绘回显（last_out 新）→ 不亮 🔄（滚动查看历史不误亮运行中）；
+    // 窗口过期后真实输出照常判 🔄（持续滚动看日志时页签仍实时刷新运行状态）。
+    // 本地缓冲滚动不写 last_scroll（=0）→ 不产生例外，滚不滚动都不影响判定。
+    #[test]
+    fn scroll_echo_window_only_swallows_prompt_redraw() {
+        let now = 100_000u64;
+        // 500ms 内转发过滚轮 + 输出新鲜（TUI 重绘回显）→ 吞掉，不亮 🔄。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 100), None);
+        // 滚动窗口边界：恰过期（501ms）即按内容恢复 🔄。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 501), Some("🔄"));
+        // 无滚动记录（本地缓冲滚动 / 从未转发，last_scroll=0）→ 输出新鲜照常 🔄。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, 0), Some("🔄"));
+        // 滚动例外不吞 ✅：滚动时内容早已停、未查看 → 仍按内容判完成。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, 0, now - 100), Some("✅"));
+        // 滚动窗口与输入窗口互不干扰：输入回声例外只由 last_input 触发。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100), None);
     }
 }
 #[cfg(test)]
@@ -4701,11 +5163,19 @@ mod update_tests {
     fn looks_like_exe_checks_mz_header() {
         let dir = std::env::temp_dir();
         let p = dir.join("tpm_test_mz_check.bin");
-        std::fs::write(&p, b"MZ\x90\x00\x03\x00").unwrap();
+        // 真实 exe ≥256KB 才过体积门（volume gate 2026-09 后加的，旧 6 字节桩恒败）；
+        // 构造带 DOS 头（0x3C 处 e_lfanew=0x40）→ "PE\0\0" 的合法最小夹具。
+        let mut ok = vec![0u8; 256 * 1024 + 8];
+        ok[0..2].copy_from_slice(b"MZ");
+        ok[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        ok[0x40..0x44].copy_from_slice(b"PE\0\0");
+        std::fs::write(&p, &ok).unwrap();
         assert!(super::looks_like_exe(&p));
-        std::fs::write(&p, b"<html>404 Not Found</html>").unwrap();
+        // 同体积但纯 HTML：不判 exe。
+        std::fs::write(&p, vec![b'<'; 256 * 1024]).unwrap();
         assert!(!super::looks_like_exe(&p));
-        std::fs::write(&p, b"MXZ").unwrap();
+        // 体积不够（历史 6 字节桩场景）恒判否。
+        std::fs::write(&p, b"MZ\x90\x00\x03\x00").unwrap();
         assert!(!super::looks_like_exe(&p));
         let _ = std::fs::remove_file(&p);
     }
