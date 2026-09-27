@@ -7,6 +7,9 @@
 //! 静止帧优化：每格算 FNV 哈希入表，与上一帧全等则直接重放缓存的 Mesh，
 //! 跳过 quad 重建；内容一变即整帧重建（不做局部更新——重建本身已是微秒级）。
 //!
+//! 多页签：字形位图与纹理**全进程共享**（同字体链 + 物理字号一份，见
+//! SHARED_ATLASES），页签各留的只有与自身屏幕内容相关的帧缓冲。
+//!
 //! 内存控制（实测驱动）：
 //! - 分页图集：单页 1024² RGBA ≈ 4MB，满页开新页渐进，不做整体清空重灌
 //!   （整体清空曾造成汉字输入 ~400ms 卡顿）。
@@ -16,7 +19,7 @@
 //!   永无卡顿峰值。代价：CJK 解析结果常驻内存（用户明确要求常驻加载）。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use eframe::egui;
 use egui::{Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureOptions};
@@ -402,147 +405,341 @@ pub fn hash_mix(h: &mut u64, v: u64) {
     *h = h.wrapping_mul(0x100_0000_01b3);
 }
 
-// @@PART2@@/// 每会话 GPU 批渲染状态。`None` = 尚未初始化或初始化失败，整格走 galley 回落。
-/// 分页架构：`pages[i]` 一张独立图集 + 独立纹理，`glyph()` 返回 (页号, 槽位)，
-/// quad 也要带页号收集到 `quads[pg]`。
-pub struct TermGpu {
-    pub pages: Vec<GlyphAtlas>,
-    /// 图集重建所需的原始字体字节（Arc 共享，DPI 变化时重建用）。
-    sources: Vec<FontSource>,
-    font_size_pt: f32,
-    params_ppp: f32,
-    pub texs: Vec<Option<TextureHandle>>,
-    tex_versions: Vec<u64>,
-    /// 上一帧每格哈希（rows×cols，索引 vline*cols+col，未访问格保持 0）。
-    prev_hash: Vec<u64>,
-    /// 本帧哈希写入缓冲（跨帧复用分配）。
-    pub hash_scratch: Vec<u64>,
-    /// 本帧 quad 收集缓冲（跨帧复用分配），按页分桶。
-    pub quads: Vec<Vec<CellQuad>>,
-    /// 静止帧复用的已提交网格（页序号 → 纹理 id + Arc<Mesh>）。
-    pub meshes: Vec<(egui::TextureId, std::sync::Arc<Mesh>)>,
+// ── 进程级共享图集（多页签复用）──
+// 字形位图只取决于「字体链 + 物理字号」，与哪个页签在显示什么毫无关系：
+// 每页签各建一份纯属重复——单页 1024² RGBA = 4MB 内存 + 4MB 显存，5 个页签
+// 白吃 ~40MB，且每个新页签都要把 ASCII 重新光栅化一遍。改为按
+// (字体链, 物理字号) 建一份全进程共享的图集页 + egui 纹理，所有页签复用：
+// - 位图页（4MB/页）只存一份：内存 O(页数) 而非 O(页签数 × 页数)，
+//   显存同理（纹理唯一，不再一页签一张同内容纹理）。
+// - 重传走 `TextureHandle::set` 原地更新，TextureId 保持不变：其他页签
+//   缓存的 mesh 无需重建，也不会出现「纹理被换掉、旧 id 悬垂」的问题。
+// - 新页签直接命中已光栅化的字形（ASCII 预热也在共享图集里），零重复光栅化。
+// 不能共享的只有每帧缓冲（见 TabBuffers）：静止帧 diff 哈希、quad 收集桶与
+// 已提交 mesh 都与本页签屏幕内容一一对应。
+// 生命周期：注册表只存 Weak，最后一个页签关掉后条目在下一次 acquire 时回收，
+// 整组图集页与纹理随之释放（回到单页签前的占用，不留常驻大块）。
+// 并发：渲染全在 UI 线程，逐格 `glyph()` 不能再加锁（每帧上万格），
+// 故取帧时加一次锁并把访问权（TermFrame）借给整帧，逐格路径零锁开销。
+
+/// 一页图集 + 该页全进程唯一的 egui 纹理。
+struct AtlasPage {
+    atlas: GlyphAtlas,
+    /// 已上传纹理的位图版本（与 `atlas.version` 不等才需重传）。
+    uploaded: u64,
+    /// 该页纹理：所有页签共用同一个 TextureId（重传原地更新，id 不变）。
+    tex: Option<TextureHandle>,
 }
 
-impl TermGpu {
-    /// 从 egui 已注册的 Monospace 家族提取字体数据初始化。字体链为空返回 None。
-    pub fn new(ctx: &egui::Context, font_size_pt: f32, ppp: f32) -> Option<Self> {
-        let sources = cached_font_data(ctx); // 进程级零拷贝，见 FONT_DATA_CACHE
-        if sources.is_empty() {
-            return None;
-        }
-        let atlas = GlyphAtlas::new(&sources, font_size_pt, ppp);
-        Some(Self {
-            pages: vec![atlas],
-            sources,
+impl AtlasPage {
+    fn new(atlas: GlyphAtlas) -> Self {
+        Self { atlas, uploaded: 0, tex: None }
+    }
+}
+
+/// 进程级共享图集：同（字体链, 物理字号）下所有页签共用同一组图集页。
+struct SharedAtlas {
+    /// 开新页用的字体源（Arc 共享，零拷贝；字体链全进程恒定，见 FONT_DATA_CACHE）。
+    sources: Vec<FontSource>,
+    /// 开新页时复用的物理字号参数。
+    font_size_pt: f32,
+    ppp: f32,
+    pages: Vec<AtlasPage>,
+}
+
+impl SharedAtlas {
+    fn new(sources: &[FontSource], font_size_pt: f32, ppp: f32) -> Self {
+        Self {
+            sources: sources.to_vec(),
             font_size_pt,
-            params_ppp: ppp,
-            texs: vec![None],
-            tex_versions: vec![0],
-            prev_hash: Vec::new(),
-            hash_scratch: Vec::new(),
-            quads: vec![Vec::new()],
-            meshes: Vec::new(),
-        })
+            ppp,
+            pages: vec![AtlasPage::new(GlyphAtlas::new(sources, font_size_pt, ppp))],
+        }
     }
 
-    /// 图集是否完全为空（尚未光栅化任何字形）。首帧懒预热据此判断。
-    pub fn is_empty(&self) -> bool {
-        self.pages.iter().all(|p| p.is_empty())
-    }
-
-    /// DPI 变化时重建图集（光栅化字号随物理像素变化）；其余情况原地复用。
-    pub fn ensure_params(&mut self, font_size_pt: f32, ppp: f32) {
-        if self.params_ppp == ppp && self.font_size_pt == font_size_pt {
-            return;
-        }
-        let sources = self.sources.clone(); // 避开 &mut self 与 &self 的借用冲突
-        self.pages = vec![GlyphAtlas::new(&sources, font_size_pt, ppp)];
-        self.texs = vec![None];
-        self.tex_versions = vec![0];
-        self.quads = vec![Vec::new()];
-        self.meshes.clear();
-        self.prev_hash.clear();
-        self.params_ppp = ppp;
-        self.font_size_pt = font_size_pt;
-    }
-
-    /// 帧首准备：哈希缓冲对齐 rows×cols，清空各页 quad 桶。
-    pub fn begin_frame(&mut self, rows: usize, cols: usize) {
-        let needed = rows * cols;
-        if self.hash_scratch.len() >= needed {
-            // 已有足够容量 → fill(0) 重置，无重分配。
-            self.hash_scratch[..needed].fill(0);
-            self.hash_scratch.truncate(needed);
-        } else {
-            self.hash_scratch.clear();
-            self.hash_scratch.resize(needed, 0);
-        }
-        for q in &mut self.quads {
-            q.clear();
-        }
+    /// 是否所有页都还没光栅化过字形。首帧预热据此判断。
+    fn is_empty(&self) -> bool {
+        self.pages.iter().all(|p| p.atlas.is_empty())
     }
 
     /// 查询/光栅化字形，返回 (页号, 槽位)。缺字形且末页满 → 开新页重试
-    /// （页码单调递增，旧页字形常驻，永不整体重灌）。
-    pub fn glyph(&mut self, ch: char) -> (usize, GlyphSlot) {
+    /// （页码单调递增，旧页字形常驻，永不整体重灌）。其他页签已光栅化的
+    /// 字形直接命中共享表，零重复光栅化。
+    fn glyph(&mut self, ch: char) -> (usize, GlyphSlot) {
         // 跨页查缓存：从最新页往前找（新字形普遍落在最新页）。
         for i in (0..self.pages.len()).rev() {
-            if let Some(s) = self.pages[i].peek(ch) {
+            if let Some(s) = self.pages[i].atlas.peek(ch) {
                 return (i, s);
             }
         }
         let last = self.pages.len() - 1;
-        let slot = self.pages[last].glyph(ch);
-        if slot.w > 0.0 || !self.pages[last].is_full() {
+        let slot = self.pages[last].atlas.glyph(ch);
+        if slot.w > 0.0 || !self.pages[last].atlas.is_full() {
             return (last, slot);
         }
         // 末页满且该字形无可见笔画：开新页（新页懒加载未触发时缺字形自动补链）。
-        let sources = self.sources.clone();
-        let mut atlas = GlyphAtlas::new(&sources, self.font_size_pt, self.params_ppp);
+        let mut atlas = GlyphAtlas::new(&self.sources, self.font_size_pt, self.ppp);
         let slot = atlas.glyph(ch);
         let idx = self.pages.len();
-        self.pages.push(atlas);
-        self.texs.push(None);
-        self.tex_versions.push(0);
-        self.quads.push(Vec::new());
+        self.pages.push(AtlasPage::new(atlas));
         (idx, slot)
+    }
+
+    /// 基线相对格子顶部的偏移（逻辑点）。
+    #[inline]
+    fn baseline_rel(&self, pg: usize, cell_h: f32) -> f32 {
+        self.pages[pg].atlas.baseline_rel(cell_h)
+    }
+
+    /// 下划线相对格子顶部的偏移（逻辑点）。
+    #[inline]
+    fn underline_rel(&self, pg: usize, cell_h: f32) -> f32 {
+        self.pages[pg].atlas.underline_rel(cell_h)
+    }
+
+    /// 取该页纹理 id，位图有新字形时**原地**重传。
+    /// 用 `TextureHandle::set` 而非 `ctx.load_texture`：后者换新 id 并释放旧
+    /// 纹理，其他页签缓存的 mesh 会指向已释放的纹理 id（渲染成空白/回退纹理）。
+    fn page_texture(&mut self, pg: usize, ctx: &egui::Context) -> egui::TextureId {
+        let page = &mut self.pages[pg];
+        if let Some(t) = &page.tex
+            && page.uploaded == page.atlas.version
+        {
+            return t.id();
+        }
+        let img = page.atlas.image();
+        match &mut page.tex {
+            Some(t) => t.set(img, TextureOptions::LINEAR),
+            None => {
+                page.tex = Some(ctx.load_texture(
+                    format!("term_glyph_atlas_{pg}"),
+                    img,
+                    TextureOptions::LINEAR,
+                ));
+            }
+        }
+        page.uploaded = page.atlas.version;
+        page.tex.as_ref().unwrap().id()
+    }
+}
+
+/// 共享图集的键：物理字号（与 FONT_CACHE 同口径取整）+ 缩放因子比特。
+/// 字体链不进键（字节全等比较要 memcmp 20MB），改在命中后校验：同参不同链
+/// 极少见，宁可错开两份图集也不能错配字形。
+#[derive(PartialEq, Eq, Hash)]
+struct AtlasKey {
+    px: u32,
+    ppp_bits: u32,
+}
+
+/// 注册表条目：字体链（命中时校验）+ 图集弱引用。
+struct AtlasEntry {
+    sources: Vec<FontSource>,
+    atlas: Weak<Mutex<SharedAtlas>>,
+}
+
+type AtlasRegistry = HashMap<AtlasKey, AtlasEntry>;
+static SHARED_ATLASES: OnceLock<Mutex<AtlasRegistry>> = OnceLock::new();
+
+/// 字体链判等：Arc 同源直接比指针（进程级缓存里就是同一份），
+/// 否则退回字节全等（~20MB memcmp，只在建图集/开新页签时发生）。
+fn same_chain(a: &[FontSource], b: &[FontSource]) -> bool {
+    a.len() == b.len()
+        && a
+            .iter()
+            .zip(b)
+            .all(|(x, y)| x.1 == y.1 && (Arc::ptr_eq(&x.0, &y.0) || x.0 == y.0))
+}
+
+/// 取（或建）本进程该参数的共享图集。已有页签在用则复用同一份，
+/// 没有页签再持有的条目顺手回收（连带释放它的位图页与纹理）。
+fn shared_atlas(
+    sources: &[FontSource],
+    font_size_pt: f32,
+    ppp: f32,
+) -> Option<Arc<Mutex<SharedAtlas>>> {
+    if sources.is_empty() {
+        return None;
+    }
+    let key = AtlasKey { px: (font_size_pt * ppp) as u32, ppp_bits: ppp.to_bits() };
+    let reg = SHARED_ATLASES.get_or_init(|| Mutex::new(HashMap::new()));
+    // 中毒（页签渲染 panic 后 unwind 穿过加锁）也要能继续服务：取回内层即可。
+    let mut reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+    // 回收已无人持有的条目：Weak 失效 → 该键的位图页/纹理可以整体释放。
+    reg.retain(|_, e| e.atlas.strong_count() > 0);
+    if let Some(entry) = reg.get(&key)
+        && same_chain(&entry.sources, sources)
+        && let Some(hit) = entry.atlas.upgrade()
+    {
+        return Some(hit);
+    }
+    let atlas = Arc::new(Mutex::new(SharedAtlas::new(sources, font_size_pt, ppp)));
+    reg.insert(key, AtlasEntry { sources: sources.to_vec(), atlas: Arc::downgrade(&atlas) });
+    Some(atlas)
+}
+
+/// 共享图集句柄（Arc clone，零拷贝）。帧期间借它取访问权：
+/// 调用方须让句柄活到 TermFrame 之后（声明在帧之前即可自动满足）。
+#[derive(Clone)]
+pub struct AtlasHandle(Arc<Mutex<SharedAtlas>>);
+
+/// 页签私有的帧缓冲：静止帧 diff 哈希、quad 收集桶、已提交网格。
+/// 与共享图集无任何引用关系，故帧借用它不构成别名（见 TermFrame）。
+#[derive(Default)]
+struct TabBuffers {
+    /// 上一帧每格哈希（rows×cols，索引 vline*cols+col，未访问格保持 0）。
+    prev_hash: Vec<u64>,
+    /// 本帧哈希写入缓冲（跨帧复用分配）。
+    hash_scratch: Vec<u64>,
+    /// 本帧 quad 收集缓冲（跨帧复用分配），按页分桶。
+    quads: Vec<Vec<CellQuad>>,
+    /// 静止帧复用的已提交网格（纹理 id + Arc<Mesh>）。
+    meshes: Vec<(egui::TextureId, Arc<Mesh>)>,
+}
+
+/// 每页签的 GPU 批渲染句柄。`None` = 尚未初始化或初始化失败（整格走 galley 回落）。
+/// 字形位图与纹理在页签间共享（见 SHARED_ATLASES），本结构只留页签私有帧缓冲。
+pub struct TermGpu {
+    /// 进程级共享图集（同字体链 + 物理字号的所有页签共用一份）。
+    atlas: AtlasHandle,
+    /// 换图集所需的原始字体字节（Arc 共享，DPI 变化时用）。
+    sources: Vec<FontSource>,
+    font_size_pt: f32,
+    params_ppp: f32,
+    buf: TabBuffers,
+}
+
+impl TermGpu {
+    /// 从 egui 已注册的 Monospace 家族提取字体数据，挂到该参数的共享图集上。
+    /// 字体链为空返回 None（整格 galley 回落）。
+    pub fn new(ctx: &egui::Context, font_size_pt: f32, ppp: f32) -> Option<Self> {
+        let sources = cached_font_data(ctx); // 进程级零拷贝，见 FONT_DATA_CACHE
+        let atlas = AtlasHandle(shared_atlas(&sources, font_size_pt, ppp)?);
+        Some(Self {
+            atlas,
+            sources,
+            font_size_pt,
+            params_ppp: ppp,
+            buf: TabBuffers::default(),
+        })
+    }
+
+    /// 帧入口用的共享图集句柄。
+    pub fn atlas_handle(&self) -> AtlasHandle {
+        self.atlas.clone()
+    }
+
+    /// DPI/字号变化时改挂对应参数的共享图集（多数页签此时也挂在同一份上，
+    /// 天然互不重复）；其余情况原地复用。换图集后旧哈希基线与已提交网格
+    /// 全部作废（字形位图与纹理 id 都可能已换）。
+    pub fn ensure_params(&mut self, font_size_pt: f32, ppp: f32) {
+        if self.params_ppp == ppp && self.font_size_pt == font_size_pt {
+            return;
+        }
+        self.atlas =
+            AtlasHandle(shared_atlas(&self.sources, font_size_pt, ppp).expect("字体源非空"));
+        self.font_size_pt = font_size_pt;
+        self.params_ppp = ppp;
+        self.buf.prev_hash.clear();
+        self.buf.meshes.clear();
+        for q in &mut self.buf.quads {
+            q.clear();
+        }
+    }
+
+    /// 帧入口：哈希缓冲对齐 rows×cols、清空各页 quad 桶，并取一帧的图集访问权。
+    /// `handle` 须是本帧之前由 `atlas_handle()` 取出的同一份句柄（见其注释）。
+    pub fn begin_frame<'a>(
+        &'a mut self,
+        handle: &'a AtlasHandle,
+        rows: usize,
+        cols: usize,
+    ) -> TermFrame<'a> {
+        let needed = rows * cols;
+        if self.buf.hash_scratch.len() >= needed {
+            // 已有足够容量 → fill(0) 重置，无重分配。
+            self.buf.hash_scratch[..needed].fill(0);
+            self.buf.hash_scratch.truncate(needed);
+        } else {
+            self.buf.hash_scratch.clear();
+            self.buf.hash_scratch.resize(needed, 0);
+        }
+        for q in &mut self.buf.quads {
+            q.clear();
+        }
+        // 每帧一次锁（单 UI 线程、零竞争），之后逐格零锁开销。
+        let atlas = handle.0.lock().unwrap_or_else(|e| e.into_inner());
+        TermFrame { atlas, buf: &mut self.buf }
+    }
+}
+
+/// 一帧的图集访问权：共享图集（帧级独占 `&mut`）+ 本页签帧缓冲借用。
+/// 帧内所有字形/纹理访问都经它，逐格路径无锁；`end_frame` 后随作用域释放。
+pub struct TermFrame<'a> {
+    /// 共享图集的唯一访问路径（帧内独占可变借用）。
+    atlas: MutexGuard<'a, SharedAtlas>,
+    /// 本页签帧缓冲：与共享图集无引用关系，&mut 它够不到图集状态。
+    buf: &'a mut TabBuffers,
+}
+
+impl TermFrame<'_> {
+    /// 图集是否完全为空（尚未光栅化任何字形）。首帧预热据此判断。
+    pub fn is_empty(&self) -> bool {
+        self.atlas.is_empty()
+    }
+
+    /// 记录一格的静止帧 diff 哈希。
+    #[inline]
+    pub fn set_hash(&mut self, idx: usize, h: u64) {
+        self.buf.hash_scratch[idx] = h;
+    }
+
+    /// 查询/光栅化字形，返回 (页号, 槽位)。空槽（w==0）由调用方回落 galley。
+    #[inline]
+    pub fn glyph(&mut self, ch: char) -> (usize, GlyphSlot) {
+        self.atlas.glyph(ch)
+    }
+
+    /// 基线相对格子顶部的偏移（逻辑点）。
+    #[inline]
+    pub fn baseline_rel(&self, pg: usize, cell_h: f32) -> f32 {
+        self.atlas.baseline_rel(pg, cell_h)
+    }
+
+    /// 下划线相对格子顶部的偏移（逻辑点）。
+    #[inline]
+    pub fn underline_rel(&self, pg: usize, cell_h: f32) -> f32 {
+        self.atlas.underline_rel(pg, cell_h)
     }
 
     /// 往指定页收一个 quad（跨帧复用分配）。
     #[inline]
     pub fn push_quad(&mut self, pg: usize, q: CellQuad) {
-        if let Some(bucket) = self.quads.get_mut(pg) {
+        if let Some(bucket) = self.buf.quads.get_mut(pg) {
             bucket.push(q);
         }
     }
 
     /// 帧尾判定 + 网格组装。返回本帧应提交的 (纹理, Mesh) 列表；静止帧返回
     /// 上一帧的同一批 Arc（调用方 clone 后照常 add——egui 每帧都要画，
-    /// 省的是 CPU 侧 quad→mesh 组装）。
-    pub fn end_frame(&mut self, ctx: &egui::Context) -> &[(egui::TextureId, std::sync::Arc<Mesh>)] {
-        let changed = self.prev_hash != self.hash_scratch;
-        if changed {
-            self.prev_hash.clear();
-            self.prev_hash.extend_from_slice(&self.hash_scratch);
-            self.meshes.clear();
-            for (pi, page) in self.pages.iter().enumerate() {
-                if self.texs[pi].is_none() || self.tex_versions[pi] != page.version {
-                    self.texs[pi] = Some(ctx.load_texture(
-                        format!("term_glyph_atlas_{pi}"),
-                        page.image(),
-                        TextureOptions::LINEAR,
-                    ));
-                    self.tex_versions[pi] = page.version;
-                }
+    /// 省的是 CPU 侧 quad→mesh 组装）。纹理缺失或位图有新字形时原地重传
+    /// （共享纹理 id 不变，其他页签缓存的 mesh 继续有效）。
+    pub fn end_frame(&mut self, ctx: &egui::Context) -> &[(egui::TextureId, Arc<Mesh>)] {
+        if self.buf.prev_hash != self.buf.hash_scratch {
+            self.buf.prev_hash.clear();
+            self.buf.prev_hash.extend_from_slice(&self.buf.hash_scratch);
+            self.buf.meshes.clear();
+            for pg in 0..self.atlas.pages.len() {
                 // 空桶页跳过：该页无新字形，旧 mesh 继续有效。
-                if !self.quads[pi].is_empty() {
-                    let tid = self.texs[pi].as_ref().unwrap().id();
-                    self.meshes
-                        .push((tid, std::sync::Arc::new(build_mesh(&self.quads[pi], tid))));
-                }
+                let Some(quads) = self.buf.quads.get(pg).filter(|q| !q.is_empty()) else {
+                    continue;
+                };
+                let tid = self.atlas.page_texture(pg, ctx);
+                let mesh = build_mesh(quads, tid);
+                self.buf.meshes.push((tid, Arc::new(mesh)));
             }
         }
-        self.meshes.as_slice()
+        &self.buf.meshes
     }
 }
 
@@ -627,5 +824,103 @@ mod tests {
         let v = a.version;
         assert_eq!(a.glyph('\u{8BD5}').w, 0.0); // 试：仍空槽
         assert_eq!(a.version, v, "补链后不得再重复触发（lazy_done 置位）");
+    }
+
+    /// 测试用字体源（HACK 单链）。
+    fn hack_sources() -> Vec<FontSource> {
+        vec![(Arc::new(epaint_default_fonts::HACK_REGULAR.to_vec()), 0)]
+    }
+
+    /// 多页签共享：同（字体链, 物理字号）必须拿到同一份图集，一个页签光栅化
+    /// 的字形另一个页签直接命中——位图页（4MB/页）与纹理都不再按页签复制。
+    /// ppp 不同则必须分开（字形位图随物理像素变化，混用会错位/发虚）。
+    #[test]
+    fn shared_atlas_reused_across_tabs() {
+        let src = hack_sources();
+        let a = shared_atlas(&src, 14.0, 1.0).unwrap();
+        let b = shared_atlas(&src, 14.0, 1.0).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "同参页签应复用同一份共享图集");
+        a.lock().unwrap().glyph('A');
+        assert!(
+            b.lock().unwrap().glyph('A').1.w > 0.0,
+            "另一个页签应命中已光栅化的字形（零重复光栅化）"
+        );
+        let hi = shared_atlas(&src, 14.0, 2.0).unwrap();
+        assert!(!Arc::ptr_eq(&a, &hi), "ppp 不同必须另建图集");
+    }
+
+    /// 生命周期：最后一个页签关掉后共享图集整体释放（不留 4MB/页 常驻），
+    /// 再开页签时重建为空图集，而非复活旧页签的字形页。
+    #[test]
+    fn shared_atlas_released_after_last_tab_closes() {
+        let src = hack_sources();
+        let a = shared_atlas(&src, 15.0, 1.0).unwrap();
+        a.lock().unwrap().glyph('B');
+        let b = shared_atlas(&src, 15.0, 1.0).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        drop(a);
+        drop(b);
+        let c = shared_atlas(&src, 15.0, 1.0).unwrap();
+        assert!(c.lock().unwrap().is_empty(), "全部页签关闭后应重建空图集");
+    }
+
+    /// 纹理重传必须原地更新：位图多一个字形后 TextureId 依旧不变，
+    /// 否则其他页签缓存的 mesh 会指向已释放的纹理（渲染成空白/回退纹理）。
+    /// 位图无变化时则完全不产生上传 delta。
+    #[test]
+    fn texture_id_stable_and_skips_redundant_upload() {
+        let ctx = egui::Context::default();
+        let mut sh = SharedAtlas::new(&hack_sources(), 14.0, 1.0);
+        sh.glyph('A');
+        let id = sh.page_texture(0, &ctx);
+        // 吃掉首帧上传的 delta（未交给渲染器的 delta 不得丢弃，egui 会断言；
+        // 里面还有 egui 自己那张 1×1 纯白默认纹理，故只查本图集那一项）。
+        let mut first = ctx.tex_manager().write().take_delta();
+        assert!(first.set.contains_key(&id), "首帧应上传图集纹理");
+        first.clear();
+        // 无新字形 → 不重传。
+        assert_eq!(sh.page_texture(0, &ctx), id);
+        let mut none = ctx.tex_manager().write().take_delta();
+        assert!(
+            none.is_empty(),
+            "无新字形不应产生纹理上传"
+        );
+        none.clear();
+        // 新字形 → 原地重传，id 不变。
+        sh.glyph('B');
+        assert_eq!(sh.page_texture(0, &ctx), id, "重传后 TextureId 必须保持不变");
+        let mut delta = ctx.tex_manager().write().take_delta();
+        assert_eq!(delta.set.len(), 1, "新字形应重传该页一次");
+        assert!(delta.free.is_empty(), "共享纹理不得被释放（其他页签还在引用）");
+        delta.clear();
+    }
+
+    /// 页签级契约：两个页签共用一份共享图集（位图/纹理/光栅化都不按页签翻倍），
+    /// 但帧缓冲各自私有（静止帧哈希、quad 桶与已提交 mesh 都与本页签内容绑定，
+    /// 共享出去会串页）。
+    #[test]
+    fn term_gpus_share_atlas_but_not_buffers() {
+        let src = hack_sources();
+        let mk = || TermGpu {
+            atlas: AtlasHandle(shared_atlas(&src, 16.0, 1.0).unwrap()),
+            sources: src.clone(),
+            font_size_pt: 16.0,
+            params_ppp: 1.0,
+            buf: TabBuffers::default(),
+        };
+        let (mut a, mut b) = (mk(), mk());
+        assert!(Arc::ptr_eq(&a.atlas.0, &b.atlas.0), "两页签应共用同一份共享图集");
+        let (ha, hb) = (a.atlas_handle(), b.atlas_handle());
+        {
+            let mut fa = a.begin_frame(&ha, 2, 4);
+            assert!(fa.glyph('W').1.w > 0.0, "'W' 应光栅化成功");
+            fa.set_hash(3, 0xabcd);
+        }
+        // 帧缓冲私有：哈希只写进了 A 的缓冲（B 未开帧，仍为空）。
+        assert_eq!(a.buf.hash_scratch[3], 0xabcd);
+        assert!(b.buf.hash_scratch.is_empty() && b.buf.prev_hash.is_empty());
+        let mut fb = b.begin_frame(&hb, 1, 4);
+        assert!(!fb.is_empty(), "共享图集已含 'W'，B 页签无需再预热/重光栅化");
+        assert!(fb.glyph('W').1.w > 0.0, "B 页签应命中 A 已光栅化的字形");
     }
 }

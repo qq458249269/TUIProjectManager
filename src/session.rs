@@ -191,6 +191,8 @@ pub struct Session {
     /// snapshot_changed=false 时直接重放，跳过逐格渲染循环。
     pub cached_render_shapes: Option<Vec<egui::Shape>>,
     /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
+    /// 字形位图与纹理全进程共享（见 term_gl::SHARED_ATLASES），本字段只留
+    /// 本页签私有的帧缓冲，多页签不再各占一份 4MB 图集。
     pub gpu: Option<crate::term_gl::TermGpu>,
     /// 会话是否仍在启动中（首次有实际输出后置 false）。
     /// UI 线程据此显示旋转 ⚙️ 加载动画。

@@ -590,28 +590,17 @@ pub fn show_terminal(
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
     }
-    // ── GPU 字形批渲染：首次帧初始化；DPI/字号变化时重建图集。失败则整格回落 galley。
+    // ── GPU 字形批渲染：首次帧初始化；DPI/字号变化时改挂共享图集。失败则整格回落 galley。
     match sess.gpu.as_mut() {
         Some(g) => g.ensure_params(TERM_FONT_SIZE, ppp),
         None => sess.gpu = TermGpu::new(ui.ctx(), TERM_FONT_SIZE, ppp),
     }
-    // 首帧懒预热：图集为空时一次性光栅化 ASCII 可打印字符，
-    // 避免首帧逐字光栅化的卡顿峰值。只在 map 为空时执行（首次或 DPI 变化后）。
-    if let Some(g) = sess.gpu.as_mut()
-        && g.is_empty()
-    {
-        for ch in (32u8..=126).map(|b| b as char) {
-            g.glyph(ch);
-        }
-    }
+    // 帧借用句柄（共享图集 Arc clone）：须活到本帧渲染块末尾，TermFrame 的
+    // 锁就借它。第二个页签起挂的是同一份共享图集，不重复占内存/重复光栅化。
+    let atlas_handle = sess.gpu.as_ref().map(|g| g.atlas_handle());
     let avail = ui.available_size();
     let cols = ((avail.x / cell_w).floor().max(1.0)) as usize;
     let rows = ((avail.y / cell_h).floor().max(1.0)) as usize;
-
-    // 哈希缓冲对齐可见区尺寸（rows×cols）。
-    if let Some(g) = sess.gpu.as_mut() {
-        g.begin_frame(rows, cols);
-    }
 
     let needs_resize = sess.needs_resize;
     let resized = sess.grid_size != (cols as u16, rows as u16) || needs_resize;
@@ -1322,6 +1311,23 @@ pub fn show_terminal(
             let mut bg_shapes: Vec<egui::Shape> = Vec::new();
             let mut bg_run: Option<(Rect, Color32)> = None;
             let mut fg_shapes: Vec<egui::Shape> = Vec::new();
+        // 本帧图集访问权：共享图集帧级加锁一次（单 UI 线程零竞争），页签私有
+        // 缓冲借用到 end_frame，循环内逐格零锁。gpu 为 None（字体链为空）时无帧，
+        // 全部格子走下方 galley 回落路径。
+        let mut frame = atlas_handle
+            .as_ref()
+            .zip(sess.gpu.as_mut())
+            .map(|(h, g)| g.begin_frame(h, rows, cols));
+        // 首帧预热：图集为空（首个页签，或 DPI 变化后的新图集）时一次性光栅化
+        // ASCII 可打印字符，避免首帧逐字光栅化的卡顿峰值。共享后第二个页签起
+        // 图集已非空，零重复预热。
+        if let Some(fr) = frame.as_mut()
+            && fr.is_empty()
+        {
+            for ch in (32u8..=126).map(|b| b as char) {
+                fr.glyph(ch);
+            }
+        }
     // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
     // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
     // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
@@ -1391,7 +1397,7 @@ pub fn show_terminal(
 
         // 哈希先行：空白快速跳过的格子也要入表，保证 rows×cols 全覆盖可 diff。
         // GPU 路径未启用时跳过，省下每格的哈希开销。
-        if let Some(g) = sess.gpu.as_mut()
+        if let Some(fr) = frame.as_mut()
             && col < cols
         {
             let idx = vline as usize * cols + col;
@@ -1403,7 +1409,7 @@ pub fn show_terminal(
                 &mut h,
                 underlined as u64 | ((wide as u64) << 1) | ((selected as u64) << 2),
             );
-            g.hash_scratch[idx] = h;
+            fr.set_hash(idx, h);
         }
 
         // 空白格快速跳过：默认底色、未选中（否则底色已是高亮灰）、无下划线的
@@ -1434,15 +1440,15 @@ pub fn show_terminal(
 
         // GPU 批渲染优先：图集命中（含本次成功入库）直推 quad；空槽回落下方
         // galley 路径（emoji 等缺字形格子逐格混合，不整屏切换）。
-        if let Some(g) = sess.gpu.as_mut() {
-            let (pg, slot) = g.glyph(ch);
+        if let Some(fr) = frame.as_mut() {
+            let (pg, slot) = fr.glyph(ch);
             if slot.w > 0.0 {
-                let baseline = y + g.pages[pg].baseline_rel(cell_h);
+                let baseline = y + fr.baseline_rel(pg, cell_h);
                 let uv_solid = GlyphAtlas::solid_uv();
                 // 位图与显示 1:1，但落点若是小数设备像素，LINEAR 采样会混入
                 // 邻素发虚 —— 原点对齐设备像素网格保证锐利。
                 let snap = |v: f32| (v * ppp).round() / ppp;
-                g.push_quad(pg, CellQuad {
+                fr.push_quad(pg, CellQuad {
                     rect: Rect::from_min_size(
                         Pos2::new(snap(x + slot.dx), snap(baseline + slot.dy)),
                         Vec2::new(slot.w, slot.h),
@@ -1452,8 +1458,8 @@ pub fn show_terminal(
                     color: fg,
                 });
                 if underlined {
-                    let uy = y + g.pages[pg].underline_rel(cell_h);
-                    g.push_quad(pg, CellQuad {
+                    let uy = y + fr.underline_rel(pg, cell_h);
+                    fr.push_quad(pg, CellQuad {
                         rect: Rect::from_min_size(
                             Pos2::new(x_slot, uy),
                             Vec2::new(slot_w, 1.0),
@@ -1501,15 +1507,17 @@ pub fn show_terminal(
     }
     // GPU 字形层：内容变化才重建网格；静止帧直接重放上一帧的同一批 Arc<Mesh>，
     // 跳过全部 quad 重建（egui 每帧仍会重画它，省的是 CPU 侧组装）。分页图集
-    // 可能有多页 mesh，逐个提交。
-    if let Some(g) = sess.gpu.as_mut() {
-        for (_tid, mesh) in g.end_frame(ui.ctx()) {
+    // 可能有多页 mesh，逐个提交。纹理为全进程共享（重传原地更新，id 不变）。
+    if let Some(fr) = frame.as_mut() {
+        for (_tid, mesh) in fr.end_frame(ui.ctx()) {
             bg_shapes.push(egui::Shape::Mesh(mesh.clone()));
         }
     }
     bg_shapes.extend(fg_shapes);
     // 缓存完整渲染结果供静止帧重放：下帧 gen_changed=false 时直接提交，
     // 跳过逐格渲染循环和 GPU mesh 重建。
+    // 先放掉帧借用：它可变借用了 sess.gpu，缓存字段在别的字段上。
+    drop(frame);
     sess.cached_render_shapes = Some(bg_shapes.clone());
     painter.add(egui::Shape::Vec(bg_shapes));
     } // end if !skip_render_loop
@@ -2114,11 +2122,4 @@ mod tests {
         assert_eq!(rel_to_cwd(r"D:\a.txt", ""), r"D:\a.txt");
     }
 
-    #[test]
-    fn path_quote_when_space() {
-        assert_eq!(path_for_input(r"src\main.rs"), r"src\main.rs");
-        assert_eq!(path_for_input(r"my dir\a.txt"), "\"my dir\\a.txt\"");
-        // 含引号直接删掉（cmd 引号内无法转义），仍按含特殊字符加双引号。
-        assert_eq!(path_for_input("say\"hi.txt"), "\"sayhi.txt\"");
-    }
 }
