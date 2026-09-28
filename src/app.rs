@@ -1642,6 +1642,46 @@ fn fresh_tool_dir(spec: &ToolSpec) -> Option<PathBuf> {
     software_dir().map(|d| tool_fresh_dir_in(&d, spec))
 }
 
+/// 状态栏里一个工具该给什么下载入口。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ToolEntryKind {
+    /// 不给按钮（已是最新且本软件目录里也有，或没处可装）。
+    None,
+    /// 升级：装到该工具当前所在目录（它现在跑在哪就更新哪份）。
+    Update,
+    /// 装到本软件同级目录：本机没装，或装在别处（PATH / 别的配置路径）而
+    /// 本软件目录里没有 —— 后者也得给，否则这种机器上一个入口都没有。
+    InstallFresh,
+}
+
+/// 状态栏入口的判定（纯函数，便于单测）：
+/// `has_update` = 检查发现有新版；`missing` = 本机完全没检测到；
+/// `fresh_present` = 本软件同级目录里已经有一份；`fresh_dir_ok` = 同级目录可写
+/// （current_exe 取得到）。
+///
+/// 升级优先：有新版就更新现在跑的那份（换机器/改 PATH 都不会让用户丢配置）。
+/// 已是最新时仍保留“装到本软件目录”入口：把工具收一份在本软件旁边，之后
+/// 检查更新以这份为准，PATH 变了、全局安装被删都不影响。
+fn tool_entry_kind(
+    has_update: bool,
+    missing: bool,
+    fresh_present: bool,
+    fresh_dir_ok: bool,
+) -> ToolEntryKind {
+    if has_update {
+        return ToolEntryKind::Update;
+    }
+    if !fresh_dir_ok {
+        // 拿不到本软件目录 → 只有“有新版”才有地方可写。
+        return ToolEntryKind::None;
+    }
+    if missing || !fresh_present {
+        ToolEntryKind::InstallFresh
+    } else {
+        ToolEntryKind::None
+    }
+}
+
 /// 把缺失的同级默认路径补进配置（已存在的不动，用户改过的不会被覆写）。
 /// 返回 true = 配置有变化，需要落盘。
 fn fill_default_tool_paths(config: &mut config::Config) -> bool {
@@ -2871,15 +2911,28 @@ impl ClientApp {
     /// 备份旧 exe 为 .old → install_update 三段式替换 → 同步其余文件（pi）→
     /// 清理暂存。失败 3 秒后自动重试，坏源在 download_race 内已被剔除；用户
     /// 取消立即退出。
-    fn start_tool_download(&mut self, idx: usize) {
+    /// 起一个工具的下载/安装作业。`into_fresh=true` = 强制装进「本软件同级
+    /// 目录」（而不管状态里记的 install_dir 在哪）：用于「装到本软件目录」
+    /// 那条入口——本机 PATH 里那份不动，这里另装一份自锁版本（pi 进同名子
+    /// 目录，opencode 平铺）。取不到可写目录就不开工，不给假入口。
+    fn start_tool_download(&mut self, idx: usize, into_fresh: bool) {
         if self.tools[idx].downloading {
             return;
         }
         let spec = &TOOL_SPECS[idx];
-        let install_dir = self.tools[idx].install_dir.clone();
+        let install_dir = if into_fresh {
+            match fresh_tool_dir(spec) {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => return,
+            }
+        } else {
+            self.tools[idx].install_dir.clone()
+        };
         if install_dir.as_os_str().is_empty() {
             return;
         }
+        // 目标目录与状态保持一致：装完之后 Done/失败重来都指着同一个位置。
+        self.tools[idx].install_dir = install_dir.clone();
         // 本机未安装（missing）时 latest 为空，版本号由作业内现查。
         let tag = self.tools[idx].latest.clone();
         self.tools[idx].downloading = true;
@@ -4233,10 +4286,10 @@ impl ClientApp {
             // 同一套交互，横向只占一颗按钮的宽度。
             // 先收集待点击的工具下标再统一下载：本循环持 self.tools 的不可变
             // 借用，start_tool_download 要 &mut self。
-            let mut tool_click: Option<usize> = None;
+            let mut tool_click: Option<(usize, bool)> = None;
             let mut tool_cancel_click: Option<usize> = None;
-            // (工具下标, 是否下载中, 按钮文案, 悬停说明)
-            let mut tool_rows: Vec<(usize, bool, String, String)> = Vec::new();
+            // (工具下标, 是否下载中, 按钮文案, 悬停说明, 是否装进“本软件目录”)
+            let mut tool_rows: Vec<(usize, bool, String, String, bool)> = Vec::new();
             for (i, t) in self.tools.iter().enumerate() {
                 let spec = &TOOL_SPECS[i];
                 let (downloading, latest, local, missing, dir) = (
@@ -4246,18 +4299,31 @@ impl ClientApp {
                     t.missing,
                     t.install_dir.clone(),
                 );
+                // 本软件同级目录里已经有一份？决定要不要再给「装到本软件目录」。
+                let fresh_dir = fresh_tool_dir(spec);
+                let fresh_present = fresh_dir
+                    .as_ref()
+                    .is_some_and(|d| d.join(spec.exe_name).is_file());
                 if downloading {
                     tool_rows.push((
                         i,
                         true,
                         format!("⬇ {} 下载中…", spec.label),
                         format!("正在从镜像源下载并安装 {}", spec.label),
+                        false,
                     ));
                 } else {
-                    // 按钮存在的三种情形：已装且有新版 / 未装但已拿到 tag /
-                    // 未装且 tag 未知（点下去时现查），后者要求目录可用。
-                    let (label, tip) = match (&latest, missing) {
-                        (Some(tag), false) => {
+                    // 按钮存在的四种情形：已装且有新版 / 未装但已拿到 tag /
+                    // 未装且 tag 未知（点下去时现查）/ **已装在别处、本软件目录
+                    // 里没有**（装一份进来）。后两种要求目录可用。
+                    let (label, tip, into_fresh) = match tool_entry_kind(
+                        latest.is_some() && !missing,
+                        missing,
+                        fresh_present,
+                        fresh_dir.as_ref().is_some_and(|d| !d.as_os_str().is_empty()),
+                    ) {
+                        ToolEntryKind::Update => {
+                            let tag = latest.clone().unwrap_or_default();
                             let cur = if local.is_empty() { "未知".to_string() } else { local.clone() };
                             (
                                 format!("⬇ {} {tag}", spec.label),
@@ -4266,9 +4332,10 @@ impl ClientApp {
                                     label = spec.label,
                                     exe = spec.exe_name
                                 ),
+                                false,
                             )
                         }
-                        (_, true) => {
+                        ToolEntryKind::InstallFresh if missing => {
                             let dir_s = dir.to_string_lossy().into_owned();
                             (
                                 match &latest {
@@ -4279,21 +4346,52 @@ impl ClientApp {
                                     "未检测到 {exe}（本软件同级目录 / 设置里的工具路径 / PATH 都没有）：点击自动下载并安装到 {dir_s}",
                                     exe = spec.exe_name
                                 ),
+                                true,
                             )
                         }
-                        _ => continue,
+                        // 本机 PATH / 别的目录里有，但本软件同级目录里没有：
+                        // “检测到即已装”会让这种机器上一个按钮都没有，用户没
+                        // 办法把工具收进本软件目录（换机器、PATH 被改、全局
+                        // 安装被删就断供）。给一条“装到本软件目录”，装好后本
+                        // 软件目录这份优先被找到（查找顺序里它在最前），按钮自退。
+                        ToolEntryKind::InstallFresh => {
+                            let d_s = fresh_dir
+                                .as_ref()
+                                .map(|d| d.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let cur = if local.is_empty() {
+                                "未知".to_string()
+                            } else {
+                                local.clone()
+                            };
+                            (
+                                format!("⬇ 装 {} 到本软件目录", spec.label),
+                                format!(
+                                    "本机在 {found} 找到 {label}（{cur}），但本软件同级目录里没有：点击另装一份到 {d_s}，之后检查更新以本软件目录这份为准",
+                                    found = dir.join(spec.exe_name).to_string_lossy(),
+                                    label = spec.label
+                                ),
+                                true,
+                            )
+                        }
+                        // 拿不到本软件目录（current_exe 失败）→ 无处可装，不给假入口
+                        ToolEntryKind::None => continue,
                     };
-                    if dir.as_os_str().is_empty() {
+                    if into_fresh {
+                        if fresh_dir.as_ref().is_none_or(|d| d.as_os_str().is_empty()) {
+                            continue;
+                        }
+                    } else if dir.as_os_str().is_empty() {
                         continue; // 拿不到安装目录 → 无处可装，不给假入口
                     }
-                    tool_rows.push((i, false, label, tip));
+                    tool_rows.push((i, false, label, tip, into_fresh));
                 }
             }
             // 渲染：1 条直接摊开；≥2 条收进「⋯」式弹出菜单。
             match tool_rows.len() {
                 0 => {}
                 1 => {
-                    let (i, downloading, label, tip) = tool_rows.remove(0);
+                    let (i, downloading, label, tip, into_fresh) = tool_rows.remove(0);
                     let spec = &TOOL_SPECS[i];
                     ui.separator();
                     if downloading {
@@ -4308,7 +4406,7 @@ impl ClientApp {
                             tool_cancel_click = Some(i);
                         }
                     } else if ui.button(label).on_hover_text(tip).clicked() {
-                        tool_click = Some(i);
+                        tool_click = Some((i, into_fresh));
                     }
                 }
                 n => {
@@ -4323,7 +4421,7 @@ impl ClientApp {
                         "{n} 个工具有安装/升级待办（点开逐条选，与「⋯ 更多」同一套交互）：{}",
                         tool_rows
                             .iter()
-                            .map(|(_, _, l, _)| l.as_str())
+                            .map(|(_, _, l, _, _)| l.as_str())
                             .collect::<Vec<_>>()
                             .join(" / ")
                     );
@@ -4339,7 +4437,7 @@ impl ClientApp {
                         .show(|ui| {
                             ui.label(RichText::new("pi / opencode 安装与升级").strong().small());
                             ui.separator();
-                            for (i, downloading, label, tip) in &tool_rows {
+                            for (i, downloading, label, tip, into_fresh) in &tool_rows {
                                 ui.horizontal(|ui| {
                                     let spec = &TOOL_SPECS[*i];
                                     if *downloading {
@@ -4359,7 +4457,7 @@ impl ClientApp {
                                         .on_hover_text(tip.clone())
                                         .clicked()
                                     {
-                                        tool_click = Some(*i);
+                                        tool_click = Some((*i, *into_fresh));
                                         ui.close();
                                     }
                                 });
@@ -4371,8 +4469,8 @@ impl ClientApp {
                 self.tool_cancel[i].store(true, Ordering::Relaxed);
                 self.status = Some(format!("正在取消 {} 下载…", TOOL_SPECS[i].label));
             }
-            if let Some(i) = tool_click {
-                self.start_tool_download(i);
+            if let Some((i, into_fresh)) = tool_click {
+                self.start_tool_download(i, into_fresh);
             }
             // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
             if self.update_done {
@@ -6379,13 +6477,12 @@ impl eframe::App for ClientApp {
                             TOOL_SPECS[idx].label
                         ));
                         if self.status.as_deref().is_none_or(|s| s.is_empty()) {
-                            // 短句：安装路径在按钮悬停里说（消息过长会挤掉状态栏
-                            // 右侧的下载/检查更新按钮）。
+                            // 点下去才发现按钮不在（多条时收进了「⬇ 工具 N」菜单）。
                             self.status = Some(if dir.is_empty() {
                                 format!("未检测到 {}，请手动安装", TOOL_SPECS[idx].label)
                             } else {
                                 format!(
-                                    "未检测到 {label}，点右侧「⬇ 安装 {label}」",
+                                    "未检测到 {label}，点右侧按钮装到本软件目录",
                                     label = TOOL_SPECS[idx].label
                                 )
                             });
@@ -7140,6 +7237,29 @@ mod update_tests {
         assert_eq!(local_version_with_floor("1.0.0", Some("0.9.1")), "1.0.0");
         // 没装过（installed=None）就认 --version 的，哪怕它读不出来。
         assert_eq!(local_version_with_floor("", None), "");
+    }
+
+    /// TEMP-DIAG-REMOVED
+    /// 状态栏工具入口的判定：升级优先；已是最新但本软件目录里没有那份时，
+    /// 仍给「装到本软件目录」（否则 PATH 里那份会让这台机器一个入口都没有，
+    /// 实测就是“pi 在 PATH 上 → 永远不出现安装按钮”）；同级目录不可写时不
+    /// 给假入口。
+    #[test]
+    fn tool_entry_kind_covers_install_fresh() {
+        use super::{tool_entry_kind, ToolEntryKind as K};
+        // 有新版 → 更新当前所在目录那份
+        assert_eq!(tool_entry_kind(true, false, false, true), K::Update);
+        assert_eq!(tool_entry_kind(true, true, false, true), K::Update);
+        // 完全没装 → 装到本软件目录
+        assert_eq!(tool_entry_kind(false, true, false, true), K::InstallFresh);
+        // 装在别处（PATH / 别的配置路径），本软件目录里没有 → 也给入口
+        assert_eq!(tool_entry_kind(false, false, false, true), K::InstallFresh);
+        // 本软件目录里已经有了且无新版 → 不给
+        assert_eq!(tool_entry_kind(false, false, true, true), K::None);
+        assert_eq!(tool_entry_kind(false, true, true, true), K::InstallFresh);
+        // 拿不到本软件目录（current_exe 失败）→ 无处可装，不给假入口
+        assert_eq!(tool_entry_kind(false, true, false, false), K::None);
+        assert_eq!(tool_entry_kind(false, false, false, false), K::None);
     }
 
     /// 自动配置启动命令时挑哪一条顶替：同义（按 tui_command_key）里只挑能**整体
