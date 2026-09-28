@@ -1498,6 +1498,12 @@ struct ToolSpec {
     /// 只换 exe 会与新版本对不上；opencode 的 zip 只含 exe，无需同步。
     /// 同步是**覆盖式**（不删旧文件），用户自装的 node_modules/扩展不受影响。
     sync_tree: bool,
+    /// **未安装**时（同级目录/配置路径/PATH 都没找到 exe）新装到哪：true = 装进
+    /// `<软件目录>\<工具名>\` 子目录，false = 平铺在软件同级目录。
+    /// pi 的 zip 含整棵程序树（assets/native/theme/docs/node_modules…），平铺会把
+    /// 软件目录弄脏、还和本软件的文件混在一起，故走子目录；opencode 的 zip 只含
+    /// 一个 exe，平铺即可（也与「D:\agent\opencode.exe」的既有摆法一致）。
+    fresh_in_subdir: bool,
 }
 
 const TOOL_SPECS: &[ToolSpec] = &[
@@ -1508,6 +1514,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
         exe_name: "pi.exe",
         asset_tpls: &["pi-windows-{arch}.zip"],
         sync_tree: true,
+        fresh_in_subdir: true,
     },
     ToolSpec {
         id: "opencode",
@@ -1520,6 +1527,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "opencode-windows-{arch}-baseline.zip",
         ],
         sync_tree: false,
+        fresh_in_subdir: false,
     },
 ];
 
@@ -1563,7 +1571,8 @@ struct ToolState {
     latest: Option<String>,
     /// 正在下载/解压/替换。
     downloading: bool,
-    /// PATH 里没找到 exe：没有安装目录可写，不给下载入口。
+    /// 本机未检测到该工具（软件同级目录 / 配置路径 / PATH 都没有）：状态栏出
+    /// 「⬇ 安装」按钮，装到 install_dir（软件同级目录），版本号点下去时现查。
     missing: bool,
     /// exe 所在目录（= 解压暂存、临时 zip、.old 备份都落在这里，同卷 rename）。
     install_dir: PathBuf,
@@ -1609,6 +1618,23 @@ fn sibling_tool_paths() -> Vec<PathBuf> {
         out.push(dir.join(spec.id).join(spec.exe_name));
     }
     out
+}
+
+/// 未安装时的新装目录（纯函数，便于单测）：pi 进 `<软件目录>\pi\`，
+/// opencode 平铺在软件同级目录。
+fn tool_fresh_dir_in(app_dir: &Path, spec: &ToolSpec) -> PathBuf {
+    if spec.fresh_in_subdir {
+        app_dir.join(spec.id)
+    } else {
+        app_dir.to_path_buf()
+    }
+}
+
+/// 未安装时的新装目录（运行期版）：以本软件 exe 所在目录为根，全部由
+/// current_exe 推得，不含任何硬编码盘符。current_exe 取不到（理论上不会）时
+/// 返回 None —— 没有目录可装，UI 也就不会给出安装入口。
+fn fresh_tool_dir(spec: &ToolSpec) -> Option<PathBuf> {
+    software_dir().map(|d| tool_fresh_dir_in(&d, spec))
 }
 
 /// 把缺失的同级默认路径补进配置（已存在的不动，用户改过的不会被覆写）。
@@ -1972,13 +1998,15 @@ fn sync_tree(stage: &Path, install_dir: &Path, skip_name: &str) -> usize {
 
 /// 检查单个工具（pi / opencode）的新版本：按 tool_dirs（默认本软件所在目录）
 /// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源并发探查拿
-/// 最新 tag → version_newer 比较。找不到 exe（未安装）时只报状态、不给下载
-/// 入口：没有安装目录可写。
+/// 最新 tag → version_newer 比较。找不到 exe（未安装）时**仍然给出下载入口**：
+/// 安装目录取「软件同级目录」（pi 走同名子目录），latest 留空由下载作业自己
+/// 解析最新 tag（这样即便检查时网络不通也还有安装按钮，不用等下次检查）。
 fn check_tool_update(idx: usize, dirs: Vec<PathBuf>, use_path: bool) -> ToolEvent {
     let spec = &TOOL_SPECS[idx];
     let Some(exe) = find_tool_exe(spec, &dirs, use_path) else {
+        let install_dir = fresh_tool_dir(spec).unwrap_or_default();
         log_update(&format!(
-            "检查更新 {}: 目录 {dirs:?}{} 中均未找到 {}",
+            "检查更新 {}: 目录 {dirs:?}{} 中均未找到 {}，改为提供一键安装到 {install_dir:?}",
             spec.label,
             if use_path { " 与 PATH" } else { "" },
             spec.exe_name
@@ -1986,7 +2014,7 @@ fn check_tool_update(idx: usize, dirs: Vec<PathBuf>, use_path: bool) -> ToolEven
         return ToolEvent::Checked {
             local: String::new(),
             latest: None,
-            install_dir: PathBuf::new(),
+            install_dir,
             missing: true,
         };
     };
@@ -2029,9 +2057,12 @@ fn check_tool_update(idx: usize, dirs: Vec<PathBuf>, use_path: bool) -> ToolEven
 /// 连续失败超过 MAX_TOOL_ATTEMPTS 次收手（自更新是无限重试，工具这边多了
 /// 一次就要重下 60MB 压缩包，不宜无限烧流量）。取消信号置位立即退出。
 /// 事件通过 tool_tx 报回 UI。
+///
+/// tag 传 None = 本机还没装（检查时未检测到），版本号在作业内现查；这样即使
+/// 检查更新时网络不通、没拿到 tag，状态栏那个「⬇ 安装」按钮照样能用。
 fn run_tool_update(
     idx: usize,
-    tag: String,
+    mut tag: Option<String>,
     install_dir: PathBuf,
     progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2045,6 +2076,15 @@ fn run_tool_update(
         let _ = tx.send((idx, ToolEvent::Status(format!("{label}: {msg}"))));
         let _ = redraw_tx.try_send(());
     };
+    if install_dir.as_os_str().is_empty() {
+        sink("没有可写入的安装目录，已放弃");
+        return;
+    }
+    // 首次安装（pi 装进 <软件目录>\pi\）时目录还不存在，先建好。
+    if let Err(e) = std::fs::create_dir_all(&install_dir) {
+        sink(&format!("创建安装目录 {install_dir:?} 失败: {e}"));
+        return;
+    }
     let stage = install_dir.join(format!(".{}-update-stage", spec.id));
     // 上次若因「被占用」没装上，暂存里已留有解好的 exe：校验通过就别再重下
     // 60MB 压缩包，直接进替换（用户只需先关掉占用的进程再点一次按钮）。
@@ -2066,13 +2106,32 @@ fn run_tool_update(
             ));
             return;
         }
+        // 0) 本机没装过（tag 为空）→ 现在查最新版本号；与下载同属网络环节，
+        //    同样按 3 秒节奏重试、共用 MAX_TOOL_ATTEMPTS 的封顶。
+        if tag.is_none() {
+            match fetch_latest_tag(spec.repo) {
+                Ok(t) => {
+                    sink(&format!("正在安装 {t}…"));
+                    tag = Some(t);
+                }
+                Err(e) => {
+                    sink(&format!(
+                        "查询最新版本号未成功（第 {attempt} 次）: {e}，3 秒后自动重试…"
+                    ));
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    attempt += 1;
+                    continue;
+                }
+            }
+        }
+        let tag = tag.as_deref().unwrap_or_default();
         // 1) 下载 zip（镜像并发竞速，产物 looks_like_zip 校验）；复用暂存时跳过。
         let zip: Option<std::path::PathBuf> = if reuse {
             reuse = false;
             sink("复用上次已解压的文件，直接重试替换…");
             None
         } else {
-            match download_tool_archive(spec, &tag, &install_dir, &progress_tx, &cancel) {
+            match download_tool_archive(spec, tag, &install_dir, &progress_tx, &cancel) {
                 Ok((zip, _total)) => Some(zip),
                 Err(e) => {
                     if cancel.load(Ordering::Relaxed) {
@@ -2123,6 +2182,8 @@ fn run_tool_update(
         }
         let final_exe = install_dir.join(spec.exe_name);
         let old_exe = install_dir.join(format!("{}.old", spec.exe_name));
+        // 首次安装（本机之前没有这个 exe）：没有 .old 可备份，完成文案也换一套。
+        let first_install = !final_exe.is_file();
         // copy 目标已存在则直接覆盖（.old 始终保留最近一版旧程序），失败不阻断替换。
         // 提示语不能含「失败」字样：自更新 UI 按关键字复位 downloading 状态。
         if let Err(e) = std::fs::copy(&final_exe, &old_exe) {
@@ -2147,7 +2208,13 @@ fn run_tool_update(
                 let _ = tx.send((
                     idx,
                     ToolEvent::Done {
-                        msg: format!("{label} 已更新到 {tag}，重新启动 {label} 即可生效"),
+                        msg: if first_install {
+                            format!(
+                                "{label} {tag} 已安装到 {final_exe:?}，可在「⚙ 设置」里把它加为启动命令"
+                            )
+                        } else {
+                            format!("{label} 已更新到 {tag}，重新启动 {label} 即可生效")
+                        },
                         // 直接采信装上去的 tag，不再去跑 `--version`：某些版本
                         // 改了输出格式抠不出数字，那样按钮会永远停在“有新版本”。
                         version: tag.trim_start_matches('v').to_string(),
@@ -2781,15 +2848,13 @@ impl ClientApp {
         dirs
     }
 
-    /// 后台下载并安装单个工具的新版本。流程与自更新同构：镜像竞速下 zip 到
-    /// .new → 解压到暂存目录 → 备份旧 exe 为 .old → install_update 三段式
-    /// 替换 → 同步其余文件（pi）→ 清理暂存。失败 3 秒后自动重试，坏源在
-    /// download_race 内已被剔除；用户取消立即退出。
+    /// 后台下载并安装单个工具的新版本（tag 为空 = 本机没装过，装到软件同级
+    /// 目录）。流程与自更新同构：镜像竞速下 zip 到 .new → 解压到暂存目录 →
+    /// 备份旧 exe 为 .old → install_update 三段式替换 → 同步其余文件（pi）→
+    /// 清理暂存。失败 3 秒后自动重试，坏源在 download_race 内已被剔除；用户
+    /// 取消立即退出。
     fn start_tool_download(&mut self, idx: usize) {
-        let Some(tag) = self.tools[idx].latest.clone() else {
-            return;
-        };
-        if self.tools[idx].downloading || self.tools[idx].missing {
+        if self.tools[idx].downloading {
             return;
         }
         let spec = &TOOL_SPECS[idx];
@@ -2797,12 +2862,18 @@ impl ClientApp {
         if install_dir.as_os_str().is_empty() {
             return;
         }
+        // 本机未安装（missing）时 latest 为空，版本号由作业内现查。
+        let tag = self.tools[idx].latest.clone();
         self.tools[idx].downloading = true;
         self.tools[idx].latest = None;
         // 记住本轮在装的 tag：作业结束（失败/取消/被占用）时用它把下载按钮
-        // 重新点亮，用户可以直接再点一次重试，而不必等下次「检查更新」。
-        self.tools[idx].pending_tag = Some(tag.clone());
-        self.status = Some(format!("正在下载 {} {tag}…", spec.label));
+        // 重新点亮，用户可直接再点一次重试，而不必等下次「检查更新」。
+        // 首次安装没有 tag（None）——按钮靠 missing 标记继续显示。
+        self.tools[idx].pending_tag = tag.clone();
+        self.status = Some(match &tag {
+            Some(t) => format!("正在下载 {} {t}…", spec.label),
+            None => format!("正在下载安装 {}…", spec.label),
+        });
         self.tool_cancel[idx].store(false, Ordering::Relaxed);
         let (ptx, prx) = std::sync::mpsc::channel();
         let cancel = self.tool_cancel[idx].clone();
@@ -4113,12 +4184,20 @@ impl ClientApp {
             }
             // pi / opencode 的下载按钮：有新版本就各出一个，与自更新按钮同一套
             // 交互（点一下即后台下载 + 替换，可取消）。下载中显示进度文字。
+            // **本机未检测到**（软件同级目录 / 配置路径 / PATH 都没有）时也出
+            // 按钮，只是文案变成「安装」——点一下就把最新版装到同级目录。
             // 先收集待点击的工具下标再统一起下载：本循环持 self.tools 的不可变
             // 借用，start_tool_download 要 &mut self。
             let mut tool_click: Option<usize> = None;
             for (i, t) in self.tools.iter().enumerate() {
                 let spec = &TOOL_SPECS[i];
-                let (downloading, latest, local) = (t.downloading, t.latest.clone(), t.local.clone());
+                let (downloading, latest, local, missing, dir) = (
+                    t.downloading,
+                    t.latest.clone(),
+                    t.local.clone(),
+                    t.missing,
+                    t.install_dir.clone(),
+                );
                 if downloading {
                     ui.separator();
                     ui.label(
@@ -4134,22 +4213,41 @@ impl ClientApp {
                         self.tool_cancel[i].store(true, Ordering::Relaxed);
                         self.status = Some(format!("正在取消 {} 下载…", spec.label));
                     }
-                } else if let Some(tag) = latest {
-                    ui.separator();
-                    let cur = if local.is_empty() {
-                        "未知".to_string()
-                    } else {
-                        local
+                } else {
+                    // 按钮存在的三种情形：已装且有新版 / 未装但已拿到 tag /
+                    // 未装且 tag 未知（点下去时现查），后者要求目录可用。
+                    let (label, tip) = match (&latest, missing) {
+                        (Some(tag), false) => {
+                            let cur = if local.is_empty() { "未知".to_string() } else { local.clone() };
+                            (
+                                format!("⬇ {} {tag}", spec.label),
+                                format!(
+                                    "{label} 有新版本 {tag}（当前 {cur}）：点击从国内镜像源下载并替换 {exe}",
+                                    label = spec.label,
+                                    exe = spec.exe_name
+                                ),
+                            )
+                        }
+                        (_, true) => {
+                            let dir_s = dir.to_string_lossy().into_owned();
+                            (
+                                match &latest {
+                                    Some(tag) => format!("⬇ 安装 {} {tag}", spec.label),
+                                    None => format!("⬇ 安装 {}", spec.label),
+                                },
+                                format!(
+                                    "未检测到 {exe}（本软件同级目录 / 设置里的工具路径 / PATH 都没有）：点击自动下载并安装到 {dir_s}",
+                                    exe = spec.exe_name
+                                ),
+                            )
+                        }
+                        _ => continue,
                     };
-                    if ui
-                        .button(format!("⬇ {} {tag}", spec.label))
-                        .on_hover_text(format!(
-                            "{label} 有新版本 {tag}（当前 {cur}）：点击从国内镜像源下载并替换 {exe}",
-                            label = spec.label,
-                            exe = spec.exe_name
-                        ))
-                        .clicked()
-                    {
+                    if dir.as_os_str().is_empty() {
+                        continue; // 拿不到安装目录 → 无处可装，不给假入口
+                    }
+                    ui.separator();
+                    if ui.button(label).on_hover_text(tip).clicked() {
                         tool_click = Some(i);
                     }
                 }
@@ -6004,14 +6102,27 @@ impl eframe::App for ClientApp {
                         continue;
                     }
                     if missing {
-                        // 未安装就没有下载入口（没目录可写），只在状态栏提一句。
+                        // 未检测到：不抢已有状态栏文案（检查是静默触发的，不扰民），
+                        // 但工具状态要收干净——由 missing 标记在状态栏持续给出
+                        // 「⬇ 安装」按钮（版本号在点下去时现查）。
                         self.tools[idx].latest = None;
                         self.tools[idx].downloading = false;
+                        let dir = self.tools[idx].install_dir.to_string_lossy().into_owned();
                         log_update(&format!(
-                            "检查更新 {} 未安装（PATH 中无 {}）",
-                            TOOL_SPECS[idx].label,
-                            TOOL_SPECS[idx].exe_name
+                            "检查更新 {} 未安装，下载入口装到 {dir}",
+                            TOOL_SPECS[idx].label
                         ));
+                        if self.status.as_deref().is_none_or(|s| s.is_empty()) {
+                            self.status = Some(if dir.is_empty() {
+                                format!("未检测到 {}，请手动安装", TOOL_SPECS[idx].label)
+                            } else {
+                                format!(
+                                    "未检测到 {label}（同级目录无 {exe}）：点击状态栏「⬇ 安装 {label}」自动装到 {dir}",
+                                    label = TOOL_SPECS[idx].label,
+                                    exe = TOOL_SPECS[idx].exe_name
+                                )
+                            });
+                        }
                     } else {
                         self.tools[idx].latest = latest.clone();
                         // 找到新版本才占用状态栏（已是最新时保持现状，不扰民）。
@@ -6046,14 +6157,18 @@ impl eframe::App for ClientApp {
                     self.tools[idx].local = version;
                     self.tools[idx].latest = None;
                     self.tools[idx].pending_tag = None;
+                    // 首次安装也是 Done：此刻 exe 已在安装目录里，不再是「未安装」，
+                    // 状态栏那个「⬇ 安装」按钮自行退场。
+                    self.tools[idx].missing = false;
                     self.status = Some(msg);
                 }
                 ToolEvent::Finished => {
                     self.tools[idx].downloading = false;
                     // 非成功结束（取消/被占用/重试到顶）：把下载按钮重新点亮，
                     // 用户可直接再点一次重试。Done 已在上面清了 pending_tag，
-                    // 所以不会在这里把刚装好的版本又标成“有新版本”。
-                    if self.tools[idx].pending_tag.is_some() && !self.tools[idx].missing {
+                    // 所以不会在这里把刚装好的版本又标成“有新版本”。未安装
+                    // （missing）时按钮本就常在，pending_tag 为空也不影响。
+                    if self.tools[idx].pending_tag.is_some() {
                         self.tools[idx].latest = self.tools[idx].pending_tag.clone();
                     }
                     self.tools[idx].pending_tag = None;
@@ -6543,7 +6658,7 @@ mod vscode_tests {
 mod update_tests {
     use super::{
         assets_from_html, exe_asset_from_html, extract_zip, parse_version_token, sync_tree, tar_bin,
-        tool_exe_candidates, version_newer, win_arch, ClientApp, TOOL_SPECS,
+        tool_exe_candidates, tool_fresh_dir_in, version_newer, win_arch, ClientApp, TOOL_SPECS,
     };
     use std::path::PathBuf;
 
@@ -6695,6 +6810,30 @@ mod update_tests {
         );
         // 不给目录也不给 PATH（如 current_exe 失败且关了 PATH）→ 无候选。
         assert!(tool_exe_candidates("pi.exe", "pi", &[], None).is_empty());
+    }
+
+    /// 未安装时的新装目录：pi 进 <软件目录>\pi\（zip 含整棵程序树，平铺会把
+    /// 软件目录弄脏），opencode 平铺在软件同级目录（zip 只含 exe）。且新装位置
+    /// 必须是查找顺序能命中的摆法，否则装完下次检查仍报「未安装」。
+    #[test]
+    fn fresh_install_dir_keeps_app_dir_clean() {
+        let app = PathBuf::from(r"D:\soft\TUIProjectManager");
+        let pi = TOOL_SPECS.iter().find(|s| s.id == "pi").unwrap();
+        let oc = TOOL_SPECS.iter().find(|s| s.id == "opencode").unwrap();
+        assert_eq!(
+            tool_fresh_dir_in(&app, pi),
+            PathBuf::from(r"D:\soft\TUIProjectManager\pi")
+        );
+        assert_eq!(tool_fresh_dir_in(&app, oc), app);
+        for spec in [pi, oc] {
+            let dir = tool_fresh_dir_in(&app, spec);
+            let cands = tool_exe_candidates(spec.exe_name, spec.id, &[dir], None);
+            assert!(
+                cands.iter().any(|c| *c == app.join(spec.id).join(spec.exe_name)),
+                "{id}: 新装位置不在查找候选里",
+                id = spec.id
+            );
+        }
     }
 
     #[test]
