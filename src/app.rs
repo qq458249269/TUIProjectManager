@@ -1584,20 +1584,113 @@ impl ToolState {
     }
 }
 
-/// 在 PATH 的各个目录里找 exe（手动扫目录，不 spawn `where`——GUI 程序 spawn
-/// 控制台程序会闪黑窗；顺带避开 Git 自带 where.exe 的行为差异）。
-fn find_exe_on_path(exe_name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let cand = dir.join(exe_name);
-        if cand.is_file() {
-            return Some(cand);
+/// 本软件 exe 所在目录（current_exe 的父目录；current_exe 可能是 unlock_exe
+/// 改名后的 {name}.running 锁名，父目录一致，仍走 canonical_exe_path 归一）。
+/// 没有任何硬编码路径：「打开软件目录」与工具查找都以它为准。
+fn software_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(ClientApp::canonical_exe_path)
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// 本软件同级目录下 pi / opencode 的**预期路径**（逐工具两种摆法：
+/// `<软件目录>\pi.exe` 与 `<软件目录>\pi\pi.exe`），全部由 current_exe 推得，
+/// 不含任何硬编码盘符——换机器/换安装位置自动跟着变。这些路径即使当前不存
+/// 在也照样写进配置（用户事后把 exe 丢进去就能被找到）；真正决定“显不显示
+/// 下载按钮”的是检查时该文件是否真存在。
+fn sibling_tool_paths() -> Vec<PathBuf> {
+    let Some(dir) = software_dir() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for spec in TOOL_SPECS {
+        out.push(dir.join(spec.exe_name));
+        out.push(dir.join(spec.id).join(spec.exe_name));
+    }
+    out
+}
+
+/// 把缺失的同级默认路径补进配置（已存在的不动，用户改过的不会被覆写）。
+/// 返回 true = 配置有变化，需要落盘。
+fn fill_default_tool_paths(config: &mut config::Config) -> bool {
+    let defaults = sibling_tool_paths();
+    if defaults.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for p in defaults {
+        let s = p.to_string_lossy().to_string();
+        if !config.settings.tool_paths.iter().any(|d| d == &s) {
+            config.settings.tool_paths.push(s);
+            changed = true;
         }
     }
-    None
+    changed
+}
+
+/// 工具 exe 的查找顺序（先到先用，同路径只留一条）：
+///  1) 调用方给的条目（默认本软件所在目录 + 配置里的路径）：每一项可以是
+///     **exe 完整路径**（文件名为当前工具的 exe 才收，否则跳过——同一列表里
+///     混着 pi / opencode 的路径互不干扰），也可以是**目录**（则同时试
+///     `<目录>\<exe>` 与 `<目录>\<工具名>\<exe>`，后者是 pi 目录安装的摆法）；
+///  2) PATH 的各个目录（全局安装那份，路径均来自环境变量，不硬编码）。
+/// 只拼路径不判存在，调用方取第一个 is_file 的（便于单测）。
+fn tool_exe_candidates(
+    exe_name: &str,
+    sub_dir: &str,
+    entries: &[PathBuf],
+    path: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for entry in entries {
+        if entry.as_os_str().is_empty() {
+            continue;
+        }
+        // 有 .exe 扩展名 = 指向具体 exe；否则当目录用。
+        if entry
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
+        {
+            if entry.file_name().is_some_and(|n| n == exe_name) {
+                push(entry.clone());
+            }
+            continue;
+        }
+        push(entry.join(exe_name));
+        push(entry.join(sub_dir).join(exe_name));
+    }
+    // PATH 手动扫目录，不 spawn `where`——GUI 程序 spawn 控制台程序会闪黑窗；
+    // 顺带避开 Git 自带 where.exe 的行为差异。
+    if let Some(path) = path {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            push(dir.join(exe_name));
+        }
+    }
+    out
+}
+
+/// 按 tool_exe_candidates 的顺序找工具 exe（第一个存在的文件即目标）。
+fn find_tool_exe(spec: &ToolSpec, entries: &[PathBuf], use_path: bool) -> Option<PathBuf> {
+    let cands = tool_exe_candidates(
+        spec.exe_name,
+        spec.id,
+        entries,
+        if use_path {
+            std::env::var_os("PATH")
+        } else {
+            None
+        },
+    );
+    cands.into_iter().find(|p| p.is_file())
 }
 
 /// 从一段输出里抠出版本号（首个「数字+点」形态的 token，去掉 v 前缀）：
@@ -1877,15 +1970,18 @@ fn sync_tree(stage: &Path, install_dir: &Path, skip_name: &str) -> usize {
     fails
 }
 
-/// 检查单个工具（pi / opencode）的新版本：PATH 定位 exe → `--version` 读本地
-/// 版本 → 复用自更新的多源并发探查拿最新 tag → version_newer 比较。
-/// 找不到 exe（未安装）时只报状态、不给下载入口：没有安装目录可写。
-fn check_tool_update(idx: usize) -> ToolEvent {
+/// 检查单个工具（pi / opencode）的新版本：按 tool_dirs（默认本软件所在目录）
+/// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源并发探查拿
+/// 最新 tag → version_newer 比较。找不到 exe（未安装）时只报状态、不给下载
+/// 入口：没有安装目录可写。
+fn check_tool_update(idx: usize, dirs: Vec<PathBuf>, use_path: bool) -> ToolEvent {
     let spec = &TOOL_SPECS[idx];
-    let Some(exe) = find_exe_on_path(spec.exe_name) else {
+    let Some(exe) = find_tool_exe(spec, &dirs, use_path) else {
         log_update(&format!(
-            "检查更新 {}: PATH 中未找到 {}",
-            spec.label, spec.exe_name
+            "检查更新 {}: 目录 {dirs:?}{} 中均未找到 {}",
+            spec.label,
+            if use_path { " 与 PATH" } else { "" },
+            spec.exe_name
         ));
         return ToolEvent::Checked {
             local: String::new(),
@@ -2146,6 +2242,10 @@ pub struct ClientApp {
     /// 编辑命令时的索引和缓冲区（Some(i) = 内联编辑第 i 行）。
     pub settings_edit_idx: Option<usize>,
     pub settings_edit_buffer: String,
+    /// 设置页里编辑的「工具更新目录」列表（工作副本，改动写回 config）。
+    pub settings_tool_dirs: Vec<String>,
+    /// 新增工具目录的输入框。
+    pub settings_new_tool_dir: String,
     pub status: Option<String>,
     pub config_path: PathBuf,
     pub term_focused: bool,
@@ -2225,7 +2325,14 @@ pub struct ClientApp {
     pi_models: config::ModelsConfig,
     /// oh-my-pi 模型配置（编辑态）。
     omp_models: config::ModelsConfig,
-    /// 模型设置当前页签：0=pi 模型配置，1=oh-my-pi 模型配置。
+    /// opencode 供应商配置（编辑态；与 pi/omp 的 schema 不同，单列一套）。
+    opencode_models: config::OcProviders,
+    /// opencode 配置读取失败的原因（如 jsonc 里写了注释）。非空时设置页只
+    /// 提示、不提供编辑与写回：宁可让人手改，也不能洗掉原文件。
+    opencode_load_err: Option<String>,
+    /// opencode 顶层 `model`（默认模型，程序不修改，仅展示）。
+    opencode_default_model: String,
+    /// 模型设置当前页签：0=pi，1=oh-my-pi，2=opencode。
     model_settings_tab: usize,
     /// 供应商名编辑缓冲（页签, 当前键, 输入缓冲）：失焦前不重命名、不落盘。
     provider_name_edit: Option<(usize, String, String)>,
@@ -2371,7 +2478,12 @@ impl ClientApp {
         // （标题栏 × / Alt+F4），终端页签内 Ctrl+Q 仍照常转发给子进程（0x11）。
         cc.egui_ctx
             .options_mut(|o| o.quit_shortcuts.clear());
-        let config = config::load();
+        let mut config = config::load();
+        // 启动时把「本软件同级目录下的 pi / opencode」写进默认配置（路径由
+        // current_exe 推得，各机器自用、不写死）；补了内容就顺手落盘一次。
+        if fill_default_tool_paths(&mut config) {
+            let _ = config::save(&config);
+        }
         let initial_dark = config.settings.dark_mode;
         apply_theme(
             &cc.egui_ctx,
@@ -2394,6 +2506,13 @@ impl ClientApp {
         let config_path = config::config_path();
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
+        let settings_tool_dirs = config.settings.tool_paths.clone();
+        // opencode 配置：读失败（如 jsonc 带注释）时只记错、设置页不提供写回。
+        let (opencode_models, opencode_load_err) = match config::load_opencode_providers() {
+            Ok(c) => (c, None),
+            Err(e) => (config::OcProviders::default(), Some(e)),
+        };
+        let opencode_default_model = config::opencode_default_model();
         // 恒定帧率渲染，无需唤醒通道；保留 sender 供历史代码 try_send（无 receiver 时直接报错，不阻塞）。
         let redraw_tx = std::sync::mpsc::sync_channel(1).0;
         let ctx = cc.egui_ctx.clone();
@@ -2412,6 +2531,8 @@ impl ClientApp {
             settings_new_command: String::new(),
             settings_edit_idx: None,
             settings_edit_buffer: String::new(),
+            settings_tool_dirs,
+            settings_new_tool_dir: String::new(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
             config_path,
             term_focused: false,
@@ -2455,6 +2576,9 @@ impl ClientApp {
             title_width_cache: HashMap::new(),
             pi_models: config::load_pi_models(),
             omp_models: config::load_omp_models(),
+            opencode_models,
+            opencode_load_err,
+            opencode_default_model,
             model_settings_tab: 0,
             provider_name_edit: None,
             model_num_edit: None,
@@ -2583,6 +2707,8 @@ impl ClientApp {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
+        self.settings_tool_dirs = self.config.settings.tool_paths.clone();
+        self.settings_new_tool_dir.clear();
         // 如果已有一个设置页签，跳转过去而不是重复添加。
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
             self.current = idx;
@@ -2628,13 +2754,31 @@ impl ClientApp {
         let ids: Vec<usize> = (0..TOOL_SPECS.len())
             .filter(|&i| !self.tools[i].downloading)
             .collect();
+        let dirs = self.tool_search_dirs();
+        let use_path = self.config.settings.tool_search_path;
         std::thread::spawn(move || {
             for idx in ids {
-                let ev = check_tool_update(idx);
+                let ev = check_tool_update(idx, dirs.clone(), use_path);
                 let _ = tx.send((idx, ev));
                 let _ = redraw_tx.try_send(());
             }
         });
+    }
+
+    /// 「检查更新」找 pi / opencode 用的条目列表（不硬编码任何路径）：
+    /// 本软件 exe 所在目录（current_exe 的父目录，运行时得出）打头，再接
+    /// 配置里的路径（启动时已自动补齐本软件同级目录下的 pi / opencode，
+    /// 用户可改成别的机器布局），最后（可选）扫 PATH。
+    fn tool_search_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = software_dir().into_iter().collect();
+        for d in &self.config.settings.tool_paths {
+            let p = PathBuf::from(d.trim());
+            if p.as_os_str().is_empty() || dirs.contains(&p) {
+                continue;
+            }
+            dirs.push(p);
+        }
+        dirs
     }
 
     /// 后台下载并安装单个工具的新版本。流程与自更新同构：镜像竞速下 zip 到
@@ -4057,10 +4201,7 @@ impl ClientApp {
                                 .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
                                 .clicked()
                             {
-                                let dir = std::env::current_exe()
-                                    .ok()
-                                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                                    .unwrap_or_else(|| PathBuf::from("."));
+                                let dir = software_dir().unwrap_or_else(|| PathBuf::from("."));
                                 self.open_explorer(dir);
                                 ui.close();
                             }
@@ -4563,13 +4704,18 @@ impl ClientApp {
                     );
                     if ui.small_button("保存").clicked() {
                         let new_cmd = self.settings_edit_buffer.trim().to_string();
-                        if !new_cmd.is_empty() && !self.settings_commands.contains(&new_cmd) {
+                        // 改名也按键判重：改成 `nvim.exe` / `NVIM` 不算新命令。
+                        if !new_cmd.is_empty()
+                            && !self.has_tui_command(&new_cmd, Some(i))
+                        {
                             let old_cmd = std::mem::take(&mut self.settings_commands[i]);
                             if self.settings_command == old_cmd {
                                 self.settings_command = new_cmd.clone();
                             }
                             self.settings_commands[i] = new_cmd;
                             dirty = true;
+                        } else if !new_cmd.is_empty() {
+                            self.status = Some(format!("命令已存在，不重复添加: {new_cmd}"));
                         }
                         self.settings_edit_idx = None;
                     }
@@ -4715,7 +4861,10 @@ impl ClientApp {
                     .desired_width(280.0)
                     .hint_text("新命令，如 lazygit / htop"),
             );
-            if ui.button("浏览…").on_hover_text("选择可执行文件").clicked()
+            if ui
+                .button("浏览…")
+                .on_hover_text("选择可执行文件")
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .set_title("选择 TUI 可执行文件")
                     .add_filter("可执行文件", &["exe", "bat", "cmd", "com"])
@@ -4727,13 +4876,25 @@ impl ClientApp {
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if clicked || enter {
                 let cmd = self.settings_new_command.trim().to_string();
-                if !cmd.is_empty() && !self.settings_commands.contains(&cmd) {
+                if !cmd.is_empty() && !self.has_tui_command(&cmd, None) {
                     self.settings_commands.push(cmd.clone());
                     self.settings_new_command.clear();
                     dirty = true;
+                } else if !cmd.is_empty() {
+                    // 已存在：只提示、不入列（`nvim` / `NVIM` / `D:\x\nvim.exe` 同义）。
+                    self.status = Some(format!("命令已存在，不重复添加: {cmd}"));
                 }
             }
         });
+        // 边输边对比已有配置：同一条命令再输一遍时就地标黄，省得点了没反应。
+        let typed = self.settings_new_command.trim().to_string();
+        if !typed.is_empty() && self.has_tui_command(&typed, None) {
+            ui.label(
+                RichText::new(format!("⚠ 已存在（{typed}），不会重复添加"))
+                    .color(ui_warn(ui))
+                    .small(),
+            );
+        }
         ui.label(
             RichText::new("示例: nvim / lazygit / htop / cmd / bash")
                 .weak()
@@ -4744,13 +4905,17 @@ impl ClientApp {
             self.config.settings.tui_commands = self.settings_commands.clone();
             self.save_config("设置已自动保存".to_string());
         }
+        self.tool_dirs_ui(ui);
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
         // ── 模型配置（页签：pi / oh-my-pi） ──
         ui.horizontal(|ui| {
             ui.label(RichText::new("供应商配置:").strong());
-            for (i, name) in ["pi 供应商配置", "oh-my-pi 供应商配置"].iter().enumerate() {
+            for (i, name) in ["pi 供应商配置", "oh-my-pi 供应商配置", "opencode 供应商配置"]
+                .iter()
+                .enumerate()
+            {
                 if ui
                     .add(egui::Button::selectable(self.model_settings_tab == i, *name))
                     .clicked()
@@ -4775,6 +4940,140 @@ impl ClientApp {
         ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+    }
+
+    /// 启动命令是否已存在（按 config::tui_command_key 等价判重，大小写/`.exe`
+    /// 后缀/路径写法不同均视为同一条）。skip_idx = 改名时跳过自己那一行。
+    fn has_tui_command(&self, cmd: &str, skip_idx: Option<usize>) -> bool {
+        let key = config::tui_command_key(cmd);
+        if key.is_empty() {
+            return false;
+        }
+        self.settings_commands
+            .iter()
+            .enumerate()
+            .any(|(i, c)| Some(i) != skip_idx && config::tui_command_key(c) == key)
+    }
+
+    /// 设置页里的「工具更新路径」区：配置「检查更新」到哪里找 pi / opencode。
+    /// 默认项（本软件同级目录下的 pi / opencode）启动时由 `current_exe` 自动
+    /// 写进配置，跨机器各自一份、**不硬编码**；用户可追加/删除别的位置
+    /// （exe 完整路径或目录均可），并决定是否再扫 PATH。改动自动保存。
+    fn tool_dirs_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label("工具更新路径（检查更新时到哪找 pi / opencode）:");
+        let default_dir = software_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "(未知，取不到本软件目录)".to_string());
+        ui.label(
+            RichText::new(format!(
+                "默认查本软件所在目录（{default_dir}）：同级目录里有 pi / opencode 就出现下载按钮，点一下直接装到那里；再查下面配的路径（exe 完整路径或目录均可，目录里也试 pi\\pi.exe），最后{}. 不存在的项不显示按钮。",
+                if self.config.settings.tool_search_path {
+                    "扫 PATH"
+                } else {
+                    "不扫 PATH"
+                }
+            ))
+            .weak()
+            .small(),
+        );
+        let mut dirty = false;
+        let mut remove_at: Option<usize> = None;
+        for i in 0..self.settings_tool_dirs.len() {
+            let d = self.settings_tool_dirs[i].clone();
+            let exists = PathBuf::from(&d).exists();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!(
+                    "{} {d}",
+                    if exists { "✅" } else { "⬜" }
+                )));
+                if ui.small_button("移除").on_hover_text("从查找路径里移除").clicked() {
+                    remove_at = Some(i);
+                }
+                if ui
+                    .small_button("打开")
+                    .on_hover_text("在资源管理器中打开（不存在则打开所在目录）")
+                    .clicked()
+                {
+                    let p = PathBuf::from(&d);
+                    let target = if p.is_dir() {
+                        p
+                    } else {
+                        p.parent().map(|x| x.to_path_buf()).unwrap_or(p)
+                    };
+                    self.open_explorer(target);
+                }
+            });
+        }
+        if let Some(i) = remove_at {
+            self.settings_tool_dirs.remove(i);
+            dirty = true;
+        }
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.settings_new_tool_dir)
+                    .desired_width(260.0)
+                    .hint_text("路径，如 D:\\Agent\\pi 或 D:\\Agent\\pi.exe"),
+            );
+            if ui
+                .button("浏览目录…")
+                .on_hover_text("选择 pi / opencode 所在目录")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("选择 pi / opencode 所在目录")
+                    .pick_folder()
+            {
+                self.settings_new_tool_dir = path.to_string_lossy().to_string();
+            }
+            if ui
+                .button("选 exe…")
+                .on_hover_text("直接选 pi.exe / opencode.exe")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("选择 pi / opencode 可执行文件")
+                    .add_filter("可执行文件", &["exe"])
+                    .pick_file()
+            {
+                self.settings_new_tool_dir = path.to_string_lossy().to_string();
+            }
+            let clicked = ui.button("添加").clicked();
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if clicked || enter {
+                let d = self.settings_new_tool_dir.trim().to_string();
+                if !d.is_empty() && !self.settings_tool_dirs.contains(&d) {
+                    self.settings_tool_dirs.push(d);
+                    self.settings_new_tool_dir.clear();
+                    dirty = true;
+                }
+            }
+        });
+        if ui
+            .button("↺ 补齐同级目录默认项")
+            .on_hover_text("把本软件同级目录下的 pi / opencode 路径写回配置")
+            .clicked()
+        {
+            let mut cfg = self.config.clone();
+            if fill_default_tool_paths(&mut cfg) {
+                self.config.settings.tool_paths = cfg.settings.tool_paths;
+                self.settings_tool_dirs = self.config.settings.tool_paths.clone();
+                dirty = true;
+            }
+        }
+        let mut use_path = self.config.settings.tool_search_path;
+        if ui
+            .checkbox(&mut use_path, "找不到时再扫 PATH")
+            .on_hover_text("关闭后只看本软件目录 + 上面配的目录")
+            .changed()
+        {
+            dirty = true;
+        }
+        if dirty {
+            self.config.settings.tool_paths = self.settings_tool_dirs.clone();
+            self.config.settings.tool_search_path = use_path;
+            self.save_config("设置已自动保存".to_string());
+        }
     }
 
     /// provider/models 编辑表单（pi / oh-my-pi 共用），返回是否有改动。
@@ -5082,41 +5381,241 @@ impl ClientApp {
         }
     }
 
-    /// 模型配置页签内容：0=pi，1=oh-my-pi。
+    /// 模型配置页签内容：0=pi，1=oh-my-pi，2=opencode。
     fn model_settings_ui(&mut self, ui: &mut egui::Ui, tab: usize) {
-        if tab == 0 {
-            ui.label(RichText::new("pi 供应商配置").strong());
-            ui.label(
-                RichText::new(format!("路径: {}", config::pi_models_path().display()))
-                    .weak()
-                    .small(),
-            );
-            if Self::provider_list_ui(
-                ui,
-                0,
-                &mut self.provider_name_edit,
-                &mut self.model_num_edit,
-                &mut self.pi_models,
-            ) && let Err(e) = config::save_pi_models(&self.pi_models)
-            {
-                self.status = Some(format!("pi 配置保存失败: {e}"));
+        match tab {
+            0 => {
+                ui.label(RichText::new("pi 供应商配置").strong());
+                ui.label(
+                    RichText::new(format!("路径: {}", config::pi_models_path().display()))
+                        .weak()
+                        .small(),
+                );
+                if Self::provider_list_ui(
+                    ui,
+                    0,
+                    &mut self.provider_name_edit,
+                    &mut self.model_num_edit,
+                    &mut self.pi_models,
+                ) && let Err(e) = config::save_pi_models(&self.pi_models)
+                {
+                    self.status = Some(format!("pi 配置保存失败: {e}"));
+                }
             }
-        } else {
-            ui.label(RichText::new("oh-my-pi 供应商配置").strong());
-            ui.label(
-                RichText::new(format!("路径: {}", config::omp_models_path().display()))
-                    .weak()
-                    .small(),
+            1 => {
+                ui.label(RichText::new("oh-my-pi 供应商配置").strong());
+                ui.label(
+                    RichText::new(format!("路径: {}", config::omp_models_path().display()))
+                        .weak()
+                        .small(),
+                );
+                if Self::provider_list_ui(
+                    ui,
+                    1,
+                    &mut self.provider_name_edit,
+                    &mut self.model_num_edit,
+                    &mut self.omp_models,
+                ) && let Err(e) = config::save_omp_models(&self.omp_models)
+                {
+                    self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
+                }
+            }
+            _ => self.opencode_settings_ui(ui),
+        }
+    }
+
+    /// opencode 供应商配置页签（页签 2）。与 pi/omp 的 schema 不同：provider 是
+    /// `npm` + `options.baseURL` + `models.<id>` map，故单独一套表单。
+    /// 写回只 patch provider 子树（见 config::save_opencode_providers）。
+    fn opencode_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("opencode 供应商配置").strong());
+        ui.label(
+            RichText::new(format!("路径: {}", config::opencode_config_path().display()))
+                .weak()
+                .small(),
+        );
+        if let Some(err) = self.opencode_load_err.clone() {
+            // 解析不了（jsonc 注释等）就不给编辑入口：宁可让人手改，也不能
+            // 把注释和本程序不认识的字段洗掉。
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 160, 60),
+                format!("读取失败，已停用编辑（不会改动原文件）: {err}"),
             );
-            if Self::provider_list_ui(
-                ui,
-                1,
-                &mut self.provider_name_edit,
-                &mut self.model_num_edit,
-                &mut self.omp_models,
-            ) && let Err(e) = config::save_omp_models(&self.omp_models)
+            return;
+        }
+        if !self.opencode_default_model.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "当前默认模型: {}（本程序不改这一项）",
+                    self.opencode_default_model
+                ))
+                .weak()
+                .small(),
+            );
+        }
+        let mut dirty = false;
+        let n = self.opencode_models.providers.len();
+        for i in 0..n {
+            ui.indent(format!("provider[{i}]"), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("供应商 id:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.opencode_models.providers[i].id)
+                                .desired_width(120.0),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                    ui.label("name:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(
+                                &mut self.opencode_models.providers[i].name,
+                            )
+                            .desired_width(120.0),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                    if ui.small_button("删除供应商").clicked() {
+                        self.opencode_models.providers.remove(i);
+                        dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("npm:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(
+                                &mut self.opencode_models.providers[i].npm,
+                            )
+                            .desired_width(260.0)
+                            .hint_text("@ai-sdk/openai-compatible"),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("baseURL:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(
+                                &mut self.opencode_models.providers[i].base_url,
+                            )
+                            .desired_width(320.0),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("apiKey:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(
+                                &mut self.opencode_models.providers[i].api_key,
+                            )
+                            .desired_width(320.0),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                });
+                let n_models = self.opencode_models.providers[i].models.len();
+                for mi in 0..n_models {
+                    ui.horizontal(|ui| {
+                        ui.label("模型 id:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(
+                                    &mut self.opencode_models.providers[i].models[mi].id,
+                                )
+                                .desired_width(120.0),
+                            )
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                        ui.label("name:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(
+                                    &mut self.opencode_models.providers[i].models[mi].name,
+                                )
+                                .desired_width(160.0),
+                            )
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                        if ui.small_button("删除模型").clicked() {
+                            self.opencode_models.providers[i].models.remove(mi);
+                            dirty = true;
+                        }
+                    });
+                }
+                if ui.button("+ 添加模型").clicked() {
+                    self.opencode_models.providers[i].models.push(config::OcModel {
+                        id: String::new(),
+                        name: String::new(),
+                    });
+                    dirty = true;
+                }
+            });
+        }
+        if ui.button("+ 添加供应商").clicked() {
+            let mut p = config::OcProvider::default();
+            // 新供应商 id 自动取未占用的数字名（同 pi 侧习惯）。
+            let mut n = 1;
+            while self
+                .opencode_models
+                .providers
+                .iter()
+                .any(|q| q.id == n.to_string())
             {
-                self.status = Some(format!("oh-my-pi 配置保存失败: {e}"));
+                n += 1;
+            }
+            p.id = n.to_string();
+            p.name = n.to_string();
+            self.opencode_models.providers.push(p);
+            dirty = true;
+        }
+        // 写回前先查两处容易踩的坑：id 重复（同键会互相覆盖）、id 为空（写不进去）。
+        let ids: Vec<&str> = self
+            .opencode_models
+            .providers
+            .iter()
+            .map(|p| p.id.trim())
+            .collect();
+        let uniq = {
+            let mut u = ids.clone();
+            u.sort_unstable();
+            u.dedup();
+            u.len()
+        };
+        let empty = ids.iter().any(|s| s.is_empty());
+        if ids.len() != uniq || empty {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 160, 60),
+                if empty {
+                    "存在空 id 的供应商（不会写入文件）"
+                } else {
+                    "存在重复的供应商 id（后写的会覆盖前一个）"
+                },
+            );
+        }
+        if dirty {
+            if let Err(e) = config::save_opencode_providers(&self.opencode_models) {
+                self.status = Some(format!("opencode 配置保存失败: {e}"));
+            } else {
+                self.opencode_default_model = config::opencode_default_model();
             }
         }
     }
@@ -6043,8 +6542,8 @@ mod vscode_tests {
 #[cfg(all(test, windows))]
 mod update_tests {
     use super::{
-        assets_from_html, exe_asset_from_html, extract_zip, parse_version_token, sync_tree,
-        tar_bin, version_newer, win_arch, ClientApp, TOOL_SPECS,
+        assets_from_html, exe_asset_from_html, extract_zip, parse_version_token, sync_tree, tar_bin,
+        tool_exe_candidates, version_newer, win_arch, ClientApp, TOOL_SPECS,
     };
     use std::path::PathBuf;
 
@@ -6158,6 +6657,44 @@ mod update_tests {
         assert!(version_newer("1.19.0", "1.18.32"));
         assert!(!version_newer("0.87.1", "0.87.1"));
         assert!(!version_newer("0.87.1", "0.88.0"));
+    }
+
+    /// 工具 exe 查找顺序：传入的目录（默认 = 本软件所在目录）优先于 PATH，
+    /// 且同路径去重。
+    #[test]
+    fn tool_exe_candidates_prefer_app_dir() {
+        let app = PathBuf::from(r"D:\soft\TUIProjectManager");
+        let path = std::ffi::OsString::from(r"D:\Agent;D:\Agent\pi");
+        let c = tool_exe_candidates("pi.exe", "pi", &[app.clone()], Some(path.clone()));
+        assert_eq!(c[0], app.join("pi.exe"));
+        assert_eq!(c[1], app.join("pi").join("pi.exe"));
+        assert_eq!(c[2], PathBuf::from(r"D:\Agent\pi.exe"));
+        assert_eq!(c[3], PathBuf::from(r"D:\Agent\pi\pi.exe"));
+        // 多个目录（软件目录 + 用户配的额外目录）按传入顺序。
+        let c2 = tool_exe_candidates(
+            "pi.exe",
+            "pi",
+            &[app.clone(), PathBuf::from(r"D:\Agent\pi")],
+            None,
+        );
+        assert_eq!(c2[2], PathBuf::from(r"D:\Agent\pi\pi.exe"));
+        // 同路径去重：额外目录与 PATH 命中同一条 → 只留一份。
+        let same = tool_exe_candidates(
+            "pi.exe",
+            "pi",
+            &[PathBuf::from(r"D:\Agent\pi")],
+            Some(path),
+        );
+        assert_eq!(
+            same,
+            vec![
+                PathBuf::from(r"D:\Agent\pi\pi.exe"),
+                PathBuf::from(r"D:\Agent\pi\pi\pi.exe"),
+                PathBuf::from(r"D:\Agent\pi.exe"),
+            ]
+        );
+        // 不给目录也不给 PATH（如 current_exe 失败且关了 PATH）→ 无候选。
+        assert!(tool_exe_candidates("pi.exe", "pi", &[], None).is_empty());
     }
 
     #[test]
