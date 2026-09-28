@@ -216,8 +216,8 @@ impl Default for ModelEntry {
         Self {
             id: "1".into(),
             name: "1".into(),
-            context_window: 100_000,
-            max_tokens: 8192,
+            context_window: 128_000,
+            max_tokens: 16_384,
         }
     }
 }

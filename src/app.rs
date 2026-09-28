@@ -523,6 +523,29 @@ fn fetch_tag_from_url(
     extract(&v).ok_or_else(|| "返回结构不符合预期".to_string())
 }
 
+/// curl 拉取 URL 到内存（-q 忽略 .curlrc 残留代理，参数与 fetch_tag_from_url 一致）。
+/// 新增的资产解析（工具更新的 API/HTML 源）复用此通道，不重复造 curl 命令。
+fn curl_get(url: &str, connect_timeout: u64, max_time: u64) -> Result<Vec<u8>, String> {
+    let mut cmd = std::process::Command::new(curl_bin());
+    let ct = connect_timeout.to_string();
+    let mt = max_time.to_string();
+    cmd.args([
+        "-q", "-s", "-f", "-L", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
+        "-H", "User-Agent: TUIProjectManager",
+        url,
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().map_err(|e| format!("启动 curl 失败: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("HTTP {}", output.status.code().unwrap_or(0)));
+    }
+    Ok(output.stdout)
+}
+
 /// HTML 302 重定向取 tag（github.com /releases/latest 重定向到
 /// /releases/tag/<tag>，免 API 限流）。同样 -q 直连、无代理无端口。
 fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<String, String> {
@@ -629,17 +652,19 @@ fn ps_fetch_html_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
     }
 }
 
-/// 拉取最新版本号。所有源**并发**探查、先到先得：GH_MIRRORS 国内镜像、
+/// 本软件自身的 GitHub 仓库（检查自身更新用）。
+const SELF_REPO: &str = "qq458249269/TUIProjectManager";
+
+/// 拉取某个 repo 的最新 tag。所有源**并发**探查、先到先得：GH_MIRRORS 国内镜像、
 /// jsDelivr 数据 API（Fastly CDN，大陆友好、不依赖 GitHub 可达性）、
 /// GitHub HTML 302（免 API 限流）、GitHub API（可能限流）同时发起，
 /// 任一源在自身超时内返回有效 tag 即胜出——坏源零成本跳过，总耗时封顶在
 /// 最快源的超时内（≈6s），不再逐源串行、最坏吃满全表，也顺带防限流误报。
-/// 全程 -q 直连、不读任何代理配置与端口。返回（状态栏消息, 有新版本时的 tag）。
-fn fetch_latest_release() -> (String, Option<String>) {
-    const REPO: &str = "qq458249269/TUIProjectManager";
-    let api_url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let html_url = format!("https://github.com/{REPO}/releases/latest");
-    let jd_url = format!("https://data.jsdelivr.com/v1/packages/gh/{REPO}");
+/// 全程 -q 直连、不读任何代理配置与端口。自更新与 pi/opencode 检查共用此源表。
+fn fetch_latest_tag(repo: &str) -> Result<String, String> {
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let html_url = format!("https://github.com/{repo}/releases/latest");
+    let jd_url = format!("https://data.jsdelivr.com/v1/packages/gh/{repo}");
 
     // 每个源：描述、URL、取 tag 方式（JSON 提取器或 HTML 302）、超时。
     struct Src {
@@ -759,16 +784,32 @@ fn fetch_latest_release() -> (String, Option<String>) {
         match rx.recv() {
             Ok(Ok((_desc, tag))) => {
                 done.store(true, Ordering::Relaxed);
-                let msg = version_message(&tag);
-                return if msg.contains("发现新版本") { (msg, Some(tag)) } else { (msg, None) };
+                log_update(&format!("检查更新 {repo} 最新 tag: {tag}"));
+                return Ok(tag);
             }
             Ok(Err(e)) => errors.push(e),
             Err(_) => break,
         }
     }
-    // 具体失败原因已逐条 log_update；这里只给用户一句可行动的提示。
-    let _ = errors;
-    ("检查更新失败：网络错误（镜像与直连、jsDelivr 均失败，请检查网络连接或加速工具如 Steam++）".to_string(), None)
+    // 具体失败原因已逐条 log_update；这里只给用户一句可行动的提示
+    //（逐源错误已写日志，展开只会把状态栏撑成一条长串）。
+    log_update(&format!("检查更新 {repo} 全部源失败: {}", errors.join("；")));
+    Err("网络错误（镜像与直连、jsDelivr 均失败，请检查网络连接或加速工具如 Steam++）".to_string())
+}
+
+/// 拉取本软件自身最新版本号，生成状态栏消息 + 有新版本时的 tag。
+fn fetch_latest_release() -> (String, Option<String>) {
+    match fetch_latest_tag(SELF_REPO) {
+        Ok(tag) => {
+            let msg = version_message(&tag);
+            if msg.contains("发现新版本") {
+                (msg, Some(tag))
+            } else {
+                (msg, None)
+            }
+        }
+        Err(e) => (format!("检查更新失败：{e}"), None),
+    }
 }
 
 /// 根据 tag 与本地版本比较生成状态栏消息。
@@ -942,7 +983,15 @@ fn download_update(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("下载已取消".to_string());
         }
-        match download_race(&name, candidates, total, dest_dir, &progress_tx, cancel) {
+        match download_race(
+            &name,
+            candidates,
+            total,
+            dest_dir,
+            &progress_tx,
+            cancel,
+            looks_like_exe,
+        ) {
             Ok(p) => {
                 log_update(&format!("下载 成功：{name} → {p}"));
                 return Ok(p);
@@ -990,7 +1039,9 @@ const GH_MIRRORS: &[&str] = &[
 /// {name}.new，其余就地 kill。坏源/停滞源零成本跳过：--connect-timeout 8 挡
 /// 连接挂死，--speed-limit 4096 --speed-time 8 判死持续 <4KB/s 达 8s 的僵尸
 /// 源（不再让一个死镜像独占整条串行下载）。失败/取消保留 .c{idx}.new 供
-/// 下次 -C - 续传；胜出 promote 若被杀软短持有则退避重试。
+/// 下次 -C - 续传；胜出 promote 若被杀软短持有则退避重试。validate 是产物
+/// 校验（自更新 = looks_like_exe，pi/opencode = looks_like_zip），错误页/
+/// 截断文件永不胜出。
 /// 返回 Ok(下载文件路径) 或 Err(所有候选失败的聚合)。
 /// ponytail: 若 release 数日后镜像纷纷清缓存变慢，可给镜像档位降权或按历史
 /// 延迟排序重试；触及率低，暂不加。
@@ -1001,6 +1052,7 @@ fn download_race(
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    validate: fn(&Path) -> bool,
 ) -> Result<String, String> {
     let new_name = format!("{asset_name}.new");
     let dest_path = dest_dir.join(&new_name);
@@ -1083,9 +1135,9 @@ fn download_race(
                     // 删其临时文件后继续等其余候选——坏源永不胜出，杜绝
                     // 「替换失败: 下载文件损坏」反复出现（原本错误页体积小、下载最快，
                     // 总是抢在真源前面 promote 成功）。
-                    if !looks_like_exe(&tmp) {
+                    if !validate(&tmp) {
                         let _ = std::fs::remove_file(&tmp);
-                        errs.push(format!("{}: 文件损坏（缺失 MZ/PE 头，疑似错误页）", candidates[i].0));
+                        errs.push(format!("{}: 文件损坏（产物校验失败，疑似错误页或截断）", candidates[i].0));
                         *slot = None;
                         continue;
                     }
@@ -1096,7 +1148,12 @@ fn download_race(
                             let _ = o.kill();
                         }
                         other.take();
-                        let _ = std::fs::remove_file(dest_dir.join(format!("{asset_name}.c{j}.new")));
+                        if let Some(p) = dest_dir
+                            .join(format!("{asset_name}.c{j}.new"))
+                            .to_str()
+                        {
+                            let _ = cleanup_file(p);
+                        }
                     }
                     // promote：rename 被杀软/Defender 短持有（os error 5）时退避重试。
                     let mut wait_ms = 300u64;
@@ -1146,18 +1203,37 @@ fn download_race(
     }
 }
 
+/// 带指数退避的 rename 重试。Windows 下杀软/Defender 实时扫描会短暂持有/// 删文件，被占用（刚被 kill 的落败 curl 进程句柄尚未释放）时退一小会重试。
+/// 残留的 .c{i}.new 危害有 twofold：占安装目录空间；更要命的是下轮换个版本
+/// 还会拿它们 -C - 续传，拼出坏包再被产物校验判死，白下载一次。
+fn cleanup_file(path: &str) -> bool {
+    for i in 0..5u32 {
+        if std::fs::remove_file(path).is_ok() {
+            return true;
+        }
+        if !std::path::Path::new(path).exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120 * (i as u64 + 1)));
+    }
+    log_update(&format!("清理下载分片失败: {path}"));
+    false
+}
+
 /// 带指数退避的 rename 重试。Windows 下杀软/Defender 实时扫描会短暂持有
 /// 源或目标文件的句柄（未授予 FILE_SHARE_DELETE），rename 因此报拒绝访问
+/// 源或目标文件的句柄（未授予 FILE_SHARE_DELETE），rename 因此报拒绝访问
 /// （os error 5）；扫描大多几秒内结束，等待后重试即可成功。
-/// progress_msg 每 report_every 次尝试向状态栏发一条进度提示——注意消息
-/// 不能含「失败」字样：UI 按该关键字复位 downloading 状态，会干扰安装。
+/// progress_msg 每 report_every 次尝试通过 sink 报一条进度提示——注意消息
+/// 不能含「失败」字样：自更新 UI 按该关键字复位 downloading 状态，会干扰安装。
+/// sink 是消息出口（自更新 = 发状态栏通道；pi/opencode = 发工具事件通道），
+/// 顺带负责唤醒重绘。
 /// 返回 Ok(()) 或 deadline 耗尽时的最后一次错误。
 fn retry_rename(
     src: &Path,
     dst: &Path,
     deadline: std::time::Duration,
-    status_tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
-    redraw_tx: &std::sync::mpsc::SyncSender<()>,
+    sink: &dyn Fn(&str),
     progress_msg: &str,
     report_every: usize,
 ) -> std::io::Result<()> {
@@ -1173,9 +1249,7 @@ fn retry_rename(
                     "替换 重试 rename {src:?}→{dst:?} 第 {attempt} 次失败: {e}"
                 ));
                 if report_every > 0 && attempt % report_every == 0 {
-                    let _ =
-                        status_tx.send((format!("{progress_msg}（等待系统释放…）"), None));
-                    let _ = redraw_tx.try_send(());
+                    sink(&format!("{progress_msg}（等待系统释放…）"));
                 }
                 if start.elapsed() >= deadline {
                     return Err(e);
@@ -1204,22 +1278,22 @@ enum InstallOutcome {
     Occupied,
 }
 
+/// install_update 会先做一遍 PE 头校验；工具更新装的是从 zip 里取出的 exe，
+/// 同样适用（validate 已在下载层用过，这里是双保险）。
+/// 消息统一走 sink 回调（自更新 = 状态栏通道；pi/opencode = 工具事件通道）。
 fn install_update(
     new_file: &Path,
     final_path: &Path,
     old_path: &Path,
-    status_tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
-    redraw_tx: &std::sync::mpsc::SyncSender<()>,
+    sink: &dyn Fn(&str),
 ) -> InstallOutcome {
     // 0) 校验下载产物（MZ+PE 头）：镜像偶发返回错误页/截断文件，装上就无法启动。
     //    竞速层已前置剔除坏源，这里双保险；失败上层会自动换源重下，无需用户手动干预。
     if !looks_like_exe(new_file) {
         let _ = std::fs::remove_file(new_file); // 删掉坏的，避免被 -C - 续传拼坏
-        let msg = format!(
+        sink(&format!(
             "下载到损坏文件，已自动换源重新下载（{new_file:?} 非有效 exe）"
-        );
-        let _ = status_tx.send((msg, None));
-        let _ = redraw_tx.try_send(());
+        ));
         return InstallOutcome::BadDownload;
     }
     // 1) 快路径：正式名空闲 → 直接替换。~10s 重试窗口：杀软/Defender 扫描
@@ -1228,8 +1302,7 @@ fn install_update(
         new_file,
         final_path,
         std::time::Duration::from_secs(10),
-        status_tx,
-        redraw_tx,
+        sink,
         "正在替换 exe",
         4,
     )
@@ -1253,18 +1326,15 @@ fn install_update(
         final_path,
         old_path,
         std::time::Duration::from_secs(8),
-        status_tx,
-        redraw_tx,
+        sink,
         "正在挪开旧版本",
         4,
     )
     .is_err()
     {
-        let msg = format!(
+        sink(&format!(
             "替换失败: 正式名 {final_path:?} 一直被其他进程占用（多为杀软扫描或另一个正在运行的实例），新文件保留在 {new_file:?}，请稍后重试"
-        );
-        let _ = status_tx.send((msg, None));
-        let _ = redraw_tx.try_send(());
+        ));
         return InstallOutcome::Occupied;
     }
     // 3) 最后一步：把 .new 放进腾出的正式名。这是最常失败的一步——刚下载
@@ -1273,8 +1343,7 @@ fn install_update(
         new_file,
         final_path,
         std::time::Duration::from_secs(20),
-        status_tx,
-        redraw_tx,
+        sink,
         "正在放入新版本",
         4,
     ) {
@@ -1285,8 +1354,7 @@ fn install_update(
                 old_path,
                 final_path,
                 std::time::Duration::from_secs(5),
-                status_tx,
-                redraw_tx,
+                sink,
                 "正在回滚旧版本",
                 5,
             );
@@ -1296,17 +1364,15 @@ fn install_update(
                 .write(true)
                 .open(new_file)
                 .is_err();
-            let msg = if src_locked {
-                format!(
+            if src_locked {
+                sink(&format!(
                     "替换失败: 新文件 {new_file:?} 持续被其他进程占用（多为杀软/Defender 实时扫描），已回滚保留旧版本；请稍后重试，或将应用目录加入 Windows 安全中心排除项"
-                )
+                ));
             } else {
-                format!(
+                sink(&format!(
                     "替换失败: {e}（已自动回滚，正式名保留旧版本；新文件仍在 {new_file:?}）"
-                )
-            };
-            let _ = status_tx.send((msg, None));
-            let _ = redraw_tx.try_send(());
+                ));
+            }
             InstallOutcome::Occupied
         }
     }
@@ -1339,27 +1405,686 @@ fn looks_like_exe(p: &Path) -> bool {
     f.read(&mut pe).unwrap_or(0) == 4 && &pe == b"PE\0\0"
 }
 
-/// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
-/// 返回 (exe 文件名, 下载 URL, 0)；HTML 不含字节数，进度按已下载字节算。
-fn exe_asset_from_html(html: &str, tag: &str) -> Option<(String, String, u64)> {
+/// 校验下载产物是完整的 zip：局部文件头 "PK\x03\x04"（空包是 "PK\x05\x06"）、
+/// 中央目录结尾 "PK\x05\x06"（截断包致命）、体积下限（1MB）。
+/// 工具（pi/opencode）的 release 产物就是 zip，不能沿用 looks_like_exe，
+/// 否则好包会被当成损坏包。
+fn looks_like_zip(p: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return false;
+    };
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    // pi 的 windows-x64 压缩包 ~44MB、opencode ~62MB；1MB 足以挡住错误页/空包，
+    // 又不会误杀小体积的合法资产。
+    if meta.len() < 1024 * 1024 {
+        return false;
+    }
+    let mut head = [0u8; 4];
+    if f.read(&mut head).unwrap_or(0) < 4 || &head != b"PK\x03\x04" {
+        return false;
+    }
+    // 末尾 64KB 内必须有中央目录结束记录：zip 尾部缺它说明下载被截断
+    // （镜像断流/代理改写都会这样），装上去解不开。
+    let tail_len = std::cmp::min(meta.len(), 64 * 1024) as u64;
+    if f.seek(SeekFrom::End(-(tail_len as i64))).is_err() {
+        return false;
+    }
+    let mut tail = vec![0u8; tail_len as usize];
+    if f.read_exact(&mut tail).is_err() {
+        return false;
+    }
+    tail.windows(4).any(|w| w == b"PK\x05\x06")
+}
+
+/// 从 GitHub Release 标签页 HTML 里抽全部 assets 直链，返回 (文件名, 下载 URL)。
+/// github.com 的资产列表是 lazy-load 的 expanded_assets fragment，标签页初始
+/// HTML 往往一个链接都没有（实测 pi/opencode 均如此）→ 解析必失败，只能当兜底源。
+fn assets_from_html(html: &str, tag: &str) -> Vec<(String, String)> {
     const NEEDLE: &str = "releases/download/";
     let mut from = 0;
+    let mut out: Vec<(String, String)> = Vec::new();
     while let Some(rel) = html[from..].find(NEEDLE) {
         let start = from + rel + NEEDLE.len();
         let rest = &html[start..];
         let end = rest.find(['\'', '\"', '<', '?', '\n']).unwrap_or(rest.len());
         // 路径形如 {tag}/{xxx.exe}
         let parts: Vec<&str> = rest[..end].split('/').collect();
-        if parts.len() == 2 && parts[0] == tag && parts[1].ends_with(".exe") {
-            return Some((
+        if parts.len() == 2 && parts[0] == tag {
+            out.push((
                 parts[1].to_string(),
                 format!("https://github.com/{NEEDLE}{}/{}", parts[0], parts[1]),
-                0,
             ));
         }
         from = start;
     }
+    out
+}
+
+/// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
+/// 返回 (exe 文件名, 下载 URL, 0)；HTML 不含字节数，进度按已下载字节算。
+fn exe_asset_from_html(html: &str, tag: &str) -> Option<(String, String, u64)> {
+    assets_from_html(html, tag)
+        .into_iter()
+        .find(|(_, name)| name.ends_with(".exe"))
+        .map(|(name, url)| (name, url, 0))
+}
+
+// ── 外部工具（pi / opencode）更新 ──────────────────────────────────────
+//
+// 自更新那套流水线（多源并发探查 → 镜像竞速下载 .new → 解压 → install_update
+// 三段式替换 .old/.new）原样复用，只在两处因工具而变：
+//  1) 产物是 zip（pi-windows-x64.zip / opencode-windows-x64.zip），下载校验
+//     换成 looks_like_zip，装上前必须解压；解开后的主产物 exe 才进替换链；
+//  2) 目标不是本软件的 exe，而是 PATH 里找到的 pi.exe / opencode.exe——
+//     安装目录 = 该 exe 所在目录，替换时可能正被本软件的内嵌终端会话占用，
+//     这正是 install_update 慢路径（挪走 .old 腾名）要处理的情形。
+
+/// 外部工具的更新目标描述。资产名模板按优先级排列，{arch} 运行时替换。
+struct ToolSpec {
+    /// 稳定 id（临时文件名/日志用）。
+    id: &'static str,
+    /// 状态栏按钮与消息里的显示名。
+    label: &'static str,
+    repo: &'static str,
+    /// 本地 exe 名（同时是 zip 解压后要取出的主产物名）。
+    exe_name: &'static str,
+    /// 候选 release 资产名模板（Windows 压缩包），{arch} → x64 / arm64。
+    asset_tpls: &'static [&'static str],
+    /// 除 exe 外是否把解压出的整棵树覆盖同步进安装目录。pi 的 zip 含
+    /// assets/native/theme/docs/examples 等运行期文件（新版可能新增或改名），
+    /// 只换 exe 会与新版本对不上；opencode 的 zip 只含 exe，无需同步。
+    /// 同步是**覆盖式**（不删旧文件），用户自装的 node_modules/扩展不受影响。
+    sync_tree: bool,
+}
+
+const TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        id: "pi",
+        label: "pi",
+        repo: "earendil-works/pi",
+        exe_name: "pi.exe",
+        asset_tpls: &["pi-windows-{arch}.zip"],
+        sync_tree: true,
+    },
+    ToolSpec {
+        id: "opencode",
+        label: "opencode",
+        repo: "anomalyco/opencode",
+        exe_name: "opencode.exe",
+        // baseline 版是给无 AVX2 的老 CPU 准备的，主版本失败时再试。
+        asset_tpls: &[
+            "opencode-windows-{arch}.zip",
+            "opencode-windows-{arch}-baseline.zip",
+        ],
+        sync_tree: false,
+    },
+];
+
+/// Windows 资产名里的架构段：x86_64 → x64，aarch64 → arm64。
+fn win_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "x64",
+    }
+}
+
+/// 工具后台线程 → UI 线程的事件。
+enum ToolEvent {
+    /// 检查完成：本地版本（空 = 未检测到）+ 有新版本时的 tag + 安装目录
+    /// （exe 所在目录，即后续下载/解压/替换的操作位置）。
+    Checked {
+        local: String,
+        latest: Option<String>,
+        install_dir: PathBuf,
+        missing: bool,
+    },
+    /// 过程中的状态栏消息（下载/解压/替换）。
+    Status(String),
+    /// 下载进度 (已下载字节, 总字节，总数为 0 时只按已下载显示)。
+    Progress(u64, u64),
+    /// 下载 + 解压 + 替换全部完成（携带状态栏消息与装好的版本号）。
+    Done { msg: String, version: String },
+    /// 本轮任务结束（成功/失败/取消），UI 据此复位 downloading 状态。
+    Finished,
+}
+
+/// 工具更新作业的最大尝试次数（自更新是无限重试，工具这边一次要重下
+/// 60MB 量级的压缩包，封顶更合理）。
+const MAX_TOOL_ATTEMPTS: u32 = 5;
+
+/// 单个工具的更新状态。install_dir 在检查线程里按 PATH 定位 exe 后回填。
+struct ToolState {
+    /// 本地版本（`--version` 解析结果，空 = 未检测到）。
+    local: String,
+    /// 有新版本时的 tag（下载按钮的标签）。
+    latest: Option<String>,
+    /// 正在下载/解压/替换。
+    downloading: bool,
+    /// PATH 里没找到 exe：没有安装目录可写，不给下载入口。
+    missing: bool,
+    /// exe 所在目录（= 解压暂存、临时 zip、.old 备份都落在这里，同卷 rename）。
+    install_dir: PathBuf,
+    /// 本轮在装的 tag：作业非成功结束时用它把下载按钮重新点亮（可再点重试）。
+    pending_tag: Option<String>,
+}
+
+impl ToolState {
+    fn new() -> Self {
+        Self {
+            local: String::new(),
+            latest: None,
+            downloading: false,
+            missing: false,
+            install_dir: PathBuf::new(),
+            pending_tag: None,
+        }
+    }
+}
+
+/// 在 PATH 的各个目录里找 exe（手动扫目录，不 spawn `where`——GUI 程序 spawn
+/// 控制台程序会闪黑窗；顺带避开 Git 自带 where.exe 的行为差异）。
+fn find_exe_on_path(exe_name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = dir.join(exe_name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
     None
+}
+
+/// 从一段输出里抠出版本号（首个「数字+点」形态的 token，去掉 v 前缀）：
+/// pi --version → 0.87.1，opencode --version → 1.18.32。抠不到返回空串。
+fn parse_version_token(text: &str) -> String {
+    for tok in text.split(|c: char| {
+        c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == '"' || c == '\'' || c == '='
+    }) {
+        let t = tok.trim().trim_start_matches('v');
+        // 至少一个点、全是数字/点、且以数字开头（排掉 "windows-x64" 之类）。
+        if t.contains('.')
+            && t.starts_with(|c: char| c.is_ascii_digit())
+            && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return t.to_string();
+        }
+    }
+    String::new()
+}
+
+/// 读工具本地版本：`<exe> --version`。失败/抠不出数字一律返回空串
+/// （上层当作「版本未知」，不误报有更新）。
+fn local_tool_version(exe: &Path) -> String {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW，不闪黑窗
+    }
+    let Ok(o) = cmd.output() else {
+        return String::new();
+    };
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let text = if stdout.trim().is_empty() {
+        String::from_utf8_lossy(&o.stderr)
+    } else {
+        stdout
+    };
+    parse_version_token(&text)
+}
+
+/// 解压用 tar：Windows 钉死系统 bsdtar（C:\Windows\System32\tar.exe，自带 zip
+/// 读取器）。PATH 里常见的 GNU tar（Git 自带）**不解 zip**（实测报 “This does
+/// not look like a tar archive”），抽出来的是垃圾目录，必须避开。精简系统无此
+/// 文件时回退 PATH，PowerShell 通道作最终兜底。
+#[cfg(windows)]
+fn tar_bin() -> &'static str {
+    const SYS_TAR: &str = "C:\\Windows\\System32\\tar.exe";
+    if std::path::Path::new(SYS_TAR).exists() {
+        SYS_TAR
+    } else {
+        "tar"
+    }
+}
+#[cfg(not(windows))]
+fn tar_bin() -> &'static str {
+    "tar"
+}
+
+/// 解压 zip 到 dest（先清空 dest 再解）。系统 bsdtar 优先（快、零依赖），
+/// 失败/缺失退 PowerShell 的 [IO.Compression.ZipFile]::ExtractToDirectory。
+/// 两条通道都在同进程 spawn 且 CREATE_NO_WINDOW，不闪黑窗。
+fn extract_zip(zip: &Path, dest: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(dest);
+    std::fs::create_dir_all(dest).map_err(|e| format!("创建解压目录失败: {e}"))?;
+    let zip_s = zip.to_str().ok_or("压缩包路径含非 ASCII 字符")?;
+    let dest_s = dest.to_str().ok_or("解压目录路径含非 ASCII 字符")?;
+    // 源①系统 bsdtar。tar 对 zip 里的反斜杠/中文名兼容性不如 .NET，失败即退下一源。
+    let mut cmd = std::process::Command::new(tar_bin());
+    cmd.args(["-xf", zip_s, "-C", dest_s]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => return Ok(()),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            log_update(&format!("解压 tar 失败: {err}"));
+        }
+        Err(e) => log_update(&format!("解压 tar 启动失败: {e}")),
+    }
+    // 源②PowerShell .NET 解压（吃系统代理，tar 不吃）。
+    #[cfg(windows)]
+    let result = {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+             [System.IO.Compression.ZipFile]::ExtractToDirectory('{zip}','{dest}')",
+            zip = zip_s.replace('\'', "''"),
+            dest = dest_s.replace('\'', "''"),
+        );
+        ps_run(&script)
+            .map_err(|e| format!("解压失败（tar 与 PowerShell 均未成功）: {e}"))
+            .map(|_| ())
+    };
+    #[cfg(not(windows))]
+    let result: Result<(), String> =
+        Err("解压失败：系统 tar 不支持该压缩包，且无 PowerShell 兜底".to_string());
+    result
+}
+
+/// 拉 GitHub Release 资产表：name → (browser_download_url, 字节数)。
+/// 带 size 是为了下载进度能显示百分比（HTML 源拿不到字节数）。
+fn gh_assets(
+    repo: &str,
+    tag: &str,
+) -> Result<std::collections::HashMap<String, (String, u64)>, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    let body = curl_get(&url, 8, 15)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("API 响应解析失败: {e}"))?;
+    let mut out = std::collections::HashMap::new();
+    for a in v["assets"].as_array().into_iter().flatten() {
+        if let (Some(n), Some(u)) = (a["name"].as_str(), a["browser_download_url"].as_str()) {
+            out.insert(
+                n.to_string(),
+                (u.to_string(), a["size"].as_u64().unwrap_or(0)),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// 下载工具 zip 产物到 {install_dir}/.{id}-update.zip.new。直链解析优先级：
+/// 源①GitHub API（资产表完整 + 字节数）→ 源②标签页 HTML（API 被墙/限流时捡
+/// releases/download/{tag}/{候选名}；实测这两个仓库的资产列表懒加载，HTML
+/// 多半解析不出来，属于兜底）→ 源③直拼直链（零请求，永远可用）。解析出直链
+/// 后按「国内镜像 + PS 通道 + curl 直链」全量并发竞速（与自更新同一套
+/// download_race，只是校验函数换 looks_like_zip）。
+/// 返回 (zip 路径, 资产字节数)。
+fn download_tool_archive(
+    spec: &ToolSpec,
+    tag: &str,
+    dest_dir: &Path,
+    progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(PathBuf, u64), String> {
+    let names: Vec<String> = spec
+        .asset_tpls
+        .iter()
+        .map(|t| t.replace("{arch}", win_arch()))
+        .collect();
+    // 源①API：一次请求拿整张资产表，筛出候选名（保留模板顺序）。
+    let mut resolved: Vec<(String, String, u64)> = Vec::new();
+    let mut api_err: Option<String> = None;
+    match gh_assets(spec.repo, tag) {
+        Ok(table) => {
+            for n in &names {
+                if let Some((url, size)) = table.get(n) {
+                    resolved.push((n.clone(), url.clone(), *size));
+                }
+            }
+        }
+        Err(e) => {
+            log_update(&format!("工具下载 API 失败: {e}"));
+            api_err = Some(e);
+        }
+    }
+    // 源②HTML 兜底：只补 API 没解析出的候选名。
+    let missing: Vec<String> = names
+        .iter()
+        .filter(|n| !resolved.iter().any(|(rn, _, _)| rn == *n))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let page = format!("https://github.com/{}/releases/tag/{}", spec.repo, tag);
+        match curl_get(&page, 8, 15) {
+            Ok(b) => {
+                let html = String::from_utf8_lossy(&b);
+                let all = assets_from_html(&html, tag);
+                for n in &missing {
+                    if let Some((_, url)) = all.iter().find(|(hn, _)| hn == n) {
+                        resolved.push((n.clone(), url.clone(), 0));
+                    }
+                }
+            }
+            Err(e) => log_update(&format!("工具下载 HTML 源失败: {e}")),
+        }
+    }
+    // 源③直拼：仍缺的候选名直接按约定 URL 拼出来（零请求保底）。
+    for n in &names {
+        if !resolved.iter().any(|(rn, _, _)| rn == n) {
+            resolved.push((
+                n.clone(),
+                format!(
+                    "https://github.com/{}/releases/download/{}/{}",
+                    spec.repo, tag, n
+                ),
+                0,
+            ));
+        }
+    }
+    // 逐个候选文件名试：每个文件名下的所有下载链（镜像 × 8 + PS + 直链）
+    // 并发竞速，全部失败再换下一个文件名。
+    let mut errs: Vec<String> = Vec::new();
+    for (name, url, total) in resolved {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
+        let mut candidates: Vec<(String, bool)> = Vec::new();
+        for mirror in GH_MIRRORS {
+            candidates.push((format!("{mirror}{url}"), false));
+        }
+        #[cfg(windows)]
+        candidates.push((url.clone(), true));
+        #[cfg(not(windows))]
+        candidates.push((url.clone(), false));
+        // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
+        #[cfg(windows)]
+        candidates.push((url.clone(), false));
+        let asset_name = format!(".{}-update.zip", spec.id);
+        log_update(&format!(
+            "工具下载 {} {name} 并发尝试 {} 个候选链（tag={tag}）",
+            spec.label,
+            candidates.len()
+        ));
+        match download_race(
+            &asset_name,
+            candidates,
+            total,
+            dest_dir,
+            progress_tx,
+            cancel,
+            looks_like_zip,
+        ) {
+            Ok(p) => {
+                log_update(&format!("工具下载 成功：{} {name} → {p}", spec.label));
+                return Ok((PathBuf::from(p), total));
+            }
+            Err(e) => {
+                log_update(&format!("工具下载 失败：{} {name}：{e}", spec.label));
+                errs.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    if let Some(e) = api_err {
+        errs.push(format!("源① API: {e}"));
+    }
+    Err(format!("所有下载源失败：{}", errs.join("；")))
+}
+
+/// 把解压暂存目录里除主 exe 外的全部内容覆盖同步进安装目录（pi 用）。
+/// 覆盖式：同名文件覆盖、缺失目录新建，**不删**任何已有内容——用户自装的
+/// node_modules / 自定义 theme 等一律保留。返回失败条目数。
+fn sync_tree(stage: &Path, install_dir: &Path, skip_name: &str) -> usize {
+    fn walk(stage: &Path, rel: &Path, install_dir: &Path, skip_name: &str, fails: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(stage) else {
+            *fails += 1;
+            return;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name_s = name.to_string_lossy().into_owned();
+            // 顶层的主 exe 已经由 install_update 装好了，跳过（它已不在 stage 里）。
+            if rel.as_os_str().is_empty() && name_s == skip_name {
+                continue;
+            }
+            let src = e.path();
+            let dst = install_dir.join(rel.join(&name));
+            if src.is_dir() {
+                if std::fs::create_dir_all(&dst).is_err() {
+                    *fails += 1;
+                    continue;
+                }
+                walk(&src, &rel.join(&name), install_dir, skip_name, fails);
+            } else if std::fs::copy(&src, &dst).is_err() {
+                log_update(&format!("工具同步文件失败: {:?} → {dst:?}", src));
+                *fails += 1;
+            }
+        }
+    }
+    let mut fails = 0;
+    walk(stage, Path::new(""), install_dir, skip_name, &mut fails);
+    fails
+}
+
+/// 检查单个工具（pi / opencode）的新版本：PATH 定位 exe → `--version` 读本地
+/// 版本 → 复用自更新的多源并发探查拿最新 tag → version_newer 比较。
+/// 找不到 exe（未安装）时只报状态、不给下载入口：没有安装目录可写。
+fn check_tool_update(idx: usize) -> ToolEvent {
+    let spec = &TOOL_SPECS[idx];
+    let Some(exe) = find_exe_on_path(spec.exe_name) else {
+        log_update(&format!(
+            "检查更新 {}: PATH 中未找到 {}",
+            spec.label, spec.exe_name
+        ));
+        return ToolEvent::Checked {
+            local: String::new(),
+            latest: None,
+            install_dir: PathBuf::new(),
+            missing: true,
+        };
+    };
+    let install_dir = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let local = local_tool_version(&exe);
+    log_update(&format!(
+        "检查更新 {}: 本地 {local}（{exe:?}），安装目录 {install_dir:?}",
+        spec.label
+    ));
+    match fetch_latest_tag(spec.repo) {
+        Ok(tag) => {
+            let latest = tag.trim_start_matches('v').to_string();
+            // 本地版本读不出来时只报「已是最新」不如报「有更新」：点下载也就是
+            // 装最新版，不会出事；反过来误报「有更新」不了才是真的漏升级。
+            let newer = local.is_empty() || version_newer(&latest, &local);
+            ToolEvent::Checked {
+                local,
+                latest: newer.then_some(tag),
+                install_dir,
+                missing: false,
+            }
+        }
+        Err(e) => {
+            log_update(&format!("检查更新 {} 失败: {e}", spec.label));
+            ToolEvent::Checked {
+                local,
+                latest: None,
+                install_dir,
+                missing: false,
+            }
+        }
+    }
+}
+
+/// 工具更新的后台作业：下载 → 解压 → 备份 .old → 替换 → 同步其余文件 →
+/// 清理暂存。失败（下载源全挂 / 解压失败 / 产物损坏）3 秒后整链重来，
+/// 连续失败超过 MAX_TOOL_ATTEMPTS 次收手（自更新是无限重试，工具这边多了
+/// 一次就要重下 60MB 压缩包，不宜无限烧流量）。取消信号置位立即退出。
+/// 事件通过 tool_tx 报回 UI。
+fn run_tool_update(
+    idx: usize,
+    tag: String,
+    install_dir: PathBuf,
+    progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<(usize, ToolEvent)>,
+    redraw_tx: std::sync::mpsc::SyncSender<()>,
+) {
+    let spec = &TOOL_SPECS[idx];
+    let label = spec.label;
+    // 消息出口：统一成「{label}: …」前缀，UI 直接显示在状态栏。
+    let sink = |msg: &str| {
+        let _ = tx.send((idx, ToolEvent::Status(format!("{label}: {msg}"))));
+        let _ = redraw_tx.try_send(());
+    };
+    let stage = install_dir.join(format!(".{}-update-stage", spec.id));
+    // 上次若因「被占用」没装上，暂存里已留有解好的 exe：校验通过就别再重下
+    // 60MB 压缩包，直接进替换（用户只需先关掉占用的进程再点一次按钮）。
+    let mut reuse = {
+        let staged = stage.join(spec.exe_name);
+        staged.is_file() && looks_like_exe(&staged)
+    };
+    let mut attempt = 1u32;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            sink("下载已取消");
+            return;
+        }
+        // 重试封顶：网络类失败重试有意义（源会恢复），但「包结构不对」这类
+        // 永久性失败每轮都要重下 60MB，无限重试纯属烧流量——到顶就收手。
+        if attempt > MAX_TOOL_ATTEMPTS {
+            sink(&format!(
+                "连续 {MAX_TOOL_ATTEMPTS} 次未能完成更新，已停止重试；请检查网络后手动点按钮重试"
+            ));
+            return;
+        }
+        // 1) 下载 zip（镜像并发竞速，产物 looks_like_zip 校验）；复用暂存时跳过。
+        let zip: Option<std::path::PathBuf> = if reuse {
+            reuse = false;
+            sink("复用上次已解压的文件，直接重试替换…");
+            None
+        } else {
+            match download_tool_archive(spec, &tag, &install_dir, &progress_tx, &cancel) {
+                Ok((zip, _total)) => Some(zip),
+                Err(e) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        sink("下载已取消");
+                        return;
+                    }
+                    sink(&format!(
+                        "下载失败（第 {attempt} 次）: {e}，3 秒后自动重试…"
+                    ));
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    attempt += 1;
+                    continue;
+                }
+            }
+        };
+        // 2) 解压到暂存目录（与安装目录同卷，后续 rename 才是原子替换）。
+        let drop_zip = |z: &Option<std::path::PathBuf>| {
+            if let Some(p) = z {
+                let _ = std::fs::remove_file(p);
+            }
+        };
+        if let Some(z) = &zip {
+            sink("正在解压…");
+            if let Err(e) = extract_zip(z, &stage) {
+                drop_zip(&zip);
+                let _ = std::fs::remove_dir_all(&stage);
+                sink(&format!(
+                    "解压失败（第 {attempt} 次）: {e}，3 秒后自动重试…"
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                attempt += 1;
+                continue;
+            }
+        }
+        // 3) 替换：备份旧 exe 为 .old（copy，运行中的映像也能读），再走
+        //    install_update 的快路径/慢路径/回滚三段式。
+        let staged_exe = stage.join(spec.exe_name);
+        if !staged_exe.is_file() {
+            let _ = std::fs::remove_dir_all(&stage);
+            drop_zip(&zip);
+            sink(&format!(
+                "压缩包内没有 {}（包结构与预期不符），3 秒后换源重试…",
+                spec.exe_name
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            attempt += 1;
+            continue;
+        }
+        let final_exe = install_dir.join(spec.exe_name);
+        let old_exe = install_dir.join(format!("{}.old", spec.exe_name));
+        // copy 目标已存在则直接覆盖（.old 始终保留最近一版旧程序），失败不阻断替换。
+        // 提示语不能含「失败」字样：自更新 UI 按关键字复位 downloading 状态。
+        if let Err(e) = std::fs::copy(&final_exe, &old_exe) {
+            log_update(&format!("工具 {label} 备份 .old 失败: {e}"));
+        }
+        match install_update(&staged_exe, &final_exe, &old_exe, &sink) {
+            InstallOutcome::Done => {
+                // 4) 其余文件覆盖同步（pi 的 assets/native/theme/docs…）。
+                if spec.sync_tree {
+                    sink("正在同步程序文件…");
+                    let fails = sync_tree(&stage, &install_dir, spec.exe_name);
+                    if fails > 0 {
+                        log_update(&format!("工具 {label} 同步 {fails} 个文件失败"));
+                    }
+                }
+                // 5) 清理暂存（下载包已装完，不再需要续传）。
+                let _ = std::fs::remove_dir_all(&stage);
+                drop_zip(&zip);
+                log_update(&format!(
+                    "工具 {label} 更新完成：{tag} → {final_exe:?}（旧版已备份 {old_exe:?}）"
+                ));
+                let _ = tx.send((
+                    idx,
+                    ToolEvent::Done {
+                        msg: format!("{label} 已更新到 {tag}，重新启动 {label} 即可生效"),
+                        // 直接采信装上去的 tag，不再去跑 `--version`：某些版本
+                        // 改了输出格式抠不出数字，那样按钮会永远停在“有新版本”。
+                        version: tag.trim_start_matches('v').to_string(),
+                    },
+                ));
+                let _ = redraw_tx.try_send(());
+                return;
+            }
+            InstallOutcome::Occupied => {
+                // 目标被占用（{label} 正在本软件的内嵌终端里跑着、或被杀软持有）：
+                // 保留解压暂存与下载包，下次点下载可直接重试替换（不再重下包）。
+                // 必须让状态复位、按钮重新出现：否则「下载中」会一直卡住，
+                // 用户点「✕ 取消」也无从下手（线程已退出），只能重启软件。
+                sink(&format!(
+                    "安装被占用：正式名 {final_exe:?} 一直被其他进程占用（多为本软件内正在运行的 {label} 会话或杀软扫描），已解好的文件保留在 {staged_exe:?}；关掉占用的 {label} 后再点一次下载即可，无需重新下载"
+                ));
+                let _ = tx.send((idx, ToolEvent::Finished));
+                return;
+            }
+            InstallOutcome::BadDownload => {
+                // 解压出的 exe 不合法：清掉 .new/暂存残留，避免 -C - 续传拼坏，
+                // 3 秒后整链重来（坏源已在竞速层剔除）。
+                drop_zip(&zip);
+                let _ = std::fs::remove_dir_all(&stage);
+                reuse = false;
+                sink(&format!(
+                    "下载到损坏文件，已自动换源重新下载（第 {attempt} 次）"
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// 点分数字版本比较（如 2025.06.30.0001），a > b 返回 true。
@@ -1438,6 +2163,13 @@ pub struct ClientApp {
     /// 本次更新安装到的正式名 exe 路径：安装兜底可能把运行映像 rename 成 .old，
     /// 重启必须仍指向正式名（新版本），不能依赖 current_exe() 现算。
     update_final: Option<PathBuf>,
+    /// pi / opencode 的更新状态（索引对应 TOOL_SPECS 顺序）。
+    tools: Vec<ToolState>,
+    /// 工具更新事件通道：(工具下标, 事件)。检查/下载/解压/替换全在后台线程。
+    tool_tx: Sender<(usize, ToolEvent)>,
+    tool_rx: Receiver<(usize, ToolEvent)>,
+    /// 每个工具独立的下载取消信号（与自更新的 cancel_download 同构）。
+    tool_cancel: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub input: Option<InputDialog>,
     pub confirm: Option<ConfirmDialog>,
     redraw_tx: std::sync::mpsc::SyncSender<()>,
@@ -1666,6 +2398,7 @@ impl ClientApp {
         let redraw_tx = std::sync::mpsc::sync_channel(1).0;
         let ctx = cc.egui_ctx.clone();
         let (check_tx, update_rx) = std::sync::mpsc::channel();
+        let (tool_tx, tool_rx) = std::sync::mpsc::channel();
         let saved_tabs = config.tabs.clone();
         let saved_active = config.tabs.active;
         let mut app = Self {
@@ -1686,12 +2419,18 @@ impl ClientApp {
             download_progress_rx: None,
             downloading: false,
             cancel_download: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_done: false,
-        update_final: None,
+            update_done: false,
+            update_final: None,
+            tools: (0..TOOL_SPECS.len()).map(|_| ToolState::new()).collect(),
+            tool_cancel: (0..TOOL_SPECS.len())
+                .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .collect(),
             input: None,
             confirm: None,
             check_tx,
             update_rx,
+            tool_tx,
+            tool_rx,
             redraw_tx,
             theme_settle_at: None,
             drag_tab: None,
@@ -1863,6 +2602,8 @@ impl ClientApp {
 
     /// 异步检查 GitHub Release 最新版本，结果回到状态栏（不弹窗，只显示在窗口底部）。
     /// silent=true（启动/新开页签自动检查）时不覆盖当前状态栏消息。
+    /// 同时顺带检查 pi / opencode（同一份源表、同一线程内串行，避免启动时
+    /// 一次拉起 3×12 个 curl 进程），结果各自变成状态栏的下载按钮。
     fn check_updates(&mut self, silent: bool) {
         if !silent {
             self.status = Some("正在检查更新…".to_string());
@@ -1873,6 +2614,72 @@ impl ClientApp {
             let _ = tx.send(fetch_latest_release());
             // try_send：通道满说明已有待处理重绘，本次唤醒请求可安全丢弃。
             let _ = redraw_tx.try_send(());
+        });
+        self.check_tool_updates();
+    }
+
+    /// 检查 pi / opencode 的新版本（与自更新同一套多源并发探查）。
+    /// 一个后台线程里按 TOOL_SPECS 顺序串行跑：每个都是「先到先得」，正常
+    /// 1~2 秒一个，串行比各起一个线程更温和（启动检查不再瞬时拉起 24 个 curl）。
+    fn check_tool_updates(&mut self) {
+        let tx = self.tool_tx.clone();
+        let redraw_tx = self.redraw_tx.clone();
+        // 正在下载/替换中的工具不打断：装到一半再报个「有新版本」纯属噪声。
+        let ids: Vec<usize> = (0..TOOL_SPECS.len())
+            .filter(|&i| !self.tools[i].downloading)
+            .collect();
+        std::thread::spawn(move || {
+            for idx in ids {
+                let ev = check_tool_update(idx);
+                let _ = tx.send((idx, ev));
+                let _ = redraw_tx.try_send(());
+            }
+        });
+    }
+
+    /// 后台下载并安装单个工具的新版本。流程与自更新同构：镜像竞速下 zip 到
+    /// .new → 解压到暂存目录 → 备份旧 exe 为 .old → install_update 三段式
+    /// 替换 → 同步其余文件（pi）→ 清理暂存。失败 3 秒后自动重试，坏源在
+    /// download_race 内已被剔除；用户取消立即退出。
+    fn start_tool_download(&mut self, idx: usize) {
+        let Some(tag) = self.tools[idx].latest.clone() else {
+            return;
+        };
+        if self.tools[idx].downloading || self.tools[idx].missing {
+            return;
+        }
+        let spec = &TOOL_SPECS[idx];
+        let install_dir = self.tools[idx].install_dir.clone();
+        if install_dir.as_os_str().is_empty() {
+            return;
+        }
+        self.tools[idx].downloading = true;
+        self.tools[idx].latest = None;
+        // 记住本轮在装的 tag：作业结束（失败/取消/被占用）时用它把下载按钮
+        // 重新点亮，用户可以直接再点一次重试，而不必等下次「检查更新」。
+        self.tools[idx].pending_tag = Some(tag.clone());
+        self.status = Some(format!("正在下载 {} {tag}…", spec.label));
+        self.tool_cancel[idx].store(false, Ordering::Relaxed);
+        let (ptx, prx) = std::sync::mpsc::channel();
+        let cancel = self.tool_cancel[idx].clone();
+        let tx = self.tool_tx.clone();
+        let redraw_tx = self.redraw_tx.clone();
+        // 进度中继：download_race 往 ptx 写 (已下载, 总数)，这里转成工具事件
+        // 走同一条通道（否则要同时管两条通道还得额外唤醒 UI）。prx 的发送端
+        // 随作业线程退出而掉落，try_recv 返回断开即收工。
+        {
+            let tx = self.tool_tx.clone();
+            let redraw_tx = self.redraw_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok((d, t)) = prx.try_recv() {
+                    let _ = tx.send((idx, ToolEvent::Progress(d, t)));
+                    let _ = redraw_tx.try_send(());
+                }
+            });
+        }
+        std::thread::spawn(move || {
+            run_tool_update(idx, tag, install_dir, ptx, cancel, tx.clone(), redraw_tx);
+            let _ = tx.send((idx, ToolEvent::Finished));
         });
     }
 
@@ -1959,7 +2766,10 @@ impl ClientApp {
                     ));
                     let _ = redraw_tx.try_send(());
                 }
-                match install_update(&new_file, &final_path, &old_path, &status_tx, &redraw_tx) {
+                match install_update(&new_file, &final_path, &old_path, &|msg: &str| {
+                    let _ = status_tx.send((msg.to_string(), None));
+                    let _ = redraw_tx.try_send(());
+                }) {
                     InstallOutcome::Done => break,
                     InstallOutcome::Occupied => {
                         // 安装失败：保留 .new 与 .old 供排查/手动处理，稍后可重新下载。
@@ -3157,6 +3967,52 @@ impl ClientApp {
                     }
                 }
             }
+            // pi / opencode 的下载按钮：有新版本就各出一个，与自更新按钮同一套
+            // 交互（点一下即后台下载 + 替换，可取消）。下载中显示进度文字。
+            // 先收集待点击的工具下标再统一起下载：本循环持 self.tools 的不可变
+            // 借用，start_tool_download 要 &mut self。
+            let mut tool_click: Option<usize> = None;
+            for (i, t) in self.tools.iter().enumerate() {
+                let spec = &TOOL_SPECS[i];
+                let (downloading, latest, local) = (t.downloading, t.latest.clone(), t.local.clone());
+                if downloading {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("⬇ {} 下载中…", spec.label)).color(
+                            ui.visuals().widgets.inactive.text_color(),
+                        ),
+                    );
+                    if ui
+                        .button("✕ 取消")
+                        .on_hover_text(format!("取消 {} 的下载", spec.label))
+                        .clicked()
+                    {
+                        self.tool_cancel[i].store(true, Ordering::Relaxed);
+                        self.status = Some(format!("正在取消 {} 下载…", spec.label));
+                    }
+                } else if let Some(tag) = latest {
+                    ui.separator();
+                    let cur = if local.is_empty() {
+                        "未知".to_string()
+                    } else {
+                        local
+                    };
+                    if ui
+                        .button(format!("⬇ {} {tag}", spec.label))
+                        .on_hover_text(format!(
+                            "{label} 有新版本 {tag}（当前 {cur}）：点击从国内镜像源下载并替换 {exe}",
+                            label = spec.label,
+                            exe = spec.exe_name
+                        ))
+                        .clicked()
+                    {
+                        tool_click = Some(i);
+                    }
+                }
+            }
+            if let Some(i) = tool_click {
+                self.start_tool_download(i);
+            }
             // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
             if self.update_done {
                 ui.separator();
@@ -3213,7 +4069,7 @@ impl ClientApp {
                 // 「检查更新」：放在 ⋯ 更多 左边，同样只响应鼠标点击。
                 let check_upd = ui
                     .add(egui::Button::new("🔄 检查更新").sense(egui::Sense::CLICK))
-                    .on_hover_text("从 GitHub Release 检查最新版本（启动/新开页签时也会自动检查）");
+                    .on_hover_text("从 GitHub Release 检查本软件 + pi + opencode 的最新版本（启动/新开页签时也会自动检查）");
                 if check_upd.clicked() && ui.input(|i| i.pointer.any_click()) {
                     self.check_updates(false);
                 }
@@ -4632,6 +5488,80 @@ impl eframe::App for ClientApp {
             self.download_progress_rx = None;
             ctx.request_repaint();
         }
+        // pi / opencode 的检查/下载事件：排空通道逐条消费（一次 try_recv
+        // 只取一条，检查+下载进度混在一个通道里，逐帧多条才不会漏）。
+        while let Ok((idx, ev)) = self.tool_rx.try_recv() {
+            if idx >= self.tools.len() {
+                continue;
+            }
+            match ev {
+                ToolEvent::Checked { local, latest, install_dir, missing } => {
+                    self.tools[idx].local = local.clone();
+                    self.tools[idx].install_dir = install_dir;
+                    self.tools[idx].missing = missing;
+                    // 检查结果以本次为准：正在下载/重试中不抢按钮（点了会
+                    // 重复起一个线程），只更新版本号与安装目录。
+                    if self.tools[idx].downloading {
+                        continue;
+                    }
+                    if missing {
+                        // 未安装就没有下载入口（没目录可写），只在状态栏提一句。
+                        self.tools[idx].latest = None;
+                        self.tools[idx].downloading = false;
+                        log_update(&format!(
+                            "检查更新 {} 未安装（PATH 中无 {}）",
+                            TOOL_SPECS[idx].label,
+                            TOOL_SPECS[idx].exe_name
+                        ));
+                    } else {
+                        self.tools[idx].latest = latest.clone();
+                        // 找到新版本才占用状态栏（已是最新时保持现状，不扰民）。
+                        if let Some(tag) = latest {
+                            self.status = Some(format!(
+                                "发现 {} 新版本 {tag}（当前 {}），点击状态栏按钮下载",
+                                TOOL_SPECS[idx].label,
+                                if local.is_empty() { "未知".to_string() } else { local }
+                            ));
+                        }
+                    }
+                }
+                ToolEvent::Status(msg) => {
+                    self.status = Some(msg);
+                }
+                ToolEvent::Progress(downloaded, total) => {
+                    let label = TOOL_SPECS[idx].label;
+                    self.status = Some(if total > 0 {
+                        format!(
+                            "下载 {} 中… {:.2}% ({}/{})",
+                            label,
+                            downloaded as f64 / total as f64 * 100.0,
+                            Self::format_bytes(downloaded),
+                            Self::format_bytes(total)
+                        )
+                    } else {
+                        format!("下载 {} 中… {}", label, Self::format_bytes(downloaded))
+                    });
+                }
+                ToolEvent::Done { msg, version } => {
+                    // 版本号直接采信刚装上的 tag（见 run_tool_update 的说明）。
+                    self.tools[idx].local = version;
+                    self.tools[idx].latest = None;
+                    self.tools[idx].pending_tag = None;
+                    self.status = Some(msg);
+                }
+                ToolEvent::Finished => {
+                    self.tools[idx].downloading = false;
+                    // 非成功结束（取消/被占用/重试到顶）：把下载按钮重新点亮，
+                    // 用户可直接再点一次重试。Done 已在上面清了 pending_tag，
+                    // 所以不会在这里把刚装好的版本又标成“有新版本”。
+                    if self.tools[idx].pending_tag.is_some() && !self.tools[idx].missing {
+                        self.tools[idx].latest = self.tools[idx].pending_tag.clone();
+                    }
+                    self.tools[idx].pending_tag = None;
+                }
+            }
+            ctx.request_repaint();
+        }
         let exited = self.update_exited(ctx);
         if exited {
             self.status = Some("有会话已退出".to_string());
@@ -5112,7 +6042,10 @@ mod vscode_tests {
 
 #[cfg(all(test, windows))]
 mod update_tests {
-    use super::{exe_asset_from_html, ClientApp};
+    use super::{
+        assets_from_html, exe_asset_from_html, extract_zip, parse_version_token, sync_tree,
+        tar_bin, version_newer, win_arch, ClientApp, TOOL_SPECS,
+    };
     use std::path::PathBuf;
 
     /// unlock_exe 把运行映像改名成 {name}.running，替换/重启目标必须去掉后缀
@@ -5178,6 +6111,183 @@ mod update_tests {
         std::fs::write(&p, b"MZ\x90\x00\x03\x00").unwrap();
         assert!(!super::looks_like_exe(&p));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn looks_like_zip_checks_magic_and_tail() {
+        let p = std::env::temp_dir().join("tpm_test_zip_check.zip");
+        // 合法最小桩：头 "PK\x03\x04"、尾 "PK\x05\x06"、体积过 1MB 门。
+        let mut ok = vec![0u8; 1024 * 1024 + 16];
+        ok[0..4].copy_from_slice(b"PK\x03\x04");
+        let n = ok.len();
+        ok[n - 4..].copy_from_slice(b"PK\x05\x06");
+        std::fs::write(&p, &ok).unwrap();
+        assert!(super::looks_like_zip(&p));
+        // 截断包：头在、尾缺（镜像断流/代理改写的典型形态）→ 判否。
+        let mut truncated = ok.clone();
+        let n = truncated.len();
+        truncated[n - 4..].fill(0);
+        std::fs::write(&p, &truncated).unwrap();
+        assert!(!super::looks_like_zip(&p));
+        // 错误页 HTML：头不对 → 判否。
+        std::fs::write(&p, vec![b'<'; 1024 * 1024 + 16]).unwrap();
+        assert!(!super::looks_like_zip(&p));
+        // 体积不够（小体积资产/空包）→ 判否。
+        std::fs::write(&p, b"PK\x03\x04PK\x05\x06").unwrap();
+        assert!(!super::looks_like_zip(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn version_token_from_cli_output() {
+        // pi --version / opencode --version 的实际形态
+        assert_eq!(parse_version_token("0.87.1\n"), "0.87.1");
+        assert_eq!(parse_version_token("1.18.32"), "1.18.32");
+        // 带 v 前缀 / 前后杂音
+        assert_eq!(parse_version_token("v0.88.0"), "0.88.0");
+        assert_eq!(parse_version_token("pi version 0.87.1 (windows-x64)"), "0.87.1");
+        // 非版本 token 不能误认（opencode 的资产名 windows-x64 之类）
+        assert_eq!(parse_version_token("opencode-windows-x64"), "");
+        assert_eq!(parse_version_token(""), "");
+    }
+
+    #[test]
+    fn tool_versions_compare_by_dotted_numbers() {
+        // pi: 0.87.1 → 0.88.0；opencode: 1.18.32 → 1.19.0
+        assert!(version_newer("0.88.0", "0.87.1"));
+        assert!(version_newer("1.19.0", "1.18.32"));
+        assert!(!version_newer("0.87.1", "0.87.1"));
+        assert!(!version_newer("0.87.1", "0.88.0"));
+    }
+
+    #[test]
+    fn tool_asset_names_follow_machine_arch() {
+        for tpl in TOOL_SPECS.iter().flat_map(|s| s.asset_tpls) {
+            let name = tpl.replace("{arch}", win_arch());
+            assert!(!name.contains("{arch}"), "架构占位符未替换: {name}");
+            assert!(name.ends_with(".zip"), "工具资产应为 zip: {name}");
+        }
+        // x64 机器上 pi 的真实产物名。
+        if win_arch() == "x64" {
+            assert_eq!(TOOL_SPECS[0].asset_tpls[0].replace("{arch}", win_arch()), "pi-windows-x64.zip");
+            assert_eq!(
+                TOOL_SPECS[1].asset_tpls[0].replace("{arch}", win_arch()),
+                "opencode-windows-x64.zip"
+            );
+        }
+    }
+
+    #[test]
+    fn html_zip_asset_extracted() {
+        // 工具 release 的 zip 资产也走同一个 HTML 解析器
+        let html = r#"<a href="/earendil-works/pi/releases/download/v0.88.0/pi-windows-x64.zip">pi</a>"#;
+        let all = assets_from_html(html, "v0.88.0");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "pi-windows-x64.zip");
+        assert_eq!(
+            all[0].1,
+            "https://github.com/releases/download/v0.88.0/pi-windows-x64.zip"
+        );
+        // tag 不匹配 / 无资产
+        assert!(assets_from_html(html, "v0.87.1").is_empty());
+        assert!(assets_from_html("<html>nothing</html>", "v1").is_empty());
+    }
+
+    #[test]
+    fn staged_exe_reuse_detected_and_consumed() {
+        // 「被占用」后重试时应复用暂存里已解好的 exe，而不是重下 60MB 包。
+        let dir = std::env::temp_dir().join("tpm_test_reuse");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stage = dir.join(".pi-update-stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        // 有效 exe（DOS 头 + PE 签名 + 过体积门）→ 可复用
+        let mut pe = vec![0u8; 256 * 1024 + 8];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        std::fs::write(stage.join("pi.exe"), &pe).unwrap();
+        assert!(stage.join("pi.exe").is_file() && super::looks_like_exe(&stage.join("pi.exe")));
+        // 残留的坏文件不得被复用（否则会拿损坏产物去替换正式名）
+        std::fs::write(stage.join("bad.exe"), b"not an exe").unwrap();
+        assert!(!(stage.join("bad.exe").is_file() && super::looks_like_exe(&stage.join("bad.exe"))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_update_rejects_bad_exe_keeps_final() {
+        // 工具链复用 install_update：替换前仍会做 PE 头校验，坏产物不得换上。
+        let dir = std::env::temp_dir().join("tpm_test_install");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let newf = dir.join("pi.exe.new");
+        let finalp = dir.join("pi.exe");
+        let oldp = dir.join("pi.exe.old");
+        std::fs::write(&newf, b"not a pe file").unwrap();
+        std::fs::write(&finalp, b"old").unwrap();
+        let msgs = std::sync::Mutex::new(Vec::new());
+        let got = super::install_update(&newf, &finalp, &oldp, &|m| {
+            msgs.lock().unwrap().push(m.to_string())
+        });
+        let msgs = msgs.into_inner().unwrap();
+        assert!(matches!(got, super::InstallOutcome::BadDownload));
+        // 正式名保持原样，坏产物已被删（避免被 -C - 续传拼坏）
+        assert_eq!(std::fs::read(&finalp).unwrap(), b"old");
+        assert!(!newf.exists());
+        // 提示不能含「失败」字样：自更新 UI 按该关键字复位 downloading 状态
+        assert!(msgs.iter().all(|m| !m.contains("失败")), "{msgs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_zip_roundtrip() {
+        // 用系统 bsdtar 打个真 zip，再解出来验证解压链路（含暂存目录清理）。
+        let dir = std::env::temp_dir().join("tpm_test_extract");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("t.zip");
+        std::fs::write(dir.join("hello.txt"), b"hello zip").unwrap();
+        let mut cmd = std::process::Command::new(tar_bin());
+        cmd.arg("-a").arg("-cf").arg(&zip).arg("-C").arg(&dir).arg("hello.txt");
+        assert!(cmd.output().unwrap().status.success(), "bsdtar 打 zip 应成功");
+        let dest = dir.join("out");
+        extract_zip(&zip, &dest).expect("解压应成功");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("hello.txt")).unwrap(),
+            "hello zip"
+        );
+        // 再解一次：暂存目录应先被清空（不留上一次的残留）
+        std::fs::write(dest.join("stale.txt"), b"x").unwrap();
+        extract_zip(&zip, &dest).expect("二次解压应成功");
+        assert!(!dest.join("stale.txt").exists(), "暂存目录应先清空");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_tree_copies_all_but_exe_and_keeps_extra() {
+        let dir = std::env::temp_dir().join("tpm_test_sync");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stage = dir.join("stage");
+        let inst = dir.join("inst");
+        std::fs::create_dir_all(stage.join("native/win32")).unwrap();
+        std::fs::create_dir_all(inst.join("node_modules")).unwrap();
+        std::fs::write(stage.join("pi.exe"), b"MZ").unwrap();
+        std::fs::write(stage.join("package.json"), b"{}").unwrap();
+        std::fs::write(stage.join("native/win32/a.node"), b"node").unwrap();
+        // 安装目录里已有同名文件（要覆盖）与自装目录（不能删）
+        std::fs::write(inst.join("package.json"), b"old").unwrap();
+        std::fs::write(inst.join("node_modules/keep.txt"), b"keep").unwrap();
+        let fails = sync_tree(&stage, &inst, "pi.exe");
+        assert_eq!(fails, 0);
+        assert_eq!(std::fs::read_to_string(inst.join("package.json")).unwrap(), "{}");
+        assert_eq!(
+            std::fs::read_to_string(inst.join("native/win32/a.node")).unwrap(),
+            "node"
+        );
+        // 主 exe 由 install_update 负责，sync_tree 不碰
+        assert!(!inst.join("pi.exe").exists());
+        // 用户自装内容保留
+        assert!(inst.join("node_modules/keep.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
