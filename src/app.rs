@@ -1578,6 +1578,10 @@ struct ToolState {
     install_dir: PathBuf,
     /// 本轮在装的 tag：作业非成功结束时用它把下载按钮重新点亮（可再点重试）。
     pending_tag: Option<String>,
+    /// 我们亲手装上的那个 tag（Done 时记下）。当本地版本读不出来时
+    /// （`--version` 输出认不出）拿它兜底，否则同一个 tag 会被反复当成
+    /// 「有新版本」，按钮刚点完又冒出来。
+    installed_tag: Option<String>,
 }
 
 impl ToolState {
@@ -1589,6 +1593,7 @@ impl ToolState {
             missing: false,
             install_dir: PathBuf::new(),
             pending_tag: None,
+            installed_tag: None,
         }
     }
 }
@@ -2262,6 +2267,19 @@ fn version_newer(a: &str, b: &str) -> bool {
         }
     }
     false
+}
+
+/// 本地版本的兜底值：`--version` 输出认不出（空）或认出来的比「我们亲手装的
+/// 那个 tag」还旧时，用后者。
+///
+/// 为什么：pi / opencode 的 `--version` 格式会变，认不出时旧逻辑把空串当
+/// “版本未知”→ 同一个 tag 被反复报成“有新版本”，用户刚点完下载，按钮又冒出
+/// 来，看着像没装成功。装成功过就以装上的 tag 为准。纯函数，便于单测。
+fn local_version_with_floor(parsed: &str, installed: Option<&str>) -> String {
+    match installed {
+        Some(v) if parsed.is_empty() || version_newer(v, parsed) => v.to_string(),
+        _ => parsed.to_string(),
+    }
 }
 
 /// 项目目录存在性（带 TTL 缓存）。每帧 UI 都要显示目录状态，直接 is_dir()
@@ -4204,13 +4222,21 @@ impl ClientApp {
                     }
                 }
             }
-            // pi / opencode 的下载按钮：有新版本就各出一个，与自更新按钮同一套
-            // 交互（点一下即后台下载 + 替换，可取消）。下载中显示进度文字。
-            // **本机未检测到**（软件同级目录 / 配置路径 / PATH 都没有）时也出
-            // 按钮，只是文案变成「安装」——点一下就把最新版装到同级目录。
-            // 先收集待点击的工具下标再统一起下载：本循环持 self.tools 的不可变
+            // pi / opencode 的安装/升级入口。条目有两个来源：有新版（⬇ pi vX.Y.Z）
+            // 与**本机未检测到**（⬇ 安装 pi，点一下装到软件同级目录）；下载中则是
+            // 进度文字 + ✕ 取消。
+            //
+            // 状态栏一行宽度有限，自更新 + pi + opencode 三个按钮同时出现会把
+            // 右侧的「检查更新 / ⋯ 更多」挤出可视区（横向一排到底，没有第二行）。
+            // 故：**只有 1 条时**照样摊在状态栏上（一眼可点），**≥2 条时**收成
+            // 一颗「⬇ 工具 · N」按钮，点了在弹出菜单里逐条列 —— 与「⋯ 更多」
+            // 同一套交互，横向只占一颗按钮的宽度。
+            // 先收集待点击的工具下标再统一下载：本循环持 self.tools 的不可变
             // 借用，start_tool_download 要 &mut self。
             let mut tool_click: Option<usize> = None;
+            let mut tool_cancel_click: Option<usize> = None;
+            // (工具下标, 是否下载中, 按钮文案, 悬停说明)
+            let mut tool_rows: Vec<(usize, bool, String, String)> = Vec::new();
             for (i, t) in self.tools.iter().enumerate() {
                 let spec = &TOOL_SPECS[i];
                 let (downloading, latest, local, missing, dir) = (
@@ -4221,20 +4247,12 @@ impl ClientApp {
                     t.install_dir.clone(),
                 );
                 if downloading {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("⬇ {} 下载中…", spec.label)).color(
-                            ui.visuals().widgets.inactive.text_color(),
-                        ),
-                    );
-                    if ui
-                        .button("✕ 取消")
-                        .on_hover_text(format!("取消 {} 的下载", spec.label))
-                        .clicked()
-                    {
-                        self.tool_cancel[i].store(true, Ordering::Relaxed);
-                        self.status = Some(format!("正在取消 {} 下载…", spec.label));
-                    }
+                    tool_rows.push((
+                        i,
+                        true,
+                        format!("⬇ {} 下载中…", spec.label),
+                        format!("正在从镜像源下载并安装 {}", spec.label),
+                    ));
                 } else {
                     // 按钮存在的三种情形：已装且有新版 / 未装但已拿到 tag /
                     // 未装且 tag 未知（点下去时现查），后者要求目录可用。
@@ -4268,11 +4286,90 @@ impl ClientApp {
                     if dir.as_os_str().is_empty() {
                         continue; // 拿不到安装目录 → 无处可装，不给假入口
                     }
+                    tool_rows.push((i, false, label, tip));
+                }
+            }
+            // 渲染：1 条直接摊开；≥2 条收进「⋯」式弹出菜单。
+            match tool_rows.len() {
+                0 => {}
+                1 => {
+                    let (i, downloading, label, tip) = tool_rows.remove(0);
+                    let spec = &TOOL_SPECS[i];
                     ui.separator();
-                    if ui.button(label).on_hover_text(tip).clicked() {
+                    if downloading {
+                        ui.label(RichText::new(label).color(
+                            ui.visuals().widgets.inactive.text_color(),
+                        ));
+                        if ui
+                            .button("✕ 取消")
+                            .on_hover_text(format!("取消 {} 的下载", spec.label))
+                            .clicked()
+                        {
+                            tool_cancel_click = Some(i);
+                        }
+                    } else if ui.button(label).on_hover_text(tip).clicked() {
                         tool_click = Some(i);
                     }
                 }
+                n => {
+                    ui.separator();
+                    let busy = tool_rows.iter().filter(|(_, d, ..)| *d).count();
+                    let text = if busy > 0 {
+                        format!("⬇ 工具 {n} · {busy} 下载中")
+                    } else {
+                        format!("⬇ 工具 {n}")
+                    };
+                    let tip = format!(
+                        "{n} 个工具有安装/升级待办（点开逐条选，与「⋯ 更多」同一套交互）：{}",
+                        tool_rows
+                            .iter()
+                            .map(|(_, _, l, _)| l.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    );
+                    let tool_id = egui::Id::new("status_tool_menu");
+                    let mut resp = ui.add(egui::Button::new(text).sense(egui::Sense::CLICK));
+                    resp = resp.on_hover_text(tip);
+                    if resp.clicked() && ui.input(|i| i.pointer.any_click()) {
+                        egui::Popup::toggle_id(ui.ctx(), tool_id);
+                    }
+                    egui::Popup::from_response(&resp)
+                        .id(tool_id)
+                        .open_memory(None)
+                        .show(|ui| {
+                            ui.label(RichText::new("pi / opencode 安装与升级").strong().small());
+                            ui.separator();
+                            for (i, downloading, label, tip) in &tool_rows {
+                                ui.horizontal(|ui| {
+                                    let spec = &TOOL_SPECS[*i];
+                                    if *downloading {
+                                        ui.label(RichText::new(label).color(
+                                            ui.visuals().widgets.inactive.text_color(),
+                                        ));
+                                        if ui
+                                            .small_button("✕ 取消")
+                                            .on_hover_text(format!("取消 {} 的下载", spec.label))
+                                            .clicked()
+                                        {
+                                            tool_cancel_click = Some(*i);
+                                            ui.close();
+                                        }
+                                    } else if ui
+                                        .button(label.clone())
+                                        .on_hover_text(tip.clone())
+                                        .clicked()
+                                    {
+                                        tool_click = Some(*i);
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        });
+                }
+            }
+            if let Some(i) = tool_cancel_click {
+                self.tool_cancel[i].store(true, Ordering::Relaxed);
+                self.status = Some(format!("正在取消 {} 下载…", TOOL_SPECS[i].label));
             }
             if let Some(i) = tool_click {
                 self.start_tool_download(i);
@@ -4798,6 +4895,8 @@ impl ClientApp {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        // 别处（如状态栏的自动安装）改过配置时热更新本页快照。
+        self.sync_settings_snapshot();
         ui.add_space(8.0);
         ui.heading("设置");
         ui.separator();
@@ -5073,6 +5172,76 @@ impl ClientApp {
             .iter()
             .enumerate()
             .any(|(i, c)| Some(i) != skip_idx && config::tui_command_key(c) == key)
+    }
+
+    /// 装完工具后的本地状态刷新：**不联网**（拿 tag 那部分仍交给「检查更新」），
+    /// 只重新定位 exe + 读一次 `--version`。
+    ///
+    /// 为什么装完要刷一遍：状态栏那个「⬇ 安装 / ⬇ pi vX」按钮是**上次检查**
+    /// 的快照。装好 opencode 之后，pi 的状态还停在那次检查的那一刻——中间
+    /// 用户自己装了 pi、或改了工具路径，按钮就跟磁盘现状脱节了（明明装好还
+    /// 提示安装，或反过来少了一个下载入口）。所以 Done 里就地再定位一次，
+    /// 保证每个工具的按钮都对得上现状。
+    fn refresh_tool_presence(&mut self) {
+        let dirs = self.tool_search_dirs();
+        let use_path = self.config.settings.tool_search_path;
+        for idx in 0..TOOL_SPECS.len() {
+            if self.tools[idx].downloading {
+                continue; // 装到一半别去动它
+            }
+            let spec = &TOOL_SPECS[idx];
+            match find_tool_exe(spec, &dirs, use_path) {
+                Some(exe) => {
+                    let install_dir = exe
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let local = local_version_with_floor(
+                        &local_tool_version(&exe),
+                        self.tools[idx].installed_tag.as_deref(),
+                    );
+                    self.tools[idx].local = local;
+                    self.tools[idx].install_dir = install_dir;
+                    if self.tools[idx].missing {
+                        // 在我们下载期间被装上了：“未安装”作废，不再提示安装。
+                        self.tools[idx].missing = false;
+                        self.tools[idx].latest = None;
+                    }
+                }
+                None => {
+                    // 真的没有：只给「⬇ 安装」（版本号点下去现查），安装目录退回
+                    // “软件同级目录”那个可写位置，拿不到就不给假入口。
+                    self.tools[idx].missing = true;
+                    self.tools[idx].latest = None;
+                    self.tools[idx].local = String::new();
+                    self.tools[idx].install_dir =
+                        fresh_tool_dir(spec).unwrap_or_else(|| self.tools[idx].install_dir.clone());
+                }
+            }
+        }
+    }
+
+    /// 设置页的「启动命令 / 工具更新路径」是**快照**（用户可能正在这页上编辑，
+    /// 不能每帧被配置覆盖），但快照也得在「配置被本程序别处改过」时热更新：
+    /// 比如刚在状态栏自动装好 opencode，Done 里往 tui_commands 追加了一条，
+    /// 此时设置页已经开着，不同步的话用户看到的还是旧列表（像是没生效），
+    /// 得关掉重开才突然出现。用内容比对当变更标记，不为它给 Config 加字段。
+    fn sync_settings_snapshot(&mut self) {
+        if self.config.settings.tui_commands != self.settings_commands {
+            self.settings_commands = self.config.settings.tui_commands.clone();
+        }
+        if self.config.settings.tool_paths != self.settings_tool_dirs {
+            self.settings_tool_dirs = self.config.settings.tool_paths.clone();
+        }
+        // 选中项：配置里的 tui_command 才是“用户正在用的那条”，别处改了
+        // （首配默认命令、删掉当前项）也得跟上。注意只在它仍存在于列表时
+        // 同步，否则会把“列表里没有的当前命令”硬拽成空。
+        let tui_command = self.config.settings.tui_command.clone();
+        if tui_command != self.settings_command
+            && self.settings_commands.iter().any(|c| c == &tui_command)
+        {
+            self.settings_command = tui_command;
+        }
     }
 
     /// 「启动命令」列表里能被自动安装的绝对路径顶替的那一条下标：与新装 exe
@@ -6185,6 +6354,11 @@ impl eframe::App for ClientApp {
             }
             match ev {
                 ToolEvent::Checked { local, latest, install_dir, missing } => {
+                    // 本地版本认不出时以「我们刚装上的 tag」兜底。
+                    let local = local_version_with_floor(
+                        &local,
+                        self.tools[idx].installed_tag.as_deref(),
+                    );
                     self.tools[idx].local = local.clone();
                     self.tools[idx].install_dir = install_dir;
                     self.tools[idx].missing = missing;
@@ -6250,7 +6424,8 @@ impl eframe::App for ClientApp {
                     // 用户点完「⬇ 安装」就该能直接用它启动页签，不必再去设置页手加。
                     let was_missing = self.tools[idx].missing;
                     // 版本号直接采信刚装上的 tag（见 run_tool_update 的说明）。
-                    self.tools[idx].local = version;
+                    self.tools[idx].local = version.clone();
+                    self.tools[idx].installed_tag = Some(version);
                     self.tools[idx].latest = None;
                     self.tools[idx].pending_tag = None;
                     // 装完 exe 已在安装目录里，不再是「未安装」：状态栏那个
@@ -6269,6 +6444,9 @@ impl eframe::App for ClientApp {
                         }
                     }
                     self.status = Some(msg);
+                    // 另一个工具（如 pi）的状态重新对一下盘：装完 opencode 后它
+                    // 到底还是“未安装”还是已经被人装好了，磁盘说了算。
+                    self.refresh_tool_presence();
                 }
                 ToolEvent::Finished => {
                     self.tools[idx].downloading = false;
@@ -6949,6 +7127,19 @@ mod update_tests {
                 id = spec.id
             );
         }
+    }
+
+    /// 本地版本兜底：`--version` 认不出（或比亲手装的还旧）→ 用装上的 tag，
+    /// 免得同一个 tag 反复被报成“有新版本”。认得出且不旧 → 原样用。
+    #[test]
+    fn local_version_falls_back_to_installed_tag() {
+        use super::local_version_with_floor;
+        assert_eq!(local_version_with_floor("", Some("0.9.1")), "0.9.1");
+        assert_eq!(local_version_with_floor("0.1.0", Some("0.9.1")), "0.9.1");
+        assert_eq!(local_version_with_floor("0.9.1", Some("0.9.1")), "0.9.1");
+        assert_eq!(local_version_with_floor("1.0.0", Some("0.9.1")), "1.0.0");
+        // 没装过（installed=None）就认 --version 的，哪怕它读不出来。
+        assert_eq!(local_version_with_floor("", None), "");
     }
 
     /// 自动配置启动命令时挑哪一条顶替：同义（按 tui_command_key）里只挑能**整体
