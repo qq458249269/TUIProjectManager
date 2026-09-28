@@ -467,43 +467,26 @@ pub fn button_text_width(ui: &egui::Ui, label: &str) -> f32 {
     text_width(ui, label) + 2.0 * pad + v.bg_stroke.width
 }
 
-/// 状态栏横向布局的宽度分配（纯函数，便于单测）——返回 (工具入口是否收进
-/// 「⬇ 工具 N」菜单, 消息宽度)。
+/// 状态栏消息该占多宽（纯函数，便于单测）。
 ///
-/// `right_w` 是右侧固定簇（⋯ 更多 / 检查更新 / 深浅色）实际占宽，`fixed_w` 是
-/// 左侧必留的按钮（自更新下载 / 装完重启）。右边那些是 right_to_left 贴边画的，
-/// 不看左边占了多宽，所以必须从行宽里先扣掉；剩下的按“消息先让、工具入口后
-/// 让”的顺序分：先问工具入口能不能全摊开（并给消息留 MIN_MSG_W），不能就收成
-/// 一颗菜单按钮；最后消息取 min(封顶比例, 实际剩余)，不足 8px 就不画。
-#[allow(clippy::too_many_arguments)]
-pub fn status_width_split(
-    avail: f32,
-    right_w: f32,
-    fixed_w: f32,
-    has_tools: bool,
-    tools_inline_w: f32,
-    tools_collapsed_w: f32,
-    gap: f32,
-) -> (bool, f32) {
-    const SEP_W: f32 = 6.0; // egui Style::separator_style 的 spacing
+/// `avail` 是整行行宽、`left_w` 是扣掉右侧固定簇后左段真正能用的宽度、
+/// `buttons_w` 是待办按钮（自更新 / 工具入口 / 重启）的实测总宽。规则：
+/// 封顶行宽的 45%（下限 120px，窗口极窄就全给消息），再扣掉按钮实际占的宽度；
+/// 剩下的不足 MIN_MSG_W 就**整条消息不画**（返回 0）—— 此时按钮已经放不下，
+/// 由外层横向滚动区出滚动条兜底，消息不能没有而按钮被藏起来。
+pub fn status_msg_width(avail: f32, left_w: f32, buttons_w: f32, gap: f32) -> f32 {
     const MIN_MSG_W: f32 = 40.0; // 再窄这条消息就没信息量了
-    let inline_total = if has_tools { SEP_W + tools_inline_w } else { 0.0 };
-    let collapsed_total = if has_tools {
-        SEP_W + gap + tools_collapsed_w
-    } else {
+    let cap = if avail < 80.0 { avail } else { (avail * 0.45).max(120.0) };
+    let free = left_w - buttons_w - gap;
+    if free < MIN_MSG_W {
         0.0
-    };
-    let left_budget = (avail - right_w - gap).max(0.0);
-    let collapsed = inline_total > left_budget - fixed_w - MIN_MSG_W - gap;
-    let tools_w = if collapsed { collapsed_total } else { inline_total };
-    // 消息封顶：行宽的 45%，下限 120px（以前是固定值，不管右边占了多少）。
-    let msg_cap = if avail < 80.0 { avail } else { (avail * 0.45).max(120.0) };
-    let msg_w = msg_cap
-        .min(left_budget - fixed_w - tools_w - gap)
-        .max(0.0);
-    (collapsed, msg_w)
+    } else {
+        cap.min(free)
+    }
 }
 
+/// 渲染时强制过一遍颜色：按实际背景亮度差验证前景色，
+/// 对比不足（含真假同色）时翻成黑/白兑底，保证文字与背景永不相同。
 fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
     let lum = |c: Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
     if (lum(fg) - lum(bg)).abs() < 60.0 {
@@ -4252,9 +4235,9 @@ impl ClientApp {
 /// 右侧固定簇是 `Layout::right_to_left` **贴右边**画的，它不看左边已经占了
 /// 多宽 —— 左边放不下时不是换行而是直接盖上去（实测「⬇ 下载 2026.09.xx」+
 /// 「⬇ 装 pi 到本软件目录」+「🔄 检查更新」+「🌙 深色」一挤，pi 那个按钮就被
-/// 深浅色按钮压住点不着）。故先量出右侧簇与左侧必留按钮的宽度，左边只拿
-/// 剩下的：消息先让宽度（截断），再不够就把工具入口收进「⬇ 工具 N」菜单，
-/// 最后连消息都不画（消息可以没有，按钮不能没有）。
+/// 深浅色按钮压住点不着）。故先量出右侧簇的宽度，左段（消息 + 待办按钮）只拿
+/// 剩下的，且左段画在**横向滚动区**里：还挤不下就在下方出滚动条（滚轮/拖条都
+/// 能滚），既不互相盖住，也没有按钮被藏进菜单里“消失”。
 fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (text, color) = match &self.status {
@@ -4434,180 +4417,137 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
                     tool_rows.push((i, false, label, tip, into_fresh));
                 }
             }
-            // 工具入口：先试“全部摊开”的宽度，放不下就收成一颗「⬇ 工具 N」。
-            let busy = tool_rows.iter().filter(|(_, d, ..)| *d).count();
-            let collapsed_label = if tool_rows.is_empty() {
-                String::new()
-            } else if busy > 0 {
-                format!("⬇ 工具 {} · {busy} 下载中", tool_rows.len())
+            // 工具入口一律全部摊开（不再收进「⬇ 工具 N」菜单：横向滚动区已经能
+            // 兜住挤不下的情况，藏进菜单反而让人以为按钮没了）。先量总宽，供
+            // 消息让宽度用。
+            let tools_w = if tool_rows.is_empty() {
+                0.0
             } else {
-                format!("⬇ 工具 {}", tool_rows.len())
+                SEP_W + tool_rows
+                    .iter()
+                    .map(|(_, downloading, label, ..)| {
+                        if *downloading {
+                            text_width(ui, label) + item_x + button_text_width(ui, "✕ 取消")
+                        } else {
+                            button_text_width(ui, label)
+                        }
+                    })
+                    .sum::<f32>()
+                    + (tool_rows.len() as f32 - 1.0).max(0.0) * item_x
             };
-            let inline_w: f32 = tool_rows
-                .iter()
-                .map(|(_, downloading, label, ..)| {
-                    if *downloading {
-                        text_width(ui, label) + item_x + button_text_width(ui, "✕ 取消")
-                    } else {
-                        button_text_width(ui, label)
-                    }
-                })
-                .sum::<f32>()
-                + (tool_rows.len() as f32 - 1.0).max(0.0) * item_x;
+            // 左段能占多宽：行宽先扣掉右侧固定簇（它贴右边画，不让位）。
             let avail = ui.available_width();
-            let fixed_w = self_upd_w + restart_w;
-            // 摊开的门槛：还剩得下最小消息宽度（MIN_MSG_W）才摊开，否则收进菜单。
-            let (tool_collapsed, msg_w) = status_width_split(
-                avail,
-                right_w,
-                fixed_w,
-                tool_rows.is_empty(),
-                inline_w,
-                button_text_width(ui, &collapsed_label),
-                item_x,
-            );
-
-            // ---- 消息 ----
-            if msg_w > 8.0 {
-                let mut label_resp = ui.add_sized(
-                    [
-                        msg_w,
-                        ui.spacing()
-                            .interact_size
-                            .y
-                            .max(ui.text_style_height(&egui::TextStyle::Body)),
-                    ],
-                    egui::Label::new(RichText::new(text).color(color)).truncate(),
-                );
-                ui.visuals_mut().override_text_color = saved_override;
-                label_resp = label_resp.on_hover_text(copy_snapshot.clone());
-                // 右键快速复制整条状态栏消息（错误/提示可直接复制去反馈或贴给 AI）。
-                label_resp.context_menu(|ui| {
-                    if ui
-                        .button("📋 复制")
-                        .on_hover_text("复制整条状态栏消息到剪贴板")
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(copy_snapshot.clone());
-                        ui.close();
-                    }
-                });
-            } else {
-                // 连最小宽度都腾不出（窗口极窄）：这条消息不画，宽度全给按钮。
-                ui.visuals_mut().override_text_color = saved_override;
-            }
-            // ---- 本程序自己的自更新 ----
-            if let Some(tag) = self.update_latest.clone() {
-                ui.separator();
-                if self.downloading {
-                    // 下载中：显示进度文本 + 取消按钮
-                    ui.label(RichText::new(format!("⬇ 下载中… {tag}")).color(
-                        ui.visuals().widgets.inactive.text_color()));
-                    if ui.button("✕ 取消").on_hover_text("取消当前下载").clicked() {
-                        self.cancel_download.store(true, std::sync::atomic::Ordering::Relaxed);
-                        self.status = Some("正在取消下载…".to_string());
-                    }
-                } else {
-                    if ui
-                        .button(format!("⬇ 下载 {tag}"))
-                        .on_hover_text("自动下载新版本到当前目录，完成后替换旧版本")
-                        .clicked()
-                    {
-                        self.start_download(&tag);
-                    }
-                }
-            }
-            // ---- 工具入口：按宽度决定摊开还是收进「⬇ 工具 N」菜单 ----
-            if !tool_rows.is_empty() {
-                ui.separator();
-                if !tool_collapsed {
-                    // 宽度够：全部摊在状态栏上（一眼可点）。
-                    for (i, downloading, label, tip, into_fresh) in tool_rows.drain(..) {
-                        let spec = &TOOL_SPECS[i];
-                        if downloading {
-                            ui.label(RichText::new(label).color(
-                                ui.visuals().widgets.inactive.text_color(),
-                            ));
+            let left_w = (avail - right_w - item_x).max(60.0);
+            let msg_w = status_msg_width(avail, left_w, self_upd_w + tools_w + restart_w, item_x);
+            let row_h = ui
+                .spacing()
+                .interact_size
+                .y
+                .max(ui.text_style_height(&egui::TextStyle::Body));
+            // 高度要额外给滚动条留一条：非浮动滚动条是从可用高度里**扣掉**它再放
+            // 内容的（见 ScrollArea::begin 的 current_bar_use），不留就等于内容
+            // 被自己的滚动条切掉一截。
+            let bar_h = ui.spacing().scroll.allocated_width();
+            // 横向单向滚动区默认只吃水平滚轮（鼠标滚轮是 delta.y，拨不动），开这
+            // 个开关让它把垂直滚轮也当横向拨（只在本段生效，不影响设置页）。
+            let saved_scroll_dir = ui.style().always_scroll_the_only_direction;
+            ui.style_mut().always_scroll_the_only_direction = true;
+            egui::ScrollArea::horizontal()
+                .id_salt("status_left_scroll")
+                // 宽度就是左段能用的宽度：右侧簇还没排（它贴右边缘），不写死
+                // max_width 的话这里会抢走整行，右侧簇又叠回它身上。
+                .max_width(left_w)
+                .max_height(row_h + bar_h)
+                // x 不自动收缩：宽度就这么多，挤不下就出横向滚动条；y 收缩到内容。
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                    // ---- 消息 ----
+                    if msg_w > 8.0 {
+                        let mut label_resp = ui.add_sized(
+                            [msg_w, row_h],
+                            egui::Label::new(RichText::new(text).color(color)).truncate(),
+                        );
+                        ui.visuals_mut().override_text_color = saved_override;
+                        label_resp = label_resp.on_hover_text(copy_snapshot.clone());
+                        // 右键快速复制整条状态栏消息（错误/提示可直接复制去反馈或贴给 AI）。
+                        label_resp.context_menu(|ui| {
                             if ui
-                                .button("✕ 取消")
-                                .on_hover_text(format!("取消 {} 的下载", spec.label))
+                                .button("📋 复制")
+                                .on_hover_text("复制整条状态栏消息到剪贴板")
                                 .clicked()
                             {
-                                tool_cancel_click = Some(i);
-                            }
-                        } else if ui.button(label).on_hover_text(tip).clicked() {
-                            tool_click = Some((i, into_fresh));
-                        }
-                    }
-                } else {
-                    let text = collapsed_label.clone();
-                    let n = tool_rows.len();
-                    let tip = format!(
-                        "{n} 个工具有安装/升级待办（行宽不够摊开，点开逐条选，与「⋯ 更多」同一套交互）：{}",
-                        tool_rows
-                            .iter()
-                            .map(|(_, _, l, _, _)| l.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" / ")
-                    );
-                    let tool_id = egui::Id::new("status_tool_menu");
-                    let mut resp = ui.add(egui::Button::new(text).sense(egui::Sense::CLICK));
-                    resp = resp.on_hover_text(tip);
-                    if resp.clicked() && ui.input(|i| i.pointer.any_click()) {
-                        egui::Popup::toggle_id(ui.ctx(), tool_id);
-                    }
-                    egui::Popup::from_response(&resp)
-                        .id(tool_id)
-                        .open_memory(None)
-                        .show(|ui| {
-                            ui.label(RichText::new("pi / opencode 安装与升级").strong().small());
-                            ui.separator();
-                            for (i, downloading, label, tip, into_fresh) in &tool_rows {
-                                ui.horizontal(|ui| {
-                                    let spec = &TOOL_SPECS[*i];
-                                    if *downloading {
-                                        ui.label(RichText::new(label).color(
-                                            ui.visuals().widgets.inactive.text_color(),
-                                        ));
-                                        if ui
-                                            .small_button("✕ 取消")
-                                            .on_hover_text(format!("取消 {} 的下载", spec.label))
-                                            .clicked()
-                                        {
-                                            tool_cancel_click = Some(*i);
-                                            ui.close();
-                                        }
-                                    } else if ui
-                                        .button(label.clone())
-                                        .on_hover_text(tip.clone())
-                                        .clicked()
-                                    {
-                                        tool_click = Some((*i, *into_fresh));
-                                        ui.close();
-                                    }
-                                });
+                                ui.ctx().copy_text(copy_snapshot.clone());
+                                ui.close();
                             }
                         });
-                }
-            }
-            if let Some(i) = tool_cancel_click {
-                self.tool_cancel[i].store(true, Ordering::Relaxed);
-                self.status = Some(format!("正在取消 {} 下载…", TOOL_SPECS[i].label));
-            }
-            if let Some((i, into_fresh)) = tool_click {
-                self.start_tool_download(i, into_fresh);
-            }
-            // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
-            if self.update_done {
-                ui.separator();
-                if ui
-                    .button("🔄 重启应用")
-                    .on_hover_text("新版本已下载并替换，点击重启使新版本生效")
-                    .clicked()
-                {
-                    self.restart_app();
-                }
-            }
+                    } else {
+                        // 连最小宽度都腾不出（窗口极窄）：这条消息不画，宽度全给按钮。
+                        ui.visuals_mut().override_text_color = saved_override;
+                    }
+                    // ---- 本程序自己的自更新 ----
+                    if let Some(tag) = self.update_latest.clone() {
+                        ui.separator();
+                        if self.downloading {
+                            // 下载中：显示进度文本 + 取消按钮
+                            ui.label(RichText::new(format!("⬇ 下载中… {tag}")).color(
+                                ui.visuals().widgets.inactive.text_color()));
+                            if ui.button("✕ 取消").on_hover_text("取消当前下载").clicked() {
+                                self.cancel_download.store(true, std::sync::atomic::Ordering::Relaxed);
+                                self.status = Some("正在取消下载…".to_string());
+                            }
+                        } else {
+                            if ui
+                                .button(format!("⬇ 下载 {tag}"))
+                                .on_hover_text("自动下载新版本到当前目录，完成后替换旧版本")
+                                .clicked()
+                            {
+                                self.start_download(&tag);
+                            }
+                        }
+                    }
+                    // ---- 工具入口：全部摊开；挤不下由外层横向滚动区出滚动条 ----
+                    if !tool_rows.is_empty() {
+                        ui.separator();
+                        for (i, downloading, label, tip, into_fresh) in tool_rows.drain(..) {
+                            let spec = &TOOL_SPECS[i];
+                            if downloading {
+                                ui.label(RichText::new(label).color(
+                                    ui.visuals().widgets.inactive.text_color(),
+                                ));
+                                if ui
+                                    .button("✕ 取消")
+                                    .on_hover_text(format!("取消 {} 的下载", spec.label))
+                                    .clicked()
+                                {
+                                    tool_cancel_click = Some(i);
+                                }
+                            } else if ui.button(label).on_hover_text(tip).clicked() {
+                                tool_click = Some((i, into_fresh));
+                            }
+                        }
+                    }
+                    if let Some(i) = tool_cancel_click {
+                        self.tool_cancel[i].store(true, Ordering::Relaxed);
+                        self.status = Some(format!("正在取消 {} 下载…", TOOL_SPECS[i].label));
+                    }
+                    if let Some((i, into_fresh)) = tool_click {
+                        self.start_tool_download(i, into_fresh);
+                    }
+                    // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
+                    if self.update_done {
+                        ui.separator();
+                        if ui
+                            .button("🔄 重启应用")
+                            .on_hover_text("新版本已下载并替换，点击重启使新版本生效")
+                            .clicked()
+                        {
+                            self.restart_app();
+                        }
+                    }
+                    });
+                });
+            ui.style_mut().always_scroll_the_only_direction = saved_scroll_dir;
             // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录）+「检查更新」+ 深浅色切换（右侧第一个 = 最右）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
@@ -7381,42 +7321,29 @@ mod update_tests {
         });
     }
 
-    /// 状态栏宽度分配：先扣右侧固定簇（它贴右边画，不看左边、不换行、只盖上
-    /// 去），再按“消息先让宽度、工具入口不够就收成菜单”的顺序分。
+    /// 状态栏消息宽度：先扣右侧固定簇（它贴右边画，不看左边、不换行、只盖上
+    /// 去），再扣待办按钮；不够就不画这条消息，溢出交给横向滚动区。
     #[test]
-    fn status_width_split_reserves_right_cluster() {
-        use super::status_width_split;
-        // 现场：行宽 1400，右侧簇 270（⋯ 更多 + 检查更新 + 深浅色 + 余量），
-        // 自更新「⬇ 下载 2026.09.13」约 150，一条工具入口约 165。
-        let (collapsed, msg) = status_width_split(1400.0, 270.0, 150.0, true, 165.0, 90.0, 8.0);
-        assert!(!collapsed, "宽裕时工具入口应摊开");
-        assert!(msg > 500.0, "宽裕时消息该拿满 45% 上限，实际 {msg}");
+    fn status_msg_width_reserves_buttons() {
+        use super::status_msg_width;
+        // 现场：行宽 1400，右侧簇约 270 → 左段 1120；一条工具入口 + 自更新约
+        // 315。宽裕时消息拿满 45% 上限。
+        let msg = status_msg_width(1400.0, 1120.0, 315.0, 8.0);
+        assert!((msg - 630.0).abs() < 0.5, "宽裕时取上限，实际 {msg}");
 
-        // 行宽收到 900：右侧簇 + 自更新 + 工具入口仍放得下 → 还是摊开，
-        // 但消息必须缩（以前固定 45% 会把工具按钮挤出可视区）。
-        let (collapsed, msg) = status_width_split(900.0, 270.0, 150.0, true, 165.0, 90.0, 8.0);
-        assert!(!collapsed, "900px 仍应摊开");
-        assert!(msg > 40.0 && msg < 405.0, "消息应缩到剩余宽度，实际 {msg}");
+        // 行宽 900（左段 620）：工具按钮占 315，剩 ~297 给消息 → 缩到剩余宽度，
+        // 不用滚动条就能一行摆下。
+        let msg = status_msg_width(900.0, 620.0, 315.0, 8.0);
+        assert!(msg > 40.0 && msg < 405.0, "应缩到剩余宽度，实际 {msg}");
 
-        // 行宽 620：摊开就没消息的份了 → 收成一颗「⬇ 工具 N」菜单按钮。
-        let (collapsed, msg) = status_width_split(620.0, 270.0, 150.0, true, 165.0, 90.0, 8.0);
-        assert!(collapsed, "620px 应收进菜单");
-        assert!(msg > 40.0, "收进菜单后消息拿回宽度，实际 {msg}");
+        // 行宽 560（左段 280）：按钮自己就装不下了 → 消息整条不画（0），剩下
+        // 交给滚动条，否则画出来就是一条几个字的碎片。
+        assert_eq!(status_msg_width(560.0, 280.0, 315.0, 8.0), 0.0);
 
-        // 行宽 520：连菜单按钮 + 最小消息都放不下 → 消息宽度归 0（调用方
-        // 直接不画这条消息），绝不允许盖到右侧簇上面。
-        let (collapsed, msg) = status_width_split(520.0, 270.0, 150.0, true, 165.0, 90.0, 8.0);
-        assert!(collapsed);
-        assert_eq!(msg, 0.0);
-
-        // 两条工具入口在 1200px 也要摊得开（以前 ≥2 条就收菜单，现在看宽度）。
-        let (collapsed, _) = status_width_split(1200.0, 270.0, 150.0, true, 165.0 * 2.0, 90.0, 8.0);
-        assert!(!collapsed);
-
-        // 没有工具入口时不该凭空多出分隔线宽度，消息拿满上限。
-        let (collapsed, msg) = status_width_split(1400.0, 270.0, 0.0, false, 0.0, 0.0, 8.0);
-        assert!(!collapsed);
-        assert!((msg - 630.0).abs() < 0.5, "无工具入口时消息取上限，实际 {msg}");
+        // 没有按钮时消息拿满上限；窗口极窄（<80px）时全给消息但也不超上限。
+        let msg = status_msg_width(1400.0, 1120.0, 0.0, 8.0);
+        assert!((msg - 630.0).abs() < 0.5, "无按钮时取上限，实际 {msg}");
+        assert!(status_msg_width(60.0, 60.0, 0.0, 8.0) <= 60.0);
     }
 
     /// 状态栏工具入口的判定：升级优先；已是最新但本软件目录里没有那份时，
