@@ -2209,9 +2209,9 @@ fn run_tool_update(
                     idx,
                     ToolEvent::Done {
                         msg: if first_install {
-                            format!(
-                                "{label} {tag} 已安装到 {final_exe:?}，可在「⚙ 设置」里把它加为启动命令"
-                            )
+                            // 具体路径/是否已入启动命令由 UI 拼（它才知道配置改动
+                            // 结果）；这里只给一句短消息。
+                            format!("{label} {tag} 已安装")
                         } else {
                             format!("{label} 已更新到 {tag}，重新启动 {label} 即可生效")
                         },
@@ -4148,9 +4148,31 @@ impl ClientApp {
             let color = forced_contrast_color(color, bg);
             let saved_override = ui.visuals().override_text_color;
             ui.visuals_mut().override_text_color = None;
-            let copy_snapshot = text.clone(); // 渲染前快照，供右键复制（label 会 move text）
-            let label_resp = ui.label(RichText::new(text).color(color));
+            let copy_snapshot = text.clone(); // 渲染前快照，供悬停/右键复制（label 会 move text）
+            // 状态消息**不许把右侧按钮挤出可视区**：宽度封顶（行宽的 45%，下限
+            // 120px），超出以省略号截断。以前一条长消息（未检测到 pi 的安装提示
+            // 带路径，能有一屏宽）会把自更新 / pi / opencode / 检查更新按钮全挤
+            // 没了，用户连“检查更新”都点不着。悬停看全文、右键复制全文。
+            let msg_w = {
+                let avail = ui.available_width();
+                if avail < 80.0 {
+                    avail // 窗口极窄：全给消息，右侧按钮反正也放不下
+                } else {
+                    (avail * 0.45).max(120.0)
+                }
+            };
+            let mut label_resp = ui.add_sized(
+                [
+                    msg_w,
+                    ui.spacing()
+                        .interact_size
+                        .y
+                        .max(ui.text_style_height(&egui::TextStyle::Body)),
+                ],
+                egui::Label::new(RichText::new(text).color(color)).truncate(),
+            );
             ui.visuals_mut().override_text_color = saved_override;
+            label_resp = label_resp.on_hover_text(copy_snapshot.clone());
             // 右键快速复制整条状态栏消息（错误/提示可直接复制去反馈或贴给 AI）。
             label_resp.context_menu(|ui| {
                 if ui
@@ -5051,6 +5073,76 @@ impl ClientApp {
             .iter()
             .enumerate()
             .any(|(i, c)| Some(i) != skip_idx && config::tui_command_key(c) == key)
+    }
+
+    /// 「启动命令」列表里能被自动安装的绝对路径顶替的那一条下标：与新装 exe
+    /// 同义（tui_command_key 相同）且**能整体替换**的条目。
+    ///
+    /// 能整体替换 = 带路径的（可含空格，整条即路径）或不带参数的裸命令名；
+    /// `pi --foo` 这种带参数的替换掉会丢用户参数，不动它（只会被追加一条）。
+    /// 纯函数，便于单测。
+    fn replaceable_command_idx(list: &[String], key: &str) -> Option<usize> {
+        list.iter().position(|c| {
+            if config::tui_command_key(c) != key {
+                return false;
+            }
+            let t = c.trim().trim_matches('"');
+            t.contains('\\') || t.contains('/') || t.split_whitespace().count() == 1
+        })
+    }
+
+    /// 启动命令条目现在还能不能用（真能跑起来吗）：带路径的看文件在不在，裸
+    /// 命令名（如 `pi`）扫 PATH 找同名 exe。两者都没命中 = 死命令。
+    fn tui_command_usable(cmd: &str) -> bool {
+        let t = cmd.trim().trim_matches('"').trim();
+        if t.is_empty() {
+            return false;
+        }
+        if t.contains('\\') || t.contains('/') {
+            return std::path::Path::new(t).is_file();
+        }
+        let name = t.split_whitespace().next().unwrap_or(t);
+        let exe = if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+            name.to_string()
+        } else {
+            format!("{name}.exe")
+        };
+        std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()))
+    }
+
+    /// 工具刚自动装好后把它写进「启动命令」列表：点完「⬇ 安装」就能直接用它
+    /// 启动页签，不必再去设置页手敲一遍路径。幂等 + 自愈：已有等价的**可用**
+    /// 命令（`nvim` / `D:\x\nvim.exe` 同义）就不动；已有等价但**跑不起来**的
+    /// 命令（死路径，或本机没装的裸名 `pi`）就地换成刚装好的绝对路径，不在列表
+    /// 里堆死条目；一条都没有则追加。
+    /// 不动 `tui_command`（当前选中的启动命令）——那是用户的默认选择，不替他改。
+    /// 返回给状态栏的一句话；Err = 落盘失败。
+    fn auto_configure_installed_tool(&mut self, exe: &str) -> Result<String, String> {
+        let cmd = exe.trim();
+        if cmd.is_empty() {
+            return Err("安装路径为空".to_string());
+        }
+        let key = config::tui_command_key(cmd);
+        let mut list = self.settings_commands.clone();
+        let same = list.iter().position(|c| config::tui_command_key(c) == key);
+        let how = match same {
+            Some(i) if Self::tui_command_usable(&list[i]) => "启动命令里已有",
+            Some(i) if Self::replaceable_command_idx(&list, &key) == Some(i) => {
+                list[i] = cmd.to_string();
+                "已替换失效的旧命令"
+            }
+            _ => {
+                list.push(cmd.to_string());
+                "已加入启动命令"
+            }
+        };
+        self.settings_commands = list.clone();
+        self.config.settings.tui_commands = list;
+        config::save(&self.config).map_err(|e| e.to_string())?;
+        self.config_save_failed = false;
+        self.last_config_save = std::time::Instant::now();
+        Ok(how.to_string())
     }
 
     /// 设置页里的「工具更新路径」区：配置「检查更新」到哪里找 pi / opencode。
@@ -6113,13 +6205,14 @@ impl eframe::App for ClientApp {
                             TOOL_SPECS[idx].label
                         ));
                         if self.status.as_deref().is_none_or(|s| s.is_empty()) {
+                            // 短句：安装路径在按钮悬停里说（消息过长会挤掉状态栏
+                            // 右侧的下载/检查更新按钮）。
                             self.status = Some(if dir.is_empty() {
                                 format!("未检测到 {}，请手动安装", TOOL_SPECS[idx].label)
                             } else {
                                 format!(
-                                    "未检测到 {label}（同级目录无 {exe}）：点击状态栏「⬇ 安装 {label}」自动装到 {dir}",
-                                    label = TOOL_SPECS[idx].label,
-                                    exe = TOOL_SPECS[idx].exe_name
+                                    "未检测到 {label}，点右侧「⬇ 安装 {label}」",
+                                    label = TOOL_SPECS[idx].label
                                 )
                             });
                         }
@@ -6153,13 +6246,28 @@ impl eframe::App for ClientApp {
                     });
                 }
                 ToolEvent::Done { msg, version } => {
+                    // 首次安装（was_missing）顺手把新 exe 写进「启动命令」列表：
+                    // 用户点完「⬇ 安装」就该能直接用它启动页签，不必再去设置页手加。
+                    let was_missing = self.tools[idx].missing;
                     // 版本号直接采信刚装上的 tag（见 run_tool_update 的说明）。
                     self.tools[idx].local = version;
                     self.tools[idx].latest = None;
                     self.tools[idx].pending_tag = None;
-                    // 首次安装也是 Done：此刻 exe 已在安装目录里，不再是「未安装」，
-                    // 状态栏那个「⬇ 安装」按钮自行退场。
+                    // 装完 exe 已在安装目录里，不再是「未安装」：状态栏那个
+                    // 「⬇ 安装」按钮自行退场。
                     self.tools[idx].missing = false;
+                    let mut msg = msg;
+                    if was_missing {
+                        let exe = self.tools[idx]
+                            .install_dir
+                            .join(TOOL_SPECS[idx].exe_name)
+                            .to_string_lossy()
+                            .into_owned();
+                        match self.auto_configure_installed_tool(&exe) {
+                            Ok(how) => msg = format!("{msg}，{how}"),
+                            Err(e) => msg = format!("{msg}，但写入启动命令失败: {e}"),
+                        }
+                    }
                     self.status = Some(msg);
                 }
                 ToolEvent::Finished => {
@@ -6489,7 +6597,14 @@ impl eframe::App for ClientApp {
                     });
                 }
                 Some(Tab::Settings) => {
-                    self.settings_ui(ui);
+                    // 设置页很长（启动命令列表 / 工具更新路径 / 供应商配置三个页签 /
+                    // 深浅主题…），窗口不够高时下面的区块直接被面板裁掉且滚不到。
+                    // 整页套竖向滚动区：auto_shrink([false,false]) = 宽高都撑满可用
+                    // 空间（否则内容短时滚动区会缩成内容宽，右侧留白）。
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.settings_ui(ui));
                 }
                 _ => {
                     self.home_ui(ui);
@@ -6834,6 +6949,20 @@ mod update_tests {
                 id = spec.id
             );
         }
+    }
+
+    /// 自动配置启动命令时挑哪一条顶替：同义（按 tui_command_key）里只挑能**整体
+    /// 替换**的；`pi --foo` 这种带参数的替换掉会丢用户参数，只能追加不能顶替。
+    #[test]
+    fn replaceable_command_picks_whole_entry_only() {
+        let f = ClientApp::replaceable_command_idx;
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(f(&list(&["pi --foo"]), "pi"), None);
+        assert_eq!(f(&list(&["pi --foo", "pi"]), "pi"), Some(1));
+        assert_eq!(f(&list(&[r"D:\old\pi-windows-x64\pi.exe"]), "pi"), Some(0));
+        // 带空格的路径整条就是路径，也能整体替换
+        assert_eq!(f(&list(&[r"C:\Program Files\pi\pi.exe"]), "pi"), Some(0));
+        assert_eq!(f(&list(&[r"C:\Program Files\pi\pi.exe"]), "opencode"), None);
     }
 
     #[test]
