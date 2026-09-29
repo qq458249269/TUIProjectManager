@@ -855,7 +855,9 @@ fn fetch_latest_release() -> (String, Option<String>) {
 fn version_message(tag: &str) -> String {
     let latest = tag.trim_start_matches('v');
     if version_newer(latest, crate::app_version()) {
-        format!("发现新版本 {tag}，点击下方按钮下载")
+        // 「点这条」= 跳设置页顶部的更新横幅（下载按钮早搬到那儿了，原文案说
+        // “点击下方按钮”已经指不到任何东西）。
+        format!("发现新版本 {tag}，点这条跳设置页下载")
     } else {
         format!("已是最新版本 ({tag})")
     }
@@ -1601,6 +1603,24 @@ enum ToolEvent {
 /// 工具更新作业的最大尝试次数（自更新是无限重试，工具这边一次要重下
 /// 60MB 量级的压缩包，封顶更合理）。
 const MAX_TOOL_ATTEMPTS: u32 = 5;
+
+/// 设置页三个折叠分区的 id（`settings_section` 的 `id_salt`）。列在这里是因为
+/// 它们是**互斥**的：点开一个要把另外两个的 `CollapsingState` 置 false，所以
+/// 必须能拿到全量 id（见 `App::settings_section`）。顺序不影响行为，只是列出
+/// 「设置」页的三大块。
+const SETTINGS_SEC_IDS: [&str; 3] = [
+    "settings_sec_cmds",
+    "settings_sec_tool_dirs",
+    "settings_sec_providers",
+];
+
+
+/// 设置页「供应商配置」区的页签表：(显示名, `model_settings_tab` 下标)。
+///
+/// oh-my-pi（下标 1）的供应商配置**已隐藏**，不在这儿列出；但下标原样保留不动，
+/// 编辑缓冲 / 配置读写那套按 0=pi、1=omp、2=opencode 走的索引不用改。停在那张
+/// 隐藏页签上时由 `providers_section_ui` 落回 pi。
+const PROVIDER_TABS: [(&str, usize); 2] = [("pi 供应商配置", 0), ("opencode 供应商配置", 2)];
 
 /// 单个工具的更新状态。install_dir 在检查线程里按 PATH 定位 exe 后回填。
 struct ToolState {
@@ -2498,6 +2518,13 @@ pub struct ClientApp {
     opencode_default_model: String,
     /// 模型设置当前页签：0=pi，1=oh-my-pi，2=opencode。
     model_settings_tab: usize,
+    /// 设置页当前展开的那一块（手风琴）：None = 全收起。它是互斥的**唯一真相**，
+    /// 每次渲染都用它去强制各块的 CollapsingState（`settings_section`），并持久化
+    /// 在 egui data 里（重启后还是上次那块开着）。
+    open_settings_sec: Option<&'static str>,
+    /// 是否已从 egui data 读过一次 `open_settings_sec`（避免每次进设置页都重读，
+    /// 把用户刚点开的块拉回旧值）。
+    settings_sec_loaded: bool,
     /// 供应商名编辑缓冲（页签, 当前键, 输入缓冲）：失焦前不重命名、不落盘。
     provider_name_edit: Option<(usize, String, String)>,
     /// 模型 context/max 数字编辑缓冲（页签, 供应商键, 模型行号, context, max）：
@@ -2744,6 +2771,8 @@ impl ClientApp {
             opencode_load_err,
             opencode_default_model,
             model_settings_tab: 0,
+            open_settings_sec: None,
+            settings_sec_loaded: false,
             provider_name_edit: None,
             model_num_edit: None,
             bg_frame: 0,
@@ -4229,16 +4258,30 @@ impl ClientApp {
         self.status = Some("正在切换命令...".to_string());
     }
 
-/// 状态栏横向布局的一行：左侧消息（可截断）+ 若干待办按钮，右侧固定簇
+/// 状态栏横向布局的一行：左侧消息（可截断），右侧固定簇
 /// （⋯ 更多 / 检查更新 / 深浅色）永远可见。
 ///
 /// 右侧固定簇是 `Layout::right_to_left` **贴右边**画的，它不看左边已经占了
-/// 多宽 —— 左边放不下时不是换行而是直接盖上去（实测「⬇ 下载 2026.09.xx」+
-/// 「⬇ 装 pi 到本软件目录」+「🔄 检查更新」+「🌙 深色」一挤，pi 那个按钮就被
-/// 深浅色按钮压住点不着）。故先量出右侧簇的宽度，左段（消息 + 待办按钮）只拿
-/// 剩下的，且左段画在**横向滚动区**里：还挤不下就在下方出滚动条（滚轮/拖条都
-/// 能滚），既不互相盖住，也没有按钮被藏进菜单里“消失”。
-fn status_bar(&mut self, ui: &mut egui::Ui) {
+/// 多宽 —— 左边放不下时不是换行而是直接盖上去。故先量出右侧簇的宽度，左段
+/// （就一条消息）只拿剩下的，且左段画在**横向滚动区**里：还挤不下就横向拨
+/// （滚轮即可，滚动条不画），绝不互相盖住。
+///
+/// 待办按钮都不在这条行里了：pi / opencode 的安装/升级入口与本程序自己的
+/// 自更新（下载 / 取消 / 重启）都已搬到「设置 → 工具更新路径」末尾的
+/// 「⬇ 下载 / 更新」区（`tool_entry_button_ui` / `self_update_buttons_ui`）——
+/// 低频操作挤在最窄的一行里点不准，字小还得悬停才知道干什么；搬走后左段只剩
+/// 消息，横向滚动那条兜底几乎用不上、仍留着以防万一。
+    /// 状态栏这条消息是不是「发现新版本」提示（可点 → 跳设置页顶部下载）。
+    ///
+    /// **只看文案，不看 `update_latest` 是否还在**：检查更新回来的那条事件会把
+    /// `update_latest` 清掉（下载完成时也会），而提示文本还会在状态栏里待一会儿。
+    /// 早先要求 `update_latest.is_some() && …`，于是提示明明还在，却已经既没有
+    /// 手型光标、也点不动了。
+    fn status_msg_is_update_hint(text: &str) -> bool {
+        text.contains("新版本")
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (text, color) = match &self.status {
                 Some(s) => (s.clone(), ui_warn(ui)),
@@ -4271,13 +4314,9 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
 
             // ================= 宽度预算 =================
             // 右侧固定簇（⋯ 更多 / 检查更新 / 深浅色）是 right_to_left 贴右边
-            // 画的，不看左边占了多宽，放不下就是直接盖上去（实测工具安装按钮
-            // 被深浅色按钮压住）。所以先量它 —— 再加上左边必留的按钮（自更新 /
-            // 重启 / 工具入口），剩下的才是消息的。顺序：消息先让宽度（封顶
-            // 行宽的 45%、下限 120px，超出以省略号截断，悬停看全文），还
-            // 不下就把工具入口收进「⬇ 工具 N」菜单（横向只占一颗按钮），最后
-            // 连消息都不画 —— 消息可以没有，按钮不能没有。
-            const SEP_W: f32 = 6.0; // egui Style::separator_style 的 spacing
+            // 画的，不看左边占了多宽，放不下就是直接盖上去。故先量它，剩下的
+            // 才是消息的（封顶行宽的 45%、下限 120px，超出以省略号截断，悬停
+            // 看全文）；连最小宽度都腾不出时整条消息不画 —— 消息可以没有。
             let item_x = ui.spacing().item_spacing.x;
             // 右侧簇：主题按钮文案随状态变，先算出来（右边那段里也要用）。
             let (fs, dark) = (self.config.settings.follow_system, self.effective_dark());
@@ -4289,187 +4328,66 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
                 }
                 right_w += button_text_width(ui, l);
             }
-            // 左侧必留：自更新（下载中多一个 ✕ 取消）+ 装完待重启。
-            let self_upd_w = match self.update_latest.as_ref() {
-                None => 0.0,
-                Some(tag) if self.downloading => {
-                    let l = format!("⬇ 下载中… {tag}");
-                    SEP_W + item_x + text_width(ui, &l) + item_x + button_text_width(ui, "✕ 取消")
-                }
-                Some(tag) => {
-                    let l = format!("⬇ 下载 {tag}");
-                    SEP_W + item_x + button_text_width(ui, &l)
-                }
-            };
-            let restart_w = if self.update_done {
-                SEP_W + item_x + button_text_width(ui, "🔄 重启应用")
-            } else {
-                0.0
-            };
-
-            // pi / opencode 的安装/升级入口。条目有两个来源：有新版（⬇ pi vX.Y.Z）
-            // 与**本机未检测到 / 只装在别处**（⬇ 安装 pi / ⬇ 装 pi 到本软件目录，
-            // 点一下装到软件同级目录）；下载中则是进度文字 + ✕ 取消。
-            //
-            // 摊开还是收进菜单由**宽度**决定（以前只看条数）：状态栏一行放不下
-            // 的时候收成一颗「⬇ 工具 N」，点了在弹出菜单里逐条列 —— 与「⋯ 更多」
-            // 同一套交互，横向只占一颗按钮的宽度。
-            // 先收集待点击的工具下标再统一下载：本循环持 self.tools 的不可变
-            // 借用，start_tool_download 要 &mut self。
-            let mut tool_click: Option<(usize, bool)> = None;
-            let mut tool_cancel_click: Option<usize> = None;
-            // (工具下标, 是否下载中, 按钮文案, 悬停说明, 是否装进“本软件目录”)
-            let mut tool_rows: Vec<(usize, bool, String, String, bool)> = Vec::new();
-            for (i, t) in self.tools.iter().enumerate() {
-                let spec = &TOOL_SPECS[i];
-                let (downloading, latest, local, missing, dir) = (
-                    t.downloading,
-                    t.latest.clone(),
-                    t.local.clone(),
-                    t.missing,
-                    t.install_dir.clone(),
-                );
-                // 本软件同级目录里已经有一份？决定要不要再给「装到本软件目录」。
-                let fresh_dir = fresh_tool_dir(spec);
-                let fresh_present = fresh_dir
-                    .as_ref()
-                    .is_some_and(|d| d.join(spec.exe_name).is_file());
-                if downloading {
-                    tool_rows.push((
-                        i,
-                        true,
-                        format!("⬇ {} 下载中…", spec.label),
-                        format!("正在从镜像源下载并安装 {}", spec.label),
-                        false,
-                    ));
-                } else {
-                    // 按钮存在的四种情形：已装且有新版 / 未装但已拿到 tag /
-                    // 未装且 tag 未知（点下去时现查）/ **已装在别处、本软件目录
-                    // 里没有**（装一份进来）。后两种要求目录可用。
-                    let (label, tip, into_fresh) = match tool_entry_kind(
-                        latest.is_some() && !missing,
-                        missing,
-                        fresh_present,
-                        fresh_dir.as_ref().is_some_and(|d| !d.as_os_str().is_empty()),
-                    ) {
-                        ToolEntryKind::Update => {
-                            let tag = latest.clone().unwrap_or_default();
-                            let cur = if local.is_empty() { "未知".to_string() } else { local.clone() };
-                            (
-                                format!("⬇ {} {tag}", spec.label),
-                                format!(
-                                    "{label} 有新版本 {tag}（当前 {cur}）：点击从国内镜像源下载并替换 {exe}",
-                                    label = spec.label,
-                                    exe = spec.exe_name
-                                ),
-                                false,
-                            )
-                        }
-                        ToolEntryKind::InstallFresh if missing => {
-                            let dir_s = dir.to_string_lossy().into_owned();
-                            (
-                                match &latest {
-                                    Some(tag) => format!("⬇ 安装 {} {tag}", spec.label),
-                                    None => format!("⬇ 安装 {}", spec.label),
-                                },
-                                format!(
-                                    "未检测到 {exe}（本软件同级目录 / 设置里的工具路径 / PATH 都没有）：点击自动下载并安装到 {dir_s}",
-                                    exe = spec.exe_name
-                                ),
-                                true,
-                            )
-                        }
-                        // 本机 PATH / 别的目录里有，但本软件同级目录里没有：
-                        // “检测到即已装”会让这种机器上一个按钮都没有，用户没
-                        // 办法把工具收进本软件目录（换机器、PATH 被改、全局
-                        // 安装被删就断供）。给一条“装到本软件目录”，装好后本
-                        // 软件目录这份优先被找到（查找顺序里它在最前），按钮自退。
-                        ToolEntryKind::InstallFresh => {
-                            let d_s = fresh_dir
-                                .as_ref()
-                                .map(|d| d.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let cur = if local.is_empty() {
-                                "未知".to_string()
-                            } else {
-                                local.clone()
-                            };
-                            (
-                                format!("⬇ 装 {} 到本软件目录", spec.label),
-                                format!(
-                                    "本机在 {found} 找到 {label}（{cur}），但本软件同级目录里没有：点击另装一份到 {d_s}，之后检查更新以本软件目录这份为准",
-                                    found = dir.join(spec.exe_name).to_string_lossy(),
-                                    label = spec.label
-                                ),
-                                true,
-                            )
-                        }
-                        // 拿不到本软件目录（current_exe 失败）→ 无处可装，不给假入口
-                        ToolEntryKind::None => continue,
-                    };
-                    if into_fresh {
-                        if fresh_dir.as_ref().is_none_or(|d| d.as_os_str().is_empty()) {
-                            continue;
-                        }
-                    } else if dir.as_os_str().is_empty() {
-                        continue; // 拿不到安装目录 → 无处可装，不给假入口
-                    }
-                    tool_rows.push((i, false, label, tip, into_fresh));
-                }
-            }
-            // 工具入口一律全部摊开（不再收进「⬇ 工具 N」菜单：横向滚动区已经能
-            // 兜住挤不下的情况，藏进菜单反而让人以为按钮没了）。先量总宽，供
-            // 消息让宽度用。
-            let tools_w = if tool_rows.is_empty() {
-                0.0
-            } else {
-                SEP_W + tool_rows
-                    .iter()
-                    .map(|(_, downloading, label, ..)| {
-                        if *downloading {
-                            text_width(ui, label) + item_x + button_text_width(ui, "✕ 取消")
-                        } else {
-                            button_text_width(ui, label)
-                        }
-                    })
-                    .sum::<f32>()
-                    + (tool_rows.len() as f32 - 1.0).max(0.0) * item_x
-            };
             // 左段能占多宽：行宽先扣掉右侧固定簇（它贴右边画，不让位）。
             let avail = ui.available_width();
             let left_w = (avail - right_w - item_x).max(60.0);
-            let msg_w = status_msg_width(avail, left_w, self_upd_w + tools_w + restart_w, item_x);
+            let msg_w = status_msg_width(avail, left_w, 0.0, item_x);
             let row_h = ui
                 .spacing()
                 .interact_size
                 .y
                 .max(ui.text_style_height(&egui::TextStyle::Body));
-            // 高度要额外给滚动条留一条：非浮动滚动条是从可用高度里**扣掉**它再放
-            // 内容的（见 ScrollArea::begin 的 current_bar_use），不留就等于内容
-            // 被自己的滚动条切掉一截。
-            let bar_h = ui.spacing().scroll.allocated_width();
+            // 高度就一行：横向滚动条已隐藏（AlwaysHidden），不再为它预留一条
+            // （原来不留就等于内容被自己的滚动条切掉一截）；留 2px 缝给按钮描边。
             // 横向单向滚动区默认只吃水平滚轮（鼠标滚轮是 delta.y，拨不动），开这
-            // 个开关让它把垂直滚轮也当横向拨（只在本段生效，不影响设置页）。
+            // 个开关让它把垂直滚轮也当横向拨（只在本段生效，不影响设置页）——滚动
+            // 条隐藏后这就是唯一的滚动入口，必须留着。
             let saved_scroll_dir = ui.style().always_scroll_the_only_direction;
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal()
                 .id_salt("status_left_scroll")
+                // 只留滚动、不画条：AlwaysHidden 时 egui 既不画横条也不从可用高度
+                // 里扣它（ScrollArea::begin 的 show_bars 恒 false → current_bar_use
+                // 为 0），滚轮 / Shift+滚轮照常生效（ScrollSource::mouse_wheel 默认开）。
+                // 状态栏就这一行高度，露一条 8px 的滚动条既占地方又抢眼。
+                .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 // 宽度就是左段能用的宽度：右侧簇还没排（它贴右边缘），不写死
                 // max_width 的话这里会抢走整行，右侧簇又叠回它身上。
                 .max_width(left_w)
-                .max_height(row_h + bar_h)
-                // x 不自动收缩：宽度就这么多，挤不下就出横向滚动条；y 收缩到内容。
+                .max_height(row_h + 2.0)
+                // x 不自动收缩：宽度就这么多，挤不下就横向滚（滚动条已隐藏）；y 收缩到内容。
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                     // ---- 消息 ----
                     if msg_w > 8.0 {
+                        // “发现新版本 …” 这类提示点一下直达设置页顶部的更新横幅
+                        // （下载按钮在那儿）。其余消息只提供悬停全文 + 右键复制。
+                        let is_update_hint = Self::status_msg_is_update_hint(&text);
                         let mut label_resp = ui.add_sized(
                             [msg_w, row_h],
-                            egui::Label::new(RichText::new(text).color(color)).truncate(),
+                            egui::Label::new(RichText::new(text).color(color))
+                                .truncate()
+                                .sense(if is_update_hint {
+                                    egui::Sense::click()
+                                } else {
+                                    egui::Sense::hover()
+                                }),
                         );
+                        if is_update_hint {
+                            // 再钉一次光标形状：状态栏是整窗最下面一行，egui 的光标
+                            // 图标可能被上层容器（面板 / 滚动区）后写覆盖，光靠
+                            // Sense::click 不够稳。“能点的东西得长得像能点”。
+                            // （egui 0.36 的手型叫 PointingHand。）
+                            label_resp =
+                                label_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
                         ui.visuals_mut().override_text_color = saved_override;
-                        label_resp = label_resp.on_hover_text(copy_snapshot.clone());
+                        label_resp = label_resp.on_hover_text(if is_update_hint {
+                            format!("{}\n（点击跳到设置页顶部下载）", copy_snapshot)
+                        } else {
+                            copy_snapshot.clone()
+                        });
                         // 右键快速复制整条状态栏消息（错误/提示可直接复制去反馈或贴给 AI）。
                         label_resp.context_menu(|ui| {
                             if ui
@@ -4481,69 +4399,13 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
                                 ui.close();
                             }
                         });
+                        if is_update_hint && label_resp.clicked() {
+                            self.open_settings();
+                        }
                     } else {
-                        // 连最小宽度都腾不出（窗口极窄）：这条消息不画，宽度全给按钮。
+                        // 连最小宽度都腾不出（窗口极窄到右侧簇就占满了整行）：这条消息
+                        // 不画。左段已无待办按钮，挤不出宽度时也就没什么可让的了。
                         ui.visuals_mut().override_text_color = saved_override;
-                    }
-                    // ---- 本程序自己的自更新 ----
-                    if let Some(tag) = self.update_latest.clone() {
-                        ui.separator();
-                        if self.downloading {
-                            // 下载中：显示进度文本 + 取消按钮
-                            ui.label(RichText::new(format!("⬇ 下载中… {tag}")).color(
-                                ui.visuals().widgets.inactive.text_color()));
-                            if ui.button("✕ 取消").on_hover_text("取消当前下载").clicked() {
-                                self.cancel_download.store(true, std::sync::atomic::Ordering::Relaxed);
-                                self.status = Some("正在取消下载…".to_string());
-                            }
-                        } else {
-                            if ui
-                                .button(format!("⬇ 下载 {tag}"))
-                                .on_hover_text("自动下载新版本到当前目录，完成后替换旧版本")
-                                .clicked()
-                            {
-                                self.start_download(&tag);
-                            }
-                        }
-                    }
-                    // ---- 工具入口：全部摊开；挤不下由外层横向滚动区出滚动条 ----
-                    if !tool_rows.is_empty() {
-                        ui.separator();
-                        for (i, downloading, label, tip, into_fresh) in tool_rows.drain(..) {
-                            let spec = &TOOL_SPECS[i];
-                            if downloading {
-                                ui.label(RichText::new(label).color(
-                                    ui.visuals().widgets.inactive.text_color(),
-                                ));
-                                if ui
-                                    .button("✕ 取消")
-                                    .on_hover_text(format!("取消 {} 的下载", spec.label))
-                                    .clicked()
-                                {
-                                    tool_cancel_click = Some(i);
-                                }
-                            } else if ui.button(label).on_hover_text(tip).clicked() {
-                                tool_click = Some((i, into_fresh));
-                            }
-                        }
-                    }
-                    if let Some(i) = tool_cancel_click {
-                        self.tool_cancel[i].store(true, Ordering::Relaxed);
-                        self.status = Some(format!("正在取消 {} 下载…", TOOL_SPECS[i].label));
-                    }
-                    if let Some((i, into_fresh)) = tool_click {
-                        self.start_tool_download(i, into_fresh);
-                    }
-                    // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
-                    if self.update_done {
-                        ui.separator();
-                        if ui
-                            .button("🔄 重启应用")
-                            .on_hover_text("新版本已下载并替换，点击重启使新版本生效")
-                            .clicked()
-                        {
-                            self.restart_app();
-                        }
                     }
                     });
                 });
@@ -4564,8 +4426,11 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
                     .id(more_id)
                     .open_memory(None)
                     .show(|ui| {
-                        ui.set_width(110.0);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                        // 弹出层跟随项目文字自适应大小：不再 set_width 固定 110px
+                        // （窄了会截断「打开用户目录 / 软件目录」，宽了右边留白）。
+                        // 菜单项左对齐：Align::Min —— 状态栏本身是 right_to_left，
+                        // 弹层内沿用 Align::RIGHT 会把文字甩到右边，左边空一大块。
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                             if ui.selectable_label(false, "📂 打开用户目录")
                                 .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
                                 .clicked()
@@ -5053,7 +4918,194 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.heading("设置");
         ui.separator();
-        ui.label("TUI 启动命令（点击选择启动时要用的命令，可添加多个，拖动排序，改动自动保存）:");
+        // 有可更新/可安装的东西时，页顶会摆一个更新区（带下载/取消/重启按钮）。
+        // 不占平时的版面：没得下就整块不画，用户不用在一堆设置里找“没得下”。
+        self.update_zone_ui(ui);
+        // 三大块内容都很长（命令列表 / 路径列表 / 供应商+模型表），平时用不上，
+        // 全摊开会把「设置」顶成好几屏。故都做成折叠面板（手风琴，严格互斥：同
+        // 一时刻只展开一块，点另一块就自动收起）：收起时只剩标题行 + 一句摘要
+        // （条数 / 当前项），展开才画正文。
+        self.load_settings_sec_once(ui);
+        self.commands_section_ui(ui);
+        self.tool_dirs_section_ui(ui);
+        self.providers_section_ui(ui);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        // 帧率设置已整体移除（曾可调 30 FPS）：持续高帧率重绘会干扰 Windows
+        // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
+        // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
+        ui.add_space(12.0);
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个。").weak());
+        ui.add_space(12.0);
+        ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+    }
+
+    /// 进设置页时读一次「上次展开哪一块」（egui persisted，与折叠状态一样跨重
+    /// 启）。只读一次：`open_settings_sec` 是互斥的唯一真相，每次进来都重读会把
+    /// 用户刚点开的块又拉回旧值。
+    fn load_settings_sec_once(&mut self, ui: &egui::Ui) {
+        if self.settings_sec_loaded {
+            return;
+        }
+        self.settings_sec_loaded = true;
+        self.open_settings_sec = match Self::load_open_settings_sec(ui.ctx()) {
+            // 首次：默认展开第一块（沿用旧行为），别让设置页一进来空空如也。
+            None => SETTINGS_SEC_IDS.first().copied(),
+            // 有记录就尊重它（包括用户自己全收起过）。
+            Some(sec) => sec,
+        };
+    }
+
+    /// 设置页页顶的「更新区」：本程序自己的新版本 + pi / opencode 的安装/升级入口。
+    /// **只在需要动手时才出现**（本程序有新版可下 / 正在下 / 下完待重启，或某个
+    /// 工具可安装/可升级），其余时间整块不画，不占设置页版面。
+    ///
+    /// 为什么都收在这一处：更新是全局性的（不属于任何一块设置），“有什么可更新”
+    /// 一次看完，不必先展开「工具更新路径」才知道 pi 没装；页面一进来就能看到，
+    /// 状态栏的「发现新版本 …」提示点一下也正好跳到这里。
+    fn update_zone_ui(&mut self, ui: &mut egui::Ui) {
+        // 本程序这一路：`update_latest` 单独不够——下载完成事件会把它清回
+        // None，那时得靠 update_done 把「重启应用」按钮留在横幅上。
+        let self_pending =
+            self.update_latest.is_some() || self.downloading || self.update_done;
+        let tools_pending = self.any_tool_entry_available();
+        if !self_pending && !tools_pending {
+            return; // 都是最新、工具也都齐了：不画。
+        }
+        // 描边高亮框：一眼能在这页里找到，且不靠滚动位置。
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(10))
+            .stroke(egui::Stroke::new(
+                1.0,
+                if self_pending {
+                    ui.visuals().warn_fg_color
+                } else {
+                    ui.visuals().text_color()
+                },
+            ))
+            .show(ui, |ui| {
+                if self_pending {
+                    let tag = self.update_latest.clone();
+                    let (icon, head) = if self.update_done {
+                        // 下载完成事件会清掉 latest（那条通道不携 tag），故不提版本号。
+                        ("✅", "新版本已就绪，重启一下即生效".to_string())
+                    } else if self.downloading {
+                        (
+                            "⬇",
+                            match &tag {
+                                Some(t) => format!("本程序：正在下载新版本 {t}…"),
+                                None => "本程序：正在下载新版本…".to_string(),
+                            },
+                        )
+                    } else {
+                        (
+                            "⬇",
+                            format!(
+                                "本程序：发现新版本 {}（当前 {}）",
+                                tag.unwrap_or_default(),
+                                crate::app_version()
+                            ),
+                        )
+                    };
+                    ui.label(RichText::new(format!("{icon} {head}")).strong());
+                    ui.horizontal_wrapped(|ui| {
+                        self.self_update_buttons_ui(ui);
+                    });
+                }
+                // 工具入口：每个按钮自己判定该不该出现（已装且有新版 / 未装可装 /
+                // 装在别处可收进本软件目录），一个都没有时这行不画。
+                if tools_pending {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(if self_pending {
+                            "工具（pi / opencode）："
+                        } else {
+                            "⬇ 工具（pi / opencode）可安装 / 升级："
+                        })
+                        .strong(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for i in 0..TOOL_SPECS.len() {
+                            self.tool_entry_button_ui(ui, i);
+                        }
+                    });
+                }
+            });
+        ui.add_space(6.0);
+    }
+
+    /// 是否至少有一个工具的安装/升级入口按钮会出现（`tool_entry_button_ui` 里
+    /// 那套判定的同款，在按钮之外做一次，以便调用方先决定“这一行要不要画”）。
+    fn any_tool_entry_available(&self) -> bool {
+        self.tools.iter().enumerate().any(|(i, t)| {
+            let spec = &TOOL_SPECS[i];
+            let fresh = fresh_tool_dir(spec);
+            !matches!(
+                tool_entry_kind(
+                    t.latest.is_some() && !t.missing,
+                    t.missing,
+                    fresh.as_ref().is_some_and(|d| d.join(spec.exe_name).is_file()),
+                    fresh.as_ref().is_some_and(|d| !d.as_os_str().is_empty()),
+                ),
+                ToolEntryKind::None
+            )
+        })
+    }
+
+    /// 读某块折叠面板的展开状态（用的是 `settings_section` 里同一个 id 口径）。
+    fn settings_section_open(ui: &egui::Ui, id_salt: &'static str) -> bool {
+        egui::containers::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(id_salt),
+            false,
+        )
+        .is_open()
+    }
+
+    /// 直接写某块折叠面板的展开状态（不动动画，调用方负责 request_repaint）。
+    fn set_settings_section_open(ui: &egui::Ui, id_salt: &'static str, open: bool) {
+        let mut st = egui::containers::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(id_salt),
+            false,
+        );
+        st.set_open(open);
+        st.store(ui.ctx());
+    }
+
+    /// 设置页折叠面板 1/3：TUI 启动命令。标题行带摘要（命令数 + 当前选中项），
+    /// 收起时只剩这一行。
+    fn commands_section_ui(&mut self, ui: &mut egui::Ui) {
+        let cur = if self.settings_command.is_empty() {
+            "（未选）".to_string()
+        } else {
+            self.settings_command.clone()
+        };
+        let title = format!("TUI 启动命令（{} 个 · 当前 {}）", self.settings_commands.len(), cur);
+        // 默认展开：三块里启动命令翻得最勤；另外两块默认收起，要用再点开。
+        let keep = self.open_settings_sec;
+        if Self::settings_section(
+            ui,
+            "settings_sec_cmds",
+            keep == Some("settings_sec_cmds"),
+            title,
+            |ui| {
+                self.commands_body_ui(ui);
+            },
+        ) {
+            self.note_settings_sec_clicked(ui, "settings_sec_cmds");
+        }
+    }
+
+    /// 启动命令区正文（折叠面板 1/3 的 body）：选中 / 拖动排序 / 内联编辑 /
+    /// 删除 / 复制 / 添加，改动自动保存。
+    fn commands_body_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("点击选择启动时要用的命令，可添加多个，拖动排序，改动自动保存。")
+                .weak()
+                .small(),
+        );
         ui.add_space(4.0);
 
         let mut dirty = false;
@@ -5277,41 +5329,334 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
             self.config.settings.tui_commands = self.settings_commands.clone();
             self.save_config("设置已自动保存".to_string());
         }
-        self.tool_dirs_ui(ui);
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(6.0);
-        // ── 模型配置（页签：pi / oh-my-pi） ──
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("供应商配置:").strong());
-            for (i, name) in ["pi 供应商配置", "oh-my-pi 供应商配置", "opencode 供应商配置"]
-                .iter()
-                .enumerate()
-            {
+    }
+
+    /// 设置页折叠面板 2/3：工具更新路径（检查更新时到哪找 pi / opencode）。
+    /// 安装/升级按钮不在这里，工具可装/可升时页顶的「更新区」会亮出来。
+    fn tool_dirs_section_ui(&mut self, ui: &mut egui::Ui) {
+        let scan = if self.config.settings.tool_search_path {
+            "找不到时再扫 PATH"
+        } else {
+            "不扫 PATH"
+        };
+        let title = format!(
+            "工具更新路径（{} 个位置 · {}）",
+            self.settings_tool_dirs.len(),
+            scan
+        );
+        let keep = self.open_settings_sec;
+        if Self::settings_section(
+            ui,
+            "settings_sec_tool_dirs",
+            keep == Some("settings_sec_tool_dirs"),
+            title,
+            |ui| {
+                self.tool_dirs_ui(ui);
+            },
+        ) {
+            self.note_settings_sec_clicked(ui, "settings_sec_tool_dirs");
+        }
+    }
+
+    /// 设置页折叠面板 3/3：供应商配置（页签 + 供应商/模型表），标题行显示当前
+    /// 在配哪一套。安装/升级按钮不在这里，去「工具更新路径」末尾那一区。
+    fn providers_section_ui(&mut self, ui: &mut egui::Ui) {
+        // oh-my-pi 那张页签已隐藏（PROVIDER_TABS 里没它）：还停在它上面时（老记忆
+        // / 老配置里就是 1）落回 pi，否则会显示出一块没有按钮被选中的供应商配置。
+        if !PROVIDER_TABS.iter().any(|(_, tab)| *tab == self.model_settings_tab) {
+            // 先把那张隐藏页签里未失焦的改名/数字编辑提交掉，别白丢。
+            self.flush_provider_rename(self.model_settings_tab);
+            self.flush_model_num_edit(self.model_settings_tab);
+            self.model_settings_tab = 0;
+        }
+        let tab = PROVIDER_TABS
+            .iter()
+            .find(|(_, t)| *t == self.model_settings_tab)
+            .map(|(name, _)| *name)
+            .unwrap_or("pi");
+        let title = format!("供应商配置（当前：{tab}）");
+        let keep = self.open_settings_sec;
+        if Self::settings_section(
+            ui,
+            "settings_sec_providers",
+            keep == Some("settings_sec_providers"),
+            title,
+            |ui| {
+                self.providers_body_ui(ui);
+            },
+        ) {
+            self.note_settings_sec_clicked(ui, "settings_sec_providers");
+        }
+    }
+
+    /// 供应商配置区正文（折叠面板 3/3 的 body）：页签条 + 当前页签的供应商/模型表。
+    fn providers_body_ui(&mut self, ui: &mut egui::Ui) {
+        // 页签条（PROVIDER_TABS：pi / opencode，oh-my-pi 已隐藏）。窗口窄时自动换行。
+        ui.horizontal_wrapped(|ui| {
+            for (name, tab) in PROVIDER_TABS {
                 if ui
-                    .add(egui::Button::selectable(self.model_settings_tab == i, *name))
+                    .add(egui::Button::selectable(self.model_settings_tab == tab, name))
                     .clicked()
-                    && self.model_settings_tab != i
+                    && self.model_settings_tab != tab
                 {
                     // 切页签前提交原页签里未失焦的供应商改名/数字编辑（失焦事件只在字段被
                     // 渲染的帧里能捕捉，切页签的点击发生在对方页签渲染之前，会漏）避免丢失。
                     self.flush_provider_rename(self.model_settings_tab);
                     self.flush_model_num_edit(self.model_settings_tab);
-                    self.model_settings_tab = i;
+                    self.model_settings_tab = tab;
                 }
             }
         });
         self.model_settings_ui(ui, self.model_settings_tab);
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(6.0);
-        // 帧率设置已整体移除（曾可调 30 FPS）：持续高帧率重绘会干扰 Windows
-        // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
-        // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
-        ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个。").weak());
-        ui.add_space(12.0);
-        ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+    }
+
+    /// 本程序自己的更新按钮组（下载新版本 / 取消下载 / 装完重启），只出现在设置页
+    /// 顶部的更新横幅里（该横幅仅在需要下载时出现）。
+    ///
+    /// 状态栏右簇只留了「🔄 检查更新」（查有没有新版本，一键）；要下就得有个
+    /// 不那么挤的地方点，否则长标签会挤掉右簇的深浅色按钮。状态栏消息里那条
+    /// “发现新版本 …” 点一下就能跳到这块。
+    fn self_update_buttons_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(tag) = self.update_latest.clone() {
+            if self.downloading {
+                // 下载中：进度文字 + 取消（具体百分比在状态栏消息里随下载线程刷新）。
+                ui.label(
+                    RichText::new(format!("⬇ 下载中… {tag}"))
+                        .color(ui.visuals().widgets.inactive.text_color()),
+                );
+                if ui.button("✕ 取消").on_hover_text("取消当前下载").clicked() {
+                    self.cancel_download
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.status = Some("正在取消下载…".to_string());
+                }
+            } else if ui
+                .button(format!("⬇ 下载 {tag}"))
+                .on_hover_text("自动下载新版本到当前目录，完成后替换旧版本")
+                .clicked()
+            {
+                self.start_download(&tag);
+            }
+        }
+        // 下载完成待重启：新 exe 已替换到当前路径，点击重启立刻生效。
+        if self.update_done && ui
+            .button("🔄 重启应用")
+            .on_hover_text("新版本已下载并替换，点击重启使新版本生效")
+            .clicked()
+        {
+            self.restart_app();
+        }
+    }
+
+    /// 单个工具（pi / opencode）的安装/升级入口按钮，画在设置页**页顶的更新区**
+    /// （本程序的新版本 + 工具安装/升级都收在那一块里）。四种情形的判定沿用状态栏
+    /// （原代码整段搬过来，只把 `continue` 换成 `return`）：已装且有新版 → 「⬇ pi vX」；
+    /// 没装 → 「⬇ 安装 pi」（tag 未知则点下去现查）；装在别处、本软件目录里没有 →
+    /// 「⬇ 装 pi 到本软件目录」；拿不到可写目录 → 不画按钮。下载中 → 进度文字 +
+    /// 「✕ 取消」。
+    ///
+    /// 为什么搬过来：装/升级是低频操作，却挤在状态栏最窄的一行里，字小、要点得准，
+    /// 挤不下时还得横向滚才看全；而“有什么可更新”一次看完才是顺手的路径。搬走后
+    /// 状态栏左段只剩消息，横向滚动那条兜底基本用不上（仍保留，以防消息被顶到
+    /// 看不见）。
+    fn tool_entry_button_ui(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let spec = &TOOL_SPECS[idx];
+        // 先把 self.tools 里的值取出来：下面点按钮要 &mut self（start_tool_download）。
+        let (downloading, latest, local, missing, dir) = {
+            let t = &self.tools[idx];
+            (
+                t.downloading,
+                t.latest.clone(),
+                t.local.clone(),
+                t.missing,
+                t.install_dir.clone(),
+            )
+        };
+        // 本软件同级目录里已经有一份？决定要不要再给「装到本软件目录」。
+        let fresh_dir = fresh_tool_dir(spec);
+        let fresh_present = fresh_dir
+            .as_ref()
+            .is_some_and(|d| d.join(spec.exe_name).is_file());
+        if downloading {
+            ui.label(
+                RichText::new(format!("⬇ {} 下载中…", spec.label))
+                    .color(ui.visuals().widgets.inactive.text_color()),
+            );
+            if ui
+                .button("✕ 取消")
+                .on_hover_text(format!("取消 {} 的下载", spec.label))
+                .clicked()
+            {
+                self.tool_cancel[idx].store(true, Ordering::Relaxed);
+                self.status = Some(format!("正在取消 {} 下载…", spec.label));
+            }
+            return;
+        }
+        // 按钮存在的四种情形：已装且有新版 / 未装但已拿到 tag /
+        // 未装且 tag 未知（点下去时现查）/ **已装在别处、本软件目录
+        // 里没有**（装一份进来）。后两种要求目录可用。
+        let (label, tip, into_fresh) = match tool_entry_kind(
+            latest.is_some() && !missing,
+            missing,
+            fresh_present,
+            fresh_dir.as_ref().is_some_and(|d| !d.as_os_str().is_empty()),
+        ) {
+            ToolEntryKind::Update => {
+                let tag = latest.clone().unwrap_or_default();
+                let cur = if local.is_empty() { "未知".to_string() } else { local.clone() };
+                (
+                    format!("⬇ {} {tag}", spec.label),
+                    format!(
+                        "{label} 有新版本 {tag}（当前 {cur}）：点击从国内镜像源下载并替换 {exe}",
+                        label = spec.label,
+                        exe = spec.exe_name
+                    ),
+                    false,
+                )
+            }
+            ToolEntryKind::InstallFresh if missing => {
+                let dir_s = dir.to_string_lossy().into_owned();
+                (
+                    match &latest {
+                        Some(tag) => format!("⬇ 安装 {} {tag}", spec.label),
+                        None => format!("⬇ 安装 {}", spec.label),
+                    },
+                    format!(
+                        "未检测到 {exe}（本软件同级目录 / 设置里的工具路径 / PATH 都没有）：点击自动下载并安装到 {dir_s}",
+                        exe = spec.exe_name
+                    ),
+                    true,
+                )
+            }
+            // 本机 PATH / 别的目录里有，但本软件同级目录里没有：
+            // “检测到即已装”会让这种机器上一个按钮都没有，用户没
+            // 办法把工具收进本软件目录（换机器、PATH 被改、全局
+            // 安装被删就断供）。给一条“装到本软件目录”，装好后本
+            // 软件目录这份优先被找到（查找顺序里它在最前），按钮自退。
+            ToolEntryKind::InstallFresh => {
+                let d_s = fresh_dir
+                    .as_ref()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let cur = if local.is_empty() {
+                    "未知".to_string()
+                } else {
+                    local.clone()
+                };
+                (
+                    format!("⬇ 装 {} 到本软件目录", spec.label),
+                    format!(
+                        "本机在 {found} 找到 {label}（{cur}），但本软件同级目录里没有：点击另装一份到 {d_s}，之后检查更新以本软件目录这份为准",
+                        found = dir.join(spec.exe_name).to_string_lossy(),
+                        label = spec.label
+                    ),
+                    true,
+                )
+            }
+            // 拿不到本软件目录（current_exe 失败）→ 无处可装，不给假入口
+            ToolEntryKind::None => return,
+        };
+        if into_fresh {
+            if fresh_dir.as_ref().is_none_or(|d| d.as_os_str().is_empty()) {
+                return;
+            }
+        } else if dir.as_os_str().is_empty() {
+            return; // 拿不到安装目录 → 无处可装，不给假入口
+        }
+        if ui.button(label).on_hover_text(tip).clicked() {
+            self.start_tool_download(idx, into_fresh);
+        }
+    }
+
+    /// 折叠面板通用外壳：粗体标题（带摘要）+ 展开才画的 body，**三个分区互斥**
+    /// （同一时刻最多只展开一个）。
+    ///
+    /// 展开状态用 egui 自己的 `CollapsingState`（按 `id_salt` 存在 `Context::data`，
+    /// 开 persistence 时跟着窗口记忆落盘，重启后仍是上次那个开合），
+    /// `default_open` 只在“记忆里还没有这个 id”时生效——启动命令默认展开，另两块
+    /// 默认收起。收起时 body 根本不会被调用，里面那些输入框 / 拖动排序自然一起停用，
+    /// 不会出现“看不见却能改”的幽灵控件。body 缩进一级（`show` 自带），里面是垂直
+    /// 流，宽度照旧铺满。
+    ///
+    /// 互斥怎么来的：不自己另存一份“当前开着谁”，而是点开自己时直接把另外两个分区
+    /// 的 `CollapsingState` 置 false（`store` 落到 `Context::data`，同一帧后面渲染
+    /// 到的那两个立刻读到 false，动画一起收）。用 `header_response.clicked()` 而不是
+    /// `fully_open()`：后者要等展开动画播完（这软件锁 10 FPS）才为真，互斥会慢半拍。
+    /// 三段都收起也允许（再点一次自己即可），这样“全收起”仍是可达状态。
+    /// 设置页的折叠面板外壳。**互斥的唯一执行点**：渲染前把本块的展开状态强制成
+    /// `force_open`（= 当前该开着的那块），所以任意时刻只有一块是开的，不依赖
+    /// “点开后再去关别人”那种跨控件写状态的时序。
+    ///
+    /// force_open 为 true 时会先 `set_open(true)`，于是 header 的 toggle 把它
+    /// 关掉 = 用户点收起；调用方据此把 `open_settings_sec` 置 None。返回
+    /// 「这一帧 header 是不是被点了」。
+    ///
+    /// 注意它是关联函数（不带 &mut self）：body 闭包要借用 self，签名里再带
+    /// &mut self 就双重可变借用了。
+    fn settings_section(
+        ui: &mut egui::Ui,
+        id_salt: &'static str,
+        force_open: bool,
+        title: String,
+        body: impl FnOnce(&mut egui::Ui),
+    ) -> bool {
+        // 只在状态与目标不同时才写：写 persisted state 会把 egui memory 标脏并
+        // 落盘，每帧都写等于一直写盘。
+        if Self::settings_section_open(ui, id_salt) != force_open {
+            Self::set_settings_section_open(ui, id_salt, force_open);
+        }
+        let resp = egui::CollapsingHeader::new(RichText::new(title).strong())
+            .id_salt(id_salt)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                body(ui);
+                ui.add_space(4.0);
+            });
+        // header_response.clicked() 是“这一帧点在 header 上”，比 fully_open()
+        // 及时（后者要等展开动画播完，10 FPS 下慢半拍）。
+        resp.header_response.clicked()
+    }
+
+    /// 记下刚刚被点的折叠块：点开的成为唯一展开项；点的是收起 → 全关（手风琴就
+    /// 该一块都不留）。下一帧其余块就被 `settings_section` 的 force 收掉。
+    /// 状态直接改 ctx.data 不走 toggle()，动画得自己催一帧。
+    fn note_settings_sec_clicked(&mut self, ui: &egui::Ui, id_salt: &'static str) {
+        self.open_settings_sec = if Self::settings_section_open(ui, id_salt) {
+            Some(id_salt)
+        } else {
+            None
+        };
+        Self::save_open_settings_sec(ui.ctx(), self.open_settings_sec);
+        ui.ctx().request_repaint();
+    }
+
+    /// 「当前展开哪一块」的唯一真相存在哪儿：egui 的 persisted data（跟折叠状态
+    /// 一样跨重启）。用 `Option<String>`：无记录 = 从没展开过（视为全收起）。
+    const OPEN_SEC_KEY: &'static str = "settings_open_sec";
+
+    fn save_open_settings_sec(ctx: &egui::Context, sec: Option<&'static str>) {
+        // 值的类型是 `Option<String>`（存 `None` = 记着“全收起”），与读取端的
+        // `get_persisted` 泛型参数一致：`get_persisted::<T>` 返回 `Option<T>`，所以
+        // `let raw: Option<Option<String>> = …get_persisted(…)` 里的 T 正是
+        // `Option<String>`。类型不一致 egui 会当成两个 key（持久化按 TypeId 分桶）。
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                egui::Id::new(Self::OPEN_SEC_KEY),
+                sec.map(|s| s.to_string()),
+            )
+        });
+    }
+
+    /// 读回展开状态：`None` = 从没展开过（首次进设置页）；`Some(None)` = 记着
+    /// “全收起”；`Some(Some(id))` = 记着哪块。记录里的 id 已不存在（老版本遗留）
+    /// 当全收起。
+    ///
+    /// `get_persisted::<T>` 返回的是 `Option<T>`：把结果标注成
+    /// `Option<Option<String>>` 就等价于 T = `Option<String>`，外层 None = 没这个 key。
+    fn load_open_settings_sec(ctx: &egui::Context) -> Option<Option<&'static str>> {
+        // persisted 数据的读取也要走 data_mut（get_persisted 要 &mut self）。
+        let raw: Option<Option<String>> = ctx
+            .data_mut(|d| d.get_persisted(egui::Id::new(Self::OPEN_SEC_KEY)));
+        raw.map(|sec| sec.and_then(|s| SETTINGS_SEC_IDS.iter().copied().find(|id| *id == s)))
     }
 
     /// 启动命令是否已存在（按 config::tui_command_key 等价判重，大小写/`.exe`
@@ -5471,11 +5816,10 @@ fn status_bar(&mut self, ui: &mut egui::Ui) {
     /// 默认项（本软件同级目录下的 pi / opencode）启动时由 `current_exe` 自动
     /// 写进配置，跨机器各自一份、**不硬编码**；用户可追加/删除别的位置
     /// （exe 完整路径或目录均可），并决定是否再扫 PATH。改动自动保存。
+    ///
+    /// 这是折叠面板 2/3 的正文：标题（位置数 / 扫不扫 PATH）在
+    /// `tool_dirs_section_ui` 里，这里只管内容。
     fn tool_dirs_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.label("工具更新路径（检查更新时到哪找 pi / opencode）:");
         let default_dir = software_dir()
             .map(|d| d.display().to_string())
             .unwrap_or_else(|| "(未知，取不到本软件目录)".to_string());
@@ -7055,6 +7399,82 @@ mod tab_icon_tests {
         assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100), None);
     }
 }
+
+#[cfg(test)]
+mod settings_accordion_tests {
+    use super::{ClientApp as App, SETTINGS_SEC_IDS};
+    use eframe::egui;
+
+    /// 状态栏里“能点”的那条提示必须只靠文案识别：不能因为 update_latest 被清掉
+    /// （下载完成 / 事件回来）就变成不能点，否则提示还在、手型却没了。
+    #[test]
+    fn update_hint_depends_on_text_only() {
+        assert!(App::status_msg_is_update_hint("发现新版本 v0.2.0（当前 0.1.0）…"));
+        assert!(App::status_msg_is_update_hint("新版本已就绪，重启一下即生效"));
+        assert!(!App::status_msg_is_update_hint("正在检查更新…"));
+        assert!(!App::status_msg_is_update_hint("已启动 2 个会话 · pi v0.1.0"));
+    }
+
+    /// 把三块按 keep 渲染一遍（force_open = keep == 本块），返回仍处于展开的块。
+    fn render_once(ui: &mut egui::Ui, keep: Option<&'static str>) -> Vec<&'static str> {
+        for id in SETTINGS_SEC_IDS {
+            let _ = App::settings_section(ui, id, keep == Some(id), "标题".to_string(), |_| {});
+        }
+        SETTINGS_SEC_IDS
+            .iter()
+            .copied()
+            .filter(|id| App::settings_section_open(ui, id))
+            .collect()
+    }
+
+    /// 手风琴的唯一真相：渲染前把各块强制成「只有 keep 开着」，所以哪怕底层
+    /// CollapsingState 里同时存着两个 true（老记忆、手工改 memory），画出来也只有一块。
+    #[test]
+    fn only_keep_section_stays_open() {
+        egui::__run_test_ui(|ui| {
+            // 先人为把前两块都置成展开（模拟状态残留）。
+            for id in &SETTINGS_SEC_IDS[..2] {
+                App::set_settings_section_open(ui, id, true);
+            }
+            assert_eq!(App::settings_section_open(ui, SETTINGS_SEC_IDS[0]), true);
+
+            // keep = 第三块 → 前两块必须被收掉。
+            let open = render_once(ui, Some(SETTINGS_SEC_IDS[2]));
+            assert_eq!(open, vec![SETTINGS_SEC_IDS[2]]);
+
+            // keep = None（三块全收起）→ 一个都不许开着。
+            let open = render_once(ui, None);
+            assert!(open.is_empty(), "全收起时仍开着：{open:?}");
+
+            // keep = 第一块 → 只有第一块。
+            let open = render_once(ui, Some(SETTINGS_SEC_IDS[0]));
+            assert_eq!(open, vec![SETTINGS_SEC_IDS[0]]);
+        });
+    }
+
+    /// 「哪块开着」要跨重启记住：写进去再读出来是同一块；全收起也能记。
+    #[test]
+    fn open_sec_persists() {
+        egui::__run_test_ctx(|ctx| {
+            // 首次：没有任何记录（外层 None = 从没展开过）。
+            assert_eq!(App::load_open_settings_sec(ctx), None);
+            App::save_open_settings_sec(ctx, Some(SETTINGS_SEC_IDS[1]));
+            assert_eq!(
+                App::load_open_settings_sec(ctx),
+                Some(Some(SETTINGS_SEC_IDS[1]))
+            );
+            // 全收起也要能存（否则每次进来都回退成上次那块）。
+            App::save_open_settings_sec(ctx, None);
+            assert_eq!(App::load_open_settings_sec(ctx), Some(None));
+            // 非法 id（老版本遗留）当全收起，不 panic。
+            ctx.data_mut(|d| {
+                d.insert_persisted(egui::Id::new(App::OPEN_SEC_KEY), Some("旧区块".to_string()))
+            });
+            assert_eq!(App::load_open_settings_sec(ctx), Some(None));
+        });
+    }
+}
+
 #[cfg(test)]
 mod restore_coords_tests {
     use super::{restore_coords, TabKind};
