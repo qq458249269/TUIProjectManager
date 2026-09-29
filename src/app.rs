@@ -3705,7 +3705,10 @@ impl ClientApp {
                 // （egui 里 Frame 的 response 是另一块无点击感的控件）。
                 // 只感 click、不感 drag：首页固定最左，不可拖动、不可关闭。
                 let hit = ui.interact(rect, egui::Id::new("home_tab"), egui::Sense::click());
-                if hit.clicked() && !selected {
+                // 只认指针点击（clicked_by 而非 clicked）：egui 把「控件持有键盘
+                // 焦点 + Enter/Space」也算一次点击，页签栏不是键盘可达控件（切页
+                // 走点击 / Ctrl+Tab），让回车误切页就是 bug。详见 tab_focus.rs。
+                if hit.clicked_by(egui::PointerButton::Primary) && !selected {
                     actions.push(TabAction::Activate(0));
                 }
                 let hovering = !selected
@@ -3839,7 +3842,9 @@ impl ClientApp {
                     if resp.dragged() {
                         drag_index = Some(i);
                     }
-                    if resp.clicked() {
+                    // 只认指针点击：键盘（Enter/Space）落在页签上不切页也不关页，
+                    // 否则终端里一次误落的回车就能把当前页签切走/关掉。
+                    if resp.clicked_by(egui::PointerButton::Primary) {
                         let pos = ui.ctx().pointer_interact_pos();
                         // 指针按在 × 上 —— 关闭；否则 —— 激活。即便已激活也推送 Activate，
                         // 让「输出结束」对号在点击当前页签时也能被清除。
@@ -4029,7 +4034,8 @@ impl ClientApp {
                     if resp.dragged() {
                         drag_index = Some(i);
                     }
-                    if resp.clicked() {
+                    // 同会话页签：只认指针点击，键盘回车不切页/不关页。
+                    if resp.clicked_by(egui::PointerButton::Primary) {
                         let pos = ui.ctx().pointer_interact_pos();
                         if pos.is_some_and(|p| close_rect.contains(p)) {
                             actions.push(TabAction::Close(i));

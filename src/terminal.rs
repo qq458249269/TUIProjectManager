@@ -750,9 +750,38 @@ pub fn show_terminal(
 
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
     let term_id = resp.id;
-    if resp.clicked() {
+    // 只认指针点击：egui 的 clicked() 把「该控件有键盘焦点 + Enter/Space」也算
+    // 一次点击（FAKE_PRIMARY_CLICKED，见 egui context.rs get_response），那样
+    // 终端里每按一次回车都会走 request_focus → interrupt_ime，打断输入法候选。
+    if resp.clicked_by(egui::PointerButton::Primary) {
         *term_focused = true;
         resp.request_focus();
+    }
+
+    // ── 键盘焦点必须锁在终端上 ──
+    // egui 0.36 起，聚焦控件默认不独占 Tab/方向键/Esc（EventFilter 四项默认
+    // false，见 egui memory/mod.rs Focus::begin_pass）：这些键会被判成「焦点
+    // 遍历」，把键盘焦点交给下一个可聚焦控件。本页签栏在终端之前注册，Tab
+    // 之后焦点就落到「首页」页签上；再按 Enter，egui 把这次回车记成该页签的
+    // FAKE_PRIMARY_CLICKED → Response::clicked() 为真 → 页签被键盘「点击」→
+    // 切到首页（斜杠命令里 Tab 补全 + 回车提交就会踩到，方向键翻历史同样会）。
+    // 终端聚焦期间：声明独占这四类键（set_focus_lock_filter 要求已有焦点，故在
+    // 拿到焦点后的下一帧生效），并把被抢走的焦点当帧拽回终端。
+    if *term_focused {
+        if ui.memory(|m| m.focused()) != Some(term_id) {
+            resp.request_focus();
+        }
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                term_id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            )
+        });
     }
 
     // IME 归属：终端聚焦，且没有其他 egui 控件（如输入弹窗里的 TextEdit）
