@@ -299,6 +299,9 @@ fn paste_file_paths(sess: &Session, files: &[String], status: &mut Option<String
         .map(|p| path_for_input(&rel_to_cwd(p, &sess.dir)))
         .collect();
     let _ = sess.writer.try_send(mapped.join(" ").into_bytes());
+    // 粘贴文件路径同样是用户驱动的写入（TUI 会补全/回显路径），
+    // 记输入窗口，否则页签把它当成任务在跑。
+    stamp_user_input(sess);
     *status = Some(if mapped.len() == 1 {
         format!("已粘贴文件相对路径：{}", mapped[0])
     } else {
@@ -669,6 +672,27 @@ pub fn wheel_scroll_action(
     }
 }
 
+/// 该滚轮动作是否要把这次操作记进「滚动回显短窗口」（`Session::last_scroll_ms`）。
+///
+/// 纯函数（[`wheel_scroll_action`] 的镜像判定，见 show_terminal 里的统一记账点）：
+/// 只有**写 PTY** 的两个分支要记——转发鼠标滚轮与 PgUp/PgDn 翻页，它们引发的
+/// TUI 重绘会刷新 `last_output_ms`，不记就会把「用户在翻历史」误判成「任务在跑」
+/// 而点亮页签 🔄。本地翻页/按行滚（`PageScroll`/`LineScroll`/`None`）不碰 PTY、
+/// 不产生输出，记了反而会白吞一次真实输出判定。
+fn stamps_scroll_echo(action: &WheelScroll) -> bool {
+    matches!(
+        action,
+        WheelScroll::ForwardMouse(_) | WheelScroll::PageKey(_)
+    )
+}
+
+/// 记「用户驱动的 PTY 写入」：键盘、点击/中键转发、粘贴文件路径这类写入都会
+/// 让 TUI 立刻回显重绘，reader 随之刷新 `last_output_ms` → 页签误亮 🔄。
+/// 统一走这一个入口，漏记就会退化成「用户一动就显示任务在跑」。
+fn stamp_user_input(sess: &Session) {
+    sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
 pub fn show_terminal(
     ui: &mut egui::Ui,
@@ -781,7 +805,19 @@ pub fn show_terminal(
         // 清掉 egui 的平滑增量：终端自己按档位滚动，同一份位移不能再流向
         // 其他 ScrollArea（页签栏/设置页），否则滚终端会连带滚别的滚动区。
         ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
-        match wheel_scroll_action(*wheel, cell_h, mouse_reporting, alt_screen) {
+        let action = wheel_scroll_action(*wheel, cell_h, mouse_reporting, alt_screen);
+        // 滚轮即「用户驱动视口操作」：转发给 TUI 后 TUI 会重绘回显新输出 →
+        // reader 刷新 last_output_ms → 页签误亮 🔄。凡是把滚轮写进 PTY 的
+        // 分支都在这里统一记一次滚动回显短窗口（app.rs SCROLL_ECHO_MS=500ms，
+        // 不共用键盘输入 1.5s 窗口）：只吞滚动引起的这一下重绘，真实任务输出
+        // 晚于窗口即照常判 🔄。本地滚动分支不产生 PTY 输出，不写任何时间戳。
+        // 记账点收敛在一处：早先只在 ForwardMouse 记，PageKey（PgUp/PgDn 翻页，
+        // 即不开鼠标上报的全屏 TUI——pi 等）漏记 → 用户一滚轮页签就常亮 🔄。
+        if stamps_scroll_echo(&action) {
+            sess.last_scroll_ms
+                .store(crate::now_ms(), Ordering::Relaxed);
+        }
+        match action {
             WheelScroll::None => {}
             WheelScroll::ForwardMouse(n) => {
                 // 子进程开了鼠标上报（opencode/nvim 等）→ 滚轮作为真实滚轮事件转发，
@@ -789,12 +825,6 @@ pub fn show_terminal(
                 let pos = ui
                     .input(|i| i.pointer.latest_pos())
                     .unwrap_or(rect.center());
-                // 滚轮即「用户驱动视口操作」：转发给 TUI 后 TUI 会重绘回显新
-                // 输出 → reader 刷新 last_output_ms → 页签误亮 🔄。记入滚动回显短
-                // 窗口（app.rs SCROLL_ECHO_MS=500ms，不共用键盘输入 1.5s 窗口）：
-                // 只吞滚动引起的这一下重绘，真实任务输出晚于窗口即照常判 🔄。
-                // 本地缓冲滚动分支不产生 PTY 输出，不写任何时间戳。
-                sess.last_scroll_ms.store(crate::now_ms(), Ordering::Relaxed);
                 let (col, row) = to_col_row(pos);
                 let b = if n > 0 { 64u16 } else { 65 }; // xterm 滚轮上/下事件码
                 for _ in 0..n.unsigned_abs() {
@@ -804,8 +834,8 @@ pub fn show_terminal(
             WheelScroll::PageKey(n) => {
                 // ALT_SCREEN 无鼠标上报 → PgUp/PgDn 翻页。
                 // 应用自己管滚屏（不吐滚轮序列），只能改用翻页键：
-                // 一格拨轮 = 一次翻页（与 PageUp 键同量）；同 ForwardMouse，
-                // 转发出去的翻页键会引起 TUI 回显，记滚动回显短窗口。
+                // 一格拨轮 = 一次翻页（与 PageUp 键同量）；回显短窗口在上方
+                // stamps_scroll_echo 处统一记。
                 for _ in 0..n.unsigned_abs() {
                     let key: &[u8] = if n > 0 { b"\x1b[5~" } else { b"\x1b[6~" }; // PgUp / PgDn
                     let _ = sess.writer.try_send(key.to_vec());
@@ -881,6 +911,8 @@ pub fn show_terminal(
                 // 中键：照旧立即转发。
                 if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                     let (col, row) = to_col_row(pos);
+                    // 同滚轮：点击是「用户驱动」写入，TUI 重绘回显不算任务在跑。
+                    stamp_user_input(sess);
                     send_mouse_event(&sess.writer, sgr_mouse, 1, col, row, false);
                     ui.ctx().request_repaint();
                 }
@@ -895,6 +927,8 @@ pub fn show_terminal(
             && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
         {
             let (col, row) = to_col_row(pos);
+            // 中键释放同样会引发 TUI 重绘 → 记输入窗口。
+            stamp_user_input(sess);
             send_mouse_event(&sess.writer, sgr_mouse, 0, col, row, true);
             ui.ctx().request_repaint();
         }
@@ -1033,6 +1067,9 @@ pub fn show_terminal(
                     sess.mouse_press_pending = None;
                 } else if let Some((code, col, row, sgr)) = sess.mouse_press_pending.take() {
                     // 普通点击：按原行为成对转发（按下位置 + 释放位置）。
+                    // 成对字节是一次用户驱动的写入（TUI 多半立刻重绘/滚屏），
+                    // 记键盘输入窗口，免得页签把它当成任务在跑。
+                    stamp_user_input(sess);
                     send_mouse_bytes(&sess.writer, mouse_event_bytes(sgr, code, col, row, false));
                     let (col2, row2) = to_col_row(latest_pos.unwrap_or(rect.center()));
                     send_mouse_bytes(&sess.writer, mouse_event_bytes(sgr, 0, col2, row2, true));
@@ -1317,9 +1354,10 @@ pub fn show_terminal(
             all.extend_from_slice(b);
         }
         let sent = sess.writer.try_send(all).is_ok();
-        // 回显延迟探针：记录输入时间戳（读取线程比对首块回显）。
+        // 键盘输入时间戳：读取线程用它比对首块回显（回显延迟探针），
+        // 页签判定也靠它识别「新鲜回显是打字引起的」。
         if sent {
-            sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
+            stamp_user_input(sess);
         }
     }
 
@@ -2287,6 +2325,23 @@ mod tests {
             wheel_scroll_action(flood, h, false, true),
             WheelScroll::PageKey(MAX_WHEEL_STEPS)
         );
+    }
+
+    /// 只有写 PTY 的滚轮分支要记滚动回显窗口。
+    /// 回归锁：PageKey（alt_screen 无鼠标上报，即 pi/opencode 关闭鼠标上报的
+    /// 形态）早先漏记 last_scroll_ms，用户一滚轮，TUI 翻页重绘刷新
+    /// last_output_ms → 页签 🔄 常亮到用户停止滚动为止。
+    #[test]
+    fn only_pty_writing_wheel_branches_stamp_echo() {
+        assert!(stamps_scroll_echo(&WheelScroll::ForwardMouse(1)));
+        assert!(stamps_scroll_echo(&WheelScroll::ForwardMouse(-3)));
+        // alt_screen 无鼠标上报：PgUp/PgDn 翻页也写 PTY → 同样要记。
+        assert!(stamps_scroll_echo(&WheelScroll::PageKey(1)));
+        assert!(stamps_scroll_echo(&WheelScroll::PageKey(-1)));
+        // 本地滚动不写 PTY → 不记（否则白吞一次真实输出判定）。
+        assert!(!stamps_scroll_echo(&WheelScroll::PageScroll(1)));
+        assert!(!stamps_scroll_echo(&WheelScroll::LineScroll(2)));
+        assert!(!stamps_scroll_echo(&WheelScroll::None));
     }
 
     /// 触摸板是连续位移：按格高折算成行；普通屏按行滚，不按页（否则手指
