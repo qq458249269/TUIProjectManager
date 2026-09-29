@@ -4258,8 +4258,8 @@ impl ClientApp {
         self.status = Some("正在切换命令...".to_string());
     }
 
-/// 状态栏横向布局的一行：左侧消息（可截断），右侧固定簇
-/// （⋯ 更多 / 检查更新 / 深浅色）永远可见。
+/// 状态栏横向布局的一行：左侧消息（可截断），右侧固定簇（现在只剩「⋯ 更多」
+/// 一个按钮）永远可见。设置 / 检查更新 / 打开目录 / 深浅色都收进它的弹出层。
 ///
 /// 右侧固定簇是 `Layout::right_to_left` **贴右边**画的，它不看左边已经占了
 /// 多宽 —— 左边放不下时不是换行而是直接盖上去。故先量出右侧簇的宽度，左段
@@ -4296,7 +4296,7 @@ impl ClientApp {
                         ui_gray(ui),
                     ),
                     _ => (
-                        "选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除 / 设置"
+                        "选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除   |   右下角 ⋯ 更多信息"
                             .to_string(),
                         ui_gray(ui),
                     ),
@@ -4313,21 +4313,16 @@ impl ClientApp {
             let copy_snapshot = text.clone(); // 渲染前快照，供悬停/右键复制（label 会 move text）
 
             // ================= 宽度预算 =================
-            // 右侧固定簇（⋯ 更多 / 检查更新 / 深浅色）是 right_to_left 贴右边
-            // 画的，不看左边占了多宽，放不下就是直接盖上去。故先量它，剩下的
-            // 才是消息的（封顶行宽的 45%、下限 120px，超出以省略号截断，悬停
-            // 看全文）；连最小宽度都腾不出时整条消息不画 —— 消息可以没有。
+            // 右侧固定簇（⋯ 更多）是 right_to_left 贴右边画的，不看左边占了多宽，
+            // 放不下就是直接盖上去。故先量它，剩下的才是消息的（封顶行宽的 45%、
+            // 下限 120px，超出以省略号截断，悬停看全文）；连最小宽度都腾不出时整条
+            // 消息不画 —— 消息可以没有。
             let item_x = ui.spacing().item_spacing.x;
-            // 右侧簇：主题按钮文案随状态变，先算出来（右边那段里也要用）。
+            // 主题：当前状态（弹层里那一项的文案，切完下一帧就变）+ 轮转用。
             let (fs, dark) = (self.config.settings.follow_system, self.effective_dark());
             let theme_label = if fs { "🎨 跟随系统" } else if dark { "🌙 深色" } else { "☀ 浅色" };
-            let mut right_w = 8.0; // + 测量误差余量
-            for (i, l) in ["⋯ 更多", "🔄 检查更新", theme_label].iter().enumerate() {
-                if i > 0 {
-                    right_w += item_x;
-                }
-                right_w += button_text_width(ui, l);
-            }
+            // 右侧固定簇只剩「⋯ 更多」一个按钮（其余全在弹层里）。
+            let right_w = button_text_width(ui, "⋯ 更多") + 8.0; // + 测量误差余量
             // 左段能占多宽：行宽先扣掉右侧固定簇（它贴右边画，不让位）。
             let avail = ui.available_width();
             let left_w = (avail - right_w - item_x).max(60.0);
@@ -4364,16 +4359,32 @@ impl ClientApp {
                         // “发现新版本 …” 这类提示点一下直达设置页顶部的更新横幅
                         // （下载按钮在那儿）。其余消息只提供悬停全文 + 右键复制。
                         let is_update_hint = Self::status_msg_is_update_hint(&text);
-                        let mut label_resp = ui.add_sized(
-                            [msg_w, row_h],
-                            egui::Label::new(RichText::new(text).color(color))
-                                .truncate()
-                                .sense(if is_update_hint {
-                                    egui::Sense::click()
-                                } else {
-                                    egui::Sense::hover()
-                                }),
-                        );
+                        // 不能用 ui.add_sized()：它内部固定用
+                        // Layout::centered_and_justified（egui 0.36 ui.rs:1543），
+                        // 于是 label 整个被**居中**摆在 msg_w × row_h 的框里——
+                        // 文字比框窄就左右各空 (msg_w-宽)/2，看着就是“居中”。
+                        // Label::halign 只管 label 自己 rect 内部的文字，管不到它被
+                        // 摆在框的哪个位置，两者必须一起钉死：这里用
+                        // left_to_right(Center) 固定横向贴左（纵向仍居中，别让文字
+                        // 顶到框上沿），Label 再显式 halign(Min) 管住截断行内部。
+                        let mut label_resp = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(msg_w, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(text).color(color))
+                                            .truncate()
+                                            .halign(egui::Align::Min)
+                                            .sense(if is_update_hint {
+                                                egui::Sense::click()
+                                            } else {
+                                                egui::Sense::hover()
+                                            }),
+                                    )
+                                },
+                            )
+                            .inner;
                         if is_update_hint {
                             // 再钉一次光标形状：状态栏是整窗最下面一行，egui 的光标
                             // 图标可能被上层容器（面板 / 滚动区）后写覆盖，光靠
@@ -4410,27 +4421,48 @@ impl ClientApp {
                     });
                 });
             ui.style_mut().always_scroll_the_only_direction = saved_scroll_dir;
-            // 右下角：⋯ 更多折叠菜单（打开用户目录 / 软件目录）+「检查更新」+ 深浅色切换（右侧第一个 = 最右）。
+            // 右下角固定簇只剩一个「⋯ 更多」按钮：设置 / 检查更新 / 打开目录 /
+            // 深浅色全部收进它的弹出层（原先挤在这一行的三个按钮点不准，也把
+            // 行宽吃掉了大半）。它是 right_to_left 里**最先添加**的那个 = 最右侧。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
                 let more_id = egui::Id::new("status_more_menu");
                 // Sense::CLICK 不含 FOCUSABLE 位：不参与键盘焦点循环（Tab/方向键不会选中它）。
-                // 最先添加 = 最右侧：⋯ 更多 固定在最右边。
                 let more_resp = ui
                     .add(egui::Button::new("⋯ 更多").sense(egui::Sense::CLICK))
-                    .on_hover_text("打开用户目录 / 软件目录");
+                    .on_hover_text("设置 / 检查更新 / 打开目录 / 深浅色切换");
                 if more_resp.clicked() && ui.input(|i| i.pointer.any_click()) {
                     egui::Popup::toggle_id(ui.ctx(), more_id);
                 }
+                // CloseOnClickOutside：egui 的 Popup 默认是 CloseOnClick，**点弹层
+                // 里的任何一项都会顺手把菜单关掉**（ComboBox/菜单才是那个语义）。
+                // 这里要的是「点了项菜单还在」，故改成只有点在弹层**外面**才关——
+                // 菜单项里也就不调 ui.close()（那会立刻置 CLOSE 标记，绕过
+                // close_behavior 直接关掉）。连着点两三个项（查完更新接着切主题）
+                // 不用反复把菜单点开。再点「⋯ 更多」本身仍是切换开关。
                 egui::Popup::from_response(&more_resp)
                     .id(more_id)
                     .open_memory(None)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show(|ui| {
-                        // 弹出层跟随项目文字自适应大小：不再 set_width 固定 110px
-                        // （窄了会截断「打开用户目录 / 软件目录」，宽了右边留白）。
+                        // 弹出层跟随菜单项文字自适应大小：不 set_width（窄了会截断
+                        // 「📂 打开用户目录」，宽了右边留白）。
                         // 菜单项左对齐：Align::Min —— 状态栏本身是 right_to_left，
                         // 弹层内沿用 Align::RIGHT 会把文字甩到右边，左边空一大块。
                         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            if ui.selectable_label(false, "⚙ 设置")
+                                .on_hover_text("打开设置页：TUI 启动命令 / 工具更新路径 / 供应商与模型")
+                                .clicked()
+                            {
+                                self.open_settings();
+                            }
+                            if ui.selectable_label(false, "🔄 检查更新")
+                                .on_hover_text("从 GitHub Release 检查本软件 + pi + opencode 的最新版本（启动/新开页签时也会自动检查）")
+                                .clicked()
+                            {
+                                self.check_updates(false);
+                            }
+                            ui.separator();
                             if ui.selectable_label(false, "📂 打开用户目录")
                                 .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
                                 .clicked()
@@ -4439,57 +4471,48 @@ impl ClientApp {
                                     .or_else(|_| std::env::var("HOME"))
                                     .unwrap_or_else(|_| ".".to_string());
                                 self.open_explorer(dir);
-                                ui.close();
                             }
-                            ui.separator();
                             if ui.selectable_label(false, "📂 打开软件目录")
                                 .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
                                 .clicked()
                             {
                                 let dir = software_dir().unwrap_or_else(|| PathBuf::from("."));
                                 self.open_explorer(dir);
-                                ui.close();
+                            }
+                            ui.separator();
+                            // 深浅色：菜单项本身就是当前状态（theme_label），点一下
+                            // 轮转 深色 → 浅色 → 跟随系统 → 深色。菜单不关（close_behavior），
+                            // 想连着调就接着点。
+                            if ui.selectable_label(false, theme_label)
+                                .on_hover_text("点击切换：深色 → 浅色 → 跟随系统（随 Windows 深浅自动切换）")
+                                .clicked()
+                            {
+                                if fs {
+                                    // 跟随系统 → 切回固定深色。
+                                    self.config.settings.follow_system = false;
+                                    self.config.settings.dark_mode = true;
+                                } else if dark {
+                                    // 深色 → 浅色。
+                                    self.config.settings.dark_mode = false;
+                                } else {
+                                    // 浅色 → 跟随系统。
+                                    self.config.settings.follow_system = true;
+                                }
+                                apply_theme(ui.ctx(), self.effective_dark());
+                                self.save_config("已切换主题".to_string());
+                                // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色
+                                // （opencode 等 TUI 会据此匹配自己的配色）。
+                                self.broadcast_theme();
+                                // 延迟全量重绘：子进程收到广播后重绘需要时间，晚到的输出
+                                // 可能在清缓存之后才写入；定时再清一次并强制整帧，兜住
+                                // 这类脏状态。
+                                self.theme_settle_at = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_millis(100),
+                                );
+                                ui.ctx().request_repaint();
                             }
                         });
                     });
-                // 「检查更新」：放在 ⋯ 更多 左边，同样只响应鼠标点击。
-                let check_upd = ui
-                    .add(egui::Button::new("🔄 检查更新").sense(egui::Sense::CLICK))
-                    .on_hover_text("从 GitHub Release 检查本软件 + pi + opencode 的最新版本（启动/新开页签时也会自动检查）");
-                if check_upd.clicked() && ui.input(|i| i.pointer.any_click()) {
-                    self.check_updates(false);
-                }
-                // 主题切换按钮：深色 → 浅色 → 跟随系统 → 深色 轮转。
-                // 只响应鼠标点击，防止键盘方向键选中后回车误触发。
-                // label 已在宽度预算里算过（theme_label），直接复用。
-                // Sense::CLICK 不含 FOCUSABLE 位：主题切换按钮同样只响应鼠标，
-                // 不参与键盘焦点循环（方向键不会选中它，回车不会误触发）。
-                let theme_btn = ui
-                    .add(egui::Button::new(theme_label).sense(egui::Sense::CLICK))
-                    .on_hover_text("点击切换：深色 → 浅色 → 跟随系统（随 Windows 深浅自动切换）");
-                if theme_btn.clicked() && ui.input(|i| i.pointer.any_click()) {
-                    if fs {
-                        // 跟随系统 → 切回固定深色。
-                        self.config.settings.follow_system = false;
-                        self.config.settings.dark_mode = true;
-                    } else if dark {
-                        // 深色 → 浅色。
-                        self.config.settings.dark_mode = false;
-                    } else {
-                        // 浅色 → 跟随系统。
-                        self.config.settings.follow_system = true;
-                    }
-                    apply_theme(ui.ctx(), self.effective_dark());
-                    self.save_config("已切换主题".to_string());
-                    // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色（
-                    // opencode 等 TUI 会据此匹配自己的配色）。
-                    self.broadcast_theme();
-                    // 延迟全量重绘：子进程收到广播后重绘需要时间，晚到的输出可能
-                    // 在清缓存之后才写入；定时再清一次并强制整帧，兜住这类脏状态。
-                    self.theme_settle_at =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
-                    ui.ctx().request_repaint();
-                }
             });
         });
     }
@@ -4503,14 +4526,13 @@ impl ClientApp {
                 ui.heading("项目列表");
                 ui.separator();
                 ui.horizontal(|ui| {
+                    // 「⚙ 设置」已挪到右下角「⋯ 更多」弹层里（所有按钮都收在一处），
+                    // 左侧面板这一行只留「＋ 添加」。
                     if ui.button("＋ 添加").clicked() {
                         self.input = Some(InputDialog::AddProject {
                             name: String::new(),
                             path: String::new(),
                         });
-                    }
-                    if ui.button("⚙ 设置").clicked() {
-                        self.open_settings();
                     }
                 });
                 // 搜索框 + 排序文本按钮（点击循环切换：默认 → 升序 → 降序 → 默认）
