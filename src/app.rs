@@ -525,51 +525,19 @@ fn curl_bin() -> &'static str {
     "curl"
 }
 
-/// 用 curl 请求 URL 并解析 JSON 中的 tag。extract 决定取哪个字段：GitHub
-/// API 用 tag_name，jsDelivr 数据 API 用 versions[0].version。
+/// 用 curl 请求 URL 并把响应体取回内存（自更新与工具资产表探查共用）。
 /// 通用性说明：`-q` 让 curl 完全不读 ~/.curlrc（曾有残留 Clash 127.0.0.1:7897
 /// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误）——任何机器上的
 /// 残留配置都不影响；环境 http_proxy/https_proxy 代理仍读（用户明确配置的
 /// 代理放行，配合 PS/WinHTTP 系统代理通道，直连/代理双栈互补——全禁代理
 /// 曾导致有加速器的机器下载不了）。connect_timeout / max_time（秒）由调用方
 /// 决定。
-fn fetch_tag_from_url(
-    url: &str,
-    connect_timeout: u64,
-    max_time: u64,
-    extract: fn(&serde_json::Value) -> Option<String>,
-) -> Result<String, String> {
-    let mut cmd = std::process::Command::new(curl_bin());
-    let ct = connect_timeout.to_string();
-    let mt = max_time.to_string();
-    cmd.args([
-        "-q", // 忽略 .curlrc / _curlrc，防用户机器上的残留代理端口
-        "-s", "-f", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
-        "-H", "User-Agent: TUIProjectManager",
-        url,
-    ]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    let output = cmd.output().map_err(|e| format!("启动 curl 失败: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("HTTP {}", output.status.code().unwrap_or(0)));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "无法解析 JSON 响应".to_string())?;
-    extract(&v).ok_or_else(|| "返回结构不符合预期".to_string())
-}
-
-/// curl 拉取 URL 到内存（-q 忽略 .curlrc 残留代理，参数与 fetch_tag_from_url 一致）。
-/// 新增的资产解析（工具更新的 API/HTML 源）复用此通道，不重复造 curl 命令。
 fn curl_get(url: &str, connect_timeout: u64, max_time: u64) -> Result<Vec<u8>, String> {
     let mut cmd = std::process::Command::new(curl_bin());
     let ct = connect_timeout.to_string();
     let mt = max_time.to_string();
     cmd.args([
+        // -q 忽略 .curlrc / _curlrc，防用户机器上的残留代理端口
         "-q", "-s", "-f", "-L", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
         url,
@@ -586,8 +554,8 @@ fn curl_get(url: &str, connect_timeout: u64, max_time: u64) -> Result<Vec<u8>, S
     Ok(output.stdout)
 }
 
-/// HTML 302 重定向取 tag（github.com /releases/latest 重定向到
-/// /releases/tag/<tag>，免 API 限流）。同样 -q 直连、无代理无端口。
+/// GitHub HTML 302：只取重定向 URL（`-w %{redirect_url}`）原样返回，
+/// 从里面挖 /releases/tag/<tag> 的活儿交给 parse_tag。同样 -q、不读代理端口。
 fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<String, String> {
     let mut cmd = std::process::Command::new(curl_bin());
     let ct = connect_timeout.to_string();
@@ -611,18 +579,7 @@ fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<Stri
     if !o.status.success() {
         return Err(format!("HTTP {}", o.status.code().unwrap_or(0)));
     }
-    let redirect = String::from_utf8_lossy(&o.stdout);
-    match redirect.find("/releases/tag/") {
-        Some(pos) => {
-            let tag = redirect[pos + "/releases/tag/".len()..].trim().to_string();
-            if tag.is_empty() {
-                Err("HTML 返回空 tag".to_string())
-            } else {
-                Ok(tag)
-            }
-        }
-        None => Err(format!("HTML 未解析出 tag（redirect={redirect}）")),
-    }
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// 跑一段 PowerShell 并把 stdout 取回（redirect 时 PS 输出编码默认 GBK，ASCII
@@ -643,189 +600,227 @@ fn ps_run(script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// PowerShell Invoke-RestMethod 拉 JSON 取 tag。独立网络栈（WinHTTP/Schannel），
-/// 吃系统代理（Steam++/加速器系统代理模式可救直连被墙；不设 DefaultWebProxy=$null）
-/// ——curl 在这个目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「别的办法绕过」
-/// 的主力源（实测直连 api.github.com ~1.1s 返回 tag）。
+/// PowerShell Invoke-WebRequest 取回任意 URL 的正文（独立网络栈 WinHTTP/Schannel，
+/// 吃系统代理——Steam++/加速器系统代理模式可救直连被墙；不设 DefaultWebProxy=$null）。
+/// curl 在个别目标机上会 ACCESS_VIOLATION 启动即崩，PS 通道是「换个办法绕过」的
+/// 主力源。tag 探查与资产表探查共用它，取回来的正文由调用方的 parse 决定怎么用。
 #[cfg(windows)]
-fn ps_fetch_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
+fn ps_fetch_body(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
          $ErrorActionPreference='Stop'; \
-         $r = Invoke-RestMethod -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t}; \
-         $r | ConvertTo-Json -Depth 10",
-        url = url,
-        t = timeout_secs,
-    );
-    let out = ps_run(&script)?;
-    let v: serde_json::Value =
-        serde_json::from_str(&out).map_err(|e| format!("PS 响应解析失败: {e}"))?;
-    v["tag_name"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "PS 返回结构不符合预期".to_string())
-}
-
-/// PowerShell Invoke-WebRequest 取 GitHub releases/latest 页（自动跟随 302）后
-/// 从响应体里挖 /releases/tag/<tag>。
-#[cfg(windows)]
-fn ps_fetch_html_tag(url: &str, timeout_secs: u64) -> Result<String, String> {
-    let script = format!(
-        "$ErrorActionPreference='Stop'; \
          (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing).Content",
         url = url,
         t = timeout_secs,
     );
-    let body = ps_run(&script)?;
-    match body.find("/releases/tag/") {
-        Some(pos) => {
-            let tag = body[pos + "/releases/tag/".len()..]
-                .trim()
-                .to_string();
-            if tag.is_empty() {
-                Err("PS HTML 返回空 tag".to_string())
-            } else {
-                Ok(tag)
-            }
-        }
-        None => Err("PS HTML 未解析出 tag".to_string()),
-    }
+    ps_run(&script)
 }
 
 /// 本软件自身的 GitHub 仓库（检查自身更新用）。
 const SELF_REPO: &str = "qq458249269/TUIProjectManager";
 
-/// 拉取某个 repo 的最新 tag。所有源**并发**探查、先到先得：GH_MIRRORS 国内镜像、
-/// jsDelivr 数据 API（Fastly CDN，大陆友好、不依赖 GitHub 可达性）、
-/// GitHub HTML 302（免 API 限流）、GitHub API（可能限流）同时发起，
-/// 任一源在自身超时内返回有效 tag 即胜出——坏源零成本跳过，总耗时封顶在
-/// 最快源的超时内（≈6s），不再逐源串行、最坏吃满全表，也顺带防限流误报。
-/// 全程 -q 直连、不读任何代理配置与端口。自更新与 pi/opencode 检查共用此源表。
-fn fetch_latest_tag(repo: &str) -> Result<String, String> {
+/// 本软件自身 Release 的页面前缀（资产片段 / 标签页 URL 拼在这里）。
+const SELF_REPO_PAGE: &str = "https://github.com/qq458249269/TUIProjectManager";
+
+/// 探查源的**正文形态**：既决定「怎么把正文取回来」，也决定「正文里挖什么」。
+///
+/// 这套枚举 + 下面的 Probe/probe_first 就是「检查更新」的镜像源下载逻辑本身，
+/// pi / opencode 的资产表探查直接复用它（同一份 GH_MIRRORS、同一份 PS 通道、
+/// 同一套并发先到先得），不再各写一串只直连 api.github.com 的取数逻辑。
+#[derive(Clone, Copy)]
+enum ProbeKind {
+    /// JSON 响应体：解析后由 extract 取字段（GitHub API 取 tag_name）。
+    Json(fn(&serde_json::Value) -> Option<String>),
+    /// GitHub HTML 302：curl -L 后只取重定向头（`-w %{redirect_url}`），不下载
+    /// 正文，免 API 限流。
+    HtmlTag,
+    /// HTML 正文原样取回（expanded_assets 资产列表片段）。
+    Html,
+}
+
+/// 一个探查源。desc/URL/通道/超时档位都在这里配，probe_first 负责并发调度。
+/// repo/tag 挂在源上（parse 是 fn 指针、捕获不了局部变量，由解析方自行取用）。
+struct Probe {
+    desc: String,
+    url: String,
+    kind: ProbeKind,
+    /// 走 PowerShell WinHTTP（独立网络栈 + 系统代理），curl 崩溃/被墙时绕过。
+    ps: bool,
+    /// 连接超时 / 总超时（秒）。
+    ct: u64,
+    mt: u64,
+    /// 本次探查的仓库与标签（解析正文时按需取用；tag 探查不关心）。
+    repo: String,
+    tag: String,
+}
+
+impl Probe {
+    fn new(desc: &str, url: String, kind: ProbeKind, ct: u64, mt: u64) -> Self {
+        Self {
+            desc: desc.to_string(),
+            url,
+            kind,
+            ps: false,
+            ct,
+            mt,
+            repo: String::new(),
+            tag: String::new(),
+        }
+    }
+
+    /// 同一 URL 追加一条走 PS WinHTTP 的源（curl 崩/被墙时的独立网络栈兜底）。
+    fn via_ps(mut self) -> Self {
+        self.ps = true;
+        self
+    }
+
+    /// 标上本次探查的 repo / tag，供 parse 从正文里定位资产。
+    fn ctx(mut self, repo: &str, tag: &str) -> Self {
+        self.repo = repo.to_string();
+        self.tag = tag.to_string();
+        self
+    }
+}
+
+/// 按 kind 取回单个源的正文（已归一：JSON/HTML 给原文，HtmlTag 给重定向 URL）。
+/// 具体「从正文里取值」交给 probe_first 的 parse（fn 指针，便于跨线程发送）。
+fn probe_body(p: &Probe) -> Result<String, String> {
+    #[cfg(windows)]
+    if p.ps {
+        return ps_fetch_body(&p.url, p.mt);
+    }
+    match p.kind {
+        ProbeKind::HtmlTag => fetch_tag_html(&p.url, p.ct, p.mt),
+        ProbeKind::Json(_) | ProbeKind::Html => {
+            let b = curl_get(&p.url, p.ct, p.mt)?;
+            Ok(String::from_utf8_lossy(&b).into_owned())
+        }
+    }
+}
+
+/// 拉取某个 repo 的最新 tag 的源表：GH_MIRRORS 国内镜像（每个前缀拼在
+/// api.github.com 直链前）、jsDelivr 数据 API（Fastly CDN，大陆友好、不依赖
+/// GitHub 可达性）、GitHub HTML 302（免 API 限流）、GitHub API（可能限流）
+/// 以及 PS WinHTTP 通道（curl 崩溃/失败时的绕过源）。
+fn tag_probes(repo: &str) -> Vec<Probe> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let html_url = format!("https://github.com/{repo}/releases/latest");
     let jd_url = format!("https://data.jsdelivr.com/v1/packages/gh/{repo}");
 
-    // 每个源：描述、URL、取 tag 方式（JSON 提取器或 HTML 302）、超时。
-    struct Src {
-        desc: &'static str,
-        url: String,
-        html: bool,
-        ps: bool, // 走 PowerShell WinHTTP 通道（curl 崩溃/失败时的绕过源）
-        extract: fn(&serde_json::Value) -> Option<String>,
-        ct: u64,
-        mt: u64,
-    }
     let gh_api: fn(&serde_json::Value) -> Option<String> =
         |v| v["tag_name"].as_str().map(str::to_string);
-    let mut sources: Vec<Src> = Vec::new();
+    let mut sources: Vec<Probe> = Vec::new();
     for m in GH_MIRRORS {
-        sources.push(Src {
-            desc: m,
-            url: format!("{m}{api_url}"),
-            html: false,
-            ps: false,
-            extract: gh_api,
-            ct: 3,
-            mt: 6,
-        });
+        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6));
     }
     // jsDelivr 数据 API：实返回 {"tags":{},"versions":[{version,…}]}——tags 恒为空
     // 对象（只收 semver 标签），最新版在 versions[0].version。旧实现读 tags[]
     // 永远取不到 → 该源静默必败，等于少一个 CDN 主力源。
-    sources.push(Src {
-        desc: "jsDelivr",
-        url: jd_url,
-        html: false,
-        ps: false,
-        extract: |v: &serde_json::Value| -> Option<String> {
-            v["versions"]
-                .as_array()?
-                .first()?["version"]
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| v["tags"].as_array()?.first()?.as_str().map(str::to_string))
-        },
-        ct: 4,
-        mt: 8,
-    });
-    sources.push(Src { desc: "GitHub HTML", url: html_url.clone(), html: true, ps: false, extract: gh_api, ct: 6, mt: 12 });
-    sources.push(Src { desc: "GitHub API", url: api_url.clone(), html: false, ps: false, extract: gh_api, ct: 6, mt: 12 });
-
-    // PowerShell 通道（独立 WinHTTP 网络栈）：curl 失败/崩溃时仍可检查更新。
-    // 实测本机直连 api.github.com 1.1s 可达；不读任何代理端口。
+    sources.push(Probe::new(
+        "jsDelivr",
+        jd_url,
+        ProbeKind::Json(
+            |v: &serde_json::Value| -> Option<String> {
+                v["versions"]
+                    .as_array()?
+                    .first()?["version"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| v["tags"].as_array()?.first()?.as_str().map(str::to_string))
+            },
+        ),
+        4,
+        8,
+    ));
+    sources.push(Probe::new("GitHub HTML", html_url.clone(), ProbeKind::HtmlTag, 6, 12));
+    sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::Json(gh_api), 6, 12));
+    // PowerShell 通道（独立 WinHTTP 网络栈，吃系统代理）：curl 失败/崩溃时仍可
+    // 检查更新。实测本机直连 api.github.com 1.1s 可达；不读任何代理端口。
     #[cfg(windows)]
     {
-        sources.push(Src {
-            desc: "PS API",
-            url: api_url.clone(),
-            html: false,
-            ps: true,
-            extract: gh_api,
-            ct: 8,
-            mt: 15,
-        });
+        sources.push(Probe::new("PS API", api_url, ProbeKind::Json(gh_api), 8, 15).via_ps());
+        sources.push(Probe::new("PS HTML", html_url, ProbeKind::HtmlTag, 8, 15).via_ps());
     }
-    #[cfg(windows)]
-    {
-        sources.push(Src {
-            desc: "PS HTML",
-            url: html_url.clone(),
-            html: true,
-            ps: true,
-            extract: gh_api,
-            ct: 8,
-            mt: 15,
-        });
-    }
+    #[cfg(not(windows))]
+    let _ = (api_url, html_url);
+    sources
+}
 
+/// 从探查正文里挖 tag（两种 HTML 形态都只需找 `/releases/tag/<tag>`：
+/// curl 源给的是重定向 URL，PS 源给的是页面正文）。
+fn parse_tag(p: &Probe, body: &str) -> Result<String, String> {
+    let tag = match &p.kind {
+        ProbeKind::Json(f) => {
+            let v: serde_json::Value =
+                serde_json::from_str(body).map_err(|_| "无法解析 JSON 响应".to_string())?;
+            f(&v).ok_or_else(|| "返回结构不符合预期".to_string())?
+        }
+        ProbeKind::HtmlTag | ProbeKind::Html => {
+            let pos = body
+                .find("/releases/tag/")
+                .ok_or_else(|| format!("HTML 未解析出 tag（redirect={body}）"))?;
+            body[pos + "/releases/tag/".len()..].trim().to_string()
+        }
+    };
+    if tag.is_empty() {
+        return Err("返回空 tag".to_string());
+    }
+    Ok(tag)
+}
+
+/// 拉取某个 repo 的最新 tag。所有源**并发**探查、先到先得：任一源在自身超时内
+/// 返回有效 tag 即胜出——坏源零成本跳过，总耗时封顶在最快源的超时内（≈6s），
+/// 不再逐源串行、最坏吃满全表，也顺带防限流误报。全程 -q 直连、不读任何代理
+/// 配置与端口。
+fn fetch_latest_tag(repo: &str) -> Result<String, String> {
+    let (_desc, tag) = probe_first(repo, tag_probes(repo), parse_tag)?;
+    log_update(&format!("检查更新 {repo} 最新 tag: {tag}"));
+    Ok(tag)
+}
+
+/// 所有源**并发**探查、先到先得：同时发起，任一源取回正文且 parse 成功即胜出，
+/// 其余源直接放行不再取数（全败时逐条记日志）。返回 (胜出源名, 值)。
+///
+/// 这是「检查更新」与「工具下载」共用的取数骨架：GH_MIRRORS 前缀镜像、
+/// GitHub 直连、PowerShell WinHTTP 三类通道在这里统一调度，新增数据源只需
+/// 往源表里加一条。parse 是 fn 指针（不捕获局部变量），天然可 Send + 'static。
+fn probe_first<T: Send + 'static>(
+    ctx: &str,
+    sources: Vec<Probe>,
+    parse: fn(&Probe, &str) -> Result<T, String>,
+) -> Result<(String, T), String> {
     let n = sources.len();
+    if n == 0 {
+        return Err("没有可用源".to_string());
+    }
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(String, String), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(String, T), String>>();
     for s in sources {
         let tx = tx.clone();
         let done = done.clone();
+        let ctx = ctx.to_string();
         std::thread::spawn(move || {
             if done.load(Ordering::Relaxed) {
                 return; // 已有源胜出，本线程不再发消息
             }
-            let tag = if s.ps {
-                #[cfg(windows)]
-                {
-                    if s.html {
-                        ps_fetch_html_tag(&s.url, s.mt)
-                    } else {
-                        ps_fetch_tag(&s.url, s.mt)
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    // 非 Windows 无 PS 源（构造时不会插入）。
-                    Err("PS 源仅在 Windows 可用".to_string())
-                }
-            } else if s.html {
-                fetch_tag_html(&s.url, s.ct, s.mt)
-            } else {
-                fetch_tag_from_url(&s.url, s.ct, s.mt, s.extract)
-            };
-            let msg = match &tag {
-                Ok(t) => format!("检查更新 {} 成功 → tag {t}", s.desc),
-                Err(e) => format!("检查更新 {} 失败: {e}", s.desc),
-            };
-            log_update(&msg);
-            if tag.is_ok() {
+            let parsed = probe_body(&s).and_then(|body| parse(&s, &body));
+            match &parsed {
+                Ok(_) => log_update(&format!("探查 {ctx} {} 成功", s.desc)),
+                Err(e) => log_update(&format!("探查 {ctx} {} 失败: {e}", s.desc)),
+            }
+            if parsed.is_ok() {
                 done.store(true, Ordering::Relaxed);
             }
-            let _ = tx.send(tag.map(|t| (s.desc.to_string(), t)));
+            let _ = tx.send(parsed.map(|v| (s.desc.clone(), v)));
         });
     }
+    drop(tx);
     let mut errors: Vec<String> = Vec::new();
     for _ in 0..n {
         match rx.recv() {
-            Ok(Ok((_desc, tag))) => {
+            Ok(Ok(v)) => {
                 done.store(true, Ordering::Relaxed);
-                log_update(&format!("检查更新 {repo} 最新 tag: {tag}"));
-                return Ok(tag);
+                return Ok(v);
             }
             Ok(Err(e)) => errors.push(e),
             Err(_) => break,
@@ -833,8 +828,8 @@ fn fetch_latest_tag(repo: &str) -> Result<String, String> {
     }
     // 具体失败原因已逐条 log_update；这里只给用户一句可行动的提示
     //（逐源错误已写日志，展开只会把状态栏撑成一条长串）。
-    log_update(&format!("检查更新 {repo} 全部源失败: {}", errors.join("；")));
-    Err("网络错误（镜像与直连、jsDelivr 均失败，请检查网络连接或加速工具如 Steam++）".to_string())
+    log_update(&format!("探查 {ctx} 全部源失败: {}", errors.join("；")));
+    Err("网络错误（镜像与直连源均失败，请检查网络连接或加速工具如 Steam++）".to_string())
 }
 
 /// 拉取本软件自身最新版本号，生成状态栏消息 + 有新版本时的 tag。
@@ -872,52 +867,27 @@ fn download_update(
     progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
-    // 从 GitHub Release 里找 exe 直链。优先级：HTML 页面（github.com CDN，
-    // 无限流、比 api.github.com 更易连通）→ 直拼直链（零请求保底）→ GitHub
-    // API 最低（仅 HTML 拿不到时兜底，成功可补字节数）。
+    // 从 GitHub Release 里找 exe 直链。优先级：expanded_assets 资产片段
+    // （github.com CDN、无限流、比 api.github.com 更易连通，且真的带下载链接）
+    // → 标签页 HTML（有些镜像/缓存会直接把它渲染出来）→ 直拼直链（零请求保底）
+    // → GitHub API 最低（仅前面都没拿到时兜底，成功可补字节数）。
     // 旧实现 API 优先：限流/被墙时每次下载都先撞 API 失败（HTTP 22），错误
     // 汇总里「源① API」长期打头误导；现在 API 降为最低优先级，curl 带 -f
     // 失败时透出真实报错，HTML 兜底成功则照常下载。
     let mut exe_info: Option<(String, String, u64)> = None; // (url, 文件名, 字节数)
     let mut api_err: Option<String> = None;
-    // 源②主路径：HTML 页面（github.com CDN 无限流）。HTML 成功即用，
-    // total=0（页面不含字节数，进度按已下载字节显示）。
+    // 源②主路径：取 expanded_assets 片段（标签页初始 HTML 的资产列表是
+    // lazy-load 的 include-fragment，一个下载链接都没有，旧实现据此判定
+    // 「HTML 必失败」——直接取那个片段才是有效源）。
+    // 复用与「检查更新 / 工具下载」同一套镜像源探查：以前这段只裸 curl 直连
+    // github.com，被墙时先白等 2×8s 再退到直拼直链，白白卡十几秒。
     // ponytail: 要百分比进度可另发一次 HEAD 取 Content-Length，或 API 仅补 size。
-    let page_url = format!(
-        "https://github.com/qq458249269/TUIProjectManager/releases/tag/{tag}"
-    );
-    let mut page_cmd = std::process::Command::new(curl_bin());
-    page_cmd.args([
-        "-q", "-s", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-        "-H", "User-Agent: TUIProjectManager",
-        &page_url,
-    ]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        page_cmd.creation_flags(0x08000000);
-    }
-    match page_cmd.output() {
-        Ok(o) if o.status.success() => {
-            let html = String::from_utf8_lossy(&o.stdout);
-            if let Some(info) = exe_asset_from_html(&html, tag) {
-                exe_info = Some(info);
-            } else {
-                // GitHub 资产列表是 lazy-load 的 expanded_assets fragment，
-                // 初始 HTML 无下载链接 → 解析必失败，转 API/直拼。
-                log_update(&format!(
-                    "下载 源② HTML 成功但未解析出 exe 直链（页面 {} 字节，资产懒加载），转 API/直拼",
-                    html.len()
-                ));
-            }
+    match fetch_self_exe_asset(tag) {
+        Ok((src, info)) => {
+            log_update(&format!("下载 源② HTML 命中（{src}）：{}", info.1));
+            exe_info = Some(info);
         }
-        Ok(o) => {
-            log_update(&format!(
-                "下载 源② HTML HTTP {} 失败，转 API/直拼",
-                o.status.code().unwrap_or(0)
-            ));
-        }
-        Err(e) => log_update(&format!("下载 源② HTML: 启动 curl 失败: {e}")),
+        Err(e) => log_update(&format!("下载 源② HTML 全部源失败（转 API/直拼）：{e}")),
     }
     // 源①（已降为最低优先级）：仅 HTML 拿不到时才问 API，成功可补字节数。
     // 限流/被墙（curl HTTP 22）时此失败不再最先发生、不打头进错误汇总。
@@ -1027,6 +997,9 @@ fn download_update(
         }
         match download_race(
             &name,
+            // 分片指纹带 tag：不同版本的 exe 分片不得互相续传（否则会把旧版
+            // 前半截接到新版后半截上，拼出一个能过 PE 头校验却跑不起来的文件）。
+            &shard_fp(tag),
             candidates,
             total,
             dest_dir,
@@ -1073,22 +1046,77 @@ const GH_MIRRORS: &[&str] = &[
     "https://github.moeyy.xyz/", // moeyy 加速
 ];
 
-/// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset_name}.new，
+/// 下载分片的指纹（FNV-1a 64 → 8 位十六进制）：分片文件名里必须带上它。
+///
+/// **为什么**：分片文件原先只按 `{产物名}.c{i}.new` 命名，而产物名是常量
+/// （`.pi-update.zip` / `tui-project-manager.exe`），于是不同 tag、不同资产
+/// 名（opencode 的 avx2 版与 baseline 版）复用同一个分片，curl 的 `-C -`
+/// 会把 A 包的前半截接上 B 包的后半截——拼出来的东西**尾部照样有
+/// `PK\x05\x06`**（看起来合法），却是个谁也解不开/解出坏 exe 的包，还白烧
+/// 一个 60MB 下载。指纹把「这批字节属于哪个 tag 的哪个资产」显式写进文件名，
+/// 不同批次彻底隔离。
+fn shard_fp(key: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    // 取高 32 位写进文件名：够区分版本/资产名，又不把临时文件名撑太长
+    format!("{:08x}", (h >> 32) as u32)
+}
+
+/// 清掉同族产物名下**其它指纹**的残留分片（换 tag / 换资产名时上一批的半截
+/// 文件）。这些文件既占磁盘（一个工具就可能压着几百 MB），又是下一轮 `-C -`
+/// 把坏包续出来的原料。保留本轮指纹的分片（那是可用的断点续传进度）。
+fn purge_other_shards(dest_dir: &Path, asset_name: &str, fp: &str) -> usize {
+    let prefix = format!("{asset_name}.");
+    let keep = format!("{prefix}{fp}.");
+    let Ok(rd) = std::fs::read_dir(dest_dir) else {
+        return 0;
+    };
+    let mut n = 0;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // 只动本族分片 / 未晋升的 .new，且必须不是本轮指纹的。
+        if !name.starts_with(&prefix) || !name.ends_with(".new") || name.starts_with(&keep) {
+            continue;
+        }
+        if let Some(p) = e.path().to_str() {
+            if cleanup_file(p) {
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        log_update(&format!("清理旧分片 {n} 个（{asset_name}，非本轮 {fp}）"));
+    }
+    n
+}
+
+/// 文件字节数（拿不到按 0 算）。
+fn file_len(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset}.{fp}.new，
 /// 轮询文件大小报告进度。返回 Ok(下载文件路径) 或 Err(具体失败原因)。
-/// 单个文件名下的候选链**并发竞速**下载（与 fetch_latest_release 同思路）：
-/// 全部候选（国内镜像 + PS WinHTTP + curl 直链）同时发起，各自写独立临时
-/// 文件 dest_dir/{name}.c{idx}.new，第一个成功完成的胜出并 promote 为
-/// {name}.new，其余就地 kill。坏源/停滞源零成本跳过：--connect-timeout 8 挡
-/// 连接挂死，--speed-limit 4096 --speed-time 8 判死持续 <4KB/s 达 8s 的僵尸
-/// 源（不再让一个死镜像独占整条串行下载）。失败/取消保留 .c{idx}.new 供
-/// 下次 -C - 续传；胜出 promote 若被杀软短持有则退避重试。validate 是产物
-/// 校验（自更新 = looks_like_exe，pi/opencode = looks_like_zip），错误页/
-/// 截断文件永不胜出。
+/// 单个文件名下的候选链**并发竞速**下载（与检查更新同一套镜像源逻辑）：全部
+/// 候选（国内镜像 + PS WinHTTP + curl 直链）同时发起，各自写独立临时文件
+/// dest_dir/{asset}.{fp}.c{idx}.new，第一个成功完成的胜出并 promote 为
+/// {asset}.{fp}.new，其余就地 kill。坏源/停滞源零成本跳过：--connect-timeout 8
+/// 挡连接挂死，--speed-limit 4096 --speed-time 8 判死持续 <4KB/s 达 8s 的僵尸
+/// 源（不再让一个死镜像独占整条串行下载）。失败/取消保留分片供下次 `-C -`
+/// 续传；胜出 promote 若被杀软短持有则退避重试。validate 是产物校验
+/// （自更新 = looks_like_exe，pi/opencode = looks_like_zip），错误页/截断文件
+/// 永不胜出。fp 是本轮（tag + 资产名）的分片指纹，保证续传不会跨版本串包；
+/// total 已知时还额外做**字节数对账**（见下）。
 /// 返回 Ok(下载文件路径) 或 Err(所有候选失败的聚合)。
 /// ponytail: 若 release 数日后镜像纷纷清缓存变慢，可给镜像档位降权或按历史
 /// 延迟排序重试；触及率低，暂不加。
 fn download_race(
     asset_name: &str,
+    fp: &str,
     candidates: Vec<(String, bool)>, // (url, 走 PS WinHTTP)
     total: u64,
     dest_dir: &Path,
@@ -1096,12 +1124,14 @@ fn download_race(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     validate: fn(&Path) -> bool,
 ) -> Result<String, String> {
-    let new_name = format!("{asset_name}.new");
+    // 换批次前先清掉上一批的半截文件（别让它们占盘 + 续成坏包）。
+    purge_other_shards(dest_dir, asset_name, fp);
+    let new_name = format!("{asset_name}.{fp}.new");
     let dest_path = dest_dir.join(&new_name);
     let mut children: Vec<Option<std::process::Child>> = Vec::new();
     let mut errs: Vec<String> = Vec::new();
     for (i, (url, ps)) in candidates.iter().enumerate() {
-        let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+        let tmp = dest_dir.join(format!("{asset_name}.{fp}.c{i}.new"));
         let tmp_str = tmp.to_str().unwrap_or("update.exe.new").replace('\'', "''");
         let mut cmd = if *ps {
             let mut c = std::process::Command::new("powershell");
@@ -1128,9 +1158,17 @@ fn download_race(
                 "-H", "User-Agent: TUIProjectManager",
                 "-o", tmp.to_str().unwrap_or("update.exe.new"),
             ]);
-            // 断点续传：上次遗留的 .c{i}.new 非空则续传（PS 无续传，直接覆盖重下）。
-            if std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) > 0 {
-                c.arg("-C").arg("-");
+            // 断点续传：上次遗留的同指纹分片非空则续传（PS 无续传，直接覆盖重下）。
+            // 已知总字节数时分片不可能比它还大——那就是别的批次残留/拼坏的，
+            // 删掉重下，绝不拿它当续传起点。
+            let have = file_len(&tmp);
+            if have > 0 {
+                if total > 0 && have >= total {
+                    log_update(&format!("分片 {have} ≥ 总数 {total}，丢弃后重下"));
+                    let _ = cleanup_file(tmp.to_str().unwrap_or(""));
+                } else {
+                    c.arg("-C").arg("-");
+                }
             }
             c.arg(url);
             c
@@ -1159,11 +1197,7 @@ fn download_race(
         // 进度 = 各临时文件当前大小的最大值（领先者即竞速胜出者的身形）。
         let mut reported = 0u64;
         for i in 0..children.len() {
-            reported = reported.max(
-                std::fs::metadata(dest_dir.join(format!("{asset_name}.c{i}.new")))
-                    .map(|m| m.len())
-                    .unwrap_or(0),
-            );
+            reported = reported.max(file_len(&dest_dir.join(format!("{asset_name}.{fp}.c{i}.new"))));
         }
         let _ = progress_tx.send((reported, total));
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1172,7 +1206,21 @@ fn download_race(
             let Some(ch) = slot.as_mut() else { continue };
             match ch.try_wait() {
                 Ok(Some(st)) if st.success() => {
-                    let tmp = dest_dir.join(format!("{asset_name}.c{i}.new"));
+                    let tmp = dest_dir.join(format!("{asset_name}.{fp}.c{i}.new"));
+                    // 字节数对账：已知总字节数时，产物必须分毫不差。少 = 截断，
+                    // 多 = 续传时服务器没认 Range（把整个包又追加了一遍）——两种
+                    // 情况产物头尾都可能长得像模像样（zip 尾部 PK\x05\x06 在位），
+                    // 光看 looks_like_zip 拦不住，装上去才发现是个坏 exe。
+                    let got = file_len(&tmp);
+                    if total > 0 && got != total {
+                        let _ = std::fs::remove_file(&tmp);
+                        errs.push(format!(
+                            "{}: 字节数不符（收到 {got}，应为 {total}，疑似截断或续传重复追加）",
+                            candidates[i].0
+                        ));
+                        *slot = None;
+                        continue;
+                    }
                     // 源返回了非 exe 产物（错误页 HTML / 截断文件）：视作该候选失败，
                     // 删其临时文件后继续等其余候选——坏源永不胜出，杜绝
                     // 「替换失败: 下载文件损坏」反复出现（原本错误页体积小、下载最快，
@@ -1191,7 +1239,7 @@ fn download_race(
                         }
                         other.take();
                         if let Some(p) = dest_dir
-                            .join(format!("{asset_name}.c{j}.new"))
+                            .join(format!("{asset_name}.{fp}.c{j}.new"))
                             .to_str()
                         {
                             let _ = cleanup_file(p);
@@ -1481,23 +1529,54 @@ fn looks_like_zip(p: &Path) -> bool {
     tail.windows(4).any(|w| w == b"PK\x05\x06")
 }
 
-/// 从 GitHub Release 标签页 HTML 里抽全部 assets 直链，返回 (文件名, 下载 URL)。
-/// github.com 的资产列表是 lazy-load 的 expanded_assets fragment，标签页初始
-/// HTML 往往一个链接都没有（实测 pi/opencode 均如此）→ 解析必失败，只能当兜底源。
-fn assets_from_html(html: &str, tag: &str) -> Vec<(String, String)> {
+/// 从 GitHub Release 的资产列表 HTML 里抽全部资产直链，返回 (文件名, 下载 URL)。
+///
+/// **必须按 href 里给出的完整路径重建 URL**：GitHub 的 href 是
+/// `/<owner>/<repo>/releases/download/<tag>/<name>`，旧实现只截取
+/// `releases/download/` 之后的两段，再拼成 `https://github.com/releases/download/…`
+/// ——owner/repo 整个丢了，拼出来的地址必然 404。也就是说这个 HTML 源从来没
+/// 成功过（自更新的「源② HTML」与工具下载的「源② HTML」都白等一次超时）。
+///
+/// 输入既可以是标签页 HTML，也可以是 `releases/expanded_assets/<tag>` 片段
+/// （后者才是真正带资产链接的那份，标签页初始 HTML 一个链接都没有——资产列表
+/// 是 lazy-load 的 include-fragment）。
+fn assets_from_html(html: &str, repo: &str, tag: &str) -> Vec<(String, String)> {
     const NEEDLE: &str = "releases/download/";
     let mut from = 0;
     let mut out: Vec<(String, String)> = Vec::new();
+    let (want_owner, want_repo) = repo.split_once('/').unwrap_or(("", repo));
     while let Some(rel) = html[from..].find(NEEDLE) {
-        let start = from + rel + NEEDLE.len();
+        let at = from + rel; // NEEDLE 在 html 里的绝对位置
+        let start = at + NEEDLE.len();
         let rest = &html[start..];
-        let end = rest.find(['\'', '\"', '<', '?', '\n']).unwrap_or(rest.len());
-        // 路径形如 {tag}/{xxx.exe}
+        let end = rest
+            .find(['\'', '\"', '<', '?', '\n', ' ', '\t', '\r'])
+            .unwrap_or(rest.len());
+        // 形如 {owner}/{repo}/{tag}/{asset}：owner/repo 在 NEEDLE **之前**
+        // （href 可能是 /owner/repo/... 相对路径，也可能是完整 URL），得回看
+        // 到属性起点才能取到；旧实现只截了 NEEDLE 之后的两段，把这两段丢了。
+        let head_all = &html[..at];
+        let hstart = head_all
+            .rfind(['\'', '\"', '<', ' ', '\t', '\n', '\r'])
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let hp: Vec<&str> = head_all[hstart..]
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let (owner, rpo) = (
+            hp.len().checked_sub(2).and_then(|i| hp.get(i)).copied().unwrap_or_default(),
+            hp.last().copied().unwrap_or_default(),
+        );
         let parts: Vec<&str> = rest[..end].split('/').collect();
-        if parts.len() == 2 && parts[0] == tag {
+        if parts.len() == 2
+            && parts[0] == tag
+            && owner.eq_ignore_ascii_case(want_owner)
+            && rpo.eq_ignore_ascii_case(want_repo)
+        {
             out.push((
                 parts[1].to_string(),
-                format!("https://github.com/{NEEDLE}{}/{}", parts[0], parts[1]),
+                format!("https://github.com/{owner}/{rpo}/{NEEDLE}{}/{}", parts[0], parts[1]),
             ));
         }
         from = start;
@@ -1505,13 +1584,42 @@ fn assets_from_html(html: &str, tag: &str) -> Vec<(String, String)> {
     out
 }
 
-/// 从 GitHub Release 标签页 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
+/// 从 GitHub Release 的资产列表 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
 /// 返回 (exe 文件名, 下载 URL, 0)；HTML 不含字节数，进度按已下载字节算。
-fn exe_asset_from_html(html: &str, tag: &str) -> Option<(String, String, u64)> {
-    assets_from_html(html, tag)
+fn exe_asset_from_html(html: &str, repo: &str, tag: &str) -> Option<(String, String, u64)> {
+    assets_from_html(html, repo, tag)
         .into_iter()
         .find(|(_, name)| name.ends_with(".exe"))
         .map(|(name, url)| (name, url, 0))
+}
+
+/// 自更新的 exe 直链探查：与检查更新（tag）、工具下载（资产表）完全同一套
+/// 镜像源逻辑——GH_MIRRORS 前缀镜像 × 8 + 直连 + PS WinHTTP 全部并发，
+/// 先返回成功者为准。
+///
+/// 页面选取：优先 `releases/expanded_assets/{tag}`（真带下载链接的那份），
+/// 标签页只挂直连/PS（部分镜像会把 include-fragment 一起渲染出来，值得一试，
+/// 但没必要 ×8 镜像重复拉同一页）。
+fn fetch_self_exe_asset(tag: &str) -> Result<(String, (String, String, u64)), String> {
+    let frag = format!("{SELF_REPO_PAGE}/releases/expanded_assets/{tag}");
+    let page = format!("{SELF_REPO_PAGE}/releases/tag/{tag}");
+    let mut sources: Vec<Probe> = Vec::new();
+    for m in GH_MIRRORS {
+        sources.push(
+            Probe::new(&format!("{m}/资产片段"), format!("{m}{frag}"), ProbeKind::Html, 3, 6)
+                .ctx(SELF_REPO, tag),
+        );
+    }
+    sources.push(Probe::new("GitHub 资产片段", frag, ProbeKind::Html, 6, 12).ctx(SELF_REPO, tag));
+    sources.push(Probe::new("GitHub 标签页", page.clone(), ProbeKind::Html, 6, 12).ctx(SELF_REPO, tag));
+    #[cfg(windows)]
+    sources.push(
+        Probe::new("PS 标签页", page, ProbeKind::Html, 8, 15).via_ps().ctx(SELF_REPO, tag),
+    );
+    probe_first(&format!("{tag} 自更新 exe 资产"), sources, |p, body| {
+        exe_asset_from_html(body, &p.repo, &p.tag)
+            .ok_or_else(|| "HTML 里没有 exe 直链".to_string())
+    })
 }
 
 // ── 外部工具（pi / opencode）更新 ──────────────────────────────────────
@@ -1926,34 +2034,148 @@ fn extract_zip(zip: &Path, dest: &Path) -> Result<(), String> {
     result
 }
 
-/// 拉 GitHub Release 资产表：name → (browser_download_url, 字节数)。
+/// 资产表：name → (browser_download_url, 字节数)。
 /// 带 size 是为了下载进度能显示百分比（HTML 源拿不到字节数）。
-fn gh_assets(
-    repo: &str,
-    tag: &str,
-) -> Result<std::collections::HashMap<String, (String, u64)>, String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    let body = curl_get(&url, 8, 15)?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| format!("API 响应解析失败: {e}"))?;
-    let mut out = std::collections::HashMap::new();
+type AssetTable = std::collections::HashMap<String, (String, u64)>;
+
+/// 把 API 响应里的 assets 数组收进资产表。
+fn asset_table_from_json(v: &serde_json::Value) -> Result<AssetTable, String> {
+    let mut out = AssetTable::new();
     for a in v["assets"].as_array().into_iter().flatten() {
         if let (Some(n), Some(u)) = (a["name"].as_str(), a["browser_download_url"].as_str()) {
-            out.insert(
-                n.to_string(),
-                (u.to_string(), a["size"].as_u64().unwrap_or(0)),
-            );
+            out.insert(n.to_string(), (u.to_string(), a["size"].as_u64().unwrap_or(0)));
         }
+    }
+    if out.is_empty() {
+        // 空表当失败：否则「这个 tag 没有资产」会被当成「资产表拿到了」，
+        // 后面的候选筛选一步也不会做，直接落到直拼直链。
+        return Err("响应里没有 assets".to_string());
     }
     Ok(out)
 }
 
-/// 下载工具 zip 产物到 {install_dir}/.{id}-update.zip.new。直链解析优先级：
-/// 源①GitHub API（资产表完整 + 字节数）→ 源②标签页 HTML（API 被墙/限流时捡
-/// releases/download/{tag}/{候选名}；实测这两个仓库的资产列表懒加载，HTML
-/// 多半解析不出来，属于兜底）→ 源③直拼直链（零请求，永远可用）。解析出直链
-/// 后按「国内镜像 + PS 通道 + curl 直链」全量并发竞速（与自更新同一套
-/// download_race，只是校验函数换 looks_like_zip）。
+/// 探查某个 tag 的资产表。**与检查更新完全同一套镜像源逻辑**（GH_MIRRORS
+/// 前缀镜像 + GitHub 直连 + PS WinHTTP，并发先到先得），两种正文形态：
+///   1. `api.github.com/repos/{repo}/releases/tags/{tag}` → 资产表 + 字节数；
+///   2. `github.com/{repo}/releases/expanded_assets/{tag}` → 资产列表片段
+///      （标签页初始 HTML 里一个链接都没有，片段页才是真带链接的那份）。
+///
+/// 旧实现只直连 api.github.com 一次（connect 8s / max 15s），大陆机器上必然
+/// 先白等 15 秒、再白等 15 秒拿标签页 HTML（且那份 HTML 解析出来还是 404 的
+/// 假 URL），最后才落到直拼直链——检查更新明明能过镜像拿到 tag，一到下载就
+/// 变成「先卡半分钟再慢慢下」。
+fn fetch_release_assets(repo: &str, tag: &str) -> Result<(String, AssetTable), String> {
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    let frag_url = format!("https://github.com/{repo}/releases/expanded_assets/{tag}");
+    let gh_api: fn(&serde_json::Value) -> Option<String> = |v| v["tag_name"].as_str().map(str::to_string);
+    let mut sources: Vec<Probe> = Vec::new();
+    for m in GH_MIRRORS {
+        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6).ctx(repo, tag));
+    }
+    for m in GH_MIRRORS {
+        sources.push(Probe::new(m, format!("{m}{frag_url}"), ProbeKind::Html, 3, 6).ctx(repo, tag));
+    }
+    sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::Json(gh_api), 6, 12).ctx(repo, tag));
+    sources.push(Probe::new("GitHub 资产片段", frag_url.clone(), ProbeKind::Html, 6, 12).ctx(repo, tag));
+    #[cfg(windows)]
+    {
+        sources.push(Probe::new("PS API", api_url, ProbeKind::Json(gh_api), 8, 15).via_ps().ctx(repo, tag));
+        sources.push(Probe::new("PS 资产片段", frag_url, ProbeKind::Html, 8, 15).via_ps().ctx(repo, tag));
+    }
+    probe_first(&format!("{repo}@{tag} 资产表"), sources, parse_assets)
+}
+
+/// 从探查正文里收资产表（API 给 JSON，expanded_assets 片段给 HTML）。
+fn parse_assets(p: &Probe, body: &str) -> Result<AssetTable, String> {
+    match &p.kind {
+        ProbeKind::Json(_) => {
+            let v: serde_json::Value =
+                serde_json::from_str(body).map_err(|e| format!("API 响应解析失败: {e}"))?;
+            asset_table_from_json(&v)
+        }
+        _ => {
+            let all = assets_from_html(body, &p.repo, &p.tag);
+            if all.is_empty() {
+                return Err("HTML 里没有资产链接".to_string());
+            }
+            Ok(all.into_iter().map(|(n, u)| (n, (u, 0))).collect())
+        }
+    }
+}
+
+/// 从资产表里挑该工具的 Windows 压缩包，按优先级返回 (名, URL, 字节数)。
+///
+/// 先按模板精确命中（pi-windows-x64.zip / opencode-windows-x64.zip …），
+/// 模板没命中就在表里**按形态发现**：名字含 windows + 本机架构 + .zip 即算
+/// 候选，按「普通版 → baseline/兼容版」排序。没有这一步的话，上游把产物名
+/// 改成 pi-windows-x64-gnu.zip / opencode_windows_x64.zip 之类，就得跟着改
+/// 代码才能下载——而资产表明明就在手里。checksums / 源码包 / 其它架构一律排除。
+fn pick_tool_assets(table: &AssetTable, names: &[String]) -> Vec<(String, String, u64)> {
+    let mut out: Vec<(String, String, u64)> = Vec::new();
+    let mut push = |n: &str| {
+        // 模板命中过的名字不再被「发现」段重复收一遍（否则同一个资产竞速两轮）
+        if out.iter().any(|(rn, _, _)| rn == n) {
+            return;
+        }
+        if let Some((u, s)) = table.get(n) {
+            out.push((n.to_string(), u.clone(), *s));
+        }
+    };
+    for n in names {
+        push(n); // 源①：模板精确命中（保留模板顺序）
+    }
+    // 源①补：形态发现（模板名对不上也不至于整个下载不了）。
+    let arch = win_arch();
+    let mut discovered: Vec<(u8, &String)> = Vec::new();
+    for (n, _) in table {
+        let low = n.to_ascii_lowercase();
+        if !low.ends_with(".zip") || !low.contains("windows") || !low.contains(arch) {
+            continue;
+        }
+        if ["checksum", "sha256", "sbom", "source"].iter().any(|k| low.contains(k)) {
+            continue;
+        }
+        let compat = low.contains("baseline") || low.contains("gnu") || low.contains("musl");
+        discovered.push((u8::from(compat), n));
+    }
+    discovered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    for (_, n) in discovered {
+        push(n);
+    }
+    out
+}
+
+/// 工具下载的失败：区分「重下一次可能就好」（网络）与「重下多少次都是同一个
+/// 坏结果」（结构性问题）。后者不重试——工具包 44~62MB，重试 5 次就是白烧
+/// 300MB 流量 + 几分钟干等，用户看到的还是同一个错。
+#[derive(Debug, Clone)]
+struct ToolErr {
+    msg: String,
+    /// 结构性失败：换源重下无意义（产物名不存在 / 包解不开 / 校验不过）。
+    structural: bool,
+}
+
+impl ToolErr {
+    fn net(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into(), structural: false }
+    }
+    fn structural(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into(), structural: true }
+    }
+}
+
+impl From<String> for ToolErr {
+    fn from(msg: String) -> Self {
+        Self::net(msg)
+    }
+}
+
+/// 下载工具 zip 产物到 {install_dir}/.{id}-update.{fp}.zip.{fp}.new。
+///
+/// 直链解析：资产表（**与检查更新同一套镜像竞速** + expanded_assets 片段）
+/// → 模板没命中就在表里按形态发现 → 都不行才直拼约定 URL（零请求保底）。
+/// 解析出直链后同样是「国内镜像 × 8 + PS 通道 + curl 直链」全量并发竞速
+/// （与自更新同一个 download_race，只是校验函数换成 looks_like_zip）。
 /// 返回 (zip 路径, 资产字节数)。
 fn download_tool_archive(
     spec: &ToolSpec,
@@ -1961,52 +2183,26 @@ fn download_tool_archive(
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<(PathBuf, u64), String> {
+) -> Result<(PathBuf, u64), ToolErr> {
     let names: Vec<String> = spec
         .asset_tpls
         .iter()
         .map(|t| t.replace("{arch}", win_arch()))
         .collect();
-    // 源①API：一次请求拿整张资产表，筛出候选名（保留模板顺序）。
+    // 资产表（镜像竞速，与检查更新同一套源）。拿不到不算致命：直拼直链兜底。
     let mut resolved: Vec<(String, String, u64)> = Vec::new();
-    let mut api_err: Option<String> = None;
-    match gh_assets(spec.repo, tag) {
-        Ok(table) => {
-            for n in &names {
-                if let Some((url, size)) = table.get(n) {
-                    resolved.push((n.clone(), url.clone(), *size));
-                }
-            }
+    let mut table_ok = false;
+    match fetch_release_assets(spec.repo, tag) {
+        Ok((src, table)) => {
+            table_ok = true;
+            log_update(&format!("工具下载 {} 资产表来自 {src}（{} 项）", spec.label, table.len()));
+            resolved = pick_tool_assets(&table, &names);
         }
-        Err(e) => {
-            log_update(&format!("工具下载 API 失败: {e}"));
-            api_err = Some(e);
-        }
+        Err(e) => log_update(&format!("工具下载 {} 资产表探查失败（仍走直拼兜底）: {e}", spec.label)),
     }
-    // 源②HTML 兜底：只补 API 没解析出的候选名。
-    let missing: Vec<String> = names
-        .iter()
-        .filter(|n| !resolved.iter().any(|(rn, _, _)| rn == *n))
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        let page = format!("https://github.com/{}/releases/tag/{}", spec.repo, tag);
-        match curl_get(&page, 8, 15) {
-            Ok(b) => {
-                let html = String::from_utf8_lossy(&b);
-                let all = assets_from_html(&html, tag);
-                for n in &missing {
-                    if let Some((_, url)) = all.iter().find(|(hn, _)| hn == n) {
-                        resolved.push((n.clone(), url.clone(), 0));
-                    }
-                }
-            }
-            Err(e) => log_update(&format!("工具下载 HTML 源失败: {e}")),
-        }
-    }
-    // 源③直拼：仍缺的候选名直接按约定 URL 拼出来（零请求保底）。
+    // 兜底：表里没给出的模板名按约定 URL 直拼（零请求，镜像前缀照打）。
     for n in &names {
-        if !resolved.iter().any(|(rn, _, _)| rn == n) {
+        if !resolved.iter().any(|(rn, _, _)| *rn == *n) {
             resolved.push((
                 n.clone(),
                 format!(
@@ -2017,12 +2213,10 @@ fn download_tool_archive(
             ));
         }
     }
-    // 逐个候选文件名试：每个文件名下的所有下载链（镜像 × 8 + PS + 直链）
-    // 并发竞速，全部失败再换下一个文件名。
     let mut errs: Vec<String> = Vec::new();
     for (name, url, total) in resolved {
         if cancel.load(Ordering::Relaxed) {
-            return Err("下载已取消".to_string());
+            return Err(ToolErr::net("下载已取消"));
         }
         let mut candidates: Vec<(String, bool)> = Vec::new();
         for mirror in GH_MIRRORS {
@@ -2043,6 +2237,11 @@ fn download_tool_archive(
         ));
         match download_race(
             &asset_name,
+            // 分片指纹 = tag + 资产名：opencode 的 avx2 版与 baseline 版、
+            // 以及不同 tag 之间，分片绝不互相续传（旧的分片名只按工具 id 命名，
+            // `-C -` 会把两个不同的包首尾拼起来，尾部还照样有 PK\x05\x06，
+            // 能过 looks_like_zip 却装出坏 exe）。
+            &shard_fp(&format!("{tag}/{name}")),
             candidates,
             total,
             dest_dir,
@@ -2060,10 +2259,42 @@ fn download_tool_archive(
             }
         }
     }
-    if let Some(e) = api_err {
-        errs.push(format!("源① API: {e}"));
+    // 全败：资产表拿到了、里面却没有能用的 Windows 压缩包 → 上游改了产物名，
+    // 改代码之前谁重试都下不下来（重试一次 = 再烧一个 60MB），直接判结构性失败。
+    // 资产表压根没拿到则是网络问题，值得按节奏重试。
+    let detail = format!("所有下载源失败：{}", errs.join("；"));
+    if table_ok {
+        return Err(ToolErr::structural(format!(
+            "{detail}（已拿到 {tag} 的资产表，但里面没有 Windows 压缩包，上游可能改了产物名）"
+        )));
     }
-    Err(format!("所有下载源失败：{}", errs.join("；")))
+    Err(ToolErr::net(detail))
+}
+
+/// 暂存目录里找主 exe。发布方把整包套一层同名目录（pi-windows-x64/pi.exe）是
+/// 常见做法，原实现只认 `stage/pi.exe`，一遇到就从「包结构不符」重下 5 次
+/// 44MB 压缩包，最后还是同样的错。这里最多下探 MAX_EXE_DEPTH 层，找不到再说。
+const MAX_EXE_DEPTH: usize = 3;
+
+fn find_exe_in_stage(stage: &Path, exe_name: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, exe_name: &str, depth: usize) -> Option<PathBuf> {
+        let direct = dir.join(exe_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if depth == 0 {
+            return None;
+        }
+        let mut subs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subs.sort(); // 目录序稳定：多个候选包时结果可复现
+        subs.into_iter().find_map(|d| walk(&d, exe_name, depth - 1))
+    }
+    walk(stage, exe_name, MAX_EXE_DEPTH)
 }
 
 /// 把解压暂存目录里除主 exe 外的全部内容覆盖同步进安装目录（pi 用）。
@@ -2193,10 +2424,7 @@ fn run_tool_update(
     let stage = install_dir.join(format!(".{}-update-stage", spec.id));
     // 上次若因「被占用」没装上，暂存里已留有解好的 exe：校验通过就别再重下
     // 60MB 压缩包，直接进替换（用户只需先关掉占用的进程再点一次按钮）。
-    let mut reuse = {
-        let staged = stage.join(spec.exe_name);
-        staged.is_file() && looks_like_exe(&staged)
-    };
+    let reuse = find_exe_in_stage(&stage, spec.exe_name).is_some_and(|s| looks_like_exe(&s));
     let mut attempt = 1u32;
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -2230,9 +2458,9 @@ fn run_tool_update(
             }
         }
         let tag = tag.as_deref().unwrap_or_default();
-        // 1) 下载 zip（镜像并发竞速，产物 looks_like_zip 校验）；复用暂存时跳过。
+        // 1) 下载 zip（镜像并发竞速，产物 looks_like_zip + 字节数对账）；复用
+        //    暂存时跳过。
         let zip: Option<std::path::PathBuf> = if reuse {
-            reuse = false;
             sink("复用上次已解压的文件，直接重试替换…");
             None
         } else {
@@ -2243,8 +2471,15 @@ fn run_tool_update(
                         sink("下载已取消");
                         return;
                     }
+                    if e.structural {
+                        // 产物名/包结构不对：换源重下多少次都是同一个结果，
+                        // 不烧那 5×60MB，直接收手并说清楚。
+                        sink(&format!("下载中断：{}；不再自动重试", e.msg));
+                        return;
+                    }
                     sink(&format!(
-                        "下载失败（第 {attempt} 次）: {e}，3 秒后自动重试…"
+                        "下载失败（第 {attempt} 次）: {}，3 秒后自动重试…",
+                        e.msg
                     ));
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     attempt += 1;
@@ -2263,28 +2498,28 @@ fn run_tool_update(
             if let Err(e) = extract_zip(z, &stage) {
                 drop_zip(&zip);
                 let _ = std::fs::remove_dir_all(&stage);
-                sink(&format!(
-                    "解压失败（第 {attempt} 次）: {e}，3 秒后自动重试…"
-                ));
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                attempt += 1;
-                continue;
+                // 包已过 looks_like_zip 校验，tar 与 PS 却都解不开 → 包本身不对
+                // （拼坏的/换了压缩算法），重下同一个包没有意义。
+                sink(&format!("解压中断：{e}；不再自动重试"));
+                return;
             }
         }
         // 3) 替换：备份旧 exe 为 .old（copy，运行中的映像也能读），再走
-        //    install_update 的快路径/慢路径/回滚三段式。
-        let staged_exe = stage.join(spec.exe_name);
-        if !staged_exe.is_file() {
+        //    install_update 的快路径/慢路径/回滚三段式。主 exe 可能裹在
+        //    一层同名目录里（pi-windows-x64/pi.exe），故在暂存里找而不是死认
+        //    stage/pi.exe。
+        let Some(staged_exe) = find_exe_in_stage(&stage, spec.exe_name) else {
             let _ = std::fs::remove_dir_all(&stage);
             drop_zip(&zip);
             sink(&format!(
-                "压缩包内没有 {}（包结构与预期不符），3 秒后换源重试…",
+                "压缩包里找不到 {}（包结构与预期不符），已停止重试",
                 spec.exe_name
             ));
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            attempt += 1;
-            continue;
-        }
+            return;
+        };
+        // 套壳目录里的主 exe 装到安装目录后，其余文件也从那一层同步，
+        // 否则会在安装目录里凭空多出一层同名目录。
+        let sync_root = staged_exe.parent().unwrap_or(&stage).to_path_buf();
         let final_exe = install_dir.join(spec.exe_name);
         let old_exe = install_dir.join(format!("{}.old", spec.exe_name));
         // 首次安装（本机之前没有这个 exe）：没有 .old 可备份，完成文案也换一套。
@@ -2299,7 +2534,7 @@ fn run_tool_update(
                 // 4) 其余文件覆盖同步（pi 的 assets/native/theme/docs…）。
                 if spec.sync_tree {
                     sink("正在同步程序文件…");
-                    let fails = sync_tree(&stage, &install_dir, spec.exe_name);
+                    let fails = sync_tree(&sync_root, &install_dir, spec.exe_name);
                     if fails > 0 {
                         log_update(&format!("工具 {label} 同步 {fails} 个文件失败"));
                     }
@@ -2340,16 +2575,13 @@ fn run_tool_update(
                 return;
             }
             InstallOutcome::BadDownload => {
-                // 解压出的 exe 不合法：清掉 .new/暂存残留，避免 -C - 续传拼坏，
-                // 3 秒后整链重来（坏源已在竞速层剔除）。
+                // 解压出的 exe 不合法：清掉暂存与压缩包残留。包已过 zip 校验、
+                // 解压也成功，却拿不到合法 PE——同一个包重下多少次都一样
+                // （镜像改写了内容 / 包里那版 exe 本身就是坏的），不重试。
                 drop_zip(&zip);
                 let _ = std::fs::remove_dir_all(&stage);
-                reuse = false;
-                sink(&format!(
-                    "下载到损坏文件，已自动换源重新下载（第 {attempt} 次）"
-                ));
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                attempt += 1;
+                sink("下载到损坏文件（压缩包里的 exe 不是有效程序），已停止重试");
+                return;
             }
         }
     }
@@ -7551,8 +7783,10 @@ mod vscode_tests {
 #[cfg(all(test, windows))]
 mod update_tests {
     use super::{
-        assets_from_html, exe_asset_from_html, extract_zip, parse_version_token, sync_tree, tar_bin,
-        tool_exe_candidates, tool_fresh_dir_in, version_newer, win_arch, ClientApp, TOOL_SPECS,
+        asset_table_from_json, assets_from_html, exe_asset_from_html, extract_zip,
+        find_exe_in_stage, parse_version_token, pick_tool_assets, purge_other_shards, shard_fp,
+        sync_tree, tar_bin, tool_exe_candidates, tool_fresh_dir_in, version_newer, win_arch,
+        AssetTable, ClientApp, ToolErr, TOOL_SPECS,
     };
     use std::path::PathBuf;
 
@@ -7573,31 +7807,43 @@ mod update_tests {
     #[test]
     fn html_exe_extracted() {
         let html = r#"<a href="/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe">TUIProjectManager.exe</a>"#;
-        let (name, url, _size) = exe_asset_from_html(html, "v2025.06.30.0001").unwrap();
+        let (name, url, _size) =
+            exe_asset_from_html(html, "qq458249269/TUIProjectManager", "v2025.06.30.0001").unwrap();
         assert_eq!(name, "TUIProjectManager.exe");
+        // URL 必须带 owner/repo：旧实现拼的是 github.com/releases/download/…，
+        // 少了这两段，HTML 源拿到的直链 100% 是死链。
         assert_eq!(
             url,
-            "https://github.com/releases/download/v2025.06.30.0001/TUIProjectManager.exe"
+            "https://github.com/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe"
         );
     }
 
     #[test]
     fn html_wrong_tag_ignored() {
         let html = r#"<a href="/q/q/releases/download/vother/Other.exe">x</a>"#;
-        assert!(exe_asset_from_html(html, "v2025.06.30.0001").is_none());
+        assert!(
+            exe_asset_from_html(html, "q/q", "v2025.06.30.0001").is_none(),
+            "tag 不匹配的资产不得被收下"
+        );
+    }
+
+    #[test]
+    fn html_other_repo_ignored() {
+        let html = r#"<a href="/a/b/releases/download/v1/x.exe">x</a>"#;
+        assert!(assets_from_html(html, "c/d", "v1").is_empty(), "别的仓库的资产不得混入");
     }
 
     #[test]
     fn html_query_stripped() {
         let html = r#"<a href="/q/q/releases/download/v1/TUIProjectManager.exe?download=1">x</a>"#;
-        let (name, url, _) = exe_asset_from_html(html, "v1").unwrap();
+        let (name, url, _) = exe_asset_from_html(html, "q/q", "v1").unwrap();
         assert_eq!(name, "TUIProjectManager.exe");
         assert!(!url.contains('?'));
     }
 
     #[test]
     fn html_no_exe_returns_none() {
-        assert!(exe_asset_from_html("<html>nothing</html>", "v1").is_none());
+        assert!(exe_asset_from_html("<html>nothing</html>", "q/q", "v1").is_none());
     }
 
     #[test]
@@ -7850,18 +8096,150 @@ mod update_tests {
 
     #[test]
     fn html_zip_asset_extracted() {
-        // 工具 release 的 zip 资产也走同一个 HTML 解析器
+        // 工具 release 的 zip 资产也走同一个 HTML 解析器（expanded_assets 片段）
         let html = r#"<a href="/earendil-works/pi/releases/download/v0.88.0/pi-windows-x64.zip">pi</a>"#;
-        let all = assets_from_html(html, "v0.88.0");
+        let all = assets_from_html(html, "earendil-works/pi", "v0.88.0");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, "pi-windows-x64.zip");
         assert_eq!(
             all[0].1,
-            "https://github.com/releases/download/v0.88.0/pi-windows-x64.zip"
+            "https://github.com/earendil-works/pi/releases/download/v0.88.0/pi-windows-x64.zip"
         );
         // tag 不匹配 / 无资产
-        assert!(assets_from_html(html, "v0.87.1").is_empty());
-        assert!(assets_from_html("<html>nothing</html>", "v1").is_empty());
+        assert!(assets_from_html(html, "earendil-works/pi", "v0.87.1").is_empty());
+        assert!(assets_from_html("<html>nothing</html>", "earendil-works/pi", "v1").is_empty());
+    }
+
+    #[test]
+    fn expanded_assets_fragment_parsed() {
+        // expanded_assets 片段里链接带 <a href> + 换行/引号收尾，属性顺序也不定，
+        // 解析必须只认路径本身，别把 host/tag 对错仓库的收进来。
+        let html = r#"
+            <li><a href="/anomalyco/opencode/releases/download/v1.2.3/opencode-windows-x64.zip" data-view-component="true">opencode-windows-x64.zip</a></li>
+            <li><a href="/anomalyco/opencode/releases/download/v1.2.3/opencode-linux-x64.zip">linux</a></li>
+        "#;
+        let all = assets_from_html(html, "anomalyco/opencode", "v1.2.3");
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|(_, u)| u.contains("/anomalyco/opencode/")));
+        assert!(all[0].1.ends_with("/opencode-windows-x64.zip"));
+    }
+
+    #[test]
+    fn asset_table_from_json_reads_size_and_url() {
+        let j = r#"{"assets":[
+            {"name":"opencode-windows-x64.zip","browser_download_url":"https://github.com/anomalyco/opencode/releases/download/v1.2.3/opencode-windows-x64.zip","size":65000000},
+            {"name":"checksums.txt","browser_download_url":"https://x/checksums.txt","size":10}
+        ]}"#;
+        let v: serde_json::Value = serde_json::from_str(j).unwrap();
+        let t = asset_table_from_json(&v).unwrap();
+        assert_eq!(t["opencode-windows-x64.zip"].1, 65_000_000);
+        // 空表当失败：否则「这版没有资产」会被当成拿到了表，后面一步也不走
+        assert!(asset_table_from_json(&serde_json::json!({"assets":[]})).is_err());
+    }
+
+    #[test]
+    fn pick_tool_assets_exact_first_then_discovery() {
+        let names = vec!["opencode-windows-x64.zip".to_string()];
+        let mut t: AssetTable = AssetTable::new();
+        for n in [
+            "opencode-windows-x64.zip",
+            "opencode-windows-x64-baseline.zip",
+            "opencode-linux-x64.zip",
+            "opencode-windows-arm64.zip",
+            "checksums.txt",
+            "source.zip",
+        ] {
+            t.insert(n.into(), (format!("https://u/{n}"), 1));
+        }
+        let got: Vec<String> = pick_tool_assets(&t, &names)
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        // 模板精确命中第一；发现项按「普通版 → 兼容版」排；别的架构/校验文件不进
+        assert_eq!(
+            got,
+            vec![
+                "opencode-windows-x64.zip",
+                "opencode-windows-x64-baseline.zip"
+            ]
+        );
+    }
+
+    #[test]
+    fn pick_tool_assets_survives_renamed_product() {
+        // 上游改名（pi-windows-x64-gnu.zip）时仍能发现并下载，不至于全线 404。
+        let names = vec!["pi-windows-x64.zip".to_string()];
+        let mut t: AssetTable = AssetTable::new();
+        t.insert("pi-windows-x64-gnu.zip".into(), ("https://u/gnu".into(), 42));
+        let got = pick_tool_assets(&t, &names);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "pi-windows-x64-gnu.zip");
+        assert_eq!(got[0].2, 42, "字节数要带出来，进度才有百分比");
+    }
+
+    #[test]
+    fn shard_fp_separates_tags_and_assets() {
+        // 同一工具的不同 tag / 不同资产名必须落在不同分片上，否则 -C - 续传
+        // 会把两个不同的包首尾拼起来。
+        let a = shard_fp("v1.2.3/opencode-windows-x64.zip");
+        let b = shard_fp("v1.2.3/opencode-windows-x64-baseline.zip");
+        let c = shard_fp("v1.2.4/opencode-windows-x64.zip");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, shard_fp("v1.2.3/opencode-windows-x64.zip"), "指纹要稳定");
+        assert_eq!(a.len(), 8);
+    }
+
+    #[test]
+    fn purge_other_shards_keeps_current() {
+        let dir = std::env::temp_dir().join("tpm_test_shards");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = shard_fp("v2/pi-windows-x64.zip");
+        std::fs::write(dir.join(format!(".pi-update.zip.{keep}.c0.new")), b"keep").unwrap();
+        std::fs::write(dir.join(format!(".pi-update.zip.{keep}.new")), b"done").unwrap();
+        std::fs::write(dir.join(".pi-update.zip.deadbeef.c0.new"), b"old").unwrap();
+        std::fs::write(dir.join("other-tool.zip.c0.new"), b"unrelated").unwrap();
+        let n = purge_other_shards(&dir, ".pi-update.zip", &keep);
+        assert_eq!(n, 1);
+        assert!(dir.join(format!(".pi-update.zip.{keep}.c0.new")).exists());
+        assert!(dir.join(format!(".pi-update.zip.{keep}.new")).exists());
+        assert!(!dir.join(".pi-update.zip.deadbeef.c0.new").exists());
+        // 别的工具的分片不许被牵连
+        assert!(dir.join("other-tool.zip.c0.new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_exe_in_stage_handles_wrapper_dir() {
+        let dir = std::env::temp_dir().join("tpm_test_stage_find");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stage = dir.join("stage");
+        std::fs::create_dir_all(stage.join("pi-windows-x64/assets")).unwrap();
+        // 套了一层同名目录（发布方常见做法）：原实现只认 stage/pi.exe，
+        // 认不到就从「包结构不符」一路重下 5 次 44MB。
+        std::fs::write(stage.join("pi-windows-x64/pi.exe"), b"MZ").unwrap();
+        assert_eq!(
+            find_exe_in_stage(&stage, "pi.exe"),
+            Some(stage.join("pi-windows-x64/pi.exe"))
+        );
+        // 平铺（无套壳）也要认得
+        std::fs::write(stage.join("pi.exe"), b"MZ").unwrap();
+        assert_eq!(find_exe_in_stage(&stage, "pi.exe"), Some(stage.join("pi.exe")));
+        // 确实没有 → None（上层据此判定包结构不符，停止重试）
+        assert_eq!(find_exe_in_stage(&dir.join("empty"), "pi.exe"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_err_classifies_structural() {
+        // 结构性失败不该再触发「换源重下 60MB」
+        let e = ToolErr::structural("包结构与预期不符");
+        assert!(e.structural);
+        assert!(!ToolErr::net("连接超时").structural);
+        // From<String> 默认按网络类处理（保守：宁可多重下一次）
+        let e: ToolErr = "下载失败".to_string().into();
+        assert!(!e.structural);
     }
 
     #[test]
