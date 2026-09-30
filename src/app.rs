@@ -636,6 +636,11 @@ enum ProbeKind {
     HtmlTag,
     /// HTML 正文原样取回（expanded_assets 资产列表片段）。
     Html,
+    /// JSON **数组**响应体（GitHub `/releases` 发布列表，取回正文后由 parse
+    /// 逐个 release 读 tag + assets）。取数通道与 Json 完全相同，区别只在于
+    /// 顶层是数组而不是对象——单列一档是为了让调用点的语义自洽（配 Json 会
+    /// 让人以为能直接取 `tag_name`）。
+    JsonList,
 }
 
 /// 一个探查源。desc/URL/通道/超时档位都在这里配，probe_first 负责并发调度。
@@ -691,7 +696,7 @@ fn probe_body(p: &Probe) -> Result<String, String> {
     }
     match p.kind {
         ProbeKind::HtmlTag => fetch_tag_html(&p.url, p.ct, p.mt),
-        ProbeKind::Json(_) | ProbeKind::Html => {
+        ProbeKind::Json(_) | ProbeKind::Html | ProbeKind::JsonList => {
             let b = curl_get(&p.url, p.ct, p.mt)?;
             Ok(String::from_utf8_lossy(&b).into_owned())
         }
@@ -699,13 +704,27 @@ fn probe_body(p: &Probe) -> Result<String, String> {
 }
 
 /// 拉取某个 repo 的最新 tag 的源表：GH_MIRRORS 国内镜像（每个前缀拼在
-/// api.github.com 直链前）、jsDelivr 数据 API（Fastly CDN，大陆友好、不依赖
-/// GitHub 可达性）、GitHub HTML 302（免 API 限流）、GitHub API（可能限流）
-/// 以及 PS WinHTTP 通道（curl 崩溃/失败时的绕过源）。
+/// api.github.com 直链前）、GitHub HTML 302（免 API 限流）、GitHub API
+/// （可能限流）以及 PS WinHTTP 通道（curl 崩溃/失败时的绕过源）。
+///
+/// **这里曾经有一个 jsDelivr 源（`data.jsdelivr.com/v1/packages/gh/{repo}`），
+/// 已删除——它答的根本不是同一个问题。** 该接口返回的是该仓库**发布到 npm 的
+/// 包版本**，与 GitHub Release 的 tag 是两套编号，混用会直接把下载链打死：
+///  - opencode：npm 包（`opencode-ai`）最新版是 `2.0.20`，而 Release tag 是
+///    `v1.18.33`。`2.0.20` 这个 tag 根本不存在，拼出的直链
+///    `.../releases/download/2.0.20/opencode-windows-x64.zip` 必然 404；
+///  - pi：npm 版本 `0.99.1` 被剥掉了 `v` 前缀，真实 tag 是 `v0.99.1`，
+///    直链同样 404。
+/// 附带伤害：错 tag 还会喂给 `version_newer`（`2.0.20 > 1.18.32`），于是装完
+/// 也永远显示「有新版本」，下载按钮反复冒出来。
+/// jsDelivr 还是个抢跑很快的 CDN，竞速里**总是它先赢**，其他源根本没机会纠正。
+///
+/// 现在这里只放「以 GitHub Release 为准」的源；万一将来又混进答非所问的源，
+/// `download_tool_archive` 还会用发布列表兜底（见 pick_release_tag_with_assets），
+/// 错 tag 会被就地纠正成「真正带产物的那个 tag」，而不是 5 次重试白烧 300MB。
 fn tag_probes(repo: &str) -> Vec<Probe> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let html_url = format!("https://github.com/{repo}/releases/latest");
-    let jd_url = format!("https://data.jsdelivr.com/v1/packages/gh/{repo}");
 
     let gh_api: fn(&serde_json::Value) -> Option<String> =
         |v| v["tag_name"].as_str().map(str::to_string);
@@ -713,25 +732,6 @@ fn tag_probes(repo: &str) -> Vec<Probe> {
     for m in GH_MIRRORS {
         sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6));
     }
-    // jsDelivr 数据 API：实返回 {"tags":{},"versions":[{version,…}]}——tags 恒为空
-    // 对象（只收 semver 标签），最新版在 versions[0].version。旧实现读 tags[]
-    // 永远取不到 → 该源静默必败，等于少一个 CDN 主力源。
-    sources.push(Probe::new(
-        "jsDelivr",
-        jd_url,
-        ProbeKind::Json(
-            |v: &serde_json::Value| -> Option<String> {
-                v["versions"]
-                    .as_array()?
-                    .first()?["version"]
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| v["tags"].as_array()?.first()?.as_str().map(str::to_string))
-            },
-        ),
-        4,
-        8,
-    ));
     sources.push(Probe::new("GitHub HTML", html_url.clone(), ProbeKind::HtmlTag, 6, 12));
     sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::Json(gh_api), 6, 12));
     // PowerShell 通道（独立 WinHTTP 网络栈，吃系统代理）：curl 失败/崩溃时仍可
@@ -761,6 +761,8 @@ fn parse_tag(p: &Probe, body: &str) -> Result<String, String> {
                 .ok_or_else(|| format!("HTML 未解析出 tag（redirect={body}）"))?;
             body[pos + "/releases/tag/".len()..].trim().to_string()
         }
+        // 发布列表不是「一个 release 的 tag」，由 parse_release_list 单独处理。
+        ProbeKind::JsonList => return Err("发布列表不该走 tag 解析".to_string()),
     };
     if tag.is_empty() {
         return Err("返回空 tag".to_string());
@@ -2145,6 +2147,74 @@ fn pick_tool_assets(table: &AssetTable, names: &[String]) -> Vec<(String, String
     out
 }
 
+/// 一个 release 的 (tag, 资产表)。
+type ReleaseEntry = (String, AssetTable);
+
+/// 解析 `/releases` 发布列表（JSON 数组，每个元素的 `assets` 内联在响应里）：
+/// 收成「按新到旧」的 (tag, 资产表) 序列。
+///
+/// GitHub 的 `/releases` 本来就按 `created_at` 降序返回，所以**保留原序**即
+/// 「新 → 旧」；不去自己比版本号——那正是本次事故的教训：跨版本线（npm 包版本
+/// vs Release tag）比出来的「新」是假的。
+fn parse_release_list(body: &str) -> Result<Vec<ReleaseEntry>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("发布列表解析失败: {e}"))?;
+    let arr = v.as_array().ok_or("发布列表不是数组".to_string())?;
+    let mut out = Vec::new();
+    for r in arr {
+        let Some(tag) = r["tag_name"].as_str() else { continue };
+        // draft / prerelease 不进候选：它们可能压根没发 Windows 包。
+        if r["draft"].as_bool().unwrap_or(false) || r["prerelease"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        // asset_table_from_json 对空 assets 返 Err（这是刻意的），这里单个
+        // release 没资产时跳过即可，整列表为空才判失败。
+        if let Ok(table) = asset_table_from_json(r) {
+            out.push((tag.to_string(), table));
+        }
+    }
+    if out.is_empty() {
+        return Err("发布列表里没有可用 release".to_string());
+    }
+    Ok(out)
+}
+
+/// 拉取仓库的发布列表（新 → 旧）。同样走 GH_MIRRORS 镜像竞速 + PS 通道，
+/// 与 `fetch_release_assets` 同一套骨架。
+fn fetch_release_list(repo: &str) -> Result<Vec<ReleaseEntry>, String> {
+    let api_url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
+    let mut sources: Vec<Probe> = Vec::new();
+    for m in GH_MIRRORS {
+        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::JsonList, 3, 6).ctx(repo, ""));
+    }
+    sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::JsonList, 6, 12).ctx(repo, ""));
+    #[cfg(windows)]
+    sources.push(Probe::new("PS API", api_url, ProbeKind::JsonList, 8, 15).via_ps().ctx(repo, ""));
+    #[cfg(not(windows))]
+    let _ = api_url;
+    probe_first(&format!("{repo} 发布列表"), sources, |_p, body| parse_release_list(body))
+        .map(|(_, v)| v)
+}
+
+/// 从发布列表里挑**最新且确实带该工具 Windows 压缩包**的 tag。
+///
+/// 这是 tag 探查的权威兜底：`tag_probes` 是「先到先得」的快查询，任何一个源
+/// 答错就会把错 tag 带进整条下载链（拼出的直链必然 404，11 条候选链 × 5 次
+/// 重试 = 白烧几百 MB + 几分钟干等）。这里用**产物存在性**当判据：不信任任何
+/// 源报上来的 tag，只认「那个 release 里真的躺着我们要的 zip」的 tag。
+///
+/// 纯函数：GitHub 已按新到旧排好序，返回第一个能挑出 Windows 压缩包的即可
+/// （跳过 `tag`，下载端还要比对不重下）。
+fn pick_release_tag_with_assets(
+    releases: &[ReleaseEntry],
+    names: &[String],
+) -> Option<String> {
+    releases
+        .iter()
+        .find(|(_, table)| !pick_tool_assets(table, names).is_empty())
+        .map(|(tag, _)| tag.clone())
+}
+
 /// 工具下载的失败：区分「重下一次可能就好」（网络）与「重下多少次都是同一个
 /// 坏结果」（结构性问题）。后者不重试——工具包 44~62MB，重试 5 次就是白烧
 /// 300MB 流量 + 几分钟干等，用户看到的还是同一个错。
@@ -2177,29 +2247,64 @@ impl From<String> for ToolErr {
 /// 解析出直链后同样是「国内镜像 × 8 + PS 通道 + curl 直链」全量并发竞速
 /// （与自更新同一个 download_race，只是校验函数换成 looks_like_zip）。
 /// 返回 (zip 路径, 资产字节数)。
+///
+/// **tag 自愈**：传进来的 tag 只当作「探查来的候选」，本函数会先拿它探一次
+/// 资产表；探不到（错的 tag 在 GitHub 上直接 404）或探到的表里没有我们要的
+/// Windows 压缩包时，用发布列表把 tag 重新锚定到「真的带着产物」的那一个。
+/// 这一步专门收拾 `tag_probes` 里任何一个源报错的情况——错 tag 拼出的直链必
+/// 404，11 条候选链 × 5 轮重试就是几百 MB 白流量和几分钟干等，而多花的代价
+/// 只是失败路径上一次发布列表请求（约百来 KB）。探查正常时不额外发请求。
+///
+/// 返回 (zip 路径, 资产字节数, **实际下载用的 tag**)。
 fn download_tool_archive(
     spec: &ToolSpec,
     tag: &str,
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<(PathBuf, u64), ToolErr> {
+) -> Result<(PathBuf, u64, String), ToolErr> {
     let names: Vec<String> = spec
         .asset_tpls
         .iter()
         .map(|t| t.replace("{arch}", win_arch()))
         .collect();
-    // 资产表（镜像竞速，与检查更新同一套源）。拿不到不算致命：直拼直链兜底。
-    let mut resolved: Vec<(String, String, u64)> = Vec::new();
-    let mut table_ok = false;
-    match fetch_release_assets(spec.repo, tag) {
-        Ok((src, table)) => {
-            table_ok = true;
-            log_update(&format!("工具下载 {} 资产表来自 {src}（{} 项）", spec.label, table.len()));
-            resolved = pick_tool_assets(&table, &names);
+    // 资产表（镜像竞速，与检查更新同一套源）。
+    let mut tag = tag.to_string();
+    let mut table: Option<AssetTable> = None;
+    match fetch_release_assets(spec.repo, &tag) {
+        Ok((src, t)) => {
+            log_update(&format!("工具下载 {} 资产表来自 {src}（{} 项）", spec.label, t.len()));
+            table = Some(t);
         }
         Err(e) => log_update(&format!("工具下载 {} 资产表探查失败（仍走直拼兜底）: {e}", spec.label)),
     }
+    // 拿不到资产表、或表里没有我们要的压缩包 → tag 很可能报错了，用发布列表
+    // 重新锚定。发布列表本身就内联了每个 release 的 assets，换 tag 的同时把
+    // 资产表一起接过来，省掉第二次探查。
+    if table.as_ref().is_none_or(|t| pick_tool_assets(t, &names).is_empty()) {
+        match fetch_release_list(spec.repo) {
+            Ok(releases) => match pick_release_tag_with_assets(&releases, &names) {
+                Some(fixed) if fixed != tag => {
+                    log_update(&format!(
+                        "工具下载 {}：tag {tag} 取不到 Windows 压缩包，改用 {fixed}",
+                        spec.label
+                    ));
+                    table = releases
+                        .iter()
+                        .find(|(tg, _)| *tg == fixed)
+                        .map(|(_, t)| t.clone());
+                    tag = fixed;
+                }
+                _ => {}
+            },
+            Err(e) => log_update(&format!("工具下载 {} 发布列表兜底失败: {e}", spec.label)),
+        }
+    }
+    // 资产表里挑出候选；表没拿到就空着（下面直拼兜底）。
+    let mut resolved: Vec<(String, String, u64)> =
+        table.as_ref().map(|t| pick_tool_assets(t, &names)).unwrap_or_default();
+    // 「有资产表但一个可用压缩包都挑不出」= 产物名/产物线对不上，与网络无关。
+    let no_asset = table.is_some() && resolved.is_empty();
     // 兜底：表里没给出的模板名按约定 URL 直拼（零请求，镜像前缀照打）。
     for n in &names {
         if !resolved.iter().any(|(rn, _, _)| *rn == *n) {
@@ -2251,7 +2356,9 @@ fn download_tool_archive(
         ) {
             Ok(p) => {
                 log_update(&format!("工具下载 成功：{} {name} → {p}", spec.label));
-                return Ok((PathBuf::from(p), total));
+                // 带上**实际用的** tag：自愈可能把它改过，调用方要按它报版本，
+                // 否则装的是新版本、状态栏却写着一个下不下来的错版本号。
+                return Ok((PathBuf::from(p), total, tag));
             }
             Err(e) => {
                 log_update(&format!("工具下载 失败：{} {name}：{e}", spec.label));
@@ -2259,11 +2366,15 @@ fn download_tool_archive(
             }
         }
     }
-    // 全败：资产表拿到了、里面却没有能用的 Windows 压缩包 → 上游改了产物名，
-    // 改代码之前谁重试都下不下来（重试一次 = 再烧一个 60MB），直接判结构性失败。
-    // 资产表压根没拿到则是网络问题，值得按节奏重试。
+    // 全败。分类只看「**我们手上有没有一个真的能用的直链**」：
+    //  - 资产表拿到了却一个可用压缩包都挑不出（no_asset）→ 结构性：tag 已在上面
+    //    用发布列表兜底过，仍挑不出说明上游真的改了产物名。换源重下多少次都是
+    //    同一个结果（重试一次 = 再烧一个 60MB），不重试。
+    //  - 其余（表里明明有产物、只是所有源都连不上 / 校验不过）→ 网络问题，
+    //    值得按节奏重试。旧实现只拿 `table_ok`（=表取到了）判结构性，于是镜像
+    //    集体超时这种纯网络故障也被判成「不再重试」，用户干等一轮就收手。
     let detail = format!("所有下载源失败：{}", errs.join("；"));
-    if table_ok {
+    if no_asset {
         return Err(ToolErr::structural(format!(
             "{detail}（已拿到 {tag} 的资产表，但里面没有 Windows 压缩包，上游可能改了产物名）"
         )));
@@ -2425,6 +2536,9 @@ fn run_tool_update(
     // 上次若因「被占用」没装上，暂存里已留有解好的 exe：校验通过就别再重下
     // 60MB 压缩包，直接进替换（用户只需先关掉占用的进程再点一次按钮）。
     let reuse = find_exe_in_stage(&stage, spec.exe_name).is_some_and(|s| looks_like_exe(&s));
+    // 下载层可能把探查来的错 tag 自愈成「真带产物」的那个，完成文案/版本号
+    // 一律用 effective_tag，不能拿 tag 报。
+    let mut effective_tag = String::new();
     let mut attempt = 1u32;
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -2465,7 +2579,10 @@ fn run_tool_update(
             None
         } else {
             match download_tool_archive(spec, tag, &install_dir, &progress_tx, &cancel) {
-                Ok((zip, _total)) => Some(zip),
+                Ok((zip, _total, used_tag)) => {
+                    effective_tag = used_tag;
+                    Some(zip)
+                }
                 Err(e) => {
                     if cancel.load(Ordering::Relaxed) {
                         sink("下载已取消");
@@ -2542,8 +2659,9 @@ fn run_tool_update(
                 // 5) 清理暂存（下载包已装完，不再需要续传）。
                 let _ = std::fs::remove_dir_all(&stage);
                 drop_zip(&zip);
+                let done_tag = if effective_tag.is_empty() { tag } else { &effective_tag };
                 log_update(&format!(
-                    "工具 {label} 更新完成：{tag} → {final_exe:?}（旧版已备份 {old_exe:?}）"
+                    "工具 {label} 更新完成：{done_tag} → {final_exe:?}（旧版已备份 {old_exe:?}）"
                 ));
                 let _ = tx.send((
                     idx,
@@ -2551,13 +2669,13 @@ fn run_tool_update(
                         msg: if first_install {
                             // 具体路径/是否已入启动命令由 UI 拼（它才知道配置改动
                             // 结果）；这里只给一句短消息。
-                            format!("{label} {tag} 已安装")
+                            format!("{label} {done_tag} 已安装")
                         } else {
-                            format!("{label} 已更新到 {tag}，重新启动 {label} 即可生效")
+                            format!("{label} 已更新到 {done_tag}，重新启动 {label} 即可生效")
                         },
                         // 直接采信装上去的 tag，不再去跑 `--version`：某些版本
                         // 改了输出格式抠不出数字，那样按钮会永远停在“有新版本”。
-                        version: tag.trim_start_matches('v').to_string(),
+                        version: done_tag.trim_start_matches('v').to_string(),
                     },
                 ));
                 let _ = redraw_tx.try_send(());
@@ -3258,9 +3376,20 @@ impl ClientApp {
             let tx = self.tool_tx.clone();
             let redraw_tx = self.redraw_tx.clone();
             std::thread::spawn(move || {
-                while let Ok((d, t)) = prx.try_recv() {
-                    let _ = tx.send((idx, ToolEvent::Progress(d, t)));
-                    let _ = redraw_tx.try_send(());
+                loop {
+                    match prx.try_recv() {
+                        Ok((d, t)) => {
+                            let _ = tx.send((idx, ToolEvent::Progress(d, t)));
+                            let _ = redraw_tx.try_send(());
+                        }
+                        // 发送端还没掉（正在下载）也不能空转：原来这个 while
+                        // let Ok(..) = try_recv 是纯忙等，opencode 的 62MB 要下
+                        // 几十秒，期间整个核心一直 100% 占着，UI 都被抢。
+                        Err(TryRecvError::Empty) => {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        Err(TryRecvError::Disconnected) => return, // 作业结束
+                    }
                 }
             });
         }
@@ -7784,9 +7913,10 @@ mod vscode_tests {
 mod update_tests {
     use super::{
         asset_table_from_json, assets_from_html, exe_asset_from_html, extract_zip,
-        find_exe_in_stage, parse_version_token, pick_tool_assets, purge_other_shards, shard_fp,
-        sync_tree, tar_bin, tool_exe_candidates, tool_fresh_dir_in, version_newer, win_arch,
-        AssetTable, ClientApp, ToolErr, TOOL_SPECS,
+        find_exe_in_stage, parse_release_list, parse_version_token, pick_release_tag_with_assets,
+        pick_tool_assets, purge_other_shards, shard_fp, sync_tree, tag_probes, tar_bin,
+        tool_exe_candidates, tool_fresh_dir_in, version_newer, win_arch, AssetTable, ClientApp,
+        ReleaseEntry, ToolErr, TOOL_SPECS,
     };
     use std::path::PathBuf;
 
@@ -8177,6 +8307,97 @@ mod update_tests {
         assert_eq!(got[0].2, 42, "字节数要带出来，进度才有百分比");
     }
 
+    /// 回归：tag 探查源里**不得**再出现 jsDelivr。
+    ///
+    /// 事故：`data.jsdelivr.com/v1/packages/gh/{repo}` 返回的是仓库发布到 npm 的
+    /// 包版本，不是 GitHub Release 的 tag。opencode 的 npm 版是 `2.0.20`（Release
+    /// tag 是 `v1.18.33`），`.../releases/download/2.0.20/…` 必然 404，且
+    /// `version_newer("2.0.20", "1.18.32")` 为真 → 装完也永远显示「有新版本」。
+    /// jsDelivr 又是抢跑极快的 CDN，竞速里总是它先赢，其余源没机会纠正。
+    #[test]
+    fn tag_probes_exclude_npm_version_sources() {
+        let urls: Vec<String> = tag_probes("anomalyco/opencode").into_iter().map(|p| p.url).collect();
+        assert!(
+            !urls.iter().any(|u| u.contains("jsdelivr")),
+            "tag 探查源里不能有 jsDelivr：npm 包版本 ≠ Release tag\n{urls:?}"
+        );
+        // 兜底：剩下的源都得是「以 GitHub Release 为准」的
+        assert!(
+            urls.iter().all(|u| u.contains("github.com")),
+            "tag 探查只应走 GitHub 系源\n{urls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_release_list_keeps_order_and_skips_draft_prerelease() {
+        let body = serde_json::json!([
+            {
+                "tag_name": "v1.18.33",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {"name": "opencode-windows-x64.zip",
+                     "browser_download_url": "https://u/x64.zip", "size": 62127126},
+                    {"name": "opencode-linux-x64.tar.gz",
+                     "browser_download_url": "https://u/l.tgz", "size": 60}
+                ]
+            },
+            {"tag_name": "v2.0.0-rc1", "draft": false, "prerelease": true,
+             "assets": [{"name": "opencode-windows-x64.zip",
+                         "browser_download_url": "https://u/rc.zip", "size": 1}]},
+            {"tag_name": "v1.18.32", "draft": false, "prerelease": false,
+             "assets": [{"name": "opencode-windows-x64.zip",
+                         "browser_download_url": "https://u/old.zip", "size": 62}]}
+        ]);
+        let got = parse_release_list(&body.to_string()).unwrap();
+        let tags: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+        // 预发布不进候选；新 → 旧的原序必须保留（不自己比版本号）
+        assert_eq!(tags, vec!["v1.18.33", "v1.18.32"]);
+        assert_eq!(got[0].1["opencode-windows-x64.zip"].1, 62127126, "字节数要带出来");
+        assert!(parse_release_list("[]").is_err(), "空列表当失败");
+        assert!(parse_release_list("not json").is_err());
+    }
+
+    /// 回归：错 tag 会被发布列表换成「真的带产物」的那个。
+    ///
+    /// 事故现场就是 tag=`2.0.20`（npm 版）打不进 opencode 的 release；这里用
+    /// 纯函数钉住「只要列表里有带 Windows 压缩包的 release，就该选最新的它」。
+    #[test]
+    fn pick_release_tag_anchors_on_assets_not_probe() {
+        let mk = |tag: &str, with_zip: bool| -> ReleaseEntry {
+            let mut t: AssetTable = AssetTable::new();
+            if with_zip {
+                t.insert(
+                    "opencode-windows-x64.zip".into(),
+                    ("https://u/x64.zip".into(), 62),
+                );
+            } else {
+                t.insert("opencode-linux-x64.tar.gz".into(), ("https://u/l.tgz".into(), 60));
+            }
+            (tag.to_string(), t)
+        };
+        let names = vec!["opencode-windows-x64.zip".to_string()];
+        // 最新那个没发 Windows 包 → 往下一个找，而不是直接用最新
+        let rel = vec![mk("v1.18.33", false), mk("v1.18.32", true), mk("v1.18.31", true)];
+        assert_eq!(
+            pick_release_tag_with_assets(&rel, &names).as_deref(),
+            Some("v1.18.32")
+        );
+        // 全都没有 → None（交给上层报「上游改了产物名」）
+        let rel = vec![mk("v1.18.33", false), mk("v1.18.32", false)];
+        assert_eq!(pick_release_tag_with_assets(&rel, &names), None);
+        // 空列表不 panic
+        assert_eq!(pick_release_tag_with_assets(&[], &names), None);
+    }
+
+    /// 错 tag 自愈后，完成文案用的 tag 必须是**实际下载**的那个，不能是探查来的
+    /// 错 tag（否则装的是 1.18.33、状态栏却报 2.0.20，下次又判「有新版本」）。
+    #[test]
+    fn corrected_tag_is_not_compared_as_version() {
+        // 装好 1.18.33 后，探查若仍报 npm 版 2.0.20，必须认为「无新版本」。
+        assert!(!version_newer("1.18.33", "2.0.20"));
+    }
+
     #[test]
     fn shard_fp_separates_tags_and_assets() {
         // 同一工具的不同 tag / 不同资产名必须落在不同分片上，否则 -C - 续传
@@ -8339,4 +8560,3 @@ mod update_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
