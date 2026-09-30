@@ -133,6 +133,10 @@ pub struct Session {
     pub done_since_ms: Arc<AtomicU64>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
+    /// agent 权威运行态（runstate::RunState::to_slot，0=Unknown）。
+    /// pi/opencode 有自己的状态接口（会话 JSONL / DB），比自己「3s 无输出」
+    /// 猜得准；未知时 0，UI 照旧走输出启发式（见 runstate.rs）。
+    pub run_state: Arc<std::sync::atomic::AtomicU8>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     /// 含转义/动画块：页签 🔄 图标用——动画重绘也算在跑（spinner/状态栏
     /// 刷新保持旋转）。
@@ -1098,7 +1102,10 @@ pub fn spawn(
         });
     }
 
-    Ok(Session {
+    // 权威运行态槽位（runstate 模块填充，见下方 start_tracking）。
+    let run_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+
+    let session = Session {
         title: title.to_string(),
         dir: dir.to_string(),
         cmd: tui_command.to_string(),
@@ -1122,6 +1129,7 @@ pub fn spawn(
         last_reap_ms: Arc::new(AtomicU64::new(0)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
         last_clipboard_seq: None,
+        run_state: run_state.clone(),
         output_count,
         out_bytes,
         last_output_ms,
@@ -1146,10 +1154,12 @@ pub fn spawn(
         last_snapshot_gen: 0,
         last_snapshot_offset: 0,
         loading,
-
-    })
+    };
+    // pi / opencode 的权威运行态跟踪：非 agent 命令直接返回（槽位恒 0 = 走
+    // 输出启发式）。线程随会话退出（exited 置位）自动结束。
+    crate::runstate::start_tracking(tui_command, &dir, run_state, exited);
+    Ok(session)
 }
-
 impl Session {
     /// 页签「加载中」判定：loading 标志 + 墙钟双条件。reader 只在「有输出」时
     /// 才自清 loading（首个非动画块 / 3s 兜底），零输出会话（sleep、静默命令）

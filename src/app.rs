@@ -525,13 +525,34 @@ fn curl_bin() -> &'static str {
     "curl"
 }
 
+/// 强制直连：给子进程挂上「不走任何代理」的全部开关。
+///
+/// 三层保险（用户要求：下载时不带任何代理）：
+///  1. `--noproxy '*'`：curl 侧通配直连（curlrc 已被 `-q` 禁掉，这里再挡一层）；
+///  2. `env_remove` 清掉 http_proxy/https_proxy/all_proxy（含大写）：环境变量
+///     这条道也堵死，将来换传输层也不会凭空捡起代理；
+///  3. PS 通道在脚本里置 `[Net.WebRequest]::DefaultWebProxy = $null`
+///     （Invoke-WebRequest 走系统代理，WinPS 没有 `--noproxy` 那种开关）。
+///
+/// 为什么全禁而不是「有代理更好」：镜像池 10 条链若都被同一个代理端口串起来
+/// 限速，会一起跌破 `--speed-limit 4096 --speed-time 8` 的速度地板 → 集体被判
+/// 死，复现「所有下载源下载失败」；本机也确有 Clash 残留配置的病史。
+fn direct(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.arg("--noproxy").arg("*");
+    for k in [
+        "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy", "HTTP_PROXY",
+        "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    ] {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 /// 用 curl 请求 URL 并把响应体取回内存（自更新与工具资产表探查共用）。
 /// 通用性说明：`-q` 让 curl 完全不读 ~/.curlrc（曾有残留 Clash 127.0.0.1:7897
-/// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误）——任何机器上的
-/// 残留配置都不影响；环境 http_proxy/https_proxy 代理仍读（用户明确配置的
-/// 代理放行，配合 PS/WinHTTP 系统代理通道，直连/代理双栈互补——全禁代理
-/// 曾导致有加速器的机器下载不了）。connect_timeout / max_time（秒）由调用方
-/// 决定。
+/// 代理配置导致所有 curl 走指定端口、检查更新一律网络错误），且 `direct()` 把
+/// 环境/系统代理一并清掉——**任何机器上的任何代理配置都不参与**。connect_timeout
+/// / max_time（秒）由调用方决定。
 fn curl_get(url: &str, connect_timeout: u64, max_time: u64) -> Result<Vec<u8>, String> {
     let mut cmd = std::process::Command::new(curl_bin());
     let ct = connect_timeout.to_string();
@@ -540,8 +561,9 @@ fn curl_get(url: &str, connect_timeout: u64, max_time: u64) -> Result<Vec<u8>, S
         // -q 忽略 .curlrc / _curlrc，防用户机器上的残留代理端口
         "-q", "-s", "-f", "-L", "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
-        url,
     ]);
+    direct(&mut cmd);
+    cmd.arg(url);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -566,8 +588,9 @@ fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<Stri
         "-w", "%{redirect_url}",
         "--connect-timeout", &ct, "--max-time", &mt, "--ssl-no-revoke",
         "-H", "User-Agent: TUIProjectManager",
-        url,
     ]);
+    direct(&mut cmd);
+    cmd.arg(url);
     // GUI 程序 spawn 控制台程序（curl.exe）会闪一个黑窗口：
     // CREATE_NO_WINDOW 让子进程不分配控制台，彻底消除。
     #[cfg(windows)]
@@ -626,7 +649,7 @@ const SELF_REPO_PAGE: &str = "https://github.com/qq458249269/TUIProjectManager";
 ///
 /// 这套枚举 + 下面的 Probe/probe_first 就是「检查更新」的镜像源下载逻辑本身，
 /// pi / opencode 的资产表探查直接复用它（同一份 GH_MIRRORS、同一份 PS 通道、
-/// 同一套并发先到先得），不再各写一串只直连 api.github.com 的取数逻辑。
+/// 同一套「逐个尝试」调度），不再各写一串只直连 api.github.com 的取数逻辑。
 #[derive(Clone, Copy)]
 enum ProbeKind {
     /// JSON 响应体：解析后由 extract 取字段（GitHub API 取 tag_name）。
@@ -643,7 +666,7 @@ enum ProbeKind {
     JsonList,
 }
 
-/// 一个探查源。desc/URL/通道/超时档位都在这里配，probe_first 负责并发调度。
+/// 一个探查源。desc/URL/通道/超时档位都在这里配，probe_first 负责逐个调度。
 /// repo/tag 挂在源上（parse 是 fn 指针、捕获不了局部变量，由解析方自行取用）。
 struct Probe {
     desc: String,
@@ -651,6 +674,9 @@ struct Probe {
     kind: ProbeKind,
     /// 走 PowerShell WinHTTP（独立网络栈 + 系统代理），curl 崩溃/被墙时绕过。
     ps: bool,
+    /// 属 GH_MIRRORS 加速池（挂了零成本的一档）：串行下可按 PROBE_POOL_BUDGET
+    /// 提前跳过剩下的池内源，直连/PS 通道则永远试到底。
+    pool: bool,
     /// 连接超时 / 总超时（秒）。
     ct: u64,
     mt: u64,
@@ -666,6 +692,7 @@ impl Probe {
             url,
             kind,
             ps: false,
+            pool: false,
             ct,
             mt,
             repo: String::new(),
@@ -679,6 +706,12 @@ impl Probe {
         self
     }
 
+    /// 标为「加速池」源：逐个尝试时可以按预算提前跳过（见 probe_first）。
+    fn pool(mut self) -> Self {
+        self.pool = true;
+        self
+    }
+
     /// 标上本次探查的 repo / tag，供 parse 从正文里定位资产。
     fn ctx(mut self, repo: &str, tag: &str) -> Self {
         self.repo = repo.to_string();
@@ -688,7 +721,7 @@ impl Probe {
 }
 
 /// 按 kind 取回单个源的正文（已归一：JSON/HTML 给原文，HtmlTag 给重定向 URL）。
-/// 具体「从正文里取值」交给 probe_first 的 parse（fn 指针，便于跨线程发送）。
+/// 具体「从正文里取值」交给 probe_first 的 parse（fn 指针，取数与解析分层）。
 fn probe_body(p: &Probe) -> Result<String, String> {
     #[cfg(windows)]
     if p.ps {
@@ -706,7 +739,6 @@ fn probe_body(p: &Probe) -> Result<String, String> {
 /// 拉取某个 repo 的最新 tag 的源表：GH_MIRRORS 国内镜像（每个前缀拼在
 /// api.github.com 直链前）、GitHub HTML 302（免 API 限流）、GitHub API
 /// （可能限流）以及 PS WinHTTP 通道（curl 崩溃/失败时的绕过源）。
-///
 /// **这里曾经有一个 jsDelivr 源（`data.jsdelivr.com/v1/packages/gh/{repo}`），
 /// 已删除——它答的根本不是同一个问题。** 该接口返回的是该仓库**发布到 npm 的
 /// 包版本**，与 GitHub Release 的 tag 是两套编号，混用会直接把下载链打死：
@@ -717,11 +749,14 @@ fn probe_body(p: &Probe) -> Result<String, String> {
 ///    直链同样 404。
 /// 附带伤害：错 tag 还会喂给 `version_newer`（`2.0.20 > 1.18.32`），于是装完
 /// 也永远显示「有新版本」，下载按钮反复冒出来。
-/// jsDelivr 还是个抢跑很快的 CDN，竞速里**总是它先赢**，其他源根本没机会纠正。
+/// jsDelivr 还是个抢跑很快的 CDN，一旦被排在前面就**总是它先赢**，其他源根本没机会纠正。
 ///
 /// 现在这里只放「以 GitHub Release 为准」的源；万一将来又混进答非所问的源，
 /// `download_tool_archive` 还会用发布列表兜底（见 pick_release_tag_with_assets），
 /// 错 tag 会被就地纠正成「真正带产物的那个 tag」，而不是 5 次重试白烧 300MB。
+///
+/// 镜像一律 `.pool()` 标记：逐个尝试时它们是「快赢的一档」，预算用尽就跳过
+/// 剩下的，把时间留给直连/PS 通道（见 probe_first）。
 fn tag_probes(repo: &str) -> Vec<Probe> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let html_url = format!("https://github.com/{repo}/releases/latest");
@@ -730,7 +765,9 @@ fn tag_probes(repo: &str) -> Vec<Probe> {
         |v| v["tag_name"].as_str().map(str::to_string);
     let mut sources: Vec<Probe> = Vec::new();
     for m in GH_MIRRORS {
-        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6));
+        sources.push(
+            Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6).pool(),
+        );
     }
     sources.push(Probe::new("GitHub HTML", html_url.clone(), ProbeKind::HtmlTag, 6, 12));
     sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::Json(gh_api), 6, 12));
@@ -767,7 +804,7 @@ fn is_plausible_tag(s: &str) -> bool {
 /// `<meta name="route-pattern" content="/:user_id/:repository/releases/tag/*name">`
 /// ——它排在真正的 tag 链接**前面**，于是 `find` 命中它，抠出来的「tag」是
 /// `/*name" data-turbo-transient>` 这种 HTML 碎片。它照样非空、能过
-/// 「返回空 tag」检查、照样赢下并发竞速（PS 通道 8s 连通时，镜像往往还没回来），
+/// 「返回空 tag」检查、照样赢下探查（PS 通道 8s 连通时，镜像往往还没回来），
 /// 于是状态栏顶上冒出一个鬼版本号，点下去拼出的
 /// `…/releases/download/*name" data-turbo-transient>/opencode-windows-x64.zip`
 /// 必然 404——**正是「检测出一个乱七八糟的版本、点下载却全挂」这类事故的形状**。
@@ -828,63 +865,79 @@ fn parse_tag(p: &Probe, body: &str) -> Result<String, String> {
     Ok(tag)
 }
 
-/// 拉取某个 repo 的最新 tag。所有源**并发**探查、先到先得：任一源在自身超时内
-/// 返回有效 tag 即胜出——坏源零成本跳过，总耗时封顶在最快源的超时内（≈6s），
-/// 不再逐源串行、最坏吃满全表，也顺带防限流误报。全程 -q 直连、不读任何代理
-/// 配置与端口。
+/// 拉取某个 repo 的最新 tag。所有源**逐个**探查、先成功先得：任一源在自身超时内
+/// 返回有效 tag 即胜出，坏源安静退场（每个源只花自己那一份超时），全程 -q 直连、
+/// 不读任何代理配置与端口。
+///
+/// **从并发改成逐个**（事故：「所有下载源下载失败」）。旧的并发同时打 8 个镜像 +
+/// GitHub API + PS 通道 ≈ 10 条请求，一次检查把同一份 API 文档同时问十遍：
+/// api.github.com 匿名调用是**按 IP 每小时 60 次**限流的，镜像前缀代理转发的
+/// 请求同样从限流池里扣，撞到 403/429 就整片源同时躺平；何况并发时**谁先回谁赢**，
+/// 一个答非所问的源照样能抢跑。现在一个一个来，谁先成用谁，请求数降到个位数，
+/// 限流基本碰不到；代价是全挂时要多花几份超时，由 PROBE_POOL_BUDGET 兜住。
 fn fetch_latest_tag(repo: &str) -> Result<String, String> {
     let (_desc, tag) = probe_first(repo, tag_probes(repo), parse_tag)?;
     log_update(&format!("检查更新 {repo} 最新 tag: {tag}"));
     Ok(tag)
 }
 
-/// 所有源**并发**探查、先到先得：同时发起，任一源取回正文且 parse 成功即胜出，
-/// 其余源直接放行不再取数（全败时逐条记日志）。返回 (胜出源名, 值)。
+/// 所有源**逐个**探查、先成功先得：按源表顺序一个一个试，任一源取回正文且
+/// parse 成功即胜出，剩下的不再取数（全败时逐条记日志）。返回 (胜出源名, 值)。
 ///
 /// 这是「检查更新」与「工具下载」共用的取数骨架：GH_MIRRORS 前缀镜像、
 /// GitHub 直连、PowerShell WinHTTP 三类通道在这里统一调度，新增数据源只需
-/// 往源表里加一条。parse 是 fn 指针（不捕获局部变量），天然可 Send + 'static。
-fn probe_first<T: Send + 'static>(
+/// 往源表里加一条。parse 是 fn 指针（不捕获局部变量）。
+///
+/// **不再一源一线程同时开跑**（见 fetch_latest_tag 的事故说明）：并发探查把
+/// 同一份文档同时问十遍，最容易撞 api.github.com 的匿名 60 次/小时限流，
+/// 而且「谁先回谁赢」会让答非所问的源抢跑。逐个试把请求数压到个位数，代价是
+/// 全挂时的耗时——用下面的「加速池预算」兜住。
+///
+/// **加速池预算**：源表顺序 = 优先级（国内加速 → 直连 → PS），前 8 条镜像标了
+/// `.pool()`；累计耗时超过 PROBE_POOL_BUDGET 秒就放弃**剩下的**池内源（它们
+/// 挂了也不会再活），直连/PS 通道则一定试到底。正常情况下第一个源就赢，
+/// 根本走不到这条分支。
+const PROBE_POOL_BUDGET: u64 = 12; // 秒
+
+fn probe_first<T>(
     ctx: &str,
     sources: Vec<Probe>,
     parse: fn(&Probe, &str) -> Result<T, String>,
 ) -> Result<(String, T), String> {
-    let n = sources.len();
-    if n == 0 {
+    if sources.is_empty() {
         return Err("没有可用源".to_string());
     }
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(String, T), String>>();
-    for s in sources {
-        let tx = tx.clone();
-        let done = done.clone();
-        let ctx = ctx.to_string();
-        std::thread::spawn(move || {
-            if done.load(Ordering::Relaxed) {
-                return; // 已有源胜出，本线程不再发消息
-            }
-            let parsed = probe_body(&s).and_then(|body| parse(&s, &body));
-            match &parsed {
-                Ok(_) => log_update(&format!("探查 {ctx} {} 成功", s.desc)),
-                Err(e) => log_update(&format!("探查 {ctx} {} 失败: {e}", s.desc)),
-            }
-            if parsed.is_ok() {
-                done.store(true, Ordering::Relaxed);
-            }
-            let _ = tx.send(parsed.map(|v| (s.desc.clone(), v)));
-        });
-    }
-    drop(tx);
+    let start = Instant::now();
     let mut errors: Vec<String> = Vec::new();
-    for _ in 0..n {
-        match rx.recv() {
-            Ok(Ok(v)) => {
-                done.store(true, Ordering::Relaxed);
-                return Ok(v);
-            }
-            Ok(Err(e)) => errors.push(e),
-            Err(_) => break,
+    let mut skipped = 0usize;
+    for s in sources {
+        if s.pool && start.elapsed().as_secs() >= PROBE_POOL_BUDGET {
+            skipped += 1;
+            continue;
         }
+        match probe_body(&s).and_then(|body| parse(&s, &body)) {
+            Ok(v) => {
+                log_update(&format!(
+                    "探查 {ctx} {} 成功（{:.1}s）",
+                    s.desc,
+                    start.elapsed().as_secs_f64()
+                ));
+                return Ok((s.desc, v));
+            }
+            Err(e) => {
+                log_update(&format!(
+                    "探查 {ctx} {} 失败（{:.1}s）: {e}",
+                    s.desc,
+                    start.elapsed().as_secs_f64()
+                ));
+                errors.push(e);
+            }
+        }
+    }
+    if skipped > 0 {
+        log_update(&format!(
+            "探查 {ctx} 加速池预算用尽（{PROBE_POOL_BUDGET}s），跳过剩余 {skipped} 个镜像源"
+        ));
     }
     // 具体失败原因已逐条 log_update；这里只给用户一句可行动的提示
     //（逐源错误已写日志，展开只会把状态栏撑成一条长串）。
@@ -959,8 +1012,9 @@ fn download_update(
         api_cmd.args([
             "-q", "-s", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
             "-H", "User-Agent: TUIProjectManager",
-            &api_url,
         ]);
+        direct(&mut api_cmd);
+        api_cmd.arg(&api_url);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1028,34 +1082,22 @@ fn download_update(
             0,
         ),
     };
-    // ── 候选下载链：国内镜像 + PS WinHTTP + curl 直链，每个文件名下全量并发 ──
-    // 竞速第一个到达（见 download_race）：坏源/停滞源零成本跳过，速度地板判死
-    // 僵尸源；旧实现逐链串行（镜像×8 → PS → curl 直连按序等待），8 个死镜像
-    // 的 connect 超时（8s 各）累计 64s+ 才轮到直链——正是「镜像源下载缓慢」
-    // 的根因，已由并发取代。单个 fallback 失败再试下一个候选文件名。
+    // ── 候选下载链：国内镜像 + PS WinHTTP + curl 直链，每个文件名下逐个尝试 ──
+    //（见 download_chain）：一次只跑一条，坏源/停滞源花光自己的超时退场，下一条
+    // 接着上。单个 fallback 失败再试下一个候选文件名。
     let mut parts: Vec<String> = Vec::new();
     for (url, name) in fallback {
-        let mut candidates: Vec<(String, bool)> = Vec::new(); // (url, 走 PS)
-        for mirror in GH_MIRRORS {
-            candidates.push((format!("{mirror}{url}"), false));
-        }
-        #[cfg(windows)]
-        candidates.push((url.clone(), true));
-        #[cfg(not(windows))]
-        candidates.push((url.clone(), false));
-        // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
-        #[cfg(windows)]
-        candidates.push((url.clone(), false));
+        let candidates = candidate_chains(&url);
         log_update(&format!(
-            "下载 {} 并发尝试 {} 个候选链（tag={tag}，total={total}）",
+            "下载 {} 逐个尝试 {} 个候选链（tag={tag}，total={total}）",
             name,
             candidates.len()
         ));
-        // 用户取消时立即停止本轮竞速。
+        // 用户取消时立即停止本轮尝试。
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("下载已取消".to_string());
         }
-        match download_race(
+        match download_chain(
             &name,
             // 分片指纹带 tag：不同版本的 exe 分片不得互相续传（否则会把旧版
             // 前半截接到新版后半截上，拼出一个能过 PE 头校验却跑不起来的文件）。
@@ -1086,20 +1128,30 @@ fn download_update(
 
 /// GitHub Release 检查/下载加速镜像（前缀拼接原始 github.com 或
 /// api.github.com 直链，如 {mirror}https://github.com/...）。大陆直连 GitHub
-/// 慢/被墙，镜像 CDN 缓存、延迟低；检查更新时所有镜像**并发**探查、先到
-/// 先得（挂了零成本跳过）；下载仍逐链尝试、挂了自动跳到下一个，全挂才回退
-/// 原始直链。列表换成当前可用即可，多放几个零成本、坏节点自动跳过。
-// 镜像列表为「加速前缀池」而非命运列表：检查更新/下载全部**并发**批量发起、
-// 先到先得，连接失败与坏文件（错误页/截断）都会被即时剔除记错并继续等其余
-// 源——所以越多越稳，坏节点零成本，谁响应快谁胜出，天然满足「实时性高」。
-// 池内包含踩点验证过数量级的常见国内加速：热门前缀代理、jsDelivr CDN 之外的
-// 各家 gh-proxy 系。个别历史 403/超时/证书过期的源保留在池里：连通状态随时
-// 变化，竞速机制下不必人工汰换，哪家活了立即自动启用。
+/// 慢/被墙，镜像 CDN 缓存、延迟低；检查更新时镜像逐个探查、谁先答对谁赢；
+/// 下载则逐链尝试、挂了自动跳下一条，镜像全不行才走 PS 通道与原始直链。
+/// 列表换成当前可用即可，多放几个零成本、坏节点自动跳过。
+// 镜像列表是「加速前缀池」而非命运列表：检查更新/下载都按池顺序**逐个**试，
+// 连接失败与坏文件（错误页/截断）都被即时剔除记错并轮到下一条——所以越多越稳，
+// 坏节点只是多花自己那一份 connect 超时。池内包含踩点验证过数量级的常见国内
+// 加速：热门前缀代理、jsDelivr CDN 之外的家 gh-proxy 系。个别历史 403/超时/
+// 证书过期的源保留在池里：连通状态随时变化，哪家活了立即自动启用。
+//
+// **别再改回“一源一线程全部并发”**（事故：整轮提示「所有下载源下载失败」）。
+// 一次检查/下载同时打 8 个镜像 + 直连 + PS ≈ 10 条并行请求 + 10 份镜像同时
+// 拉同一个 60MB 文件：
+//  1. api.github.com 匿名调用按 IP 限流 60 次/小时，一次扇出等于把配额一下
+//     花光，403/429 让整片源同时躺平（检查更新与资产表都靠它）；
+//  2. 带宽被 N 份平分，每份都可能跌破 `--speed-limit 4096 --speed-time 8`
+//     的速度地板 → **全部候选在同一个判定下被判死**，正好就是「所有下载源
+//     下载失败」；单源独享带宽时它下得飞快；
+//  3. “谁先回谁赢”让一个答非所问 / 报错页的源最容易被当赢家。
+// 现在一条一条来：请求与带宽都独占，第一个成功的即胜出。
 const GH_MIRRORS: &[&str] = &[
     "https://gh-proxy.com/",   // 热门前缀代理
     "https://gh-proxy.net/",   // 同系备用
     "https://ghps.cc/",        // 极速代理
-    "https://ghfast.top/",     // gh-proxy 系，状态多变，竞速下自动甄别
+    "https://ghfast.top/",     // gh-proxy 系，状态多变，池内逐个试时自动甄别
     "https://mirror.ghproxy.com/", // ghproxy 系老牌
     "https://ghproxy.net/",    // ghproxy 系
     "https://gh.llkk.cc/",     // 备用代理
@@ -1159,25 +1211,85 @@ fn file_len(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-/// 用 curl（或 PowerShell WinHTTP）把单个 URL 下载到 dest_dir/{asset}.{fp}.new，
-/// 轮询文件大小报告进度。返回 Ok(下载文件路径) 或 Err(具体失败原因)。
-/// 单个文件名下的候选链**并发竞速**下载（与检查更新同一套镜像源逻辑）：全部
-/// 候选（国内镜像 + PS WinHTTP + curl 直链）同时发起，各自写独立临时文件
-/// dest_dir/{asset}.{fp}.c{idx}.new，第一个成功完成的胜出并 promote 为
-/// {asset}.{fp}.new，其余就地 kill。坏源/停滞源零成本跳过：--connect-timeout 8
-/// 挡连接挂死，--speed-limit 4096 --speed-time 8 判死持续 <4KB/s 达 8s 的僵尸
-/// 源（不再让一个死镜像独占整条串行下载）。失败/取消保留分片供下次 `-C -`
-/// 续传；胜出 promote 若被杀软短持有则退避重试。validate 是产物校验
-/// （自更新 = looks_like_exe，pi/opencode = looks_like_zip），错误页/截断文件
-/// 永不胜出。fp 是本轮（tag + 资产名）的分片指纹，保证续传不会跨版本串包；
-/// total 已知时还额外做**字节数对账**（见下）。
-/// 返回 Ok(下载文件路径) 或 Err(所有候选失败的聚合)。
-/// ponytail: 若 release 数日后镜像纷纷清缓存变慢，可给镜像档位降权或按历史
-/// 延迟排序重试；触及率低，暂不加。
-fn download_race(
+/// 一条候选下载链：一个资产直链 + 通道 + 是否属镜像加速池。
+#[derive(Debug)]
+struct Chain {
+    /// 完整 URL（镜像前缀已拼好，或原始 github.com 直链）。
+    url: String,
+    /// 走 PowerShell WinHTTP（独立网络栈 + 系统代理），否则 curl 直连。
+    ps: bool,
+    /// 属 GH_MIRRORS 加速池：逐个尝试时可按 DL_POOL_BUDGET 提前跳过剩下的池内
+    /// 链；直链与 PS 通道则一定试到底（它们是保底，不能被预算砍掉）。
+    pool: bool,
+}
+
+/// 候选链的 connect 超时（秒）：镜像给短的（挂了要快速退场——逐个尝试下 8 个死
+/// 镜像不能各占 8s），直链与 PS 给长的（最后的保底，值得多等一会儿）。
+const POOL_CONNECT_TIMEOUT: &str = "5";
+const BACKUP_CONNECT_TIMEOUT: &str = "8";
+
+/// 把一条资产直链铺成候选链：国内镜像池（GH_MIRRORS 前缀）→ PS WinHTTP →
+/// curl 直连。**顺序即优先级**，逐个尝试（见 download_chain）。
+fn candidate_chains(url: &str) -> Vec<Chain> {
+    let mut out: Vec<Chain> = GH_MIRRORS
+        .iter()
+        .map(|m| Chain {
+            url: format!("{m}{url}"),
+            ps: false,
+            pool: true,
+        })
+        .collect();
+    // PS/WinHTTP 通道吃系统代理（Steam++/Clash 系统代理模式能救直连被墙；不设
+    // DefaultWebProxy=$null——远端曾禁代理导致下载不了）。
+    #[cfg(windows)]
+    out.push(Chain {
+        url: url.to_string(),
+        ps: true,
+        pool: false,
+    });
+    // curl 直连兜底：Windows 下 PS 失败（无 PowerShell 等）时仍有它；非 Windows
+    // 更是唯一通道。
+    out.push(Chain {
+        url: url.to_string(),
+        ps: false,
+        pool: false,
+    });
+    out
+}
+
+/// 下载的「加速池干等预算」（秒）：**连续**这么久没从任何镜像链上拿到新字节，
+/// 就放弃剩下的镜像链，直接走 PS 通道与直链保底。串行化之后全挂时的耗时全靠
+/// 它兜底（没有并发去「同时试」，8 个死镜像各吃一份 connect 超时会拖很久）。
+///
+/// 刻意按「干等」而不是总耗时计：某条镜像正下到一半（哪怕下了 40MB 才断流），
+/// 说明链路本身是通的，此刻换链等于把已下的字节全扔掉重下一份；只有连不上、
+/// 一字节都拿不到的镜像才该被预算砍掉。
+const DL_POOL_BUDGET: u64 = 20;
+
+/// 把某个候选链的单个 URL 下载到 dest_dir/{asset}.{fp}.c{i}.new，下完且过校验
+/// 才 promote 为 {asset}.{fp}.new。返回 Ok(产物路径) 或 Err(具体失败原因)。
+///
+/// 同一份产物的候选链（国内镜像 × 8 → PS WinHTTP → curl 直连）**逐个尝试**，
+/// 一次只跑一条：请求与带宽都独占它，第一个下成功且过校验的即胜出。不是并发——
+/// 事故「所有下载源下载失败」正是并发扇出造成的（见 GH_MIRRORS 上方说明：
+/// 同时打 10 条请求撞 API 限流；带宽被平分后每条都跌破速度地板，一起被判死）。
+///
+/// 每条链的护栏：
+///  - `--connect-timeout`：镜像 5s、直链与 PS 8s，挡连接挂死；
+///  - `--speed-limit 4096 --speed-time 8`：持续 <4KB/s 达 8s 的僵尸源判死，
+///    不让它把整轮的时间都占了（独占带宽时正常镜像远在这个地板之上）；
+///  - 字节数对账 + validate（自更新 = looks_like_exe，pi/opencode =
+///    looks_like_zip）：错误页 / 截断文件永不胜出，坏分片当场删掉；
+///  - 失败/取消**保留**分片，下次同一条链 `-C -` 续传；fp 带 tag + 资产名，
+///    绝不跨版本串包；
+///  - 换链时进度会回到新链的起点（分片按链隔离的必然结果），这是如实反映
+///    当前这条链下了多少，不是卡死。
+///
+/// 返回 Ok(下载文件路径) 或 Err(所有候选链失败的聚合)。
+fn download_chain(
     asset_name: &str,
     fp: &str,
-    candidates: Vec<(String, bool)>, // (url, 走 PS WinHTTP)
+    candidates: Vec<Chain>,
     total: u64,
     dest_dir: &Path,
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
@@ -1188,21 +1300,42 @@ fn download_race(
     purge_other_shards(dest_dir, asset_name, fp);
     let new_name = format!("{asset_name}.{fp}.new");
     let dest_path = dest_dir.join(&new_name);
-    let mut children: Vec<Option<std::process::Child>> = Vec::new();
+    let n = candidates.len();
     let mut errs: Vec<String> = Vec::new();
-    for (i, (url, ps)) in candidates.iter().enumerate() {
+    let mut skipped = 0usize;
+    // 「干等」计时起点：只有连续拿不到字节才累加预算（见 DL_POOL_BUDGET）。
+    let mut dry_since = Instant::now();
+    let start = Instant::now();
+    for (i, ch) in candidates.iter().enumerate() {
+        // 取消：立刻停，不再起下一条链。
+        if cancel.load(Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
+        // 镜像池预算：干等太久就别在镜像上耗着了，直链/PS 一定还会试。
+        if ch.pool && dry_since.elapsed().as_secs() >= DL_POOL_BUDGET {
+            skipped += 1;
+            continue;
+        }
         let tmp = dest_dir.join(format!("{asset_name}.{fp}.c{i}.new"));
         let tmp_str = tmp.to_str().unwrap_or("update.exe.new").replace('\'', "''");
-        let mut cmd = if *ps {
+        let ct = if ch.pool {
+            POOL_CONNECT_TIMEOUT
+        } else {
+            BACKUP_CONNECT_TIMEOUT
+        };
+        let mut cmd = if ch.ps {
             let mut c = std::process::Command::new("powershell");
             c.args(["-NoProfile", "-NonInteractive", "-Command"]);
-            // PS/WinHTTP 通道吃系统代理（Steam++/Clash 系统代理模式可救大陆
-            // 直连被墙；不设 DefaultWebProxy=$null——远端曾禁代理导致下载不了）。
+            for k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+                c.env_remove(k);
+            }
             let script = format!(
-                "$ErrorActionPreference='Stop'; \
+                // DefaultWebProxy=$null：Invoke-WebRequest 默认读系统代理，这里
+                // 先置空再发请求，PS 通道也不带代理（与 curl 的 direct() 对齐）。
+                "$ErrorActionPreference='Stop'; [System.Net.WebRequest]::DefaultWebProxy=$null; \
                  Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} \
                  -TimeoutSec 120 -OutFile '{dest}' -UseBasicParsing",
-                url = url.replace('\'', "''"),
+                url = ch.url.replace('\'', "''"),
                 dest = tmp_str,
             );
             c.arg(script);
@@ -1210,14 +1343,17 @@ fn download_race(
         } else {
             let mut c = std::process::Command::new(curl_bin());
             c.args([
-                "-q", "-L", "-f", "--connect-timeout", "8", "--ssl-no-revoke",
-                // 传输停滞判死：持续 <4KB/s 达 8s 中止本候选，让位其余候选。
+                "-q", "-L", "-f", "--ssl-no-revoke",
+                // 挡连接挂死：镜像 5s，直链保底 8s。
+                "--connect-timeout", ct,
+                // 传输停滞判死：持续 <4KB/s 达 8s 中止本候选，轮到下一条链。
                 "--speed-limit", "4096", "--speed-time", "8",
-                // 不带 --noproxy：-q 已禁 .curlrc 残留代理（历史坑 3a70473），
-                // 依仍读环境 http_proxy/https_proxy 与 PS 系统代理互补。
+                // 直连：`direct()` 禁掉环境/系统代理（历史坑 3a70473 的
+                // .curlrc 残留由 -q 挡），镜像池 10 条链不串同一个代理端口。
                 "-H", "User-Agent: TUIProjectManager",
                 "-o", tmp.to_str().unwrap_or("update.exe.new"),
             ]);
+            direct(&mut c);
             // 断点续传：上次遗留的同指纹分片非空则续传（PS 无续传，直接覆盖重下）。
             // 已知总字节数时分片不可能比它还大——那就是别的批次残留/拼坏的，
             // 删掉重下，绝不拿它当续传起点。
@@ -1230,7 +1366,7 @@ fn download_race(
                     c.arg("-C").arg("-");
                 }
             }
-            c.arg(url);
+            c.arg(&ch.url);
             c
         };
         #[cfg(windows)]
@@ -1238,119 +1374,127 @@ fn download_race(
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW，不闪黑窗
         }
-        match cmd.spawn() {
-            Ok(ch) => children.push(Some(ch)),
+        let kind = if ch.pool {
+            "镜像"
+        } else if ch.ps {
+            "PS 通道"
+        } else {
+            "直连"
+        };
+        let before = file_len(&tmp);
+        log_update(&format!(
+            "下载 链 {i}/{n}（{kind}，第 {:.0}s，续传 {before} 字节）: {}",
+            start.elapsed().as_secs_f64(),
+            ch.url
+        ));
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
             Err(e) => {
-                errs.push(format!("{url}: 启动下载失败 {e}"));
-                children.push(None);
+                errs.push(format!("{}: 启动下载失败 {e}", ch.url));
+                continue;
             }
-        }
-    }
-    loop {
-        // 取消：kill 全部，保留 .c{idx}.new 供下次续传。
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            for c in children.iter_mut().flatten() {
-                let _ = c.kill();
+        };
+        // 轮询到本链结束：退出码里才有成功/失败的真相。进度 = 本链分片当前大小。
+        let status = loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                return Err("下载已取消".to_string());
             }
-            return Err("下载已取消".to_string());
-        }
-        // 进度 = 各临时文件当前大小的最大值（领先者即竞速胜出者的身形）。
-        let mut reported = 0u64;
-        for i in 0..children.len() {
-            reported = reported.max(file_len(&dest_dir.join(format!("{asset_name}.{fp}.c{i}.new"))));
-        }
-        let _ = progress_tx.send((reported, total));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        // 扫描已结束的子进程：首个成功者胜出。
-        for (i, slot) in children.iter_mut().enumerate() {
-            let Some(ch) = slot.as_mut() else { continue };
-            match ch.try_wait() {
-                Ok(Some(st)) if st.success() => {
-                    let tmp = dest_dir.join(format!("{asset_name}.{fp}.c{i}.new"));
-                    // 字节数对账：已知总字节数时，产物必须分毫不差。少 = 截断，
-                    // 多 = 续传时服务器没认 Range（把整个包又追加了一遍）——两种
-                    // 情况产物头尾都可能长得像模像样（zip 尾部 PK\x05\x06 在位），
-                    // 光看 looks_like_zip 拦不住，装上去才发现是个坏 exe。
-                    let got = file_len(&tmp);
-                    if total > 0 && got != total {
-                        let _ = std::fs::remove_file(&tmp);
-                        errs.push(format!(
-                            "{}: 字节数不符（收到 {got}，应为 {total}，疑似截断或续传重复追加）",
-                            candidates[i].0
-                        ));
-                        *slot = None;
-                        continue;
-                    }
-                    // 源返回了非 exe 产物（错误页 HTML / 截断文件）：视作该候选失败，
-                    // 删其临时文件后继续等其余候选——坏源永不胜出，杜绝
-                    // 「替换失败: 下载文件损坏」反复出现（原本错误页体积小、下载最快，
-                    // 总是抢在真源前面 promote 成功）。
-                    if !validate(&tmp) {
-                        let _ = std::fs::remove_file(&tmp);
-                        errs.push(format!("{}: 文件损坏（产物校验失败，疑似错误页或截断）", candidates[i].0));
-                        *slot = None;
-                        continue;
-                    }
-                    // kill 其余所有候选，删除其残留临时文件（本次已废弃）。
-                    for (j, other) in children.iter_mut().enumerate() {
-                        if j == i { continue; }
-                        if let Some(o) = other.as_mut() {
-                            let _ = o.kill();
-                        }
-                        other.take();
-                        if let Some(p) = dest_dir
-                            .join(format!("{asset_name}.{fp}.c{j}.new"))
-                            .to_str()
-                        {
-                            let _ = cleanup_file(p);
-                        }
-                    }
-                    // promote：rename 被杀软/Defender 短持有（os error 5）时退避重试。
-                    let mut wait_ms = 300u64;
-                    loop {
-                        match std::fs::rename(&tmp, &dest_path) {
-                            Ok(()) => break,
-                            Err(e) => {
-                                log_update(&format!("下载 promote rename 失败: {e}"));
-                                if wait_ms > 4000 {
-                                    let _ = std::fs::copy(&tmp, &dest_path);
-                                    let _ = std::fs::remove_file(&tmp);
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-                                wait_ms = (wait_ms * 2).min(4000);
-                            }
-                        }
-                    }
-                    let final_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-                    let _ = progress_tx.send((final_size, total));
-                    return Ok(dest_path.to_string_lossy().into_owned());
-                }
-                Ok(Some(st)) => {
-                    // 失败（HTTP 非零、限流、停滞判死）→ 记错误，临时文件保留供续传。
-                    let code = st.code().map(|c| c.to_string()).unwrap_or_else(|| "信号终止".to_string());
-                    errs.push(if candidates[i].1 {
-                        format!("PS 通道失败（{code}）")
-                    } else {
-                        format!("镜像/直链失败（{code}）")
-                    });
-                    slot.take();
-                }
-                Ok(None) => {}
+            let _ = progress_tx.send((file_len(&tmp), total));
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
                 Err(e) => {
-                    errs.push(format!("{e}"));
-                    slot.take();
+                    let _ = child.kill();
+                    errs.push(format!("{}: 等待下载进程失败 {e}", ch.url));
+                    break None;
+                }
+            }
+        };
+        let Some(st) = status else { continue };
+        // 本链确实推了字节 → 干等预算重新计时（链路是通的，别急着换链）。
+        let got = file_len(&tmp);
+        if got > before {
+            dry_since = Instant::now();
+        }
+        if !st.success() {
+            // 失败（HTTP 非零、429 限流、停滞判死）→ 记错误，分片保留供续传。
+            let code = st
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "信号终止".to_string());
+            errs.push(format!(
+                "{kind}失败（{code}，已下 {got} 字节）: {}",
+                ch.url
+            ));
+            continue;
+        }
+        // 字节数对账：已知总字节数时，产物必须分毫不差。少 = 截断，
+        // 多 = 续传时服务器没认 Range（把整个包又追加了一遍）——两种
+        // 情况产物头尾都可能长得像模像样（zip 尾部 PK\x05\x06 在位），
+        // 光看 looks_like_zip 拦不住，装上去才发现是个坏 exe。
+        if total > 0 && got != total {
+            let _ = std::fs::remove_file(&tmp);
+            errs.push(format!(
+                "{}: 字节数不符（收到 {got}，应为 {total}，疑似截断或续传重复追加）",
+                ch.url
+            ));
+            continue;
+        }
+        // 源返回了非 exe/zip 产物（错误页 HTML / 截断文件）：视作该链失败，
+        // 删其分片后试下一条链——坏源永不胜出，杜绝「替换失败: 下载文件损坏」
+        // 反复出现（错误页体积小、并发时最容易被当成赢家）。
+        if !validate(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            errs.push(format!(
+                "{}: 文件损坏（产物校验失败，疑似错误页或截断）",
+                ch.url
+            ));
+            continue;
+        }
+        // promote：rename 被杀软/Defender 短持有（os error 5）时退避重试。
+        let mut wait_ms = 300u64;
+        loop {
+            match std::fs::rename(&tmp, &dest_path) {
+                Ok(()) => break,
+                Err(e) => {
+                    log_update(&format!("下载 promote rename 失败: {e}"));
+                    if wait_ms > 4000 {
+                        let _ = std::fs::copy(&tmp, &dest_path);
+                        let _ = std::fs::remove_file(&tmp);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    wait_ms = (wait_ms * 2).min(4000);
                 }
             }
         }
-        if children.iter().all(Option::is_none) {
-            return Err(if errs.is_empty() {
-                "无候选可启动".to_string()
-            } else {
-                errs.join("；")
-            });
-        }
+        let final_size = file_len(&dest_path);
+        let _ = progress_tx.send((final_size, total));
+        return Ok(dest_path.to_string_lossy().into_owned());
     }
+    if skipped > 0 {
+        log_update(&format!(
+            "下载 加速池干等预算用尽（{DL_POOL_BUDGET}s），跳过剩余 {skipped} 条镜像链"
+        ));
+    }
+    if errs.is_empty() {
+        return Err("无候选可启动".to_string());
+    }
+    // 错误汇总要能塞进状态栏：逐链原文可能有十来条，这里留头两条 + 末条（末条
+    // 是最后试的保底链，最接近“现在到底卡在哪”），其余折成条数。log_update
+    // 早已是空函数（不落盘），这句就是用户唯一能看到的原因，别把它撑成一行
+    // 几千字符。
+    Err(if errs.len() <= 3 {
+        errs.join("；")
+    } else {
+        format!(
+            "{}；……；{}（共 {} 条链失败）",
+            errs[..2].join("；"),
+            errs[errs.len() - 1],
+            errs.len()
+        )
+    })
 }
 
 /// 带指数退避的 rename 重试。Windows 下杀软/Defender 实时扫描会短暂持有/// 删文件，被占用（刚被 kill 的落败 curl 进程句柄尚未释放）时退一小会重试。
@@ -1438,7 +1582,7 @@ fn install_update(
     sink: &dyn Fn(&str),
 ) -> InstallOutcome {
     // 0) 校验下载产物（MZ+PE 头）：镜像偶发返回错误页/截断文件，装上就无法启动。
-    //    竞速层已前置剔除坏源，这里双保险；失败上层会自动换源重下，无需用户手动干预。
+    //    下载层已前置剔除坏源，这里双保险；失败上层会自动换源重下，无需用户手动干预。
     if !looks_like_exe(new_file) {
         let _ = std::fs::remove_file(new_file); // 删掉坏的，避免被 -C - 续传拼坏
         sink(&format!(
@@ -1654,8 +1798,8 @@ fn exe_asset_from_html(html: &str, repo: &str, tag: &str) -> Option<(String, Str
 }
 
 /// 自更新的 exe 直链探查：与检查更新（tag）、工具下载（资产表）完全同一套
-/// 镜像源逻辑——GH_MIRRORS 前缀镜像 × 8 + 直连 + PS WinHTTP 全部并发，
-/// 先返回成功者为准。
+/// 镜像源逻辑——GH_MIRRORS 前缀镜像 × 8 → 直连 → PS WinHTTP **逐个尝试**，
+/// 先成功者为准。
 ///
 /// 页面选取：优先 `releases/expanded_assets/{tag}`（真带下载链接的那份），
 /// 标签页只挂直连/PS（部分镜像会把 include-fragment 一起渲染出来，值得一试，
@@ -1667,6 +1811,7 @@ fn fetch_self_exe_asset(tag: &str) -> Result<(String, (String, String, u64)), St
     for m in GH_MIRRORS {
         sources.push(
             Probe::new(&format!("{m}/资产片段"), format!("{m}{frag}"), ProbeKind::Html, 3, 6)
+                .pool()
                 .ctx(SELF_REPO, tag),
         );
     }
@@ -1684,7 +1829,7 @@ fn fetch_self_exe_asset(tag: &str) -> Result<(String, (String, String, u64)), St
 
 // ── 外部工具（pi / opencode）更新 ──────────────────────────────────────
 //
-// 自更新那套流水线（多源并发探查 → 镜像竞速下载 .new → 解压 → install_update
+// 自更新那套流水线（多源逐个探查 → 候选链逐个下载 .new → 解压 → install_update
 // 三段式替换 .old/.new）原样复用，只在两处因工具而变：
 //  1) 产物是 zip（pi-windows-x64.zip / opencode-windows-x64.zip），下载校验
 //     换成 looks_like_zip，装上前必须解压；解开后的主产物 exe 才进替换链；
@@ -1780,6 +1925,38 @@ enum ToolEvent {
 /// 工具更新作业的最大尝试次数（自更新是无限重试，工具这边一次要重下
 /// 60MB 量级的压缩包，封顶更合理）。
 const MAX_TOOL_ATTEMPTS: u32 = 5;
+
+/// 自更新下载的最大尝试次数。**原来是无限重试**：所有源都挂时每 3 秒重跑一
+/// 轮 download_chain（10 条链）永远停不下来，而且 UI 看到含「失败」的状态栏
+/// 文案就把 downloading 复位 → 「✕ 取消」按钮随之消失 → 用户**连按都按不到
+/// 停止**（下载线程还在后台每 3 秒烧一次网）。现在：封顶 5 次 + 退避递增，
+/// 收手后提示手动重试，取消始终有按钮可按。
+const MAX_SELF_UPDATE_ATTEMPTS: u32 = 5;
+
+/// 重试退避：3s → 6s → 12s → 24s → 封顶 30s。
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let secs = 3u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4));
+    std::time::Duration::from_secs(secs.min(30))
+}
+
+/// 可中断的等待：`cancel` 一置位立刻返回（分片 100ms 睡，不做满全程）。
+/// 返回 true = 期间被取消。原来的 `thread::sleep(3s)` 让「✕ 取消」最多 3 秒
+/// 才生效，重试期间一直这样。
+fn sleep_until_cancel(
+    cancel: &std::sync::atomic::AtomicBool,
+    total: std::time::Duration,
+) -> bool {
+    let mut left = total;
+    while !left.is_zero() {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = left.min(std::time::Duration::from_millis(100));
+        std::thread::sleep(step);
+        left -= step;
+    }
+    cancel.load(Ordering::Relaxed)
+}
 
 /// 设置页三个折叠分区的 id（`settings_section` 的 `id_salt`）。列在这里是因为
 /// 它们是**互斥**的：点开一个要把另外两个的 `CollapsingState` 置 false，所以
@@ -2123,7 +2300,7 @@ fn asset_table_from_json(v: &serde_json::Value) -> Result<AssetTable, String> {
 }
 
 /// 探查某个 tag 的资产表。**与检查更新完全同一套镜像源逻辑**（GH_MIRRORS
-/// 前缀镜像 + GitHub 直连 + PS WinHTTP，并发先到先得），两种正文形态：
+/// 前缀镜像 → GitHub 直连 → PS WinHTTP，逐个尝试先成功先得），两种正文形态：
 ///   1. `api.github.com/repos/{repo}/releases/tags/{tag}` → 资产表 + 字节数；
 ///   2. `github.com/{repo}/releases/expanded_assets/{tag}` → 资产列表片段
 ///      （标签页初始 HTML 里一个链接都没有，片段页才是真带链接的那份）。
@@ -2138,10 +2315,10 @@ fn fetch_release_assets(repo: &str, tag: &str) -> Result<(String, AssetTable), S
     let gh_api: fn(&serde_json::Value) -> Option<String> = |v| v["tag_name"].as_str().map(str::to_string);
     let mut sources: Vec<Probe> = Vec::new();
     for m in GH_MIRRORS {
-        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6).ctx(repo, tag));
+        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::Json(gh_api), 3, 6).pool().ctx(repo, tag));
     }
     for m in GH_MIRRORS {
-        sources.push(Probe::new(m, format!("{m}{frag_url}"), ProbeKind::Html, 3, 6).ctx(repo, tag));
+        sources.push(Probe::new(m, format!("{m}{frag_url}"), ProbeKind::Html, 3, 6).pool().ctx(repo, tag));
     }
     sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::Json(gh_api), 6, 12).ctx(repo, tag));
     sources.push(Probe::new("GitHub 资产片段", frag_url.clone(), ProbeKind::Html, 6, 12).ctx(repo, tag));
@@ -2181,7 +2358,7 @@ fn parse_assets(p: &Probe, body: &str) -> Result<AssetTable, String> {
 fn pick_tool_assets(table: &AssetTable, names: &[String]) -> Vec<(String, String, u64)> {
     let mut out: Vec<(String, String, u64)> = Vec::new();
     let mut push = |n: &str| {
-        // 模板命中过的名字不再被「发现」段重复收一遍（否则同一个资产竞速两轮）
+        // 模板命中过的名字不再被「发现」段重复收一遍（否则同一个资产多探两轮）
         if out.iter().any(|(rn, _, _)| rn == n) {
             return;
         }
@@ -2245,13 +2422,13 @@ fn parse_release_list(body: &str) -> Result<Vec<ReleaseEntry>, String> {
     Ok(out)
 }
 
-/// 拉取仓库的发布列表（新 → 旧）。同样走 GH_MIRRORS 镜像竞速 + PS 通道，
+/// 拉取仓库的发布列表（新 → 旧）。同样走 GH_MIRRORS 镜像（逐个试）+ PS 通道，
 /// 与 `fetch_release_assets` 同一套骨架。
 fn fetch_release_list(repo: &str) -> Result<Vec<ReleaseEntry>, String> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
     let mut sources: Vec<Probe> = Vec::new();
     for m in GH_MIRRORS {
-        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::JsonList, 3, 6).ctx(repo, ""));
+        sources.push(Probe::new(m, format!("{m}{api_url}"), ProbeKind::JsonList, 3, 6).pool().ctx(repo, ""));
     }
     sources.push(Probe::new("GitHub API", api_url.clone(), ProbeKind::JsonList, 6, 12).ctx(repo, ""));
     #[cfg(windows)]
@@ -2264,7 +2441,7 @@ fn fetch_release_list(repo: &str) -> Result<Vec<ReleaseEntry>, String> {
 
 /// 从发布列表里挑**最新且确实带该工具 Windows 压缩包**的 tag。
 ///
-/// 这是 tag 探查的权威兜底：`tag_probes` 是「先到先得」的快查询，任何一个源
+/// 这是 tag 探查的权威兜底：`tag_probes` 是「先成功先得」的快查询，任何一个源
 /// 答错就会把错 tag 带进整条下载链（拼出的直链必然 404，11 条候选链 × 5 次
 /// 重试 = 白烧几百 MB + 几分钟干等）。这里用**产物存在性**当判据：不信任任何
 /// 源报上来的 tag，只认「那个 release 里真的躺着我们要的 zip」的 tag。
@@ -2308,10 +2485,10 @@ impl From<String> for ToolErr {
 
 /// 下载工具 zip 产物到 {install_dir}/.{id}-update.{fp}.zip.{fp}.new。
 ///
-/// 直链解析：资产表（**与检查更新同一套镜像竞速** + expanded_assets 片段）
+/// 直链解析：资产表（**与检查更新同一套镜像源** + expanded_assets 片段）
 /// → 模板没命中就在表里按形态发现 → 都不行才直拼约定 URL（零请求保底）。
-/// 解析出直链后同样是「国内镜像 × 8 + PS 通道 + curl 直链」全量并发竞速
-/// （与自更新同一个 download_race，只是校验函数换成 looks_like_zip）。
+/// 解析出直链后同样是「国内镜像 × 8 → PS 通道 → curl 直链」逐个尝试
+/// （与自更新同一个 download_chain，只是校验函数换成 looks_like_zip）。
 /// 返回 (zip 路径, 资产字节数)。
 ///
 /// **tag 自愈**：传进来的 tag 只当作「探查来的候选」，本函数会先拿它探一次
@@ -2330,7 +2507,7 @@ fn download_tool_archive(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(PathBuf, u64, String), ToolErr> {
     let names = tool_asset_names(spec);
-    // 资产表（镜像竞速，与检查更新同一套源）。
+    // 资产表（镜像逐个试，与检查更新同一套源）。
     let mut tag = tag.to_string();
     let mut table: Option<AssetTable> = None;
     match fetch_release_assets(spec.repo, &tag) {
@@ -2385,24 +2562,14 @@ fn download_tool_archive(
         if cancel.load(Ordering::Relaxed) {
             return Err(ToolErr::net("下载已取消"));
         }
-        let mut candidates: Vec<(String, bool)> = Vec::new();
-        for mirror in GH_MIRRORS {
-            candidates.push((format!("{mirror}{url}"), false));
-        }
-        #[cfg(windows)]
-        candidates.push((url.clone(), true));
-        #[cfg(not(windows))]
-        candidates.push((url.clone(), false));
-        // Windows 下 PS 失败（无 PowerShell 等）时仍有 curl 直链保底：
-        #[cfg(windows)]
-        candidates.push((url.clone(), false));
+        let candidates = candidate_chains(&url);
         let asset_name = format!(".{}-update.zip", spec.id);
         log_update(&format!(
-            "工具下载 {} {name} 并发尝试 {} 个候选链（tag={tag}）",
+            "工具下载 {} {name} 逐个尝试 {} 个候选链（tag={tag}）",
             spec.label,
             candidates.len()
         ));
-        match download_race(
+        match download_chain(
             &asset_name,
             // 分片指纹 = tag + 资产名：opencode 的 avx2 版与 baseline 版、
             // 以及不同 tag 之间，分片绝不互相续传（旧的分片名只按工具 id 命名，
@@ -2507,7 +2674,7 @@ fn sync_tree(stage: &Path, install_dir: &Path, skip_name: &str) -> usize {
 
 /// 把探查来的 tag **锚定到「真的带着该工具 Windows 压缩包」的那个 release**。
 ///
-/// `tag_probes` 是「先到先得」的快查询，**任何一个源报上来的 tag 都不作数**：
+/// `tag_probes` 是「先成功先得」的快查询，**任何一个源报上来的 tag 都不作数**：
 /// 它可能是 HTML 模板碎片、错误页、或者历史上混进来的「答非所问的版本源」
 /// （jsDelivr 返回的是 npm 包版本，opencode 那边是 `2.0.20` 而 Release tag 是
 /// `v1.18.33`）。这类 tag 有两个害处：
@@ -2522,7 +2689,7 @@ fn sync_tree(stage: &Path, install_dir: &Path, skip_name: &str) -> usize {
 ///
 /// 检查阶段也跑这一层，是为了让**错误版本号根本没有机会显示到 UI 上**——
 /// 之前只有下载端自愈，用户看到的是「检测出 X，点下载却失败」，正是本次事故的
-/// 完整形状。代价是每次检查多一次镜像竞速请求（命中即止）。
+/// 完整形状。代价是每次检查多一次镜像请求（命中即止）。
 fn anchor_tag_on_assets(spec: &ToolSpec, probed: String) -> String {
     let names = tool_asset_names(spec);
     // 判据一：这个 tag 的 release 里真的有我们要的 Windows 压缩包 → 认，不多发请求。
@@ -2605,7 +2772,7 @@ fn tab_cycle_target(tabs: &[Tab], current: usize, fwd: bool) -> Option<usize> {
 }
 
 /// 检查单个工具（pi / opencode）的新版本：按 tool_dirs（默认本软件所在目录）
-/// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源并发探查拿
+/// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源逐个探查拿
 /// 最新 tag → **按产物存在性锚定 tag**（`anchor_tag_on_assets`）→
 /// version_newer 比较。找不到 exe（未安装）时**仍然给出下载入口**：
 /// 安装目录取「软件同级目录」（pi 走同名子目录），latest 留空由下载作业自己
@@ -2729,16 +2896,19 @@ fn run_tool_update(
                 }
                 Err(e) => {
                     sink(&format!(
-                        "查询最新版本号未成功（第 {attempt} 次）: {e}，3 秒后自动重试…"
+                        "查询最新版本号未成功（第 {attempt}/{MAX_TOOL_ATTEMPTS} 次）: {e}，3 秒后自动重试…"
                     ));
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if sleep_until_cancel(&cancel, retry_backoff(attempt)) {
+                        sink("下载已取消");
+                        return;
+                    }
                     attempt += 1;
                     continue;
                 }
             }
         }
         let tag = tag.as_deref().unwrap_or_default();
-        // 1) 下载 zip（镜像并发竞速，产物 looks_like_zip + 字节数对账）；复用
+        // 1) 下载 zip（候选链逐个尝试，产物 looks_like_zip + 字节数对账）；复用
         //    暂存时跳过。
         let zip: Option<std::path::PathBuf> = if reuse {
             sink("复用上次已解压的文件，直接重试替换…");
@@ -2760,11 +2930,17 @@ fn run_tool_update(
                         sink(&format!("下载中断：{}；不再自动重试", e.msg));
                         return;
                     }
+                    let wait = retry_backoff(attempt);
                     sink(&format!(
-                        "下载失败（第 {attempt} 次）: {}，3 秒后自动重试…",
-                        e.msg
+                        "下载失败（第 {attempt}/{MAX_TOOL_ATTEMPTS} 次）: {}，{} 秒后自动重试…",
+                        e.msg,
+                        wait.as_secs()
                     ));
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    // 可中断等待：取消即刻生效；被取消就直接收手。
+                    if sleep_until_cancel(&cancel, wait) {
+                        sink("下载已取消");
+                        return;
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -3063,7 +3239,7 @@ pub struct ClientApp {
 }
 
 
-/// 页签状态图标判定（纯函数，便于测试）。仅凭终端内容判定：
+/// 页签状态图标判定（纯函数，便于测试）。**默认保底机制**：仅凭终端内容判定
 /// 已退出 → ❌；启动加载中 → 🔄；最近 OUTPUT_END_MS（3s）内有输出 → 🔄；
 /// 输出停止 ≥3s 且有可查看内容且未查看 → ✅（完成/待查看）；否则空。
 /// 滚动/翻页只改视口、不写 last_output_ms → 不计更新状态；周期重绘、CPU
@@ -3076,6 +3252,11 @@ pub struct ClientApp {
 /// 一次性输出给 500ms；真实输出晚于各自窗口即照常判 🔄。
 /// ever_output：是否有任何输出块（含动画）。零输出会话不因 last_output_ms
 /// 初始化为 spawn 时刻而假闪 🔄，🔄 只属于真实内容驱动/加载态。
+///
+/// 这是**无权威状态源**时的旧口径（普通 shell 命令就走这条）。pi/opencode
+/// 页签走 [`tab_icon_with`]：拿得到 agent 自己的状态接口时以它为准。
+/// 只留给测试当保底基准（运行期调用方一律传权威状态，Unknown 即等价于它）。
+#[cfg(test)]
 fn tab_icon(
     exited: bool,
     loading: bool,
@@ -3087,12 +3268,62 @@ fn tab_icon(
     last_input: u64,
     last_scroll: u64,
 ) -> Option<&'static str> {
+    tab_icon_with(
+        exited,
+        loading,
+        ever_output,
+        count,
+        viewed,
+        last_out,
+        now_ms,
+        last_input,
+        last_scroll,
+        crate::runstate::RunState::Unknown,
+    )
+}
+
+/// 同 [`tab_icon`]，但多一路**权威运行态**（runstate 模块的抽象接口）。
+///
+/// 抽象分层：`run_state` 是 agent 自己报的准信（pi 追会话 JSONL、opencode 读
+/// DB），对「模型思考十几秒不出字」「工具跑一分钟不出字」这类场景才判得对；
+/// `Unknown`（没装/没识别/读失败）时**原样回退上面的输出启发式**，一个字
+/// 都不改语义。
+///
+/// 合并口径（有意保守）：
+/// `Busy` → 直接 🔄，不查输出窗口：agent 明确在跑，哪怕终端一个字节没动。
+/// `Idle` → **压掉输出窗口那条 🔄**（pi 停在输入框时界面动画/光标重绘一直有
+/// 输出，不压就会常亮 🔄）；但 **✅/空 仍按 ≥3s 无输出算**：刚提交一条
+/// prompt 的瞬间 pi 末条记录就是 user（=Idle），若据此立刻判 done 会弹假
+/// 「任务完成」通知。
+/// 10 个参数与 `tab_icon` 一一对应（纯函数，便于测试逐项钉住），不拆结构体。
+#[allow(clippy::too_many_arguments)]
+fn tab_icon_with(
+    exited: bool,
+    loading: bool,
+    ever_output: bool,
+    count: u32,
+    viewed: bool,
+    last_out: u64,
+    now_ms: u64,
+    last_input: u64,
+    last_scroll: u64,
+    run_state: crate::runstate::RunState,
+) -> Option<&'static str> {
     if exited {
         return Some("❌");
     }
     if loading {
         return Some("🔄");
     }
+    // 权威「在跑」直接点亮 🔄：模型思考/长工具期间终端可以零输出，输出窗口
+    // 必然会误判成「完成」。它比输出窗口更可信，压过 typing/scroll_echo 例外
+    // （那两条只是压人工回显，agent 自报的准信不该被压）。
+    if run_state == crate::runstate::RunState::Busy {
+        return Some("🔄");
+    }
+    // 权威「空闲」→ 不再用输出窗口判运行中：agent 停在输入框时终端仍在刷动画，
+    // 否则页签会永远 🔄。✅/空 的判据不动（见上面合并口径）。
+    let authoritative_idle = run_state == crate::runstate::RunState::Idle;
     // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——其直接引发
     // 的回显/整屏重绘是用户操作引起、不是任务在跑 → 跳过运行中判定。命令
     // 真实输出晚于窗口即照常判 🔄（慢命令几乎总是超出窗口）。
@@ -3104,6 +3335,7 @@ fn tab_icon(
     // 初始值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
     if !typing
         && !scroll_echo
+        && !authoritative_idle
         && ever_output
         && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS
     {
@@ -3454,8 +3686,8 @@ impl ClientApp {
         self.check_tool_updates();
     }
 
-    /// 检查 pi / opencode 的新版本（与自更新同一套多源并发探查）。
-    /// 一个后台线程里按 TOOL_SPECS 顺序串行跑：每个都是「先到先得」，正常
+    /// 检查 pi / opencode 的新版本（与自更新同一套多源逐个探查）。
+    /// 一个后台线程里按 TOOL_SPECS 顺序串行跑：每个都是「先成功先得」，正常
     /// 1~2 秒一个，串行比各起一个线程更温和（启动检查不再瞬时拉起 24 个 curl）。
     fn check_tool_updates(&mut self) {
         let tx = self.tool_tx.clone();
@@ -3492,9 +3724,9 @@ impl ClientApp {
     }
 
     /// 后台下载并安装单个工具的新版本（tag 为空 = 本机没装过，装到软件同级
-    /// 目录）。流程与自更新同构：镜像竞速下 zip 到 .new → 解压到暂存目录 →
+    /// 目录）。流程与自更新同构：候选链下 zip 到 .new → 解压到暂存目录 →
     /// 备份旧 exe 为 .old → install_update 三段式替换 → 同步其余文件（pi）→
-    /// 清理暂存。失败 3 秒后自动重试，坏源在 download_race 内已被剔除；用户
+    /// 清理暂存。失败 3 秒后自动重试，坏源在 download_chain 内已被剔除；用户
     /// 取消立即退出。
     /// 起一个工具的下载/安装作业。`into_fresh=true` = 强制装进「本软件同级
     /// 目录」（而不管状态里记的 install_dir 在哪）：用于「装到本软件目录」
@@ -3535,7 +3767,7 @@ impl ClientApp {
         let cancel = self.tool_cancel[idx].clone();
         let tx = self.tool_tx.clone();
         let redraw_tx = self.redraw_tx.clone();
-        // 进度中继：download_race 往 ptx 写 (已下载, 总数)，这里转成工具事件
+        // 进度中继：download_chain 往 ptx 写 (已下载, 总数)，这里转成工具事件
         // 走同一条通道（否则要同时管两条通道还得额外唤醒 UI）。prx 的发送端
         // 随作业线程退出而掉落，try_recv 返回断开即收工。
         {
@@ -3610,9 +3842,9 @@ impl ClientApp {
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| PathBuf::from("."));
-            // 失败后 3 秒自动重试，直到下载成功为止。坏源在 download_race 内已被
-            // 剔除、install 校验失败（BadDownload）也会清掉续传残留换源重下，
-            // 不会再出现「替换失败: 下载文件损坏…请重新下载」的僵局。
+            // 失败后按退避重试，**封顶 MAX_SELF_UPDATE_ATTEMPTS 次**。坏源在
+            // download_chain 内已被剔除、install 校验失败（BadDownload）也会
+            // 清掉续传残留换源重下；封顶后不再无限循环，收手并提示手动重试。
             let mut attempt = 1u32;
             let mut installed_new: PathBuf; // 成功装入的 .new（供完成日志）
             loop {
@@ -3625,11 +3857,31 @@ impl ClientApp {
                 let new_path = match download_update(&tag, &exe_path, ptx.clone(), &cancel) {
                     Ok(p) => p,
                     Err(e) => {
+                        if attempt >= MAX_SELF_UPDATE_ATTEMPTS {
+                            let _ = status_tx.send((
+                                format!(
+                                    "已停止自动重试：连续 {MAX_SELF_UPDATE_ATTEMPTS} 次下载失败（最后一次: {e}）；请检查网络后手动点「⬇ 下载」重试"
+                                ),
+                                None,
+                            ));
+                            let _ = redraw_tx.try_send(());
+                            return;
+                        }
+                        let wait = retry_backoff(attempt);
                         let _ = status_tx.send((
-                            format!("下载失败（第 {attempt} 次）: {e}，3 秒后自动重试…"),
+                            format!(
+                                "下载失败（第 {attempt}/{MAX_SELF_UPDATE_ATTEMPTS} 次）: {e}，{} 秒后自动重试…",
+                                wait.as_secs()
+                            ),
                             None,
                         ));
-                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let _ = redraw_tx.try_send(());
+                        // 可中断等待：按「✕ 取消」即刻收手，不用等满退避。
+                        if sleep_until_cancel(&cancel, wait) {
+                            let _ = status_tx.send(("下载已取消".to_string(), None));
+                            let _ = redraw_tx.try_send(());
+                            return;
+                        }
                         attempt += 1;
                         continue;
                     }
@@ -3659,7 +3911,7 @@ impl ClientApp {
                     }
                     InstallOutcome::BadDownload => {
                         // 清掉全部 .c{i}.new 续传残留，避免下一轮 -C - 把坏文件续传
-                        // 拼成残缺 exe；3 秒后整链重新并发下载（坏源已被剔除）。
+                        // 拼成残缺 exe；3 秒后整链重新逐链下载（坏源已被剔除）。
                         if let Some(dir) = new_file.parent() {
                             if let Ok(rd) = std::fs::read_dir(dir) {
                                 for e in rd.flatten() {
@@ -3961,8 +4213,19 @@ impl ClientApp {
                 // 复位，见下）。
                 let done = !s.exited.load(Ordering::Acquire)
                     && !s.loading_active(now_ms)
-                    && now_ms.saturating_sub(s.last_real_output_ms.load(Ordering::Relaxed))
-                        > OUTPUT_END_MS;
+                    && match crate::runstate::RunState::from_slot(
+                        s.run_state.load(Ordering::Relaxed),
+                    ) {
+                        // 权威「在跑」→ 绝不算完成（长工具/思考期不弹通知）。
+                        crate::runstate::RunState::Busy => false,
+                        // 权威「空闲」/未知 → 仍按 ≥3s 无实质输出判完成。
+                        // Idle 不提前判 done：刚提交 prompt 的瞬间就是 Idle，
+                        // 提前判会弹假「任务完成」。
+                        _ => {
+                            now_ms.saturating_sub(s.last_real_output_ms.load(Ordering::Relaxed))
+                                > OUTPUT_END_MS
+                        }
+                    };
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
                 // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在
                 // 🔄↔边界横跳时（再有输出 → done=false → 清零）重置计时。
@@ -4262,7 +4525,7 @@ impl ClientApp {
                     let last_out = s.last_output_ms.load(Ordering::Relaxed);
                     let last_input = s.last_input_ms.load(Ordering::Relaxed);
                     let last_scroll = s.last_scroll_ms.load(Ordering::Relaxed);
-                    let icon = tab_icon(
+                    let icon = tab_icon_with(
                         s.exited.load(Ordering::Acquire),
                         s.loading_active(now_ms),
                         s.ever_output.load(Ordering::Relaxed),
@@ -4272,6 +4535,7 @@ impl ClientApp {
                         now_ms,
                         last_input,
                         last_scroll,
+                        crate::runstate::RunState::from_slot(s.run_state.load(Ordering::Relaxed)),
                     );
                     let title = s.title.clone();
                     let selected = self.current == i;
@@ -7360,8 +7624,10 @@ impl eframe::App for ClientApp {
             if msg.contains("下载完成") {
                 self.update_done = true;
             }
-            // 取消/失败时立即重置 downloading 状态，UI 即时恢复
-            if msg.contains("已取消") || msg.contains("失败") {
+            // 取消/失败时立即重置 downloading 状态，UI 即时恢复。
+            // **中间态的「第 n/5 次…自动重试」不能复位**：复位会让「✕ 取消」
+            // 按钮消失，下载线程却还在后台重试 → 用户按不到停止（无限循环体感）。
+            if msg.contains("已取消") || msg.contains("已停止重试") || msg.contains("已停止自动重试") {
                 self.downloading = false;
                 self.download_progress_rx = None;
             }
@@ -7846,10 +8112,114 @@ impl eframe::App for ClientApp {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::tab_icon;
+    use super::tab_icon_with;
+    use crate::runstate::RunState;
 
     fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
         tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0, 0)
+    }
+
+    /// 带权威运行态的图标（agent 页签实际走的口径）。
+    fn icon_agent(
+        ever: bool,
+        count: u32,
+        viewed: bool,
+        silent_ms: u64,
+        st: RunState,
+    ) -> Option<&'static str> {
+        let now = 100_000u64;
+        tab_icon_with(
+            false,
+            false,
+            ever,
+            count,
+            viewed,
+            now.saturating_sub(silent_ms),
+            now,
+            0,
+            0,
+            st,
+        )
+    }
+
+    // 权威 Busy：终端已经沉默 10 分钟（模型思考/长工具），仍必须亮 🔄。
+    // 这是接pi/opencode 状态接口的意义——输出窗口在这里必然判错。
+    #[test]
+    fn authoritative_busy_beats_silent_output() {
+        assert_eq!(icon_agent(true, 10, false, 600_000, RunState::Busy), Some("🔄"));
+        // 零输出会话也一样：权威说在跑就在跑。
+        assert_eq!(icon_agent(false, 0, false, 600_000, RunState::Busy), Some("🔄"));
+    }
+
+    // 权威 Busy 压过「人工回显例外」：agent 自报的准信不该被 1.5s 打字窗口压暗。
+    #[test]
+    fn authoritative_busy_overrides_typing_window() {
+        let now = 100_000u64;
+        assert_eq!(
+            tab_icon_with(
+                false,
+                false,
+                true,
+                10,
+                false,
+                now - 100,
+                now,
+                now - 100, // 刚敲过键
+                0,
+                RunState::Busy
+            ),
+            Some("🔄")
+        );
+    }
+
+    // 权威 Idle 压掉「3s 内有输出 → 🔄」：agent 停在输入框时动画一直在刷，
+    // 不压就常亮 🔄。但 ✅/空 仍按输出停顿时长算（不提前判完成）。
+    #[test]
+    fn authoritative_idle_suppresses_output_running() {
+        // 刚输出完（<3s）→ 空（等 3s 停顿才谈 ✅）
+        assert_eq!(icon_agent(true, 10, false, 500, RunState::Idle), None);
+        // 真的停了 10s 且未查看 → ✅（完成/待查看）
+        assert_eq!(
+            icon_agent(true, 10, false, 10_000, RunState::Idle),
+            Some("✅")
+        );
+        // 已查看 → 空
+        assert_eq!(icon_agent(true, 10, true, 10_000, RunState::Idle), None);
+        // 同样参数下 Unknown 会亮 🔄（保底启发式），证明 Idle 确实压了它
+        assert_eq!(icon_agent(true, 10, false, 500, RunState::Unknown), Some("🔄"));
+    }
+
+    // Unknown（没装 agent / 读不到）必须逐位等价于旧启发式：回退保底机制。
+    #[test]
+    fn unknown_falls_back_to_heuristic() {
+        for &(ever, count, viewed, silent) in &[
+            (true, 10, false, 1_000u64),
+            (true, 10, false, 10_000),
+            (true, 10, true, 10_000),
+            (false, 0, false, 1_000),
+            (false, 0, false, 10_000),
+        ] {
+            assert_eq!(
+                icon_agent(ever, count, viewed, silent, RunState::Unknown),
+                icon(ever, count, viewed, silent),
+                "Unknown 必须等于启发式口径 ever={ever} count={count} viewed={viewed} silent={silent}"
+            );
+        }
+    }
+
+    // 退出/加载中仍压过一切状态源（❌/启动 🔄 语义不变）。
+    #[test]
+    fn exited_and_loading_beat_authoritative() {
+        let now = 100_000u64;
+        assert_eq!(
+            tab_icon_with(true, false, true, 10, false, now - 10_000, now, 0, 0, RunState::Busy),
+            Some("❌")
+        );
+        assert_eq!(
+            tab_icon_with(false, true, true, 10, false, now - 10_000, now, 0, 0, RunState::Idle),
+            Some("🔄")
+        );
     }
 
     // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
@@ -8135,13 +8505,40 @@ mod vscode_tests {
 #[cfg(all(test, windows))]
 mod update_tests {
     use super::{
-        asset_table_from_json, assets_from_html, exe_asset_from_html, extract_zip,
-        find_exe_in_stage, is_plausible_tag, parse_release_list, parse_tag, parse_version_token,
-        pick_release_tag_with_assets, pick_tool_assets, purge_other_shards, shard_fp,
-        sync_tree, tag_probes, tar_bin, tool_exe_candidates, tool_fresh_dir_in, version_newer,
-        win_arch, AssetTable, ClientApp, Probe, ProbeKind, ReleaseEntry, ToolErr, TOOL_SPECS,
+        asset_table_from_json, assets_from_html, candidate_chains, direct, exe_asset_from_html,
+        extract_zip, find_exe_in_stage, is_plausible_tag, parse_release_list, parse_tag,
+        parse_version_token, pick_release_tag_with_assets, pick_tool_assets, purge_other_shards,
+        shard_fp, sync_tree, tag_probes, tar_bin, tool_exe_candidates, tool_fresh_dir_in,
+        version_newer, win_arch, AssetTable, ClientApp, Probe, ProbeKind, ReleaseEntry, ToolErr,
+        GH_MIRRORS, TOOL_SPECS,
     };
     use std::path::PathBuf;
+
+    /// 回归锁：下载/探查一律**不带任何代理**（用户要求）。两层都要在：
+    /// curl 侧的 `--noproxy *`，以及环境变量被清干净（否则改个传输层/换个
+    /// 工具就又走代理了）。
+    #[test]
+    fn downloads_never_use_proxy() {
+        let mut c = std::process::Command::new("curl");
+        direct(&mut c);
+        let args: Vec<String> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let i = args.iter().position(|a| a == "--noproxy").expect("必须带 --noproxy");
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("*"));
+        for k in [
+            "http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        ] {
+            // env_remove 的效果是「键仍在、值被抹成 None」。
+            assert!(
+                c.get_envs()
+                    .filter(|(k2, _)| k2.to_string_lossy() == k)
+                    .all(|(_, v)| v.is_none()),
+                "环境变量 {k} 必须从子进程环境里去掉"
+            );
+        }
+    }
 
     /// unlock_exe 把运行映像改名成 {name}.running，替换/重启目标必须去掉后缀
     /// 落到正式名，否则 remove/rename 打在锁定映像上 → 更新失败只剩 .new/.old。
@@ -8606,7 +9003,7 @@ mod update_tests {
     /// 包版本，不是 GitHub Release 的 tag。opencode 的 npm 版是 `2.0.20`（Release
     /// tag 是 `v1.18.33`），`.../releases/download/2.0.20/…` 必然 404，且
     /// `version_newer("2.0.20", "1.18.32")` 为真 → 装完也永远显示「有新版本」。
-    /// jsDelivr 又是抢跑极快的 CDN，竞速里总是它先赢，其余源没机会纠正。
+    /// jsDelivr 又是抢跑极快的 CDN，排前面就总是它先赢，其余源没机会纠正。
     #[test]
     fn tag_probes_exclude_npm_version_sources() {
         let urls: Vec<String> = tag_probes("anomalyco/opencode").into_iter().map(|p| p.url).collect();
@@ -8614,11 +9011,49 @@ mod update_tests {
             !urls.iter().any(|u| u.contains("jsdelivr")),
             "tag 探查源里不能有 jsDelivr：npm 包版本 ≠ Release tag\n{urls:?}"
         );
-        // 兜底：剩下的源都得是「以 GitHub Release 为准」的
+// 兜底：剩下的源都得是「以 GitHub Release 为准」的
         assert!(
             urls.iter().all(|u| u.contains("github.com")),
             "tag 探查只应走 GitHub 系源\n{urls:?}"
         );
+    }
+
+    /// 事故回归：下载/探查都不能再「一源一线程全部并发」——并发扇出会撞
+    /// api.github.com 匿名限流、把带宽平分到每条都跌破速度地板，于是整轮
+    /// 「所有下载源下载失败」。钉住两件事：
+    ///  1. 探查源表里 GH_MIRRORS 的那些条目标了 pool（预算可跳过），直连与
+    ///     PS 通道一条都不能标（它们是保底，必须试到底）；
+    ///  2. 候选链铺开仍是「镜像池在前、保底在后」的顺序。
+    #[test]
+    fn probe_and_download_sources_are_sequential_pool_then_backup() {
+        let probes = tag_probes("anomalyco/opencode");
+        let pool: Vec<&str> = probes.iter().filter(|p| p.pool).map(|p| p.desc.as_str()).collect();
+        assert_eq!(
+            pool.len(),
+            GH_MIRRORS.len(),
+            "tag 源表里的镜像条数应与 GH_MIRRORS 一一对应\n{pool:?}"
+        );
+        assert!(
+            probes.iter().any(|p| !p.pool && p.url.starts_with("https://api.github.com/")),
+            "GitHub API 直连必须是非池源（预算不能砍掉它）"
+        );
+        #[cfg(windows)]
+        assert!(
+            probes.iter().any(|p| !p.pool && p.ps),
+            "PS 通道必须是非池源（预算不能砍掉它）"
+        );
+        let chains = candidate_chains("https://github.com/o/r/releases/download/v1/x.zip");
+        let first_backup = chains.iter().position(|c| !c.pool).expect("必须有非池保底链");
+        assert!(
+            chains[..first_backup].iter().all(|c| c.pool),
+            "池内链必须排在保底链前面（顺序即优先级）"
+        );
+        assert!(
+            chains.iter().all(|c| c.url.ends_with("x.zip")),
+            "候选链 URL 必须以资产直链结尾（前缀只该加在前面）\n{chains:?}"
+        );
+        // 保底链至少要有 curl 直连；Windows 上另有 PS 通道。
+        assert!(chains.last().map(|c| !c.ps).unwrap_or(false), "最后一条应是 curl 直连保底");
     }
 
     #[test]
