@@ -2573,6 +2573,37 @@ fn anchor_tag_on_assets(spec: &ToolSpec, probed: String) -> String {
     probed
 }
 
+/// Ctrl+(Shift+)Tab 的落点：**只在页签栏里的页签之间循环，不碰首页 / 设置页**。
+///
+/// 旧实现是在整个 `tabs` 上做 `(current ± 1) % len`，于是快捷键会把人从第一个
+/// 项目页签直接甩到「首页」，再按一下又进「设置」——这两个是**页面**不是**页签**，
+/// 手不离键盘想回到项目里得连按好几下，而且很容易在两个页面之间来回弹
+/// （设置页里还嵌着大量控件，一进去连 Ctrl+Tab 的手感都变了）。
+///
+/// 规则（`fwd` = Ctrl+Tab 前进，`false` = Ctrl+Shift+Tab 后退）：
+///  - 候选集 = 除 `Home` / `Settings` 外的全部页签（会话页签 + 重启/切换期间的
+///    `Placeholder` 占位页签——占位页签就是一个真实的位置，允许落上去）；
+///  - 当前页已在候选集里 → 在**候选集内部**走一步（不是整个 tabs 走一步）；
+///  - 当前页是首页/设置 → 前进跳候选集**第一个**、后退跳**最后一个**，
+///    第一次按就能进页签区，但**永远不会落在首页/设置上**；
+///  - 候选集为空（还没开过任何项目）→ None，按键不做事。
+///
+/// 纯函数（只读 tabs，不碰 self），便于单测钉住行为。
+fn tab_cycle_target(tabs: &[Tab], current: usize, fwd: bool) -> Option<usize> {
+    let ring: Vec<usize> = (0..tabs.len())
+        .filter(|i| !matches!(tabs[*i], Tab::Home | Tab::Settings))
+        .collect();
+    if ring.is_empty() {
+        return None;
+    }
+    let Some(pos) = ring.iter().position(|i| *i == current) else {
+        return Some(if fwd { ring[0] } else { *ring.last()? });
+    };
+    let n = ring.len();
+    // 后退 = 逆序一步（(pos + n - 1) % n）；只有一个页签时原地不动。
+    Some(ring[(pos + if fwd { 1 } else { n - 1 }) % n])
+}
+
 /// 检查单个工具（pi / opencode）的新版本：按 tool_dirs（默认本软件所在目录）
 /// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源并发探查拿
 /// 最新 tag → **按产物存在性锚定 tag**（`anchor_tag_on_assets`）→
@@ -5461,7 +5492,7 @@ impl ClientApp {
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
         ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
@@ -7235,11 +7266,8 @@ impl eframe::App for ClientApp {
             (back, fwd)
         });
         if tab_back || tab_fwd {
-            let n = self.tabs.len();
-            if n > 1 {
-                // 后退 = 逆序一步（(current + n - 1) % n）。
-                let step = if tab_fwd { 1 } else { n - 1 };
-                self.current = (self.current + step) % n;
+            if let Some(target) = tab_cycle_target(&self.tabs, self.current, tab_fwd) {
+                self.current = target;
                 self.refresh_focus();
                 // 切入口即视为已查看（✅/`任务完成`通知清零，与点击页签一致；
                 // 前台每帧同步与 update_done_states 随本帧随后生效）。
@@ -8002,7 +8030,67 @@ mod settings_accordion_tests {
 
 #[cfg(test)]
 mod restore_coords_tests {
-    use super::{restore_coords, TabKind};
+    use super::{restore_coords, tab_cycle_target, Tab, TabKind};
+
+    /// 回归：Ctrl+(Shift+)Tab 只在页签之间循环，不得落到首页 / 设置页。
+    ///
+    /// 旧实现是 `(current ± 1) % tabs.len()`，候选集里混进了 `Home`（下标 0）
+    /// 和 `Settings`（末尾），于是「从项目 A 按 Ctrl+Tab」直接回到首页，
+    /// 再按又进设置——两个页面都不是页签，想回项目得连按几下，且极易在
+    /// 首页/设置之间来回弹。设置页里还嵌着模型配置等大量控件，一进去
+    /// 手感就变了。
+    #[test]
+    fn tab_cycle_never_lands_on_home_or_settings() {
+        // 真实布局：Home 在 0，Settings 追加在末尾，中间是会话/占位页签。
+        let tabs = vec![
+            Tab::Home,
+            Tab::Placeholder { title: "A 重启中".into() },
+            Tab::Settings,
+        ];
+        // 首页 → 前进进页签区第一个，后退进最后一个（都不是首页/设置）
+        assert_eq!(tab_cycle_target(&tabs, 0, true), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 0, false), Some(1));
+        // 在页签区里循环：1 → 1（只有一个候选，原地不动），且绝不去 0/2
+        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(1));
+        // 设置页 → 同样进页签区
+        assert_eq!(tab_cycle_target(&tabs, 2, true), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 2, false), Some(1));
+
+        // 多个页签：在**页签之间**环回，不经过首页/设置
+        let tabs = vec![
+            Tab::Home,
+            Tab::Placeholder { title: "A".into() },
+            Tab::Placeholder { title: "B".into() },
+            Tab::Placeholder { title: "C".into() },
+            Tab::Settings,
+        ];
+        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(2));
+        assert_eq!(tab_cycle_target(&tabs, 2, true), Some(3));
+        assert_eq!(tab_cycle_target(&tabs, 3, true), Some(1), "末尾要回卷到第一个页签，而不是设置页");
+        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(3), "后退回卷也不落设置页");
+        assert_eq!(tab_cycle_target(&tabs, 3, false), Some(2));
+
+        // 满页遍历一圈，一次都不许出现 0（首页）或 4（设置）
+        let mut cur = 0usize;
+        for _ in 0..12 {
+            cur = tab_cycle_target(&tabs, cur, true).unwrap();
+            assert!(cur >= 1 && cur <= 3, "Ctrl+Tab 落到了非页签下标 {cur}");
+        }
+    }
+
+    /// 没有项目页签时（只有首页 + 设置）→ 按键不做事，不能 panic 也不能乱跳。
+    #[test]
+    fn tab_cycle_noop_without_session_tabs() {
+        let tabs = vec![Tab::Home];
+        assert_eq!(tab_cycle_target(&tabs, 0, true), None);
+        assert_eq!(tab_cycle_target(&tabs, 0, false), None);
+        let tabs = vec![Tab::Home, Tab::Settings];
+        assert_eq!(tab_cycle_target(&tabs, 0, true), None);
+        assert_eq!(tab_cycle_target(&tabs, 1, false), None);
+        // 越界的 current（理论上不会出现）也不许 panic
+        assert_eq!(tab_cycle_target(&tabs, 99, true), None);
+    }
 
     #[test]
     fn restore_indices_skip_exited_and_settings() {
