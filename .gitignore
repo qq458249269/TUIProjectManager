@@ -9,3 +9,6 @@
 
 # pi 会话产物
 /.pi/
+
+# Windows 上把 stdout 重定向到 NUL 会在仓库里落一个叫 nul 的空文件
+/nul

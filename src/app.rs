@@ -746,8 +746,65 @@ fn tag_probes(repo: &str) -> Vec<Probe> {
     sources
 }
 
-/// 从探查正文里挖 tag（两种 HTML 形态都只需找 `/releases/tag/<tag>`：
-/// curl 源给的是重定向 URL，PS 源给的是页面正文）。
+/// tag 是否长得像 GitHub Release 的 tag：首字符是字母/数字，其余只允许
+/// 字母数字与 `.` `-` `_` `+`，长度 ≤ 64（`v1.18.33` / `1.0.0-rc.1` 都过）。
+///
+/// 这是 tag 解析的**最后一道闸**：解析器一旦咬到 HTML 模板、错误页或某个
+/// 答非所问的源，凭形状就能拒掉，不必把垃圾 tag 放行进下载链。
+fn is_plausible_tag(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.chars().all(|c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+}
+
+/// 从 HTML 里挖 tag。两种形态都含 `/releases/tag/<tag>`：
+///  - curl 的 HtmlTag 源给的是**重定向 URL**（整段就是那一个链接）；
+///  - PS 的 HtmlTag 源给的是**标签页整页正文**。
+///
+/// **旧实现只取正文里第一个 `/releases/tag/`，在标签页正文上必然咬错。**
+/// GitHub 是 React 页，`<head>` 里有一行路由元数据
+/// `<meta name="route-pattern" content="/:user_id/:repository/releases/tag/*name">`
+/// ——它排在真正的 tag 链接**前面**，于是 `find` 命中它，抠出来的「tag」是
+/// `/*name" data-turbo-transient>` 这种 HTML 碎片。它照样非空、能过
+/// 「返回空 tag」检查、照样赢下并发竞速（PS 通道 8s 连通时，镜像往往还没回来），
+/// 于是状态栏顶上冒出一个鬼版本号，点下去拼出的
+/// `…/releases/download/*name" data-turbo-transient>/opencode-windows-x64.zip`
+/// 必然 404——**正是「检测出一个乱七八糟的版本、点下载却全挂」这类事故的形状**。
+///
+/// 改成：按出现顺序扫全部 `/releases/tag/`，逐个取到分隔符为止的片段，用
+/// `is_plausible_tag` 过滤，第一个**合法**的即答案（真实 tag 紧随其后）；
+/// 一个都没有就判失败，让这一源安静退场（别的源还在跑）。标签页正文里
+/// 13 处 `/releases/tag/` 依次是 `*name`（模板）、`v1.18.33`×6（真 tag）、
+/// `v1.18.33&quot;,...`（内嵌 JSON，被 `;` 截断后仍不合法）——只有第 2 类
+/// 能过闸。
+fn parse_tag_from_html(body: &str) -> Result<String, String> {
+    const NEEDLE: &str = "/releases/tag/";
+    let stop = |c: char| {
+        c == '\'' || c == '"' || c == '<' || c == '>' || c == '?' || c == '#' || c == '/'
+            || c == '\\' || c.is_whitespace() || c == ';'
+    };
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(NEEDLE) {
+        let at = from + rel;
+        let start = at + NEEDLE.len();
+        let end = body[start..]
+            .find(stop)
+            .map(|i| start + i)
+            .unwrap_or(body.len());
+        let cand = body[start..end].trim();
+        if is_plausible_tag(cand) {
+            return Ok(cand.to_string());
+        }
+        from = start;
+    }
+    Err(format!(
+        "HTML 里没有合法的 /releases/tag/ 链接（正文 {} 字节）",
+        body.len()
+    ))
+}
+
+/// 从探查正文里挖 tag（JSON 取 tag_name；HTML 走上面的多候选 + 合法性过滤）。
 fn parse_tag(p: &Probe, body: &str) -> Result<String, String> {
     let tag = match &p.kind {
         ProbeKind::Json(f) => {
@@ -755,17 +812,18 @@ fn parse_tag(p: &Probe, body: &str) -> Result<String, String> {
                 serde_json::from_str(body).map_err(|_| "无法解析 JSON 响应".to_string())?;
             f(&v).ok_or_else(|| "返回结构不符合预期".to_string())?
         }
-        ProbeKind::HtmlTag | ProbeKind::Html => {
-            let pos = body
-                .find("/releases/tag/")
-                .ok_or_else(|| format!("HTML 未解析出 tag（redirect={body}）"))?;
-            body[pos + "/releases/tag/".len()..].trim().to_string()
-        }
+        ProbeKind::HtmlTag | ProbeKind::Html => parse_tag_from_html(body)?,
         // 发布列表不是「一个 release 的 tag」，由 parse_release_list 单独处理。
         ProbeKind::JsonList => return Err("发布列表不该走 tag 解析".to_string()),
     };
+    let tag = tag.trim().to_string();
     if tag.is_empty() {
         return Err("返回空 tag".to_string());
+    }
+    // 兜底闸：JSON 源同样可能被换成答非所问的实现（历史上就混进过一个返回
+    // npm 包版本的源），形状不对就地拒掉，绝不带着它去拼直链。
+    if !is_plausible_tag(&tag) {
+        return Err(format!("tag 不合法: {tag:?}"));
     }
     Ok(tag)
 }
@@ -1691,6 +1749,14 @@ fn win_arch() -> &'static str {
     }
 }
 
+/// 该工具在本机的 Windows 压缩包候选名（按优先级，{arch} 已替换）。
+fn tool_asset_names(spec: &ToolSpec) -> Vec<String> {
+    spec.asset_tpls
+        .iter()
+        .map(|t| t.replace("{arch}", win_arch()))
+        .collect()
+}
+
 /// 工具后台线程 → UI 线程的事件。
 enum ToolEvent {
     /// 检查完成：本地版本（空 = 未检测到）+ 有新版本时的 tag + 安装目录
@@ -2263,11 +2329,7 @@ fn download_tool_archive(
     progress_tx: &std::sync::mpsc::Sender<(u64, u64)>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(PathBuf, u64, String), ToolErr> {
-    let names: Vec<String> = spec
-        .asset_tpls
-        .iter()
-        .map(|t| t.replace("{arch}", win_arch()))
-        .collect();
+    let names = tool_asset_names(spec);
     // 资产表（镜像竞速，与检查更新同一套源）。
     let mut tag = tag.to_string();
     let mut table: Option<AssetTable> = None;
@@ -2443,9 +2505,78 @@ fn sync_tree(stage: &Path, install_dir: &Path, skip_name: &str) -> usize {
     fails
 }
 
+/// 把探查来的 tag **锚定到「真的带着该工具 Windows 压缩包」的那个 release**。
+///
+/// `tag_probes` 是「先到先得」的快查询，**任何一个源报上来的 tag 都不作数**：
+/// 它可能是 HTML 模板碎片、错误页、或者历史上混进来的「答非所问的版本源」
+/// （jsDelivr 返回的是 npm 包版本，opencode 那边是 `2.0.20` 而 Release tag 是
+/// `v1.18.33`）。这类 tag 有两个害处：
+///  1. `version_newer` 恒真 → 状态栏/设置页反复冒出一个**点下去必定 404** 的
+///     「有新版本」；
+///  2. 下载端拼出的直链必然 404。
+///
+/// 判据只用**产物存在性**：拿 tag 探一次资产表，表里有我们要的 Windows 压缩包
+/// 才认；否则用 `/releases` 发布列表（新 → 旧）找到第一个真带产物的 tag。
+/// 探查正常时**不发第二个请求**（资产表探查就是那一个，命中即返回原 tag）；
+/// 网络全挂时保持原样（不把「网络故障」升级成「报了个假版本号」，重试会再来）。
+///
+/// 检查阶段也跑这一层，是为了让**错误版本号根本没有机会显示到 UI 上**——
+/// 之前只有下载端自愈，用户看到的是「检测出 X，点下载却失败」，正是本次事故的
+/// 完整形状。代价是每次检查多一次镜像竞速请求（命中即止）。
+fn anchor_tag_on_assets(spec: &ToolSpec, probed: String) -> String {
+    let names = tool_asset_names(spec);
+    // 判据一：这个 tag 的 release 里真的有我们要的 Windows 压缩包 → 认，不多发请求。
+    let suspect = match fetch_release_assets(spec.repo, &probed) {
+        Ok((src, table)) if !pick_tool_assets(&table, &names).is_empty() => {
+            log_update(&format!(
+                "工具检查 {}: tag {probed} 带 Windows 压缩包（资产表来自 {src}）",
+                spec.label
+            ));
+            false
+        }
+        Ok((src, _)) => {
+            log_update(&format!(
+                "工具检查 {}: tag {probed} 的资产表（{src}）里没有 Windows 压缩包，重新锚定",
+                spec.label
+            ));
+            true
+        }
+        Err(e) => {
+            log_update(&format!(
+                "工具检查 {}: tag {probed} 资产表探查失败（{e}），尝试用发布列表纠正",
+                spec.label
+            ));
+            true
+        }
+    };
+    if !suspect {
+        return probed;
+    }
+    // 判据二：发布列表（新 → 旧）里第一个真带产物的 tag。
+    match fetch_release_list(spec.repo) {
+        Ok(releases) => {
+            if let Some(fixed) = pick_release_tag_with_assets(&releases, &names)
+                && fixed != probed
+            {
+                log_update(&format!(
+                    "工具检查 {}: tag {probed} → {fixed}（后者真带产物）",
+                    spec.label
+                ));
+                return fixed;
+            }
+        }
+        Err(e) => log_update(&format!(
+            "工具检查 {}: 发布列表兜底失败（{e}），仍用 {probed}",
+            spec.label
+        )),
+    }
+    probed
+}
+
 /// 检查单个工具（pi / opencode）的新版本：按 tool_dirs（默认本软件所在目录）
 /// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源并发探查拿
-/// 最新 tag → version_newer 比较。找不到 exe（未安装）时**仍然给出下载入口**：
+/// 最新 tag → **按产物存在性锚定 tag**（`anchor_tag_on_assets`）→
+/// version_newer 比较。找不到 exe（未安装）时**仍然给出下载入口**：
 /// 安装目录取「软件同级目录」（pi 走同名子目录），latest 留空由下载作业自己
 /// 解析最新 tag（这样即便检查时网络不通也还有安装按钮，不用等下次检查）。
 fn check_tool_update(idx: usize, dirs: Vec<PathBuf>, use_path: bool) -> ToolEvent {
@@ -2476,6 +2607,10 @@ fn check_tool_update(idx: usize, dirs: Vec<PathBuf>, use_path: bool) -> ToolEven
     ));
     match fetch_latest_tag(spec.repo) {
         Ok(tag) => {
+            // 锚定：探查来的 tag 只是「某个源报上来的」，不确认它真带着我们要的
+            // 产物就直接拿去比较版本，UI 上就会出现一个点下去必定 404 的版本号
+            // （事故现场：报上来的是 npm 包版本 2.0.20，Release tag 却是 v1.18.33）。
+            let tag = anchor_tag_on_assets(spec, tag);
             let latest = tag.trim_start_matches('v').to_string();
             // 本地版本读不出来时只报「已是最新」不如报「有更新」：点下载也就是
             // 装最新版，不会出事；反过来误报「有更新」不了才是真的漏升级。
@@ -7913,10 +8048,10 @@ mod vscode_tests {
 mod update_tests {
     use super::{
         asset_table_from_json, assets_from_html, exe_asset_from_html, extract_zip,
-        find_exe_in_stage, parse_release_list, parse_version_token, pick_release_tag_with_assets,
-        pick_tool_assets, purge_other_shards, shard_fp, sync_tree, tag_probes, tar_bin,
-        tool_exe_candidates, tool_fresh_dir_in, version_newer, win_arch, AssetTable, ClientApp,
-        ReleaseEntry, ToolErr, TOOL_SPECS,
+        find_exe_in_stage, is_plausible_tag, parse_release_list, parse_tag, parse_version_token,
+        pick_release_tag_with_assets, pick_tool_assets, purge_other_shards, shard_fp,
+        sync_tree, tag_probes, tar_bin, tool_exe_candidates, tool_fresh_dir_in, version_newer,
+        win_arch, AssetTable, ClientApp, Probe, ProbeKind, ReleaseEntry, ToolErr, TOOL_SPECS,
     };
     use std::path::PathBuf;
 
@@ -8308,7 +8443,77 @@ mod update_tests {
     }
 
     /// 回归：tag 探查源里**不得**再出现 jsDelivr。
+    /// 事故二（与 jsDelivr 同形、换了个马甲）：**tag 探查的 HTML 源咬到了
+    /// GitHub 页面里的路由元数据**。
     ///
+    /// `tag_probes` 里的 `PS HTML` 源把整页正文交给 `parse_tag`，而旧实现是
+    /// `body.find("/releases/tag/")` 取**第一个**。GitHub 是 React 页，`<head>`
+    /// 里这行排在真 tag 链接**前面**：
+    ///
+    /// ```html
+    /// <meta name="route-pattern" content="/:user_id/:repository/releases/tag/*name">
+    /// ```
+    ///
+    /// 于是抠出来的是 `/*name" data-turbo-transient>`：非空、能过「返回空 tag」
+    /// 检查、PS 通道 8s 就能连通还常常抢在镜像前面 → 状态栏冒出一个鬼版本号，
+    /// 点下去拼出的 `…/releases/download/*name"…/opencode-windows-x64.zip` 全 404。
+    /// 现象与 jsDelivr 那次一模一样（异常版本号 + 下载必失败），但根因在解析器。
+    ///
+    /// 真实标签页正文里 13 处 `/releases/tag/` 依次是：`*name`（模板，1 处）、
+    /// `v1.18.33`（真 tag，6 处）、`v1.18.33&quot;,…`（内嵌 JSON，被 `;` 截断后
+    /// 仍不合法）。只有第 2 类能过闸——下面把现场存成夹具钉住。
+    #[test]
+    fn parse_tag_skips_route_pattern_meta_in_release_page() {
+        // GitHub 标签页正文骨架（按真实顺序：route-pattern 在 <title>/真链接之前）
+        let page = concat!(
+            r#"<meta name="route-pattern" content="/:user_id/:repository/releases/tag/*name">"#,
+            "<title>Release v1.18.33 - anomalyco/opencode - GitHub</title>",
+            r#"<a href="/anomalyco/opencode/releases/tag/v1.18.33">v1.18.33</a>"#,
+            r#"<a href="/anomalyco/opencode/releases/tag/v1.18.33&quot;,&quot;user_id&quot;:null}}"#,
+        );
+        let p = Probe::new("PS HTML", String::new(), ProbeKind::HtmlTag, 8, 15).via_ps();
+        assert_eq!(parse_tag(&p, page).unwrap(), "v1.18.33");
+
+        // 旧实现的形状：只认第一个 → 必须换掉（这条断言就是本次回归的根因）
+        let naive = &page[page.find("/releases/tag/").unwrap() + "/releases/tag/".len()..];
+        assert!(
+            !is_plausible_tag(naive.trim()),
+            "第一个 /releases/tag/ 仍是路由模板碎片，不能直接当 tag 用：{naive:?}"
+        );
+
+        // curl 的 HtmlTag 源给的是重定向 URL（整段就一个链接）→ 照旧能用
+        let red = "https://github.com/anomalyco/opencode/releases/tag/v1.18.33";
+        assert_eq!(parse_tag(&p, red).unwrap(), "v1.18.33");
+
+        // 一个合法 tag 都找不到（错误页 / 只有模板）→ 判失败让这一源退场，
+        // 绝不能把 HTML 碎片当 tag 放行进下载链
+        let err_page = "<html><body>503 Service Unavailable</body></html>";
+        assert!(parse_tag(&p, err_page).is_err(), "错误页不该解析出 tag");
+        let only_meta =
+            r#"<meta name="route-pattern" content="/:user_id/:repository/releases/tag/*name">"#;
+        assert!(parse_tag(&p, only_meta).is_err(), "只有路由模板时必须判失败");
+    }
+
+    /// tag 合法性闸：拒掉 HTML 碎片 / 路径 / 带引号的一坨，放行正常 tag。
+    /// 这道闸对 JSON 源同样生效——历史上就混进过一个返回 npm 包版本的源。
+    #[test]
+    fn is_plausible_tag_rejects_html_fragments() {
+        for ok in ["v1.18.33", "1.18.33", "v0.99.1", "1.0.0-rc.1", "v2.0.20"] {
+            assert!(is_plausible_tag(ok), "{ok} 应当合法");
+        }
+        for bad in [
+            r#"/*name" data-turbo-transient"#,
+            "*name",
+            "",
+            "v1.18.33&quot;,&quot;user_id&quot;:null",
+            "../../evil",
+            "v1 18 33",
+            "1.18.33\nX-Injected: 1",
+        ] {
+            assert!(!is_plausible_tag(bad), "{bad:?} 应当判非法");
+        }
+    }
+
     /// 事故：`data.jsdelivr.com/v1/packages/gh/{repo}` 返回的是仓库发布到 npm 的
     /// 包版本，不是 GitHub Release 的 tag。opencode 的 npm 版是 `2.0.20`（Release
     /// tag 是 `v1.18.33`），`.../releases/download/2.0.20/…` 必然 404，且
