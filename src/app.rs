@@ -1959,9 +1959,9 @@ fn sleep_until_cancel(
 }
 
 /// 设置页三个折叠分区的 id（`settings_section` 的 `id_salt`）。列在这里是因为
-/// 它们是**互斥**的：点开一个要把另外两个的 `CollapsingState` 置 false，所以
-/// 必须能拿到全量 id（见 `App::settings_section`）。顺序不影响行为，只是列出
-/// 「设置」页的三大块。
+/// 它们是**互斥**的：`open_settings_sec` 里只放得下一块，`settings_section` 每帧
+/// 按它强制各块的开合，所以必须能拿到全量 id（见 `App::settings_section`）。顺序
+/// 不影响行为，只是列出「设置」页的三大块。
 const SETTINGS_SEC_IDS: [&str; 3] = [
     "settings_sec_cmds",
     "settings_sec_tool_dirs",
@@ -3251,8 +3251,8 @@ pub struct ClientApp {
     /// 模型设置当前页签：0=pi，1=oh-my-pi，2=opencode。
     model_settings_tab: usize,
     /// 设置页当前展开的那一块（手风琴）：None = 全收起。它是互斥的**唯一真相**，
-    /// 每次渲染都用它去强制各块的 CollapsingState（`settings_section`），并持久化
-    /// 在 egui data 里（重启后还是上次那块开着）。
+    /// 每次渲染都用它去强制各块的开合（`settings_section`），并持久化在 egui data 里
+    /// （重启后还是上次那块开着）。
     open_settings_sec: Option<&'static str>,
     /// 是否已从 egui data 读过一次 `open_settings_sec`（避免每次进设置页都重读，
     /// 把用户刚点开的块拉回旧值）。
@@ -5923,25 +5923,21 @@ impl ClientApp {
         })
     }
 
-    /// 读某块折叠面板的展开状态（用的是 `settings_section` 里同一个 id 口径）。
-    fn settings_section_open(ui: &egui::Ui, id_salt: &'static str) -> bool {
-        egui::containers::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            ui.make_persistent_id(id_salt),
-            false,
-        )
-        .is_open()
-    }
-
-    /// 直接写某块折叠面板的展开状态（不动动画，调用方负责 request_repaint）。
-    fn set_settings_section_open(ui: &egui::Ui, id_salt: &'static str, open: bool) {
-        let mut st = egui::containers::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            ui.make_persistent_id(id_salt),
-            false,
-        );
-        st.set_open(open);
-        st.store(ui.ctx());
+    /// 折叠块在 egui 里的 id 口径（`settings_section` 要用它驱动展开动画）。
+    ///
+    /// **必须和 `egui::CollapsingHeader` 内部算出来的那个一模一样**，否则我们动它
+    /// 的展开动画它读不到——手风琴就漏了，能同时展开好几块（这坑踩过：egui 先把
+    /// salt 压成 u64 再哈希，且 header 还自带一层 `ui.vertical` 子 ui）。
+    ///
+    /// 三段都要对齐：① `CollapsingHeader::show` 会先包一层 `ui.vertical`，子 ui 的 id
+    /// 多一级 `"child"`；② 标题行再用 `IdSalt` 压过的 salt 派生（所以不能图省事直接
+    /// `make_persistent_id(id_salt)`，那样哈希的是字符串本身）。口径由测试
+    /// `header_id_matches_our_id` 钉住：egui 哪天改了这里会立刻红，不会又悄悄漏成
+    /// 「能同时展开两块」。
+    fn settings_section_id(ui: &egui::Ui, id_salt: &str) -> egui::Id {
+        ui.id()
+            .with(egui::IdSalt::new("child"))
+            .with(egui::IdSalt::new(id_salt))
     }
 
     /// 设置页折叠面板 1/3：TUI 启动命令。标题行带摘要（命令数 + 当前选中项），
@@ -5955,7 +5951,7 @@ impl ClientApp {
         let title = format!("TUI 启动命令（{} 个 · 当前 {}）", self.settings_commands.len(), cur);
         // 默认展开：三块里启动命令翻得最勤；另外两块默认收起，要用再点开。
         let keep = self.open_settings_sec;
-        if Self::settings_section(
+        if let Some(want_open) = Self::settings_section(
             ui,
             "settings_sec_cmds",
             keep == Some("settings_sec_cmds"),
@@ -5964,7 +5960,7 @@ impl ClientApp {
                 self.commands_body_ui(ui);
             },
         ) {
-            self.note_settings_sec_clicked(ui, "settings_sec_cmds");
+            self.note_settings_sec_clicked(ui, "settings_sec_cmds", want_open);
         }
     }
 
@@ -6215,7 +6211,7 @@ impl ClientApp {
             scan
         );
         let keep = self.open_settings_sec;
-        if Self::settings_section(
+        if let Some(want_open) = Self::settings_section(
             ui,
             "settings_sec_tool_dirs",
             keep == Some("settings_sec_tool_dirs"),
@@ -6224,7 +6220,7 @@ impl ClientApp {
                 self.tool_dirs_ui(ui);
             },
         ) {
-            self.note_settings_sec_clicked(ui, "settings_sec_tool_dirs");
+            self.note_settings_sec_clicked(ui, "settings_sec_tool_dirs", want_open);
         }
     }
 
@@ -6246,7 +6242,7 @@ impl ClientApp {
             .unwrap_or("pi");
         let title = format!("供应商配置（当前：{tab}）");
         let keep = self.open_settings_sec;
-        if Self::settings_section(
+        if let Some(want_open) = Self::settings_section(
             ui,
             "settings_sec_providers",
             keep == Some("settings_sec_providers"),
@@ -6255,7 +6251,7 @@ impl ClientApp {
                 self.providers_body_ui(ui);
             },
         ) {
-            self.note_settings_sec_clicked(ui, "settings_sec_providers");
+            self.note_settings_sec_clicked(ui, "settings_sec_providers", want_open);
         }
     }
 
@@ -6438,27 +6434,27 @@ impl ClientApp {
     }
 
     /// 折叠面板通用外壳：粗体标题（带摘要）+ 展开才画的 body，**三个分区互斥**
-    /// （同一时刻最多只展开一个）。
+    /// （同一时刻最多只展开一块）。
     ///
-    /// 展开状态用 egui 自己的 `CollapsingState`（按 `id_salt` 存在 `Context::data`，
-    /// 开 persistence 时跟着窗口记忆落盘，重启后仍是上次那个开合），
-    /// `default_open` 只在“记忆里还没有这个 id”时生效——启动命令默认展开，另两块
-    /// 默认收起。收起时 body 根本不会被调用，里面那些输入框 / 拖动排序自然一起停用，
-    /// 不会出现“看不见却能改”的幽灵控件。body 缩进一级（`show` 自带），里面是垂直
+    /// **互斥的唯一执行点**：开合只认 `force_open`（= `open_settings_sec` 说的
+    /// 「当前该开着的那块」），每帧都用 `CollapsingHeader::open(Some(..))` 强制给
+    /// header。所以哪怕底层 `CollapsingState` 里同时存着两个 true（老记忆、手工改
+    /// memory），这一帧也只会画出一块——不再依赖「点开自己再去关别人」那种跨控件
+    /// 改状态的时序（那种写法一旦 id 口径对不上就会失效）。
+    ///
+    /// 点标题只回报「这一帧被点了」（`Some(want_open)` = 想切成开还是关），真正的
+    /// 开合留给下一帧由调用方改 `open_settings_sec` 统一决定：不在被点的那一帧里
+    /// 抢着改状态，就没有「先开的还没关、后开的又开了」的缝。三段都收起也允许
+    /// （再点一次当前那块即可），这样「全收起」仍是可达状态。
+    ///
+    /// 收起时要把展开动画**直接归零**：egui 的收起动画会在其后 ~0.2s 里继续把正文
+    /// 画出来（`show_body_unindented` 按 openness 裁剪着画），而本软件锁 10 FPS，
+    /// 那就是整整一帧「点开的和刚收的都在」——正是「能同时展开两个」的观感。归零后
+    /// 收起是硬切，展开动画只留给刚点开的那一块（此时别的块已归零，不会有第二个）。
+    ///
+    /// 正文只在 `force_open` 时才会被调用，里面那些输入框 / 拖动排序自然一起停用，
+    /// 不会出现「看不见却能改」的幽灵控件。body 缩进一级（`show` 自带），里面是垂直
     /// 流，宽度照旧铺满。
-    ///
-    /// 互斥怎么来的：不自己另存一份“当前开着谁”，而是点开自己时直接把另外两个分区
-    /// 的 `CollapsingState` 置 false（`store` 落到 `Context::data`，同一帧后面渲染
-    /// 到的那两个立刻读到 false，动画一起收）。用 `header_response.clicked()` 而不是
-    /// `fully_open()`：后者要等展开动画播完（这软件锁 10 FPS）才为真，互斥会慢半拍。
-    /// 三段都收起也允许（再点一次自己即可），这样“全收起”仍是可达状态。
-    /// 设置页的折叠面板外壳。**互斥的唯一执行点**：渲染前把本块的展开状态强制成
-    /// `force_open`（= 当前该开着的那块），所以任意时刻只有一块是开的，不依赖
-    /// “点开后再去关别人”那种跨控件写状态的时序。
-    ///
-    /// force_open 为 true 时会先 `set_open(true)`，于是 header 的 toggle 把它
-    /// 关掉 = 用户点收起；调用方据此把 `open_settings_sec` 置 None。返回
-    /// 「这一帧 header 是不是被点了」。
     ///
     /// 注意它是关联函数（不带 &mut self）：body 闭包要借用 self，签名里再带
     /// &mut self 就双重可变借用了。
@@ -6468,33 +6464,32 @@ impl ClientApp {
         force_open: bool,
         title: String,
         body: impl FnOnce(&mut egui::Ui),
-    ) -> bool {
-        // 只在状态与目标不同时才写：写 persisted state 会把 egui memory 标脏并
-        // 落盘，每帧都写等于一直写盘。
-        if Self::settings_section_open(ui, id_salt) != force_open {
-            Self::set_settings_section_open(ui, id_salt, force_open);
+    ) -> Option<bool> {
+        if !force_open {
+            // animation_time = 0.0 → 立刻归零（egui 内部除零有 is_finite 兜底）。
+            ui.ctx()
+                .animate_bool_with_time(Self::settings_section_id(ui, id_salt), false, 0.0);
         }
         let resp = egui::CollapsingHeader::new(RichText::new(title).strong())
             .id_salt(id_salt)
+            // 开合交给 force_open，header 自己不再按点击 toggle（互斥只认 force_open；
+            // 点击只用来回报 want_open）。
+            .open(Some(force_open))
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 body(ui);
                 ui.add_space(4.0);
             });
-        // header_response.clicked() 是“这一帧点在 header 上”，比 fully_open()
+        // header_response.clicked() 是「这一帧点在 header 上」，比 fully_open()
         // 及时（后者要等展开动画播完，10 FPS 下慢半拍）。
-        resp.header_response.clicked()
+        resp.header_response.clicked().then(|| !force_open)
     }
 
-    /// 记下刚刚被点的折叠块：点开的成为唯一展开项；点的是收起 → 全关（手风琴就
-    /// 该一块都不留）。下一帧其余块就被 `settings_section` 的 force 收掉。
-    /// 状态直接改 ctx.data 不走 toggle()，动画得自己催一帧。
-    fn note_settings_sec_clicked(&mut self, ui: &egui::Ui, id_salt: &'static str) {
-        self.open_settings_sec = if Self::settings_section_open(ui, id_salt) {
-            Some(id_salt)
-        } else {
-            None
-        };
+    /// 记下刚刚被点的折叠块：want_open = true → 它成为唯一展开项；点的是当前展开的
+    /// 那一块（want_open = false）→ 全关（手风琴就该一块都不留）。下一帧其余块就被
+    /// `settings_section` 的 force 收掉。状态直接改字段，动画得自己催一帧。
+    fn note_settings_sec_clicked(&mut self, ui: &egui::Ui, id_salt: &'static str, want_open: bool) {
+        self.open_settings_sec = want_open.then_some(id_salt);
         Self::save_open_settings_sec(ui.ctx(), self.open_settings_sec);
         ui.ctx().request_repaint();
     }
@@ -8425,42 +8420,200 @@ mod settings_accordion_tests {
         assert!(!App::status_msg_is_update_hint("已启动 2 个会话 · pi v0.1.0"));
     }
 
-    /// 把三块按 keep 渲染一遍（force_open = keep == 本块），返回仍处于展开的块。
-    fn render_once(ui: &mut egui::Ui, keep: Option<&'static str>) -> Vec<&'static str> {
-        for id in SETTINGS_SEC_IDS {
-            let _ = App::settings_section(ui, id, keep == Some(id), "标题".to_string(), |_| {});
-        }
-        SETTINGS_SEC_IDS
-            .iter()
-            .copied()
-            .filter(|id| App::settings_section_open(ui, id))
-            .collect()
+    /// 一帧的结果：这一帧真正画了正文的块 + 各块标题行可点的位置。
+    struct FrameOut {
+        drawn: Vec<&'static str>,
+        hits: Vec<(&'static str, egui::Pos2)>,
     }
 
-    /// 手风琴的唯一真相：渲染前把各块强制成「只有 keep 开着」，所以哪怕底层
-    /// CollapsingState 里同时存着两个 true（老记忆、手工改 memory），画出来也只有一块。
-    #[test]
-    fn only_keep_section_stays_open() {
-        egui::__run_test_ui(|ui| {
-            // 先人为把前两块都置成展开（模拟状态残留）。
-            for id in &SETTINGS_SEC_IDS[..2] {
-                App::set_settings_section_open(ui, id, true);
+    /// 直接改某块的底层 `CollapsingState`（走 header 用的同一个 id 口径）。
+    fn force_state(ui: &egui::Ui, id_salt: &str, open: bool) {
+        let mut st = egui::containers::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            App::settings_section_id(ui, id_salt),
+            false,
+        );
+        st.set_open(open);
+        st.store(ui.ctx());
+    }
+
+    fn raw_input(t: f64, click: Option<(egui::Pos2, bool)>) -> egui::RawInput {
+        let mut raw = egui::RawInput {
+            time: Some(t),
+            predicted_dt: 0.1, // 本软件锁 10 FPS：一帧 100ms
+            ..Default::default()
+        };
+        if let Some((pos, pressed)) = click {
+            raw.events.push(egui::Event::PointerMoved(pos));
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        raw
+    }
+
+    /// 模拟一帧设置页：按 keep 渲染三块，并把「点了标题」的记账做了（同
+    /// `note_settings_sec_clicked`：那个要 `&mut ClientApp`，这里只能照它的语义改
+    /// 同一个 keep 变量）。
+    fn frame(
+        ctx: &egui::Context,
+        keep: &mut Option<&'static str>,
+        input: egui::RawInput,
+    ) -> FrameOut {
+        let mut out = FrameOut {
+            drawn: vec![],
+            hits: vec![],
+        };
+        let o = ctx.run_ui(input, |ui| {
+            for id in SETTINGS_SEC_IDS {
+                let top = ui.cursor().min;
+                let want = App::settings_section(
+                    ui,
+                    id,
+                    *keep == Some(id),
+                    format!("标题 {id}"),
+                    |ui| {
+                        out.drawn.push(id);
+                        ui.label("这一块正文");
+                    },
+                );
+                if let Some(want_open) = want {
+                    *keep = want_open.then_some(id);
+                    ui.ctx().request_repaint();
+                }
+                // 标题行就是这块的顶部一行：测试用空字体，标题行高 18px，往里 3px
+                // 必落在标题行里。
+                out.hits.push((id, top + egui::vec2(3.0, 3.0)));
             }
-            assert_eq!(App::settings_section_open(ui, SETTINGS_SEC_IDS[0]), true);
+        });
+        o.drop_without_applying_deltas();
+        out
+    }
 
-            // keep = 第三块 → 前两块必须被收掉。
-            let open = render_once(ui, Some(SETTINGS_SEC_IDS[2]));
-            assert_eq!(open, vec![SETTINGS_SEC_IDS[2]]);
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty()); // 不加载字体，测试快
+        ctx
+    }
 
-            // keep = None（三块全收起）→ 一个都不许开着。
-            let open = render_once(ui, None);
-            assert!(open.is_empty(), "全收起时仍开着：{open:?}");
-
-            // keep = 第一块 → 只有第一块。
-            let open = render_once(ui, Some(SETTINGS_SEC_IDS[0]));
-            assert_eq!(open, vec![SETTINGS_SEC_IDS[0]]);
+    /// 我们算的 id 必须**就是** `CollapsingHeader` 内部用的那个。口径一旦对不上，
+    /// 我们动它的展开动画它读不到，「只留一块」就漏了（能同时展开好几块）。旧实现
+    /// 栽在这：`make_persistent_id(id_salt)` 哈希的是字符串本身，而 egui 是先把 salt
+    /// 压成 u64（`IdSalt`）再哈希，且 header 还自带一层 `ui.vertical` 子 ui。
+    #[test]
+    fn header_id_matches_our_id() {
+        egui::__run_test_ui(|ui| {
+            for id in SETTINGS_SEC_IDS {
+                let resp = egui::CollapsingHeader::new("标题").id_salt(id).show(ui, |_| {});
+                assert_eq!(
+                    resp.header_response.id,
+                    App::settings_section_id(ui, id),
+                    "settings_section_id 与 header 的 id 对不上（egui 改了 id 口径？）"
+                );
+            }
         });
     }
+
+    /// 手风琴的唯一真相是 keep：不管底层 `CollapsingState` 里同时存着几个 true
+    /// （老记忆、手工改 memory），这一帧也只能画出一块；收起要硬切，不留动画尾巴。
+    #[test]
+    fn only_keep_section_body_is_drawn() {
+        let ctx = test_ctx();
+        let mut keep: Option<&'static str> = Some(SETTINGS_SEC_IDS[2]);
+        // 先人为把前两块都置成展开（模拟状态残留）。
+        let o = ctx.run_ui(raw_input(0.1, None), |ui| {
+            for id in &SETTINGS_SEC_IDS[..2] {
+                force_state(ui, id, true);
+            }
+        });
+        o.drop_without_applying_deltas();
+
+        let mut t = 0.1;
+        let out = frame(&ctx, &mut keep, raw_input(t, None));
+        assert_eq!(out.drawn, [SETTINGS_SEC_IDS[2]], "残留的两块没收掉");
+
+        // keep = None（三块全收起）→ 一个都不许画。
+        keep = None;
+        t += 0.1;
+        let out = frame(&ctx, &mut keep, raw_input(t, None));
+        assert!(out.drawn.is_empty(), "全收起时仍画着：{:?}", out.drawn);
+
+        // keep = 第一块 → 只有第一块，且后续几帧也不许冒出第二块。
+        keep = Some(SETTINGS_SEC_IDS[0]);
+        for i in 0..4 {
+            t += 0.1;
+            let out = frame(&ctx, &mut keep, raw_input(t, None));
+            assert!(
+                out.drawn.len() <= 1,
+                "第 {i} 帧画了 {:?}（同一时刻只能有一块）",
+                out.drawn
+            );
+            assert_eq!(out.drawn, [SETTINGS_SEC_IDS[0]]);
+        }
+    }
+
+    /// 端到端回归：A 开着时点 B 的标题，**任何一帧都只能画出一块正文**；再点一次
+    /// 当前那块 → 全收起。正好钉住两个坑：① id 口径对不上（收起的块照旧画着，能同时
+    /// 展开好几块）；② 收起的块跟着 egui 的收起动画再画 ~0.2s（10 FPS 下整整一帧
+    /// 「刚收的和刚开的都在」）。
+    #[test]
+    fn clicking_header_never_shows_two_bodies() {
+        let ctx = test_ctx();
+        let (a, b) = (SETTINGS_SEC_IDS[0], SETTINGS_SEC_IDS[1]);
+        let mut keep: Option<&'static str> = Some(a);
+        let mut t = 0.0;
+        // 先跑几帧把布局和展开动画稳住，并记下标题行的位置（布局稳了才点得准）。
+        let mut out = FrameOut {
+            drawn: vec![],
+            hits: vec![],
+        };
+        for _ in 0..4 {
+            t += 0.1;
+            out = frame(&ctx, &mut keep, raw_input(t, None));
+            assert_eq!(out.drawn, [a], "稳帧只应有 A 展开");
+        }
+        let hit = |o: &FrameOut, id: &'static str| o.hits.iter().find(|(i, _)| *i == id).unwrap().1;
+
+        // 点 B：egui 的「点击」是松手那一帧才成立，所以按下/松开分两帧。
+        for pressed in [true, false] {
+            t += 0.1;
+            let o = frame(&ctx, &mut keep, raw_input(t, Some((hit(&out, b), pressed))));
+            assert!(
+                o.drawn.len() <= 1,
+                "点 B 的第 {pressed} 帧画了 {:?}（只能有一块）",
+                o.drawn
+            );
+        }
+        assert_eq!(keep, Some(b), "点 B 之后该由 B 独占");
+        // 接下来几帧：A 必须立刻收掉，只剩 B 的正文。
+        for i in 0..4 {
+            t += 0.1;
+            out = frame(&ctx, &mut keep, raw_input(t, None));
+            assert!(
+                out.drawn.len() <= 1,
+                "切到 B 后的第 {i} 帧画了 {:?}（只能有一块）",
+                out.drawn
+            );
+            assert_eq!(out.drawn, [b]);
+        }
+
+        // 再点 B（当前展开的那块）→ 全收起，之后不许再有正文。
+        for pressed in [true, false] {
+            t += 0.1;
+            let o = frame(&ctx, &mut keep, raw_input(t, Some((hit(&out, b), pressed))));
+            assert!(o.drawn.len() <= 1, "收起 B 时画了 {:?}", o.drawn);
+        }
+        assert_eq!(keep, None, "再点一次当前块 = 全收起");
+        for i in 0..3 {
+            t += 0.1;
+            let o = frame(&ctx, &mut keep, raw_input(t, None));
+            assert!(o.drawn.is_empty(), "全收起后第 {i} 帧仍画了 {:?}", o.drawn);
+        }
+    }
+
 
     /// 「哪块开着」要跨重启记住：写进去再读出来是同一块；全收起也能记。
     #[test]
