@@ -8593,13 +8593,97 @@ mod vscode_tests {
 mod update_tests {
     use super::{
         asset_table_from_json, assets_from_html, candidate_chains, direct, exe_asset_from_html,
-        extract_zip, find_exe_in_stage, is_plausible_tag, parse_release_list, parse_tag,
+        extract_zip, fetch_release_assets, fetch_release_list, find_exe_in_stage,
+        is_plausible_tag, parse_release_list, parse_tag, download_tool_archive,
         parse_version_token, pick_release_tag_with_assets, pick_tool_assets, purge_other_shards,
-        shard_fp, sync_tree, tag_probes, tar_bin, tool_exe_candidates, tool_fresh_dir_in,
+        shard_fp, sync_tree, tag_probes, tar_bin, tool_asset_names, tool_exe_candidates,
+        tool_fresh_dir_in,
         version_newer, win_arch, AssetTable, ClientApp, Probe, ProbeKind, ReleaseEntry, ToolErr,
         GH_MIRRORS, TOOL_SPECS,
     };
     use std::path::PathBuf;
+
+    /// 临时探针：跑真实网络下的完整工具下载管线，定位「下载失败」到底断在哪一环。
+    #[test]
+    #[ignore = "要真联网，手动跑"]
+    fn live_tool_download_pipeline() {
+        for spec in TOOL_SPECS.iter() {
+        println!("\n##### 工具 = {} repo={} #####", spec.label, spec.repo);
+
+        let probes = tag_probes(spec.repo);
+        println!("tag 源数 = {}（池 {} 个）", probes.len(), probes.iter().filter(|p| p.pool).count());
+
+        let mut tag = String::from(match spec.id {
+            "pi" => "v0.99.2",
+            _ => "v1.18.34",
+        });
+        println!("\n--- 1) fetch_release_assets({}) ---", tag);
+        match fetch_release_assets(spec.repo, &tag) {
+            Ok((src, t)) => println!("  OK 来源={} 资产 {} 项", src, t.len()),
+            Err(e) => println!("  ERR {}", e),
+        }
+
+        println!("\n--- 2) fetch_release_list（tag 自愈兼底）---");
+        match fetch_release_list(spec.repo) {
+            Ok(rs) => {
+                println!("  OK {} 个 release", rs.len());
+                let names = tool_asset_names(spec);
+                match pick_release_tag_with_assets(&rs, &names) {
+                    Some(t) => println!("  锚定 tag = {}", t),
+                    None => println!("  锚定失败：没有任何 release 带 Windows 压缩包"),
+                }
+            }
+            Err(e) => println!("  ERR {}", e),
+        }
+
+        println!("\n--- 3) download_tool_archive 真下载 ---");
+        let dir = std::env::temp_dir().join(format!("tuipm_live_probe_{}", spec.id));
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn(move || {
+            let (a, b) = rx.recv().unwrap_or((0, 0));
+            println!("  进度回执收到: {} / {}", a, b);
+        });
+        match download_tool_archive(spec, &tag, &dir, &tx, &cancel) {
+            Ok((zip, size, url)) => {
+                println!("  OK 下载 {} 字节 tag={}", size, url);
+                // 4) 解压 + 找主 exe + 安装（后半段管线）
+                let stage = dir.join("stage");
+                let _ = std::fs::remove_dir_all(&stage);
+                println!("\n--- 4) extract_zip ---");
+                match extract_zip(&zip, &stage) {
+                    Ok(()) => println!("  OK 解压完成"),
+                    Err(e) => {
+                        println!("  ERR 解压失败: {}", e);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                }
+                println!("\n--- 5) find_exe_in_stage({}) ---", spec.exe_name);
+                match find_exe_in_stage(&stage, spec.exe_name) {
+                    Some(exe) => println!(
+                        "  OK {}  ({} 字节)",
+                        exe.display(),
+                        std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0)
+                    ),
+                    None => {
+                        println!("  ERR 暂存目录里找不到 {}", spec.exe_name);
+                        let mut names = Vec::new();
+                        if let Ok(rd) = std::fs::read_dir(&stage) {
+                            for e in rd.flatten() {
+                                names.push(e.file_name().to_string_lossy().into_owned());
+                            }
+                        }
+                        println!("  stage 顶层: {:?}", &names[..names.len().min(12)]);
+                    }
+                }
+            }
+            Err(e) => println!("  ERR {} (structural={})", e.msg, e.structural),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     /// 回归锁：下载/探查一律**不带任何代理**（用户要求）。两层都要在：
     /// curl 侧的 `--noproxy *`，以及环境变量被清干净（否则改个传输层/换个
