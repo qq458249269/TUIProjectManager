@@ -55,6 +55,30 @@ const INPUT_ACTIVE_MS: u64 = 1_500;
 const SCROLL_ECHO_MS: u64 = 500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
+/// 「运行/完成」状态的重算间隔：**最快 1 秒一次**（用户拍板的降频）。
+///
+/// 页签图标与「任务完成」通知都读同一份每秒快照（Session.state_icon /
+/// state_done），好处三条：① 检测频率封顶（帧率再高也不重算时间判据）；
+/// ② 图标不会亚秒抖动；③ 图标与通知不会各判各的、互相打脸。
+/// 三个**事件驱动**的例外不排队，立即重算：首次判定、退出/加载态翻转（❌ 与
+/// 启动 🔄 必须即时）、出现新的实质内容（命令刚跑起来 🔄 要立刻亮）。
+const STATE_CHECK_MS: u64 = 1_000;
+/// 动画活性阈值：最近 ANIM_BUSY_MS 内出现过**纯动画**输出 ⇒ 判定「画面还在高频
+/// 动」⇒ **还在思考/还在跑命令，不判完成**（不亮 ✅、不发完成通知）。
+///
+/// 这是纯屏幕启发式里唯一能分开「思考中」与「真停了」的分量，不依赖任何 agent
+/// 私有协议（不追 JSONL、不查 DB）：思考期 agent 都在刷 spinner/时钟/进度条，
+/// 帧间隔 ~80-150ms；空闲时的光标闪烁是 ~0.5-1s 一次。
+/// 阈值 250ms 正好卡在两者之间：任取 1s 里的采样点，spinner 恒落在窗口内
+/// （→ 恒判「在动」），而光标闪烁绝大多数采样点落在窗口外（→ 照常判完成），
+/// 于是不再出现「pi 回合跑完 🔄 直接变空、✅ 永远亮不出来」。
+///
+/// 两侧的已知误差（都是「屏幕启发式」的固有边界，只能靠调 ANIM_BUSY_MS 换）:
+/// ① 真·全程无输出也无动画的长命令（静默编译）3s 后仍会判完成——屏幕一动不动
+///    时，与「跑完了」在信息上不可区分；
+/// ② 空闲时仍高频刷动画的全屏 TUI 会常亮 🔄——这是「不误报完成」的对价：
+///    宁可少亮一次 ✅，也不在思考/执行途中谎报完成。
+const ANIM_BUSY_MS: u64 = 250;
 /// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
 /// 随 ✅ 离开复位），靠 10s 节流防周期输出/退出-完成连发轰炸（用户拍板）。
 const TOAST_MIN_INTERVAL_MS: u64 = 10_000;
@@ -2227,21 +2251,6 @@ fn find_tool_exe(spec: &ToolSpec, entries: &[PathBuf], use_path: bool) -> Option
     cands.into_iter().find(|p| p.is_file())
 }
 
-/// 给 runstate（页签运行态跟踪）用：按「检查更新 / 一键安装」**完全同款**的
-/// 顺序找 opencode 的 exe——设置页配的工具路径 → PATH。别处再写一份查找
-/// 逻辑就会出现「装更新时找得到、读状态时找不到」的分裂。
-pub(crate) fn find_opencode_exe() -> Option<PathBuf> {
-    let spec = TOOL_SPECS.iter().find(|s| s.id == "opencode")?;
-    let cfg = crate::config::load();
-    let entries: Vec<PathBuf> = cfg
-        .settings
-        .tool_paths
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    find_tool_exe(spec, &entries, true)
-}
-
 /// 从一段输出里抠出版本号（首个「数字+点」形态的 token，去掉 v 前缀）：
 /// pi --version → 0.87.1，opencode --version → 1.18.32。抠不到返回空串。
 fn parse_version_token(text: &str) -> String {
@@ -3235,8 +3244,11 @@ pub struct ClientApp {
     pending_restore: Vec<PendingLaunch>,
     /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
     restore_active: Option<usize>,
-    /// 退出时设置页签开着：启动时在原位置插回（满页签栏索引，仅恢复时消费一次）。
-    restore_settings_pos: Option<usize>,
+/// 退出时设置页签开着：启动时**固定**插在首页之后（消费一次）。
+    restore_settings: bool,
+    /// 会话页签区（首页/设置右侧那一段）的横向滚动偏移（px）。
+    /// 只滚会话页签：首页与设置常驻左侧，页签过多时才需要滚。
+    tab_scroll_x: f32,
     /// 启动恢复的会话按保存序暂存于此（save_i 槽位），全部完成后按序插入页签。
     /// 后台 spawn 完成顺序随机，逐条插入会因先到的高索引越界 panic，故先攒槽。
     restore_slots: Vec<Option<Result<Session, String>>>,
@@ -3304,124 +3316,201 @@ pub struct ClientApp {
 }
 
 
-/// 页签状态图标判定（纯函数，便于测试）。**默认保底机制**：仅凭终端内容判定
-/// 已退出 → ❌；启动加载中 → 🔄；最近 OUTPUT_END_MS（3s）内有输出 → 🔄；
-/// 输出停止 ≥3s 且有可查看内容且未查看 → ✅（完成/待查看）；否则空。
-/// 滚动/翻页只改视口、不写 last_output_ms → 不计更新状态；周期重绘、CPU
-/// 采样、锁存等后台「固定刷新」全部退出判定，3 秒无内容即完成。
-/// 唯一例外：用户驱动回显（last_input/last_scroll 距现在窗口内）——最近
-/// 1.5s 内输过键（last_input_ms）或 500ms 内转发过滚轮（last_scroll_ms）给
-/// TUI，其直接引发的重绘回显不算任务在跑，跳过 🔄；✅ 判定（基于 ≥3s 无新
-/// 内容）与空不受影响，任务完成后开始敲下一行命令时 ✅ 保持可见。
-/// 两个窗口互不兼容：键盘输入回显给 1.5s（打字可能持续），滚动重绘是
-/// 一次性输出给 500ms；真实输出晚于各自窗口即照常判 🔄。
-/// ever_output：是否有任何输出块（含动画）。零输出会话不因 last_output_ms
-/// 初始化为 spawn 时刻而假闪 🔄，🔄 只属于真实内容驱动/加载态。
+/// 页签状态图标（纯函数；参数与 [`Session`] 的输出时间戳一一对应，便于逐项钉住）。
 ///
-/// 这是**无权威状态源**时的旧口径（普通 shell 命令就走这条）。pi/opencode
-/// 页签走 [`tab_icon_with`]：拿得到 agent 自己的状态接口时以它为准。
-/// 只留给测试当保底基准（运行期调用方一律传权威状态，Unknown 即等价于它）。
-#[cfg(test)]
+/// 一律只看**通用输出启发式**，不按 agent 分家：不追 pi 的会话 JSONL、不查
+/// opencode 的 DB、不认 TUI 是不是全屏动画（曾按 pi/opencode 各写一套权威状态
+/// 通道，实测两边都判错：pi 会话文件与终端 cwd 对不上就永远读不到状态，opencode
+/// 得另起进程查 DB；而图标语义只要求「大概在跑 / 大概跑完了」，输出启发式已经
+/// 够用，少一条通道就少一份错乱的来源）。
+///
+/// 只看两块时间戳，都由 reader 刷：
+/// `last_real` = 最近一块**实质内容**（非动画块）；`last_anim` = 最近一块**纯
+/// 动画**输出（spinner/时钟/进度条），0 = 从未有过动画。
+///
+/// 判定链（自上而下，先到先得）：
+/// ❌ 进程已退出 / 🔄 启动加载中 → 压过一切。
+/// 🔄 最近 3s 内有实质内容 **或** 画面还在高频动 → 运行中。
+///   · 内容窗口走 last_real：空闲的全屏 TUI（停在输入框）只刷动画，
+///     拿全量输出当「在跑」会让页签永远 🔄（最初那个 bug）。
+///   · 动画通道（高频 spinner/时钟/进度条）覆盖「长命令一行字都不吐」：
+///     思考/跑命令期间界面在动 ⇒ 准确识别为不是结束状态（见 [`ANIM_BUSY_MS`]）。
+///   · ever_output 门挡住「刚 spawn 的新鲜时间戳」假闪；最近 1.5s 打字、
+///     500ms 滚轮回显不算（那是用户自己弄出来的，只压内容窗口不压动画通道）。
+/// ✅ 有实质输出、用户没查看、已静默 ≥3s、且画面不在高频动 → 完成/待查看。
+/// 其余（已查看 / 从无实质输出）→ 空。
+///
+/// 🔄 与 ✅ 由同一个「画面在动」量分开，互斥且不重叠：动画通道点亮 🔄 的同时
+/// 关掉 ✅，所以不会出现「思考中却亮 ✅」也不会「跑完了还常亮 🔄」。
+#[allow(clippy::too_many_arguments)]
 fn tab_icon(
     exited: bool,
     loading: bool,
     ever_output: bool,
     count: u32,
     viewed: bool,
-    last_out: u64,
+    last_real: u64,
     now_ms: u64,
     last_input: u64,
     last_scroll: u64,
+    last_anim: u64,
 ) -> Option<&'static str> {
-    tab_icon_with(
-        exited,
-        loading,
-        ever_output,
-        count,
-        viewed,
-        last_out,
-        now_ms,
-        last_input,
-        last_scroll,
-        crate::runstate::RunState::Unknown,
-        false,
-    )
-}
-
-/// 同 [`tab_icon`]，但多一路**权威运行态**（runstate 模块的抽象接口）。
-///
-/// 抽象分层：`run_state` 是 agent 自己报的准信（pi 追会话 JSONL、opencode 读
-/// DB），对「模型思考十几秒不出字」「工具跑一分钟不出字」这类场景才判得对；
-/// `Unknown`（没装/没识别/读失败）时**原样回退上面的输出启发式**，一个字
-/// 都不改语义——唯一例外是 `agent_hint`（见参数说明）。
-///
-/// 合并口径（有意保守）：
-/// `Busy` → 直接 🔄，不查输出窗口：agent 明确在跑，哪怕终端一个字节没动。
-/// `Idle` → **压掉输出窗口那条 🔄**（pi 停在输入框时界面动画/光标重绘一直有
-/// 输出，不压就会常亮 🔄）；但 **✅/空 仍按 ≥3s 无输出算**：刚提交一条
-/// prompt 的瞬间 pi 末条记录就是 user（=Idle），若据此立刻判 done 会弹假
-/// 「任务完成」通知。
-/// `Unknown` + `agent_hint` → 同样压掉输出窗口那条 🔄：agent 状态读不出来
-/// （会话文件还没写出来 / cwd 对不上 / opencode 没装）时只能靠输出窗口，
-/// 而全屏 TUI 空闲时本来就在刷动画，3s 窗口会被顶满 → 终端零新输出而页签
-/// 常亮 🔄（用户报告：「pi 没有任何输出但显示的是刷新」）。✅/空 判据不变。
-/// 10+1 个参数与 `tab_icon` 一一对应（纯函数，便于测试逐项钉住），不拆结构体。
-#[allow(clippy::too_many_arguments)]
-fn tab_icon_with(
-    exited: bool,
-    loading: bool,
-    ever_output: bool,
-    count: u32,
-    viewed: bool,
-    last_out: u64,
-    now_ms: u64,
-    last_input: u64,
-    last_scroll: u64,
-    run_state: crate::runstate::RunState,
-    agent_hint: bool,
-) -> Option<&'static str> {
+    // 画面还在高频动 ⇒ 界面在动（spinner/时钟/进度条），不是「静默跑完了」。
+    // 一次采样定生死：spinner 每 ~100ms 一帧，1s 门限下采样恒落在窗口内；
+    // 空闲时光标闪烁稀疏，绝大多数采样落在窗口外 → 照常判完成（见 ANIM_BUSY_MS）。
+    let screen_busy = last_anim != 0 && now_ms.saturating_sub(last_anim) < ANIM_BUSY_MS;
     if exited {
         return Some("❌");
     }
     if loading {
         return Some("🔄");
     }
-    // 权威「在跑」直接点亮 🔄：模型思考/长工具期间终端可以零输出，输出窗口
-    // 必然会误判成「完成」。它比输出窗口更可信，压过 typing/scroll_echo 例外
-    // （那两条只是压人工回显，agent 自报的准信不该被压）。
-    if run_state == crate::runstate::RunState::Busy {
-        return Some("🔄");
-    }
-    // 权威「空闲」→ 不再用输出窗口判运行中：agent 停在输入框时终端仍在刷动画，
-    // 否则页签会永远 🔄。✅/空 的判据不动（见上面合并口径）。
-    // Unknown 且本页签确实是 agent（状态读不出来）时同样压掉：全屏 TUI 的
-    // 动画刷新会让输出窗口恒新，不压就是「零输出却永远 🔄」。
-    let authoritative_idle =
-        run_state == crate::runstate::RunState::Idle || (run_state == crate::runstate::RunState::Unknown && agent_hint);
     // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——其直接引发
     // 的回显/整屏重绘是用户操作引起、不是任务在跑 → 跳过运行中判定。命令
     // 真实输出晚于窗口即照常判 🔄（慢命令几乎总是超出窗口）。
     let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
     let scroll_echo = last_scroll != 0 && now_ms.saturating_sub(last_scroll) < SCROLL_ECHO_MS;
-    // 有内容（最近一块输出距今 ≤3s）→ 运行中。动画块也刷新 last_output_ms，
-    // spinner/周期重绘期间保持 🔄；本地滚动/翻页不产生输出，不会点亮它。
-    // ever_output 门：从未收到任何输出的会话（last_output_ms 仍是 spawn 的
-    // 初始值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
-    if !typing
-        && !scroll_echo
-        && !authoritative_idle
-        && ever_output
-        && now_ms.saturating_sub(last_out) <= OUTPUT_END_MS
-    {
+    // 有实质内容（最近一块距今 ≤3s）→ 运行中。动画重绘不算「在跑」（那是界面
+    // 在动，内容没变——见上面 🔄 的两条通道）；本地滚动/翻页不产生输出，不会
+    // 点亮它。ever_output 门：从未收到任何输出的会话（时间戳仍是 spawn 的初始
+    // 值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
+    let fresh_content = ever_output && now_ms.saturating_sub(last_real) <= OUTPUT_END_MS;
+    if !typing && !scroll_echo && fresh_content {
+        return Some("🔄");
+    }
+    // 画面高频动 → 运行中（思考/长工具/静默构建）。不受打字·滚轮例外影响：
+    // 那两条只压「人工回显」，而动画不是回显。
+    if screen_busy {
         return Some("🔄");
     }
     // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
     // 陈旧判据与 🔄 互补：打字期内新鲜回显不落 ✅，只能走空（旧代码语义）。
-    if count > 0 && !viewed && now_ms.saturating_sub(last_out) > OUTPUT_END_MS {
+    // screen_busy 已在上面被 🔄 吃掉，这里自然不会误亮 ✅。
+    if count > 0
+        && !viewed
+        && !screen_busy
+        && now_ms.saturating_sub(last_real) > OUTPUT_END_MS
+    {
         return Some("✅");
     }
     // 空：无内容可看 / 已查看过。
     None
+}
+
+/// [`tab_icon`] 的图标码（存进 Session.state_icon 的低 2 位）。
+const ICON_EMPTY: u8 = 0;
+/// ✅ 完成/待查看。
+const ICON_DONE: u8 = 1;
+/// 🔄 运行中（或加载中，渲染层直接给 🔄）。
+const ICON_BUSY: u8 = 2;
+/// ❌ 已退出（渲染层直接给 ❌，不进快照）。
+const ICON_ERR: u8 = 3;
+/// state_icon 的位掩码：低 2 位图标码。
+const SNAP_CODE_MASK: u8 = 0b11;
+/// state_icon 的位：判定那一刻进程是否已退出。
+const SNAP_EXITED: u8 = 0b100;
+/// state_icon 的位：判定那一刻是否加载中。
+const SNAP_LOADING: u8 = 0b1000;
+
+fn icon_code(icon: Option<&'static str>) -> u8 {
+    match icon {
+        None => ICON_EMPTY,
+        Some("✅") => ICON_DONE,
+        Some("🔄") => ICON_BUSY,
+        Some("❌") => ICON_ERR,
+        Some(_) => ICON_EMPTY,
+    }
+}
+
+fn icon_from_code(code: u8) -> Option<&'static str> {
+    match code {
+        ICON_DONE => Some("✅"),
+        ICON_BUSY => Some("🔄"),
+        ICON_ERR => Some("❌"),
+        _ => None,
+    }
+}
+
+/// 「现在该不该重算状态快照」（纯函数，把频率语义钉在测试里）。
+///
+/// 默认走 [`STATE_CHECK_MS`] 门限（最快 1s 一次）；三条**事件驱动**的例外立即
+/// 放行，否则会迟钝到能看出来：
+/// ① 首次（`last_check == 0`）；
+/// ② 退出/加载态与快照里的位不一致（❌ 与启动 🔄 不能等下一秒）；
+/// ③ 出现了新的**实质**内容（命令刚跑起来，🔄 必须立刻亮；动画不算，否则
+/// spinner 会把门限彻底顶掉，等于没降频）。
+#[allow(clippy::too_many_arguments)]
+fn state_due(
+    last_check_ms: u64,
+    now_ms: u64,
+    real_out_ms: u64,
+    snap: u8,
+    exited: bool,
+    loading: bool,
+) -> bool {
+    if last_check_ms == 0 || now_ms.saturating_sub(last_check_ms) >= STATE_CHECK_MS {
+        return true;
+    }
+    if (snap & SNAP_EXITED != 0) != exited || (snap & SNAP_LOADING != 0) != loading {
+        return true;
+    }
+    real_out_ms > last_check_ms
+}
+
+/// App 侧的快照刷新：把图标 + 完成态**一起**算进 Session 的原子里。
+///
+/// 页签图标（tab_bar）与「任务完成」通知（update_done_states）都只读这份快照，
+/// 1s 门限也只在这里生效一次——两个消费者因此永远不会互相矛盾。
+fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
+    let last_check = s.state_check_ms.load(Ordering::Relaxed);
+    let snap = s.state_icon.load(Ordering::Relaxed);
+    let exited = s.exited.load(Ordering::Acquire);
+    let loading = s.loading_active(now_ms);
+    let real_out = s.last_real_output_ms.load(Ordering::Relaxed);
+    if !state_due(last_check, now_ms, real_out, snap, exited, loading) {
+        return;
+    }
+    s.state_check_ms.store(now_ms, Ordering::Relaxed);
+    let last_anim = s.last_anim_ms.load(Ordering::Relaxed);
+    let code = icon_code(tab_icon(
+        exited,
+        loading,
+        s.ever_output.load(Ordering::Relaxed),
+        s.output_count.load(Ordering::Relaxed),
+        !s.has_been_viewed.load(Ordering::Relaxed),
+        real_out,
+        now_ms,
+        s.last_input_ms.load(Ordering::Relaxed),
+        s.last_scroll_ms.load(Ordering::Relaxed),
+        last_anim,
+    ));
+    let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
+    s.state_icon.store(code | flags, Ordering::Relaxed);
+    // 完成态（通知判据）与图标同源同刻：退出/加载中不算、动画高频动不算、
+    // 实质内容静默 ≥3s 才算。✅ 额外要求「有实质输出 + 未查看」，通知那侧则
+    // 另有 out_bytes / viewed / 节流等门槛（见 update_done_states）。
+    let done = !exited
+        && !loading
+        && (last_anim == 0 || now_ms.saturating_sub(last_anim) >= ANIM_BUSY_MS)
+        && now_ms.saturating_sub(real_out) > OUTPUT_END_MS;
+    s.state_done.store(done, Ordering::Relaxed);
+}
+
+/// 读快照出图标：退出/加载中即时纠正（事件驱动，不受 1s 门限约束）；
+/// 已查看则把 ✅ 立刻抹掉（用户刚看过就不该还亮着待查看）。
+fn tab_icon_from_snap(s: &crate::session::Session, viewed: bool) -> Option<&'static str> {
+    let snap = s.state_icon.load(Ordering::Relaxed);
+    if snap & SNAP_EXITED != 0 {
+        return Some("❌");
+    }
+    if snap & SNAP_LOADING != 0 {
+        return Some("🔄");
+    }
+    let code = snap & SNAP_CODE_MASK;
+    if viewed && code == ICON_DONE {
+        return None;
+    }
+    icon_from_code(code)
 }
 
 /// Tab 的轻量投影（Tab 持有 Session，坐标换算只需这四类）。
@@ -3440,19 +3529,11 @@ enum TabKind {
 /// current = active（见 ui() 恢复流程）。已退出页签不恢复，直接存
 /// self.current / 满页签索引会整体左移错位（active 落到隔壁页签）。
 /// settings_pos 是**插入前**坐标，active 是**插入后**最终坐标。
+///
+/// settings_pos 恒为 1：设置页签固定插在首页之后（见 `open_settings`）。
+/// 放在会话中间既难找，拖动后的位置还会在重启时丢掉（拖动只改内存，不落盘）。
 fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
-    let settings_pos = kinds
-        .iter()
-        .position(|k| *k == TabKind::Settings)
-        .map(|pos| {
-            1 + kinds
-                .iter()
-                .skip(1)
-                .take(pos.saturating_sub(1))
-                .filter(|k| **k == TabKind::Alive)
-                .count()
-        })
-        .unwrap_or(1);
+    let settings_pos = 1usize;
     let settings_open = kinds.contains(&TabKind::Settings);
     let mut pre = 1usize; // 下一个「插入前」槽位（1 = Home 之后）
     let mut active = 0usize; // 0 = Home / 无匹配
@@ -3471,6 +3552,72 @@ fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
         }
     }
     (active, settings_pos)
+}
+
+/// 页签栏里页签内外的固定空隙（绘制与滚动量算共用一份数字，避免两处漂移）。
+const TAB_GAP: f32 = 4.0;
+
+/// 一行页签的横向度量（绘制公式与滚动量算共用）。
+#[derive(Clone, Copy)]
+struct StripMetrics {
+    /// 状态图标槽宽（所有页签相同）。
+    slot_w: f32,
+    /// 「×」宽（占位页签没有 ×）。
+    close_w: f32,
+    /// 页签最小内容宽（≈四个汉字）。
+    min_width: f32,
+    /// 页签**之间**的间距：绘制的 add_space(TAB_GAP) + 父布局 item_spacing.x。
+    gap: f32,
+    /// 页签 Frame 的左右内边距之和。
+    pad: f32,
+}
+
+/// 会话页签区的排布结果：每个下标在内容坐标系里的 `[x, x+w]`，以及内容总宽。
+struct StripGeom {
+    spans: Vec<(usize, f32, f32)>,
+    content_w: f32,
+}
+
+/// 纯计算：把一行页签排成 `[x, x+w]`（相对内容左缘）。`items` = (下标, 标题宽, 有无 ×)。
+///
+/// 必须与绘制里 Frame 内的排版一致——差几像素只会让滚动范围略偏，不会错位
+/// （真正的定位一直由 egui 布局负责，这里只用来算裁剪范围与跟随位置）。
+fn strip_geom(items: &[(usize, f32, bool)], m: StripMetrics) -> StripGeom {
+    let mut spans = Vec::with_capacity(items.len());
+    let mut x = 0.0f32;
+    for &(i, title_w, has_close) in items {
+        if !spans.is_empty() {
+            x += m.gap;
+        }
+let inner = m.slot_w + TAB_GAP + title_w
+            + if has_close { TAB_GAP + m.close_w } else { 0.0 };
+        // 占位页签（无 ×）的补白公式比会话页签少减一个间距，最小宽度也跟着少一个
+        // —— 否则滚动范围会比实际画出来的宽，末尾多出一截空白。
+        let min_w = m.min_width - if has_close { 0.0 } else { TAB_GAP };
+        let w = inner.max(min_w) + m.pad;
+        spans.push((i, x, w));
+        x += w;
+    }
+    StripGeom { spans, content_w: x }
+}
+
+/// 把 `[x, x+w]` 挪进视口：整体可见就不动；左出界贴左、右出界贴右。
+///
+/// 单个页签比视口还宽时只能贴左（两端都露不全，贴左保前缀可见）。
+fn offset_to_show(off: f32, view_w: f32, content_w: f32, x: f32, w: f32) -> f32 {
+    let max_off = (content_w - view_w).max(0.0);
+    let off = off.clamp(0.0, max_off);
+    if w >= view_w {
+        return 0.0;
+    }
+    let shown = if x < off {
+        x
+    } else if x + w > off + view_w {
+        x + w - view_w
+    } else {
+        off
+    };
+    shown.clamp(0.0, max_off)
 }
 
 /// 同页签 10s 一条的通知节流（TOAST_MIN_INTERVAL_MS）。通过即占位时间戳——
@@ -3576,8 +3723,9 @@ impl ClientApp {
             pending_restore: Vec::new(),
             spawning: Vec::new(),
             spawn_rx: None,
-            restore_active: None,
-            restore_settings_pos: None,
+restore_active: None,
+        restore_settings: false,
+        tab_scroll_x: 0.0,
             last_term_size: (80, 24),
             titlebar_hwnd,
             last_theme_dark: initial_dark,
@@ -3634,10 +3782,11 @@ impl ClientApp {
                 cmd,
             });
         }
-        if saved_tabs.settings_open {
-            app.restore_settings_pos = Some(saved_tabs.settings_pos.max(1));
+if saved_tabs.settings_open {
+            // 位置不再持久化：设置页签固定在首页之后（restore_coords 恒返回 1）。
+            app.restore_settings = true;
         }
-        if !app.pending_restore.is_empty() || app.restore_settings_pos.is_some() {
+        if !app.pending_restore.is_empty() || app.restore_settings {
             // 注意：升级前的旧配置坐标含退出页签/设置页签偏移，首启可能落错
             // 一格——旧值无法换算（配置没存退出标记），落错时切回正确页签后
             // 第一次保存即写入 restore_coords 新格式，此后恢复正确（一次性）。
@@ -3665,7 +3814,7 @@ impl ClientApp {
             .collect();
         let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
         let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
-        // 设置页签也记录：退出时开着则启动时在相同位置恢复（见构造器 restore_settings_pos）。
+// 设置页签也记录：退出时开着则启动时插回首页之后（见 restore_settings）。
         let settings_open = self.tabs.iter().any(|t| matches!(t, Tab::Settings));
         let kinds: Vec<TabKind> = self
             .tabs
@@ -3719,18 +3868,56 @@ impl ClientApp {
     }
 
 
+/// 量出本帧会话页签区（首页/设置之外）的横向排布。
+    ///
+    /// 标题宽走缓存，与绘制共用同一个 `title_width_cache`：这里顺带把未量过的标题
+    /// 排版一次，绘制时就零排版成本。
+fn strip_geom_for_frame(
+        &mut self,
+        ui: &egui::Ui,
+        font: egui::FontId,
+        m: StripMetrics,
+    ) -> StripGeom {
+        let mut items: Vec<(usize, f32, bool)> = Vec::new();
+        for (i, tab) in self.tabs.iter().enumerate().skip(1) {
+            let (title, has_close) = match tab {
+                Tab::Session(s) => (s.title.clone(), true),
+                Tab::Placeholder { title } => (title.clone(), false),
+                _ => continue, // 首页/设置在固定区，不参与排布
+            };
+            let w = *self.title_width_cache.entry(title.clone()).or_insert_with(|| {
+ui.ctx().fonts_mut(|f| {
+                    f.layout_no_wrap(title, font.clone(), Color32::TRANSPARENT)
+                        .size()
+                        .x
+                })
+            });
+            items.push((i, w, has_close));
+        }
+        strip_geom(&items, m)
+    }
+
     fn open_settings(&mut self) {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
         self.settings_tool_dirs = self.config.settings.tool_paths.clone();
         self.settings_new_tool_dir.clear();
-        // 如果已有一个设置页签，跳转过去而不是重复添加。
+// 如果已有一个设置页签，跳转过去而不是重复添加。
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
-            self.current = idx;
+            // 已在位则不动（idx == 1）；旧状态里它可能被拖到了会话中间 → 拉回
+            // 首页之后，保证「设置固定在第二个」这条不变量。
+            if idx != 1 {
+                let t = self.tabs.remove(idx);
+                self.tabs.insert(1, t);
+            }
+            self.current = 1;
         } else {
-            self.tabs.push(Tab::Settings);
-            self.current = self.tabs.len() - 1;
+            // 固定插在首页之后，不追加到末尾：设置是全局页面，不是某个项目的
+            // 一部分；夹在一堆会话页签中间既难找，重启恢复也拿不到它的位置
+            // （拖动只改内存）。
+            self.tabs.insert(1, Tab::Settings);
+            self.current = 1;
         }
         self.term_focused = false;
     }
@@ -4195,13 +4382,23 @@ impl ClientApp {
 
     /// 会话页签拖动落位：把 from 移到「原索引空间」的插入点 target（1..=len）。
     /// 0 是固定的首页，不在可移动范围内。
-    fn move_tab(&mut self, from: usize, target: usize) {
+fn move_tab(&mut self, from: usize, target: usize) {
         let len = self.tabs.len();
-        if from == 0 || from >= len || target == 0 || target > len {
+        // 固定区不参与重排：首页恒在 0，设置恒在 1（开着时）。落点不得插到它
+        // 前面/中间，否则设置页签会被拖离首页之后，下次打开又被拉回去。
+        let fixed_end = if self.tabs.get(1).is_some_and(|t| matches!(t, Tab::Settings)) {
+            2
+        } else {
+            1
+        };
+        if from < fixed_end || from >= len || target == 0 || target > len {
             return;
         }
-        let new_p = if target > from { target - 1 } else { target };
-        if new_p == from {
+        let mut new_p = if target > from { target - 1 } else { target };
+        if new_p < fixed_end {
+            new_p = fixed_end;
+        }
+        if new_p >= len || new_p == from {
             return;
         }
         let c = self.current;
@@ -4280,26 +4477,16 @@ impl ClientApp {
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
                 // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
-                // 非启动加载中、最近一块**实质内容**输出停止 ≥3s。last_real_output_ms
-                // 只看非动画块：周期转义重绘（tmux 状态栏/光标/屏幕刷新）不会让它
-                // 刷新 → 这类会话不会因 done 横跳而循环弹「任务完成」+ 闪烁。
+                // 非启动加载中、最近一块**实质内容**输出停止 ≥3s、画面不在高频动。
+                // last_real_output_ms 只看非动画块：周期转义重绘（tmux 状态栏、
+                // 光标/屏幕刷新）不会让它刷新 → 这类会话不会因 done 横跳而循环弹
+                // 「任务完成」+ 闪烁；last_anim 负责把「还在思考/跑命令」的高频
+                // 动画挡在完成之外（见 ANIM_BUSY_MS）。四条判据与图标**共用同一份
+                // 快照**（最快 1s 重算一次，见 refresh_tab_state），两者不会打脸。
                 // 未查看门槛在弹窗条件里（viewed 语义：启动即已见，仅新输出轮
                 // 复位，见下）。
-                let done = !s.exited.load(Ordering::Acquire)
-                    && !s.loading_active(now_ms)
-                    && match crate::runstate::RunState::from_slot(
-                        s.run_state.load(Ordering::Relaxed),
-                    ) {
-                        // 权威「在跑」→ 绝不算完成（长工具/思考期不弹通知）。
-                        crate::runstate::RunState::Busy => false,
-                        // 权威「空闲」/未知 → 仍按 ≥3s 无实质输出判完成。
-                        // Idle 不提前判 done：刚提交 prompt 的瞬间就是 Idle，
-                        // 提前判会弹假「任务完成」。
-                        _ => {
-                            now_ms.saturating_sub(s.last_real_output_ms.load(Ordering::Relaxed))
-                                > OUTPUT_END_MS
-                        }
-                    };
+                refresh_tab_state(s, now_ms);
+                let done = s.state_done.load(Ordering::Relaxed);
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
                 // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在
                 // 🔄↔边界横跳时（再有输出 → done=false → 清零）重置计时。
@@ -4577,13 +4764,156 @@ impl ClientApp {
                 }
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-                let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
+let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                 ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
             }
 
+            // ── 固定区：设置页签（恒在首页之后）──
+            // 与首页一样常驻左侧：设置是全局页面，滚走就找不着了。
+            // 不可拖动：位置是固定的（open_settings 每次都插回下标 1），能被拖走
+            // 又会被拉回来，不如直接不响应拖动。
+            if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
+                ui.add_space(4.0);
+                let title = "⚙ 设置";
+                let selected = self.current == i;
+                let bg_idx = ui.painter().add(egui::Shape::Noop);
+                let (close_rect, frame_resp) = egui::Frame::new()
+                    .corner_radius(4.0)
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(tab_margin)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = TAB_GAP;
+                        let min_width = ui.text_style_height(&egui::TextStyle::Body) * 4.0;
+                        let title_w = *self.title_width_cache.entry(title.to_string()).or_insert_with(|| {
+                            ui.ctx().fonts_mut(|f| {
+                                f.layout_no_wrap(title.to_string(), tab_font.clone(), Color32::TRANSPARENT)
+                                    .size()
+                                    .x
+                            })
+                        });
+                        let s = TAB_GAP;
+                        let icon_title_w = slot_w + s + title_w;
+                        let slack = (min_width - icon_title_w - s - close_w).max(0.0);
+                        let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
+                            ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
+                        } else if slack > 0.0 {
+                            (slack, 0.0)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        if pad_l > 0.0 {
+                            ui.add_space(pad_l);
+                        }
+                        let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                        ui.add_sized(
+                            egui::vec2(slot_w, row_h),
+                            egui::Label::new(" ").selectable(false),
+                        );
+                        ui.add(
+                            if selected {
+                                egui::Label::new(RichText::new(title).strong())
+                            } else {
+                                egui::Label::new(RichText::new(title))
+                            }
+                            .selectable(false),
+                        );
+                        if pad_m > 0.0 {
+                            ui.add_space(pad_m);
+                        }
+                        (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
+                    })
+                    .inner;
+                let rect = frame_resp.rect;
+                // 只感 click：固定页签不参与重排（同首页）。
+                let resp = ui.interact(rect, egui::Id::new("settings_tab"), egui::Sense::click());
+                // 只认指针点击：键盘回车不切页/不关页。
+                if resp.clicked_by(egui::PointerButton::Primary) {
+                    let pos = ui.ctx().pointer_interact_pos();
+                    if pos.is_some_and(|p| close_rect.contains(p)) {
+                        actions.push(TabAction::Close(i));
+                    } else {
+                        actions.push(TabAction::Activate(i));
+                    }
+                }
+                if resp.hovered()
+                    && ui
+                        .ctx()
+                        .pointer_interact_pos()
+                        .is_some_and(|p| close_rect.contains(p))
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let hovering = !selected
+                    && drag_index.is_none()
+                    && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
+                let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
+                tab_rects.push((i, rect));
+            }
+
+            // ── 会话页签区：页签太多时**只滚这一段** ──
+            // 首页与设置常驻左侧；首页/设置**页面**上的滚轮也不归它（判定靠指针
+            // 是否落在本行矩形内）。不需要真的用 ScrollArea：它靠「测量一遍 + 裁剪
+            // 重画一遍」实现，而本函数每帧都在收集点击动作/拖动源，两遍会重复执行
+            // 副作用。这里改成：按量出来的宽度把布局起点左移 off，再按视口裁剪。
+            let avail = ui.available_rect_before_wrap();
+            let view_w = avail.width().max(0.0);
+            let geom = self.strip_geom_for_frame(
+                ui,
+                tab_font.clone(),
+                StripMetrics {
+                    slot_w,
+                    close_w,
+                    min_width: ui.text_style_height(&egui::TextStyle::Body) * 4.0,
+                    gap: ui.spacing().item_spacing.x + TAB_GAP,
+pad: tab_margin.left as f32 + tab_margin.right as f32,
+                },
+            );
+            let view =
+                egui::Rect::from_min_size(avail.min, egui::vec2(view_w, avail.height()));
+            let mut off = self.tab_scroll_x;
+            // 滚轮：竖滚轮 → 横移（鼠标最常见），触控板横扫同样生效。
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
+            if scroll != 0.0
+                && ui.ctx().pointer_interact_pos().is_some_and(|p| view.contains(p))
+            {
+                off -= scroll;
+                // 同一份位移不能再流向别的 ScrollArea（首页项目列表等）——照终端
+                // show_terminal 里的做法清掉。
+                ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+            }
+            // 当前页签必须留在视野里：Ctrl+Tab 切页、新建/关闭页签都靠它。
+            off = match geom.spans.iter().find(|(i, _, _)| *i == self.current) {
+Some((_, x, w)) => offset_to_show(off, view_w, geom.content_w, *x, *w),
+                None => off.clamp(0.0, (geom.content_w - view_w).max(0.0)),
+            };
+            self.tab_scroll_x = off;
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(view.left() - off, view.top()),
+                egui::pos2(
+                    view.left() - off + geom.content_w.max(view_w),
+                    view.bottom(),
+                ),
+            );
+            // 影子 `ui`：布局仍在内容坐标系里排（页签定位继续由 egui 负责），
+            // 只是起点左移了 off，并按视口裁剪。下面循环体一个字都不用改。
+            let mut ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("tab_strip")
+                    .max_rect(content_rect)
+.layout(
+                        egui::Layout::left_to_right(egui::Align::Center)
+                            .with_cross_align(egui::Align::Center),
+                    ),
+            );
+            ui.set_clip_rect(view);
+
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
+                if matches!(tab, Tab::Settings) {
+                    continue; // 固定区已画
+                }
                 if let Tab::Session(s) = tab {
-                    ui.add_space(4.0);
+                    ui.add_space(TAB_GAP);
                     // 状态图标：固定宽度单字符。
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
                     let now_ms = crate::now_ms();
@@ -4595,23 +4925,10 @@ impl ClientApp {
                     // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）或
                     // 500ms 内转发过滚轮（last_scroll_ms）→ 直接引发的回显不
                     // 算任务在跑 → 跳过 🔄；真实输出晚于窗口照常判 🔄。
-                    let count = s.output_count.load(Ordering::Relaxed);
-                    let last_out = s.last_output_ms.load(Ordering::Relaxed);
-                    let last_input = s.last_input_ms.load(Ordering::Relaxed);
-                    let last_scroll = s.last_scroll_ms.load(Ordering::Relaxed);
-                    let icon = tab_icon_with(
-                        s.exited.load(Ordering::Acquire),
-                        s.loading_active(now_ms),
-                        s.ever_output.load(Ordering::Relaxed),
-                        count,
-                        viewed,
-                        last_out,
-                        now_ms,
-                        last_input,
-                        last_scroll,
-                        crate::runstate::RunState::from_slot(s.run_state.load(Ordering::Relaxed)),
-                        crate::runstate::is_agent_cmd(s.cmd.as_str()),
-                    );
+                    // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
+                    // 新实质内容这三类事件不等门限（见 state_due）。
+                    refresh_tab_state(s, now_ms);
+                    let icon = tab_icon_from_snap(s, viewed);
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
@@ -4630,9 +4947,9 @@ impl ClientApp {
                     let (close_rect, frame_resp) = egui::Frame::new()
                         .corner_radius(4.0)
                         .fill(Color32::TRANSPARENT)
-                        .inner_margin(tab_margin)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
+.inner_margin(tab_margin)
+                        .show(&mut ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = TAB_GAP;
                             // 最小宽度≈四个汉字（汉字宽度≈字号）：短标题（如单字项目名）
                             // 不至于把页签缩成一小条，文字与 × 挤在一起、点选/拖拽目标过小。
                             let min_width =
@@ -4652,7 +4969,7 @@ impl ClientApp {
                                         .x
                                 })
                             });
-                            let s = ui.spacing().item_spacing.x;
+let s = TAB_GAP;
                             let icon_title_w = slot_w + s + title_w;
                             let slack = (min_width - icon_title_w - s - close_w).max(0.0);
                             let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
@@ -4697,8 +5014,13 @@ impl ClientApp {
                             }
                             (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
                         })
-                        .inner;
+.inner;
                     let rect = frame_resp.rect;
+                    // 滚出可见区的页签：整段跳过（绘制本来就被裁掉，但**交互不会**——
+                    // 不跳过就变成点右侧空白处命中一个看不见的页签）。
+                    if !view.intersects(rect) {
+                        continue;
+                    }
                     // 交互层注册在内容之后（更上层），点击/拖动都落在它身上。
                     let resp = ui.interact(
                         rect,
@@ -4790,15 +5112,15 @@ impl ClientApp {
                     let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                     ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
                     tab_rects.push((i, rect));
-                } else if let Tab::Placeholder { title } = tab {
+} else if let Tab::Placeholder { title } = tab {
                     // ── 重启/切换命令占位页签：保持位置与标题可见，不可拖动/关闭。
-                    ui.add_space(4.0);
+                    ui.add_space(TAB_GAP);
                     let frame_resp = egui::Frame::new()
                         .corner_radius(4.0)
                         .fill(Color32::TRANSPARENT)
-                        .inner_margin(tab_margin)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
+.inner_margin(tab_margin)
+                        .show(&mut ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = TAB_GAP;
                             let min_width = ui.text_style_height(&egui::TextStyle::Body) * 4.0;
                             let title_w = *self
                                 .title_width_cache
@@ -4814,7 +5136,7 @@ impl ClientApp {
                                         .x
                                     })
                                 });
-                            let s = ui.spacing().item_spacing.x;
+let s = TAB_GAP;
                             let icon_title_w = slot_w + s + title_w;
                             let slack = (min_width - icon_title_w - s).max(0.0);
                             let pad_l = if slack > 0.0 { slack } else { 0.0 };
@@ -4834,94 +5156,12 @@ impl ClientApp {
                             );
                             ui.response()
                         })
-                        .inner;
+.inner;
                     let rect = frame_resp.rect;
+                    if !view.intersects(rect) {
+                        continue;
+                    }
                     // 占位页签不响应点击/拖拽：只展示，防止拖动后位置错乱。
-                    tab_rects.push((i, rect));
-                } else if let Tab::Settings = tab {
-                    // ── 设置页签 ──
-                    ui.add_space(4.0);
-                    let title = "⚙ 设置";
-                    let selected = self.current == i;
-                    let bg_idx = ui.painter().add(egui::Shape::Noop);
-                    let (close_rect, frame_resp) = egui::Frame::new()
-                        .corner_radius(4.0)
-                        .fill(Color32::TRANSPARENT)
-                        .inner_margin(tab_margin)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let min_width =
-                                ui.text_style_height(&egui::TextStyle::Body) * 4.0;
-                            let title_w = *self.title_width_cache.entry(title.to_string()).or_insert_with(|| {
-                                ui.ctx().fonts_mut(|f| {
-                                    f.layout_no_wrap(title.to_string(), tab_font.clone(), Color32::TRANSPARENT)
-                                        .size()
-                                        .x
-                                })
-                            });
-                            let s = ui.spacing().item_spacing.x;
-                            let icon_title_w = slot_w + s + title_w;
-                            let slack = (min_width - icon_title_w - s - close_w).max(0.0);
-                            let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
-                                ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
-                            } else if slack > 0.0 {
-                                (slack, 0.0)
-                            } else {
-                                (0.0, 0.0)
-                            };
-                            if pad_l > 0.0 {
-                                ui.add_space(pad_l);
-                            }
-                            let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                            ui.add_sized(
-                                egui::vec2(slot_w, row_h),
-                                egui::Label::new(" ").selectable(false),
-                            );
-                            ui.add(
-                                if selected {
-                                    egui::Label::new(RichText::new(title).strong())
-                                } else {
-                                    egui::Label::new(RichText::new(title))
-                                }
-                                .selectable(false),
-                            );
-                            if pad_m > 0.0 {
-                                ui.add_space(pad_m);
-                            }
-                            (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
-                        })
-                        .inner;
-                    let rect = frame_resp.rect;
-                    let resp = ui.interact(
-                        rect,
-                        egui::Id::new(("settings_tab", i)),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if resp.dragged() {
-                        drag_index = Some(i);
-                    }
-                    // 同会话页签：只认指针点击，键盘回车不切页/不关页。
-                    if resp.clicked_by(egui::PointerButton::Primary) {
-                        let pos = ui.ctx().pointer_interact_pos();
-                        if pos.is_some_and(|p| close_rect.contains(p)) {
-                            actions.push(TabAction::Close(i));
-                        } else {
-                            actions.push(TabAction::Activate(i));
-                        }
-                    }
-                    if resp.hovered()
-                        && ui
-                            .ctx()
-                            .pointer_interact_pos()
-                            .is_some_and(|p| close_rect.contains(p))
-                    {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    let hovering = !selected
-                        && drag_index.is_none()
-                        && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-                    let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
                     tab_rects.push((i, rect));
                 }
             }
@@ -8061,8 +8301,8 @@ impl eframe::App for ClientApp {
             // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
             // 恢复 spawn 必须在本块之前执行：首帧先把 spawning 填上，否则单独恢复
             // 设置页签（无会话）会在会话 spawn 前误触发，导致设置插到会话前面。
-            if self.spawning.is_empty()
-                && (!self.restore_slots.is_empty() || self.restore_settings_pos.is_some())
+if self.spawning.is_empty()
+                && (!self.restore_slots.is_empty() || self.restore_settings)
             {
                 let slots = std::mem::take(&mut self.restore_slots);
                 let mut restored = 0usize;
@@ -8078,9 +8318,10 @@ impl eframe::App for ClientApp {
                         None => {}
                     }
                 }
-                // 退出时设置页签开着：按满页签栏索引插回原位置（首页后、会话之间）。
-                if let Some(pos) = self.restore_settings_pos.take() {
-                    self.tabs.insert(pos.min(self.tabs.len()), Tab::Settings);
+// 退出时设置页签开着：固定插回首页之后（位置不再持久化）。
+                if self.restore_settings {
+                    self.restore_settings = false;
+                    self.tabs.insert(1, Tab::Settings);
                 }
                 if let Some(active) = self.restore_active.take() {
                     self.current = active.min(self.tabs.len() - 1);
@@ -8182,152 +8423,13 @@ impl eframe::App for ClientApp {
 }
 #[cfg(test)]
 mod tab_icon_tests {
-    use super::tab_icon;
-    use super::tab_icon_with;
-    use crate::runstate::RunState;
+    use super::{
+        state_due, tab_icon, ANIM_BUSY_MS, ICON_EMPTY, SNAP_EXITED, STATE_CHECK_MS,
+    };
 
     fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0, 0)
-    }
-
-    /// 带权威运行态的图标（agent 页签实际走的口径）。
-    fn icon_agent(
-        ever: bool,
-        count: u32,
-        viewed: bool,
-        silent_ms: u64,
-        st: RunState,
-    ) -> Option<&'static str> {
-        icon_agent_agent_hint(ever, count, viewed, silent_ms, st, true)
-    }
-
-    /// [`icon_agent`] 且显式指定 agent_hint。
-    fn icon_agent_agent_hint(
-        ever: bool,
-        count: u32,
-        viewed: bool,
-        silent_ms: u64,
-        st: RunState,
-        agent_hint: bool,
-    ) -> Option<&'static str> {
-        let now = 100_000u64;
-        tab_icon_with(
-            false,
-            false,
-            ever,
-            count,
-            viewed,
-            now.saturating_sub(silent_ms),
-            now,
-            0,
-            0,
-            st,
-            agent_hint,
-        )
-    }
-
-    // 权威 Busy：终端已经沉默 10 分钟（模型思考/长工具），仍必须亮 🔄。
-    // 这是接pi/opencode 状态接口的意义——输出窗口在这里必然判错。
-    #[test]
-    fn authoritative_busy_beats_silent_output() {
-        assert_eq!(icon_agent(true, 10, false, 600_000, RunState::Busy), Some("🔄"));
-        // 零输出会话也一样：权威说在跑就在跑。
-        assert_eq!(icon_agent(false, 0, false, 600_000, RunState::Busy), Some("🔄"));
-    }
-
-    // 权威 Busy 压过「人工回显例外」：agent 自报的准信不该被 1.5s 打字窗口压暗。
-    #[test]
-    fn authoritative_busy_overrides_typing_window() {
-        let now = 100_000u64;
-        assert_eq!(
-            tab_icon_with(
-                false,
-                false,
-                true,
-                10,
-                false,
-                now - 100,
-                now,
-                now - 100, // 刚敲过键
-                0,
-                RunState::Busy,
-                true,
-            ),
-            Some("🔄")
-        );
-    }
-
-    // 权威 Idle 压掉「3s 内有输出 → 🔄」：agent 停在输入框时动画一直在刷，
-    // 不压就常亮 🔄。但 ✅/空 仍按输出停顿时长算（不提前判完成）。
-    #[test]
-    fn authoritative_idle_suppresses_output_running() {
-        // 刚输出完（<3s）→ 空（等 3s 停顿才谈 ✅）
-        assert_eq!(icon_agent(true, 10, false, 500, RunState::Idle), None);
-        // 真的停了 10s 且未查看 → ✅（完成/待查看）
-        assert_eq!(
-            icon_agent(true, 10, false, 10_000, RunState::Idle),
-            Some("✅")
-        );
-        // 已查看 → 空
-        assert_eq!(icon_agent(true, 10, true, 10_000, RunState::Idle), None);
-        // 同样参数下 Unknown + 非 agent 页签会亮 🔄（保底启发式），证明 Idle 确实压了它
-        assert_eq!(
-            icon_agent_agent_hint(true, 10, false, 500, RunState::Unknown, false),
-            Some("🔄")
-        );
-    }
-
-    // 回归锁：Unknown **且本页签确实是 agent**（会话文件还没写出来 / cwd 对不上 /
-    // opencode 没装 → 状态读不出来）时，也必须压掉输出窗口那条 🔄。
-    // 用户报告「pi 没有任何输出但显示的是刷新」：全屏 TUI 空闲时一直刷光标/
-    // 动画，3s 输出窗口恒被顶满，不压就是常亮 🔄。
-    #[test]
-    fn unknown_agent_suppresses_output_running() {
-        // 刚「输出」过（<3s，全是 TUI 动画）→ 不该亮 🔄
-        assert_eq!(icon_agent(true, 10, false, 500, RunState::Unknown), None);
-        // 真停了 10s 且未查看 → ✅（判据不变）
-        assert_eq!(
-            icon_agent(true, 10, false, 10_000, RunState::Unknown),
-            Some("✅")
-        );
-        // 已查看 → 空
-        assert_eq!(icon_agent(true, 10, true, 10_000, RunState::Unknown), None);
-        // 零输出会话同样不假闪 🔄
-        assert_eq!(icon_agent(false, 0, false, 500, RunState::Unknown), None);
-    }
-
-    // Unknown（没装 agent / 读不到）必须逐位等价于旧启发式：回退保底机制。
-    // 注意：这里 agent_hint=false（非 agent 页签），语义与旧版完全一致。
-    #[test]
-    fn unknown_falls_back_to_heuristic() {
-        for &(ever, count, viewed, silent) in &[
-            (true, 10, false, 1_000u64),
-            (true, 10, false, 10_000),
-            (true, 10, true, 10_000),
-            (false, 0, false, 1_000),
-            (false, 0, false, 10_000),
-        ] {
-            assert_eq!(
-                icon_agent_agent_hint(ever, count, viewed, silent, RunState::Unknown, false),
-                icon(ever, count, viewed, silent),
-                "Unknown 必须等于启发式口径 ever={ever} count={count} viewed={viewed} silent={silent}"
-            );
-        }
-    }
-
-    // 退出/加载中仍压过一切状态源（❌/启动 🔄 语义不变）。
-    #[test]
-    fn exited_and_loading_beat_authoritative() {
-        let now = 100_000u64;
-        assert_eq!(
-            tab_icon_with(true, false, true, 10, false, now - 10_000, now, 0, 0, RunState::Busy, true),
-            Some("❌")
-        );
-        assert_eq!(
-            tab_icon_with(false, true, true, 10, false, now - 10_000, now, 0, 0, RunState::Idle, true),
-            Some("🔄")
-        );
+        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0, 0, 0)
     }
 
     // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
@@ -8369,16 +8471,16 @@ mod tab_icon_tests {
     fn never_output_never_flashes_running() {
         let now = 100_000u64;
         // loading 未结束 → 🔄 由加载态负责（正常）；加载结束后零输出 → 空。
-        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0, 0), None);
-        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0, 0), None);
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0, 0, 0), None);
+        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0, 0, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0, 0, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0, 0, 0), Some("🔄"));
     }
 
     // 输入驱动例外：最近 1.5s 内用户输过键，回显即使刷新 last_output_ms
@@ -8387,11 +8489,11 @@ mod tab_icon_tests {
     fn typing_echo_not_running() {
         let now = 100_000u64;
         // 1s 前刚输入过（回显新鲜）→ 不亮 🔄，落空。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000, 0), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000, 0, 0), None);
         // 输入窗口边界：不敢 1.5s 整（< INPUT_ACTIVE_MS 才算），恰过期即恢复。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501, 0), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501, 0, 0), Some("🔄"));
         // 无输入历史（last_input=0，鼠标选择/拖拽等）→ 正常判 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0, 0, 0), Some("🔄"));
     }
 
     // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、但内容已停
@@ -8399,8 +8501,100 @@ mod tab_icon_tests {
     #[test]
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500, 0), Some("✅"));
-        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500, 0), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500, 0, 0), Some("✅"));
+        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500, 0, 0), None);
+    }
+
+    /// 动画活性判定：思考/跑命令期间界面在高频动（spinner/时钟/进度条，帧间隔
+    /// ~100ms）→ 判**运行中**（🔄），绝不判完成。这是用户要求「思考或执行命令
+    /// 时也能准确识别到不是结束状态」的落点，且不依赖任何 agent 私有协议
+    /// （不追 JSONL、不查 DB）——只看屏幕还在不在动。
+    #[test]
+    fn screen_animation_means_running_not_done() {
+        let now = 100_000u64;
+        // 静默 10s、动画 100ms 前刚来（spinner 在动）→ 🔄 而不是 ✅。
+        assert_eq!(
+            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - 100),
+            Some("🔄"),
+            "画面还在高频动 = 还在思考/跑命令，不能判完成"
+        );
+        // 动画停 300ms（超过 ANIM_BUSY_MS）→ 照常亮 ✅（回合真跑完了）。
+        assert_eq!(
+            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - 300),
+            Some("✅")
+        );
+        // 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」，靠 < 而非 <=。
+        assert_eq!(
+            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - ANIM_BUSY_MS),
+            Some("✅")
+        );
+        // 1s 采样点上的 spinner 相位无关：任意 0-150ms 的动画年龄都判「在动」。
+        for ago in [0u64, 40, 99, 150] {
+            assert_eq!(
+                tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - ago),
+                Some("🔄"),
+                "spinner 每 ~100ms 一帧，1s 门限下采样必落在 ANIM_BUSY_MS 内（ago={ago}）"
+            );
+        }
+        // 「画面在动」也压掉 ✅ 这条通道之外的误判：动画+已查看仍不亮 ✅。
+        assert_eq!(
+            tab_icon(false, false, true, 10, true, now - 10_000, now, 0, 0, now - 100),
+            Some("🔄")
+        );
+    }
+
+    /// 从未出现动画输出的普通 shell 命令（last_anim=0）不受否决影响：语义与
+    /// 纯静默判据完全一致（不能让普通命令的 ✅ 判据变严）。
+    #[test]
+    fn never_seen_animation_keeps_silent_done() {
+        let now = 100_000u64;
+        assert_eq!(
+            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, 0),
+            Some("✅")
+        );
+    }
+
+    /// 活性否决不越过更高优先级：动画在动但刚有实质内容 → 仍是 🔄（运行中）。
+    #[test]
+    fn screen_animation_does_not_override_running() {
+        let now = 100_000u64;
+        assert_eq!(
+            tab_icon(false, false, true, 10, false, now - 500, now, 0, 0, now - 100),
+            Some("🔄")
+        );
+        // 加载中/已退出同理压过一切。
+        assert_eq!(
+            tab_icon(false, true, true, 10, false, now - 10_000, now, 0, 0, now - 100),
+            Some("🔄")
+        );
+        assert_eq!(
+            tab_icon(true, false, true, 10, false, now - 10_000, now, 0, 0, now - 100),
+            Some("❌")
+        );
+    }
+
+    /// 1s 门限：默认最快一秒重算一次快照（降频），但三条事件通道立即放行——
+    /// 首次、退出/加载态翻转、新实质内容（动画不算，否则 spinner 把门限顶掉）。
+    #[test]
+    fn state_snapshot_rechecks_at_most_once_a_second() {
+        let now = 100_000u64;
+        let idle = ICON_EMPTY;
+        // 首次：必算。
+        assert!(state_due(0, now, 0, idle, false, false));
+        // 刚算过（200ms 前）且什么都没变 → 不算。
+        assert!(!state_due(now - 200, now, now - 10_000, idle, false, false));
+        // 差一毫秒到 1s → 还差一口气。
+        assert!(!state_due(now - STATE_CHECK_MS + 1, now, now - 10_000, idle, false, false));
+        // 满 1s → 算。
+        assert!(state_due(now - STATE_CHECK_MS, now, now - 10_000, idle, false, false));
+        // 事件通道：新实质内容晚于上次判定 → 立即算（命令刚跑起来 🔄 要立刻亮）。
+        assert!(state_due(now - 200, now, now - 100, idle, false, false));
+        // 事件通道：退出/加载态翻转（快照里没有这两位）→ 立即算（❌ 不能等下一秒）。
+        assert!(state_due(now - 200, now, now - 10_000, idle, true, false));
+        assert!(state_due(now - 200, now, now - 10_000, idle, false, true));
+        // 快照里已是退出态、现在仍退出 → 不重复算（没有无谓的每帧重算）。
+        let snap_exit = idle | SNAP_EXITED;
+        assert!(!state_due(now - 200, now, now - 10_000, snap_exit, true, false));
     }
 
     // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
@@ -8419,15 +8613,15 @@ mod tab_icon_tests {
     fn scroll_echo_window_only_swallows_prompt_redraw() {
         let now = 100_000u64;
         // 500ms 内转发过滚轮 + 输出新鲜（TUI 重绘回显）→ 吞掉，不亮 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 100), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 100, 0), None);
         // 滚动窗口边界：恰过期（501ms）即按内容恢复 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 501), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 501, 0), Some("🔄"));
         // 无滚动记录（本地缓冲滚动 / 从未转发，last_scroll=0）→ 输出新鲜照常 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, 0, 0), Some("🔄"));
         // 滚动例外不吞 ✅：滚动时内容早已停、未查看 → 仍按内容判完成。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, 0, now - 100), Some("✅"));
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, 0, now - 100, 0), Some("✅"));
         // 滚动窗口与输入窗口互不干扰：输入回声例外只由 last_input 触发。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100), None);
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100, 0), None);
     }
 }
 
@@ -8666,7 +8860,7 @@ mod settings_accordion_tests {
 
 #[cfg(test)]
 mod restore_coords_tests {
-    use super::{restore_coords, tab_cycle_target, Tab, TabKind};
+    use super::{offset_to_show, restore_coords, strip_geom, tab_cycle_target, StripMetrics, Tab, TabKind};
 
     /// 回归：Ctrl+(Shift+)Tab 只在页签之间循环，不得落到首页 / 设置页。
     ///
@@ -8676,46 +8870,46 @@ mod restore_coords_tests {
     /// 首页/设置之间来回弹。设置页里还嵌着模型配置等大量控件，一进去
     /// 手感就变了。
     #[test]
-    fn tab_cycle_never_lands_on_home_or_settings() {
-        // 真实布局：Home 在 0，Settings 追加在末尾，中间是会话/占位页签。
+fn tab_cycle_never_lands_on_home_or_settings() {
+        // 真实布局：Home 在 0、Settings 固定在 1，其余是会话/占位页签。
         let tabs = vec![
             Tab::Home,
-            Tab::Placeholder { title: "A 重启中".into() },
             Tab::Settings,
+            Tab::Placeholder { title: "A 重启中".into() },
         ];
         // 首页 → 前进进页签区第一个，后退进最后一个（都不是首页/设置）
-        assert_eq!(tab_cycle_target(&tabs, 0, true), Some(1));
-        assert_eq!(tab_cycle_target(&tabs, 0, false), Some(1));
-        // 在页签区里循环：1 → 1（只有一个候选，原地不动），且绝不去 0/2
-        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(1));
-        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 0, true), Some(2));
+        assert_eq!(tab_cycle_target(&tabs, 0, false), Some(2));
+        // 在页签区里循环：2 → 2（只有一个候选，原地不动），且绝不去 0/1
+        assert_eq!(tab_cycle_target(&tabs, 2, true), Some(2));
+        assert_eq!(tab_cycle_target(&tabs, 2, false), Some(2));
         // 设置页 → 同样进页签区
-        assert_eq!(tab_cycle_target(&tabs, 2, true), Some(1));
-        assert_eq!(tab_cycle_target(&tabs, 2, false), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(2));
+        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(2));
 
         // 多个页签：在**页签之间**环回，不经过首页/设置
         let tabs = vec![
             Tab::Home,
+            Tab::Settings,
             Tab::Placeholder { title: "A".into() },
             Tab::Placeholder { title: "B".into() },
             Tab::Placeholder { title: "C".into() },
-            Tab::Settings,
         ];
-        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(2));
         assert_eq!(tab_cycle_target(&tabs, 2, true), Some(3));
-        assert_eq!(tab_cycle_target(&tabs, 3, true), Some(1), "末尾要回卷到第一个页签，而不是设置页");
-        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(3), "后退回卷也不落设置页");
-        assert_eq!(tab_cycle_target(&tabs, 3, false), Some(2));
+        assert_eq!(tab_cycle_target(&tabs, 3, true), Some(4));
+        assert_eq!(tab_cycle_target(&tabs, 4, true), Some(2), "末尾要回卷到第一个页签，而不是设置页");
+        assert_eq!(tab_cycle_target(&tabs, 2, false), Some(4), "后退回卷也不落设置页");
+        assert_eq!(tab_cycle_target(&tabs, 4, false), Some(3));
 
-        // 满页遍历一圈，一次都不许出现 0（首页）或 4（设置）
+        // 满页遍历一圈，一次都不许出现 0（首页）或 1（设置）
         let mut cur = 0usize;
         for _ in 0..12 {
             cur = tab_cycle_target(&tabs, cur, true).unwrap();
-            assert!(cur >= 1 && cur <= 3, "Ctrl+Tab 落到了非页签下标 {cur}");
+            assert!((2..=4).contains(&cur), "Ctrl+Tab 落到了非页签下标 {cur}");
         }
     }
 
-    /// 没有项目页签时（只有首页 + 设置）→ 按键不做事，不能 panic 也不能乱跳。
+/// 没有项目页签时（只有首页 + 设置）→ 按键不做事，不能 panic 也不能乱跳。
     #[test]
     fn tab_cycle_noop_without_session_tabs() {
         let tabs = vec![Tab::Home];
@@ -8728,23 +8922,76 @@ mod restore_coords_tests {
         assert_eq!(tab_cycle_target(&tabs, 99, true), None);
     }
 
+    /// 页签栏横向排布：宽度公式 = 图标槽 + 间距 + 标题 + 间距 + ×（占位页签无 ×），
+    /// 不足最小宽度的按最小宽度算，页签之间再加一个 gap。
+    ///
+    /// 这份数字同时决定「内容有多宽」（裁剪范围）和「当前页签在哪」（跟随滚动），
+    /// 与绘制共用一份常量 TAB_GAP，改一处就够。
     #[test]
-    fn restore_indices_skip_exited_and_settings() {
+    fn strip_geom_lays_tabs_out_left_to_right() {
+        let m = StripMetrics { slot_w: 16.0, close_w: 8.0, min_width: 60.0, gap: 8.0, pad: 4.0 };
+        // 两个会话页签（标题宽 30）+ 间隔。
+        let g = strip_geom(&[(2, 30.0, true), (3, 30.0, true)], m);
+        // 单页签 = 16+4+30+4+8 = 62 ≥ 最小 60 → 62 + pad 4 = 66。
+        assert_eq!(g.spans, vec![(2, 0.0, 66.0), (3, 74.0, 66.0)]);
+        assert_eq!(g.content_w, 140.0);
+        // 短标题按最小宽度兜底（32+4=36 < 60 → 60+4 = 64），不缩成一小条。
+        let g = strip_geom(&[(2, 4.0, true)], m);
+        assert_eq!(g.spans, vec![(2, 0.0, 64.0)]);
+        assert_eq!(g.content_w, 64.0);
+// 占位页签没有 ×：自然宽度少「一个间距 + ×」，但最小宽度只少一个间距。
+        let g = strip_geom(&[(2, 30.0, false)], m);
+        assert_eq!(g.spans, vec![(2, 0.0, 60.0)]);
+        // 空会话区 → 没有页签、内容宽 0（滚动范围自然为 0）。
+        let g = strip_geom(&[], m);
+        assert!(g.spans.is_empty());
+        assert_eq!(g.content_w, 0.0);
+    }
+
+    /// 滚动跟随：当前页签必须留在视口里；已经装得下时不得乱动。
+    #[test]
+    fn offset_to_show_keeps_active_tab_visible() {
+        // 视口 100、内容 300 → 偏移范围 [0, 200]。
+        let f = |off, x, w| offset_to_show(off, 100.0, 300.0, x, w);
+        // 已经可见 → 不动。
+        assert_eq!(f(50.0, 60.0, 60.0), 50.0);
+        // 在左边之外 → 贴左（当前页签紧跟左缘）。
+        assert_eq!(f(150.0, 40.0, 60.0), 40.0);
+        // 右缘出界 → 右缘贴视口右缘（180 + 60 - 100）。
+        assert_eq!(f(10.0, 180.0, 60.0), 140.0);
+        // 越界的旧偏移先夹进范围再判断（页签被关掉后偏移可能超界）：夹到 200 后
+        // 当前页签落在左边之外 → 贴它的左缘（可见性优先）。
+        assert_eq!(f(9999.0, 60.0, 60.0), 60.0);
+        // 负偏移先夹到 0；右缘仍超界时只能贴到最大偏移（末尾那点露不全是
+        // 内容比视口只多一点的必然结果，不许给出越界偏移）。
+        assert_eq!(f(-50.0, 250.0, 60.0), 200.0);
+        // 内容比视口窄 → 无处可滚，恒为 0。
+        assert_eq!(offset_to_show(80.0, 100.0, 60.0, 0.0, 60.0), 0.0);
+        // 单个页签比视口还宽 → 贴左（前缀可见），不许算出越界偏移。
+        assert_eq!(f(100.0, 0.0, 300.0), 0.0);
+    }
+
+    #[test]
+fn restore_indices_skip_exited_and_settings() {
         use TabKind::*;
-        // 恢复数组 = [Home, B, Settings, D]（A 已退出不恢复）。
-        let kinds = [Home, Gone, Alive, Settings, Alive];
-        assert_eq!(restore_coords(&kinds, 4), (3, 2)); // D → 3
-        assert_eq!(restore_coords(&kinds, 2), (1, 2)); // B → 1
-        assert_eq!(restore_coords(&kinds, 3), (2, 2)); // Settings 自身 → 2
-        assert_eq!(restore_coords(&kinds, 1), (1, 2)); // 已退出 → 邻位
-        assert_eq!(restore_coords(&kinds, 0), (0, 2)); // Home → 0
-        // 无设置页签：坐标 = Home + 存活会话序。
+        // settings_pos 恒为 1：设置页签固定插在首页之后（位置不再持久化）。
+        // 恢复数组 = [Home, Settings, B, D]（A 已退出不恢复）。
+        let kinds = [Home, Settings, Gone, Alive, Alive];
+        assert_eq!(restore_coords(&kinds, 3), (2, 1)); // B → 2
+        assert_eq!(restore_coords(&kinds, 4), (3, 1)); // D → 3
+assert_eq!(restore_coords(&kinds, 1), (1, 1)); // Settings 自身 → 1
+        assert_eq!(restore_coords(&kinds, 2), (2, 1)); // 已退出 → 邻位（正好是 B）
+        assert_eq!(restore_coords(&kinds, 0), (0, 1)); // Home → 0
+        // 无设置页签：坐标 = Home + 存活会话序（不因没设置而错位）。
         let kinds = [Home, Alive, Alive];
         assert_eq!(restore_coords(&kinds, 2), (2, 1));
-        // 设置页签排在会话前：插入后会话右移一格。
-        let kinds = [Home, Settings, Alive];
-        assert_eq!(restore_coords(&kinds, 2), (2, 1));
         assert_eq!(restore_coords(&kinds, 1), (1, 1));
+        // 旧配置里设置页签夹在会话中间（拖动过的老状态）：激活会话仍要落在它自己
+        // 上——会话一律排在固定的设置页签之后。
+        let kinds = [Home, Alive, Settings, Alive];
+        assert_eq!(restore_coords(&kinds, 1), (2, 1));
+        assert_eq!(restore_coords(&kinds, 3), (3, 1));
+        assert_eq!(restore_coords(&kinds, 2), (1, 1));
     }
 }
 
@@ -8792,7 +9039,7 @@ mod update_tests {
         let probes = tag_probes(spec.repo);
         println!("tag 源数 = {}（池 {} 个）", probes.len(), probes.iter().filter(|p| p.pool).count());
 
-        let mut tag = String::from(match spec.id {
+        let tag = String::from(match spec.id {
             "pi" => "v0.99.2",
             _ => "v1.18.34",
         });
@@ -9672,5 +9919,336 @@ mod update_tests {
         // 用户自装内容保留
         assert!(inst.join("node_modules/keep.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 替换链路（install_update）的真机验证。`cargo test -- --ignored live_install_ --nocapture`
+///
+/// 为什么必须真机：`install_update` 的每条分支都踩 Windows 的文件语义，而单测里
+/// 一个都造不出来——
+///  - **运行映像禁止覆盖写、却允许 rename**（unlock_exe 能腾出正式名全靠这条），
+///    std 的 `File::open` 句柄（带 FILE_SHARE_DELETE）模拟不出来，只能真起一个进程；
+///  - **独占句柄挡住 rename 源**（Defender 扫 .new 的等效场景），只能用
+///    `share_mode(0)` 真锁；
+///  - **回滚要 20s 重试窗口耗尽才触发**，也造不出来。
+/// 沙箱全在 target/live_install/ 下，不碰真实安装目录；唯一例外是
+/// `live_install_into_real_path`，需显式给环境变量才动真文件（见该用例）。
+#[cfg(all(test, windows))]
+mod live_install_tests {
+    use super::{install_update, looks_like_exe, InstallOutcome};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// 每例一个独立沙箱（跑之前清空，避免上一轮的残留把结论带偏）。
+    fn sandbox(name: &str) -> PathBuf {
+        let root = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_owned()))
+            .unwrap_or_else(std::env::temp_dir)
+            .join("live_install");
+        let dir = root.join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 「刚下载好的 .new」夹具：测试二进制自身就是一枚 10MB+ 的合法 exe（MZ+PE
+    /// 头齐全），不必造假字节——体积门、e_lfanew 对齐这些只有真产物才有意义。
+    /// 文件名照生产格式 `{资产名}.{指纹}.new`，顺手验证指纹路径没被写坏。
+    fn fresh_new(dir: &Path, fp: &str) -> PathBuf {
+        let dst = dir.join(format!("tui-project-manager.exe.{fp}.new"));
+        std::fs::copy(std::env::current_exe().unwrap(), &dst).unwrap();
+        dst
+    }
+
+    /// 内容指纹（fnv1a）：只用于「是不是同一个文件」的相等判断，不做安全用途。
+    fn fnv(p: &Path) -> String {
+        use std::io::Read;
+        let mut f = std::fs::File::open(p).unwrap();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            for b in &buf[..n] {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        format!("{h:016x}（{} 字节）", std::fs::metadata(p).unwrap().len())
+    }
+
+    /// 收集 sink 消息（生产里是状态栏通道），断言文案与实际分支对得上。
+    struct Msgs(Mutex<Vec<String>>);
+    impl Msgs {
+        fn new() -> Self {
+            Msgs(Mutex::new(Vec::new()))
+        }
+        fn push(&self, m: &str) {
+            println!("  状态栏: {m}");
+            self.0.lock().unwrap().push(m.to_owned());
+        }
+        fn joined(&self) -> String {
+            self.0.lock().unwrap().join(" | ")
+        }
+    }
+
+    /// 把沙箱里那枚 exe 变成「另一个正在运行的实例」：ping 的副本 + `-t` 长跑。
+    /// 这样正式名就是一个真·运行映像，覆盖写必被拒、rename 却允许——与生产里
+    /// 「用户手滑开了第二个实例」的情形同构。
+    fn spawn_running_instance(exe: &Path) -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new(exe);
+        c.args(["-t", "127.0.0.1"]);
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW，测试别往桌面弹黑窗
+        let child = c.spawn().expect("起「另一个实例」失败");
+        std::thread::sleep(std::time::Duration::from_millis(600)); // 等映像映射完成
+        child
+    }
+
+    /// 快路径：正式名空闲 → 一次 rename 就装上（自更新最常见的分支）。
+    #[test]
+    #[ignore = "要真动文件，手动跑"]
+    fn live_install_fast_path() {
+        let dir = sandbox("fast_path");
+        let final_path = dir.join("tui-project-manager.exe");
+        let old_path = dir.join("tui-project-manager.exe.old");
+        let new_file = fresh_new(&dir, "fastpath");
+        std::fs::copy(std::env::current_exe().unwrap(), &final_path).unwrap();
+        let new_fp = fnv(&new_file);
+
+        let msgs = Msgs::new();
+        let outcome = install_update(&new_file, &final_path, &old_path, &|m| msgs.push(m));
+
+        assert!(matches!(outcome, InstallOutcome::Done), "快路径应装上");
+        assert_eq!(fnv(&final_path), new_fp, "正式名必须是新版本");
+        assert!(!new_file.exists(), ".new 应被 rename 走，不留残骸");
+        println!("正式名 = {}", fnv(&final_path));
+    }
+
+    /// 慢路径：正式名是**另一个正在运行的实例**。真机实测（Windows 11）：覆盖写 /
+    /// 覆盖 rename 打在运行映像上是 os error 5「拒绝访问」且**永不**释放，但把运行
+    /// 映像 rename 走是放行的 → 腾名 → 放入 .new。这条分支以前只在注释里被论证过，
+    /// 从没在真机上跑通过。
+    ///
+    /// 别断言「正在挪开旧版本」这类进度文案：它只在 rename **失败、等系统释放**时
+    /// 才发（report_every），慢路径一次成功时是静默的。走没走慢路径的真指纹是
+    /// `.old` 里躺着旧映像的字节。
+    #[test]
+    #[ignore = "要真动文件 + 起子进程，手动跑"]
+    fn live_install_slow_path_when_final_is_running_image() {
+        let dir = sandbox("slow_path");
+        let final_path = dir.join("tui-project-manager.exe");
+        let old_path = dir.join("tui-project-manager.exe.old");
+        let new_file = fresh_new(&dir, "slowpath");
+        // 正式名 = ping 的副本并真的跑起来。不用真实应用 exe：那 14MB 的东西会
+        // 带出窗口/子进程把沙箱搅浑，而这里要的只是「运行映像」这一个文件语义。
+        std::fs::copy(r"C:\Windows\System32\ping.exe", &final_path).unwrap();
+        // 生产流程（start_download）会先把正式名 copy 成 .old。这里放一份**陈旧**
+        // .old：慢路径必须先清掉它，否则 rename 目标被占、白耗 8s 窗口。
+        std::fs::write(&old_path, b"stale backup from last time").unwrap();
+        let old_fp = fnv(&final_path);
+        let new_fp = fnv(&new_file);
+        let mut child = spawn_running_instance(&final_path);
+
+        let msgs = Msgs::new();
+        let outcome = install_update(&new_file, &final_path, &old_path, &|m| msgs.push(m));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(matches!(outcome, InstallOutcome::Done), "慢路径也应装上");
+        assert_eq!(fnv(&final_path), new_fp, "腾出的正式名要放新版本");
+        assert_eq!(fnv(&old_path), old_fp, "旧映像应完整挪进 .old（兼备份）——这就是慢路径的真指纹");
+        assert!(!new_file.exists());
+        println!("状态栏: {}", msgs.joined());
+    }
+
+    /// 回滚：`.new` 被独占句柄占住（Defender 实时扫描的等效场景）→ 快路径与最后
+    /// 一步 rename 全部失败 → 必须把 .old 挪回正式名，绝不能让用户落到
+    /// 「正式名没了、只剩 .running」的空档。
+    ///
+    /// 锁必须在 install_update 跑起来**之后**才拿：step 0 的 looks_like_exe 要
+    /// 读 .new，抢在它前面锁会被判成损坏产物（BadDownload），测的就不是回滚了。
+    #[test]
+    #[ignore = "要真动文件 + 约 35s 重试窗口，手动跑"]
+    fn live_install_rolls_back_when_new_file_is_locked() {
+        let dir = sandbox("rollback");
+        let final_path = dir.join("tui-project-manager.exe");
+        let old_path = dir.join("tui-project-manager.exe.old");
+        let new_file = fresh_new(&dir, "rollback");
+        std::fs::copy(std::env::current_exe().unwrap(), &final_path).unwrap();
+        let old_fp = fnv(&final_path);
+        let new_fp = fnv(&new_file);
+
+        // 锁形态很讲究：只放行**读**（share_mode = FILE_SHARE_READ），不放行
+        // delete/write —— 与杀软扫描句柄同构。真用 share_mode(0)（谁都不许碰）
+        // 会把 step 0 的 looks_like_exe 也挡掉，结果判成 BadDownload，测的就不是
+        // 回滚了；这条测试要的正是「读得了、改不动」。
+        const FILE_SHARE_READ: u32 = 0x1;
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&new_file)
+            .expect("按杀软形态打开 .new 失败");
+        assert!(looks_like_exe(&new_file), "锁只挡改名，读仍应放行");
+
+        let msgs = Msgs::new();
+        let outcome = install_update(&new_file, &final_path, &old_path, &|m| msgs.push(m));
+        drop(holder); // 先放锁，再断言
+
+        assert!(
+            matches!(outcome, InstallOutcome::Occupied),
+            "被占住只能报 Occupied 等用户重试"
+        );
+        assert_eq!(fnv(&final_path), old_fp, "回滚后正式名必须还是旧版且可用");
+        assert_eq!(fnv(&new_file), new_fp, ".new 要保留供稍后重试，不能删");
+        let log = msgs.joined();
+        assert!(log.contains("已回滚保留旧版本"), "文案应说明已回滚：{log}");
+        assert!(log.contains("持续被其他进程占用"), "应点名 .new 被占：{log}");
+        println!("回滚后正式名 = {}", fnv(&final_path));
+    }
+
+    /// 坏产物：镜像返错误页 / 截断文件 → BadDownload，当场删掉（否则残留会被
+    /// 下一轮 `-C -` 续传拼成更坏的 exe），正式名分毫不动。
+    #[test]
+    #[ignore = "要真动文件，手动跑"]
+    fn live_install_rejects_corrupt_new() {
+        let dir = sandbox("corrupt");
+        let final_path = dir.join("tui-project-manager.exe");
+        let old_path = dir.join("tui-project-manager.exe.old");
+        std::fs::copy(std::env::current_exe().unwrap(), &final_path).unwrap();
+        let old_fp = fnv(&final_path);
+        // 体积过得去、头不对：镜像的错误页就是这样（几百 KB 的 HTML）。
+        let junk = dir.join("tui-project-manager.exe.corrupt.new");
+        std::fs::write(&junk, vec![b'<'; 512 * 1024]).unwrap();
+
+        let msgs = Msgs::new();
+        let outcome = install_update(&junk, &final_path, &old_path, &|m| msgs.push(m));
+
+        assert!(matches!(outcome, InstallOutcome::BadDownload));
+        assert!(!junk.exists(), "坏产物必须当场删掉，不能被续传拼坏");
+        assert_eq!(fnv(&final_path), old_fp, "正式名不受影响");
+        assert!(msgs.joined().contains("已自动换源重新下载"));
+    }
+
+    /// 端到端：真联网跑生产用的 `download_update`（当前代码里的下载链），把产物
+    /// 装进沙箱的正式名。覆盖「tag → 资产直链 → 分片下载 → 校验 → 替换」整条，
+    /// 且完全不动真实安装目录。
+    #[test]
+    #[ignore = "要真联网 + 真动文件，手动跑"]
+    fn live_self_update_download_then_install() {
+        use super::{download_update, fetch_latest_tag, SELF_REPO};
+        let dir = sandbox("e2e");
+        println!("--- 1) fetch_latest_tag({SELF_REPO}) ---");
+        let tag = fetch_latest_tag(SELF_REPO).expect("取最新 tag 失败");
+
+        println!("--- 2) download_update({tag}) ---");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let printer = std::thread::spawn(move || {
+            let mut last = 0u64;
+            while let Ok((done, _total)) = rx.recv() {
+                if done / (1 << 20) != last / (1 << 20) {
+                    last = done;
+                    println!("  进度 {}.{} MB", done >> 20, (done & 0xFF_FFFF) >> 16);
+                }
+            }
+        });
+        let new_file = PathBuf::from(download_update(&tag, &dir, tx, &cancel).expect("下载失败"));
+        let _ = printer.join().unwrap();
+
+        println!("  产物 = {} → {}", new_file.display(), fnv(&new_file));
+        // 留一份产物：真实目录的替换验证（live_install_into_real_path）要拿它当
+        // .new，而 install_update 会把 .new rename 走，不留就白下一趟。
+        let kept = dir.parent().unwrap().join("downloaded_release.exe");
+        std::fs::copy(&new_file, &kept).unwrap();
+        println!("  产物留档 = {}", kept.display());
+        assert!(looks_like_exe(&new_file), "下载产物必须是合法 exe");
+        assert!(
+            new_file.to_string_lossy().ends_with(".new"),
+            "产物名必须是 .new 续传分片，实际 {}",
+            new_file.display()
+        );
+        // 装反字段的历史坑：url 字段拿到纯文件名、name 字段拿到整条 URL，于是续传
+        // 分片名长成「…/https://github.com/….exe.<fp>.c0.new」——带 '/' 与 ':'，
+        // Windows 开不出这个文件（curl error 23，分片恒 0 字节 → 进度永远卡 0）。
+        // 只查文件名：整条路径本来就带盘符冒号。
+        let fname = new_file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !fname.contains('/') && !fname.contains('\\') && !fname.contains(':'),
+            "产物文件名不得含路径分隔符/盘符冒号，实际 {fname}"
+        );
+        assert!(!fname.contains("github.com"), "产物文件名不得含 URL 片段，实际 {fname}");
+
+        println!("--- 3) install_update 装进沙箱正式名 ---");
+        let final_path = dir.join("tui-project-manager.exe");
+        let old_path = dir.join("tui-project-manager.exe.old");
+        std::fs::copy(std::env::current_exe().unwrap(), &final_path).unwrap();
+        let new_fp = fnv(&new_file);
+        let msgs = Msgs::new();
+        let outcome = install_update(&new_file, &final_path, &old_path, &|m| msgs.push(m));
+        assert!(matches!(outcome, InstallOutcome::Done));
+        assert_eq!(fnv(&final_path), new_fp, "正式名必须是刚下的那个 exe");
+        println!("沙箱正式名 = {}", fnv(&final_path));
+    }
+
+    /// 对**真实安装目录**跑一遍替换（默认跳过）。要动真文件必须显式给两个环境
+    /// 变量，且会在同目录留一份带时间戳的备份：
+    ///   TUIPM_LIVE_INSTALL_FINAL=D:\agent\tui-project-manager.exe \
+    ///   TUIPM_LIVE_INSTALL_NEW=<刚下载的 exe> \
+    ///   cargo test --release -- --ignored live_install_into_real_path --nocapture
+    /// 走的是生产同一函数（同样先 copy 正式名成 .old），失败自动回滚。
+    #[test]
+    #[ignore = "要真动真实安装目录，手动跑并显式给环境变量"]
+    fn live_install_into_real_path() {
+        let (Ok(final_env), Ok(new_env)) = (
+            std::env::var("TUIPM_LIVE_INSTALL_FINAL"),
+            std::env::var("TUIPM_LIVE_INSTALL_NEW"),
+        ) else {
+            println!("跳过：未给 TUIPM_LIVE_INSTALL_FINAL / TUIPM_LIVE_INSTALL_NEW");
+            return;
+        };
+        let final_path = PathBuf::from(final_env);
+        let new_file = PathBuf::from(new_env);
+        assert!(looks_like_exe(&new_file), "指定的 .new 不是合法 exe");
+        let old_path = final_path.with_extension("exe.old");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let backup = final_path.with_extension(format!("exe.bak{stamp}"));
+        // 生产流程（start_download）同款备份，且多留一份带时间戳的（.old 会被
+        // 下一次更新覆盖，验证期间不动它）。
+        std::fs::copy(&final_path, &old_path).unwrap();
+        std::fs::copy(&final_path, &backup).unwrap();
+        println!("正式名 {} → {}", fnv(&final_path), fnv(&backup));
+        let new_fp = fnv(&new_file);
+
+        let msgs = Msgs::new();
+        let outcome = install_update(&new_file, &final_path, &old_path, &|m| msgs.push(m));
+
+        match outcome {
+            InstallOutcome::Done => {
+                assert_eq!(fnv(&final_path), new_fp);
+                println!(
+                    "装上成功，正式名 = {}；旧版备份 {}",
+                    fnv(&final_path),
+                    backup.display()
+                );
+            }
+            _ => {
+                // 没装上：正式名必须仍是旧版（回滚），否则从 backup 手工恢复。
+                assert_eq!(
+                    fnv(&final_path),
+                    fnv(&backup),
+                    "未装上且正式名不是旧版，请用 {} 手工恢复",
+                    backup.display()
+                );
+                println!("未装上，正式名仍是旧版（已回滚）：{}", msgs.joined());
+            }
+        }
     }
 }

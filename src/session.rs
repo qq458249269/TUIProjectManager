@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[cfg(windows)]
@@ -133,10 +133,6 @@ pub struct Session {
     pub done_since_ms: Arc<AtomicU64>,
     /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
     pub last_clipboard_seq: Option<std::num::NonZeroU32>,
-    /// agent 权威运行态（runstate::RunState::to_slot，0=Unknown）。
-    /// pi/opencode 有自己的状态接口（会话 JSONL / DB），比自己「3s 无输出」
-    /// 猜得准；未知时 0，UI 照旧走输出启发式（见 runstate.rs）。
-    pub run_state: Arc<std::sync::atomic::AtomicU8>,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     /// 含转义/动画块：页签 🔄 图标用——动画重绘也算在跑（spinner/状态栏
     /// 刷新保持旋转）。
@@ -178,6 +174,21 @@ pub struct Session {
     /// (解析代数, 行, 列)。代数没变就直接复用，
     /// 免去每帧 rows×cols 的全屏网格扫描。offset 恒为 0。
     pub caret_scan: Option<(u64, Line, Column)>,
+/// 最近一块**纯动画**输出（转义重绘 / spinner / 时钟 / 进度条）的绝对时间戳。
+    /// 只由动画块刷新，0 = 从未见过动画输出。
+    /// 用途：屏幕启发式里唯一能分开「还在思考/跑命令」与「真停了」的分量——
+    /// 动画在高频来（spinner ~80-150ms 一帧）说明界面还在动，不能判完成；
+    /// 而空闲时的光标闪烁是稀疏的。完成判定见 app.rs 的 ANIM_BUSY_MS。
+    pub last_anim_ms: Arc<AtomicU64>,
+    /// 「运行/完成」状态快照的上次重算时刻（毫秒）。门限 STATE_CHECK_MS（1s）：
+    /// 每个页签最快一秒重算一次，其余帧复用快照——降低检测频率，也让图标不再
+    /// 亚秒抖动（🔄↔✅ 来回闪）。
+    pub state_check_ms: Arc<AtomicU64>,
+    /// 状态快照（app.rs 写）：低 2 位 = 图标码，高 2 位 = 判定时的 exited /
+    /// loading。渲染与「任务完成」通知共用这一份，保证两者不各判各的。
+    pub state_icon: Arc<AtomicU8>,
+    /// 状态快照（app.rs 写）：是否处于「完成态」（通知判据用，与图标同源同刻）。
+    pub state_done: Arc<AtomicBool>,
     /// 回显延迟探针：最近一次向 PTY 写入输入字节的毫秒时间戳。
     /// 读取线程据此计算「按键 → 首块回显」延迟（TUIPM_LATENCY_DEBUG=1 打印）。
     pub last_input_ms: Arc<AtomicU64>,
@@ -765,6 +776,11 @@ pub fn spawn(
     let last_real_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     let last_scroll_ms = Arc::new(AtomicU64::new(0));
+    let last_anim_ms = Arc::new(AtomicU64::new(0));
+    // 状态快照：首帧由 app.rs 的 refresh_tab_state 填（门限 1s）。
+    let state_check_ms = Arc::new(AtomicU64::new(0));
+    let state_icon = Arc::new(AtomicU8::new(0));
+    let state_done = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
     let term = Arc::new(RwLock::new(term));
@@ -782,6 +798,7 @@ pub fn spawn(
         let reader_out_bytes = out_bytes.clone();
         let last_output_ms = last_output_ms.clone();
         let reader_last_real_output = last_real_output_ms.clone();
+        let reader_last_anim = last_anim_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
@@ -907,7 +924,12 @@ pub fn spawn(
                         class_bytes += (esc_bytes + printable) as u64;
                         let is_animation = class_bytes == 0
                             || class_esc as f64 / class_bytes as f64 > 0.5;
-                        if !is_animation {
+                        if is_animation {
+                            // 纯动画块（转义重绘/spinner/时钟）：刷「画面还在动」
+                            // 时间戳。高频来 ⇒ 还在思考/跑命令，完成判定据此否决
+                            // （空闲时的光标闪烁稀疏，不会误否决，见 ANIM_BUSY_MS）。
+                            reader_last_anim.store(now_ms, Ordering::Relaxed);
+                        } else {
                             // 实质内容块：刷「最近实质内容」时间戳——完成/通知判据
                             // 只认它（周期转义重绘不产生实质内容 → 永不误判完成）。
                             reader_last_real_output.store(now_ms, Ordering::Relaxed);
@@ -1102,9 +1124,6 @@ pub fn spawn(
         });
     }
 
-    // 权威运行态槽位（runstate 模块填充，见下方 start_tracking）。
-    let run_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
-
     let session = Session {
         title: title.to_string(),
         dir: dir.to_string(),
@@ -1129,7 +1148,6 @@ pub fn spawn(
         last_reap_ms: Arc::new(AtomicU64::new(0)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
         last_clipboard_seq: None,
-        run_state: run_state.clone(),
         output_count,
         out_bytes,
         last_output_ms,
@@ -1143,6 +1161,10 @@ pub fn spawn(
         gpu: None,
         last_input_ms,
         last_scroll_ms,
+        last_anim_ms,
+        state_check_ms,
+        state_icon,
+        state_done,
         drag_press_pos: None,
         click_press_pos: None,
         mouse_press_pending: None,
@@ -1155,9 +1177,6 @@ pub fn spawn(
         last_snapshot_offset: 0,
         loading,
     };
-    // pi / opencode 的权威运行态跟踪：非 agent 命令直接返回（槽位恒 0 = 走
-    // 输出启发式）。线程随会话退出（exited 置位）自动结束。
-    crate::runstate::start_tracking(tui_command, &dir, run_state, exited);
     Ok(session)
 }
 impl Session {

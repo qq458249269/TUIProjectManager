@@ -2,7 +2,6 @@
 
 mod app;
 mod config;
-mod runstate;
 mod session;
 mod term_gl;
 mod terminal;

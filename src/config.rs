@@ -187,7 +187,7 @@ pub struct TabsState {
     /// 上次退出时设置页签是否打开。
     #[serde(default)]
     pub settings_open: bool,
-    /// 设置页签在页签栏中的位置（0 = 首页）。
+/// 设置页签在页签栏中的位置。**已固定为 1（首页之后）**，字段保留只为读旧配置。
     #[serde(default)]
     pub settings_pos: usize,
 }
