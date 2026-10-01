@@ -362,14 +362,34 @@ fn oc_state(dir: &str) -> Option<RunState> {
     st
 }
 
+/// Windows `CREATE_NO_WINDOW`：不分配控制台窗口。
+///
+/// **必须带**：本程序是 `#![windows_subsystem = "windows"]` 的 GUI 进程，自己
+/// 没有控制台。直接 spawn 控制台子进程（`opencode.exe` 就是）会**给它新分配
+/// 一个控制台窗口并抢焦点**——表现就是开着 opencode 页签时每隔 2.5s（缓存期）
+/// 在前台闪一个「opencode」黑窗。
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 构造 `opencode db` 查询命令（抽出来只为能单测钉住 creation flags）。
+///
+/// 窗口标志之外，stdin/stdout/stderr 全由 `output()` 接管道，子进程也不会
+/// 去碰本进程的（不存在的）控制台。
+fn oc_db_cmd(exe: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["db", OC_SQL, "--format", "json"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// 跑一次查询（home 目录为 cwd：opencode 的库是全局的，别被项目目录带偏）。
 fn oc_query(dir: &str) -> Option<RunState> {
     let exe = opencode_exe()?;
-    let out = std::process::Command::new(exe)
-        .args(["db", OC_SQL, "--format", "json"])
-        .current_dir(home_dir())
-        .output()
-        .ok()?;
+    let out = oc_db_cmd(&exe).current_dir(home_dir()).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -585,6 +605,44 @@ mod tests {
             cache_hit(&found, 600),
             Some(Some(PathBuf::from("opencode.exe")))
         );
+    }
+
+/// 回归锁：状态查询**必须无窗口跑**。本程序是 GUI 子系统进程，自己没控制台，
+    /// spawn 控制台子进程会新分配控制台并抢焦点 → 开 opencode 页签时每隔 2.5s
+    /// 在前台闪一个「opencode」黑窗。
+    ///
+    /// 参数与标志两层都锁。标志只能拿源码断言：`Command` 在 stable 上**没有
+    /// `get_creation_flags` 这种读取口**，设完就看不回来，唯一能回归锁住
+    /// 「真的在 spawn 处钉上了」的办法就是把本文件源码当测试数据（自引用
+    /// `include_str!`，改动即重编）。
+    #[test]
+    fn oc_query_runs_windowless_with_exact_args() {
+        let c = oc_db_cmd(std::path::Path::new("opencode.exe"));
+        let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+assert_eq!(args.len(), 4, "只应有 db / SQL / --format / json 四段");
+        assert_eq!(args[0], "db");
+        assert_eq!(args[1], OC_SQL);
+        assert_eq!(&args[2..], &["--format".to_string(), "json".to_string()]);
+        #[cfg(windows)]
+        {
+            let src = include_str!("runstate.rs");
+            let body = src
+                .split_once("fn oc_db_cmd")
+                .and_then(|(_, r)| r.split_once("fn oc_query"))
+                .map(|(f, _)| f)
+                .expect("得找得到 oc_db_cmd");
+            assert!(
+                body.contains("creation_flags(CREATE_NO_WINDOW)"),
+                "spawn 处必须钉 CREATE_NO_WINDOW，否则每 2.5s 在前台闪一次黑窗"
+            );
+        }
+    }
+
+    /// 标志值本身锁死（0x0800_0000 = CREATE_NO_WINDOW）。
+    #[test]
+    fn create_no_window_value_is_locked() {
+        #[cfg(windows)]
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
     }
 
     /// 状态槽位往返；0 必须回到 Unknown（触发回退）。
