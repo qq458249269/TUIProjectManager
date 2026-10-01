@@ -987,7 +987,7 @@ fn download_update(
     // 旧实现 API 优先：限流/被墙时每次下载都先撞 API 失败（HTTP 22），错误
     // 汇总里「源① API」长期打头误导；现在 API 降为最低优先级，curl 带 -f
     // 失败时透出真实报错，HTML 兜底成功则照常下载。
-    let mut exe_info: Option<(String, String, u64)> = None; // (url, 文件名, 字节数)
+    let mut exe_info: Option<ExeAsset> = None;
     let mut api_err: Option<String> = None;
     // 源②主路径：取 expanded_assets 片段（标签页初始 HTML 的资产列表是
     // lazy-load 的 include-fragment，一个下载链接都没有，旧实现据此判定
@@ -997,7 +997,10 @@ fn download_update(
     // ponytail: 要百分比进度可另发一次 HEAD 取 Content-Length，或 API 仅补 size。
     match fetch_self_exe_asset(tag) {
         Ok((src, info)) => {
-            log_update(&format!("下载 源② HTML 命中（{src}）：{}", info.1));
+            log_update(&format!(
+                "下载 源② HTML 命中（{src}）：{} ← {}",
+                info.url, info.name
+            ));
             exe_info = Some(info);
         }
         Err(e) => log_update(&format!("下载 源② HTML 全部源失败（转 API/直拼）：{e}")),
@@ -1029,11 +1032,11 @@ fn download_update(
                             continue;
                         }
                         let Some(url) = a["browser_download_url"].as_str() else { continue };
-                        exe_info = Some((
-                            url.to_string(),
-                            name.to_string(),
-                            a["size"].as_u64().unwrap_or(0),
-                        ));
+                        exe_info = Some(ExeAsset {
+                            url: url.to_string(),
+                            name: name.to_string(),
+                            size: a["size"].as_u64().unwrap_or(0),
+                        });
                         break;
                     }
                 }
@@ -1066,7 +1069,7 @@ fn download_update(
     // TUIProjectManager.exe。两个候选都试，不依赖任何 API/页面解析。
     // HTML 已取的 info（真实文件名）优先。
     let (fallback, total) = match exe_info {
-        Some((url, name, size)) => (vec![(url, name)], size),
+        Some(a) => (vec![(a.url, a.name)], a.size),
         None => (
             ["tui-project-manager.exe", "TUIProjectManager.exe"]
                 .iter()
@@ -1148,14 +1151,15 @@ fn download_update(
 //  3. “谁先回谁赢”让一个答非所问 / 报错页的源最容易被当赢家。
 // 现在一条一条来：请求与带宽都独占，第一个成功的即胜出。
 const GH_MIRRORS: &[&str] = &[
-    "https://gh-proxy.com/",   // 热门前缀代理
-    "https://gh-proxy.net/",   // 同系备用
-    "https://ghps.cc/",        // 极速代理
-    "https://ghfast.top/",     // gh-proxy 系，状态多变，池内逐个试时自动甄别
-    "https://mirror.ghproxy.com/", // ghproxy 系老牌
-    "https://ghproxy.net/",    // ghproxy 系
-    "https://gh.llkk.cc/",     // 备用代理
-    "https://github.moeyy.xyz/", // moeyy 加速
+    "https://gh-proxy.com/",   // 热门前缀代理（实测 3.8MB/s，最快）
+    "https://ghfast.top/",     // gh-proxy 系，同量级（实测 3.8MB/s）
+    "https://gh-proxy.net/",   // 同系备用：答 200 但常常是几百字节的报错页（靠产物校验剔掉）
+    "https://ghps.cc/",        // 极速代理：会 302 到 56yy.com 的 HTML 页（同上，靠校验剔掉）
+    "https://ghproxy.net/",    // ghproxy 系：能用但慢（实测 ~0.5MB/s，13MB 要 25s）
+    // 已实测死链、已从池里移除（每条要白占一份 connect 超时，全挂时纯浪费 15s）：
+    //   https://mirror.ghproxy.com/   连接超时 5s（老 ghproxy 系早已停运）
+    //   https://gh.llkk.cc/           Recv failure: Connection was reset
+    //   https://github.moeyy.xyz/     连接超时 5s
 ];
 
 /// 下载分片的指纹（FNV-1a 64 → 8 位十六进制）：分片文件名里必须带上它。
@@ -1788,23 +1792,45 @@ fn assets_from_html(html: &str, repo: &str, tag: &str) -> Vec<(String, String)> 
     out
 }
 
+/// 一个待下载的 exe 资产。**用字段名而不是元组位置**。
+///
+/// 事故：曾经这里是 `Option<(String, String, u64)>` 且约定为「(文件名, URL, 字节数)」，
+/// 而 `download_update` 那边按「(URL, 文件名, 字节数)」解构——两边都没写错，合起来
+/// 正好**反了**。后果是自更新 100% 失败，而且症状极具迷惑性：
+///  - `url` 字段拿到的是纯文件名 → 每条候选链都请求 `https://gh-proxy.com/tui-project-manager.exe`
+///    → 10 条链全 404/403，看起来像「镜像全挂了」；
+///  - `name` 字段拿到的是整条 URL → 临时分片名变成
+///    `…/https://github.com/…/tui-project-manager.exe.<fp>.c0.new`（含 `:` 与 `/`），
+///    Windows 上开不出这个文件 → `curl: (23) client returned ERROR on write`，
+///    **进度永远停在 0**，正是用户看到的「卡在 0 然后失败」。
+///  工具下载（pi/opencode）走 API 资产表那套，不经过这里，所以它们一直很快——
+///  更显得「只有自更新坏了」。
+struct ExeAsset {
+    /// 可直接请求的完整 URL（自更新恒为 github.com release 直链，镜像由调用方拼前缀）。
+    url: String,
+    /// 纯文件名（**必须能当路径用**：不得含 `:` `/` 等分隔符），产物落盘与校验都用它。
+    name: String,
+    /// 已知总字节数（0 = 未知，例如 HTML 源不带长度）。
+    size: u64,
+}
+
 /// 从 GitHub Release 的资产列表 HTML 里找 exe 下载直链（API 限流/被墙时兜底）。
-/// 返回 (exe 文件名, 下载 URL, 0)；HTML 不含字节数，进度按已下载字节算。
-fn exe_asset_from_html(html: &str, repo: &str, tag: &str) -> Option<(String, String, u64)> {
+/// 返回 `ExeAsset { size: 0 }`（HTML 不含字节数）；没有 exe 直链时 None。
+fn exe_asset_from_html(html: &str, repo: &str, tag: &str) -> Option<ExeAsset> {
     assets_from_html(html, repo, tag)
         .into_iter()
         .find(|(_, name)| name.ends_with(".exe"))
-        .map(|(name, url)| (name, url, 0))
+        .map(|(name, url)| ExeAsset { url, name, size: 0 })
 }
 
 /// 自更新的 exe 直链探查：与检查更新（tag）、工具下载（资产表）完全同一套
 /// 镜像源逻辑——GH_MIRRORS 前缀镜像 × 8 → 直连 → PS WinHTTP **逐个尝试**，
-/// 先成功者为准。
+/// 先成功者为准。返回 (胜出源名, `ExeAsset`)。
 ///
 /// 页面选取：优先 `releases/expanded_assets/{tag}`（真带下载链接的那份），
 /// 标签页只挂直连/PS（部分镜像会把 include-fragment 一起渲染出来，值得一试，
 /// 但没必要 ×8 镜像重复拉同一页）。
-fn fetch_self_exe_asset(tag: &str) -> Result<(String, (String, String, u64)), String> {
+fn fetch_self_exe_asset(tag: &str) -> Result<(String, ExeAsset), String> {
     let frag = format!("{SELF_REPO_PAGE}/releases/expanded_assets/{tag}");
     let page = format!("{SELF_REPO_PAGE}/releases/tag/{tag}");
     let mut sources: Vec<Probe> = Vec::new();
@@ -8881,15 +8907,34 @@ mod update_tests {
     #[test]
     fn html_exe_extracted() {
         let html = r#"<a href="/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe">TUIProjectManager.exe</a>"#;
-        let (name, url, _size) =
+        let a =
             exe_asset_from_html(html, "qq458249269/TUIProjectManager", "v2025.06.30.0001").unwrap();
-        assert_eq!(name, "TUIProjectManager.exe");
+        assert_eq!(a.name, "TUIProjectManager.exe");
         // URL 必须带 owner/repo：旧实现拼的是 github.com/releases/download/…，
         // 少了这两段，HTML 源拿到的直链 100% 是死链。
         assert_eq!(
-            url,
+            a.url,
             "https://github.com/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe"
         );
+    }
+
+    /// **url 与 name 不得装反**（历史事故：自更新拿文件名当 URL 请求，10 条链全 404；
+    /// 又拿整条 URL 当文件名，Windows 开不出输出文件 → 进度永远 0 + 下载必失败）。
+    /// 这里按 `download_update` 的用法钉住两个字段各自的形状。
+    #[test]
+    fn html_exe_fields_not_swapped() {
+        let html = r#"<a href="/q/q/releases/download/v1/tui-project-manager.exe">x</a>"#;
+        let a = exe_asset_from_html(html, "q/q", "v1").unwrap();
+        assert!(a.url.starts_with("https://github.com/") && a.url.ends_with(".exe"), "url 字段必须是可请求的完整直链，实际 {}", a.url);
+        assert!(!a.url.contains(' '), "url 字段不得是文件名");
+        // name 要能直接当文件名落盘：不得含分隔符 / 盘符冒号。
+        for bad in ['/', '\\', ':', '?', '*', '?', '"', '<', '>', '|'] {
+            assert!(!a.name.contains(bad), "name 字段含路径分隔符 {bad:?}：{}", a.name);
+        }
+        assert!(a.name.ends_with(".exe") && !a.name.contains("github.com"));
+        // 拼镜像前缀后必须仍是「镜像 + 直链」，而不是「镜像 + 文件名」。
+        let chained = candidate_chains(&a.url);
+        assert_eq!(chained[0].url, format!("{}{}", GH_MIRRORS[0], a.url));
     }
 
     #[test]
@@ -8910,9 +8955,9 @@ mod update_tests {
     #[test]
     fn html_query_stripped() {
         let html = r#"<a href="/q/q/releases/download/v1/TUIProjectManager.exe?download=1">x</a>"#;
-        let (name, url, _) = exe_asset_from_html(html, "q/q", "v1").unwrap();
-        assert_eq!(name, "TUIProjectManager.exe");
-        assert!(!url.contains('?'));
+        let a = exe_asset_from_html(html, "q/q", "v1").unwrap();
+        assert_eq!(a.name, "TUIProjectManager.exe");
+        assert!(!a.url.contains('?'));
     }
 
     #[test]
