@@ -78,6 +78,11 @@ const EXE_CACHE_MS: u64 = 60_000;
 /// 读会话文件尾多少字节。末行可能被写了一半，最多也就一行（几 KB）。
 const TAIL_BYTES: u64 = 64 * 1024;
 
+/// [`PI_BUSY_FRESH_MS`]：Busy 判定的时效闸门。会话文件超过这么久没被写过，
+/// 就不认为这一轮还在跑（残留的 toolUse/toolResult 尾记录而已）。
+/// 依据：19189 段真实 Busy 的持续时长 p99.9 = 238s，300s 留足余量。
+const PI_BUSY_FRESH_MS: u64 = 300 * 1000;
+
 // ── agent 识别 ────────────────────────────────────────────────────────────
 
 /// 从启动命令里认出 agent。取**每个 token 的文件名部分**做全等匹配：
@@ -107,6 +112,17 @@ fn detect_kind(cmd: &str) -> Option<AgentKind> {
 }
 
 // ── pi：会话 JSONL 追尾 ──────────────────────────────────────────────────
+
+/// 启动命令里是否含已知 agent（pi / opencode…）。
+///
+/// 供 UI 区分「Unknown 是因为这不是 agent」与「Unknown 是 agent 状态读不出来」：
+/// 后者不能拿输出窗口判运行中——全屏 TUI 空闲时也一直在刷光标/动画，
+/// 3s 输出窗口会被永远顶满 → 终端一个字节新内容都没有，页签却常亮 🔄
+/// （用户报告「pi 没有任何输出但显示的是刷新」）。
+/// 未装 / 没识别 / 读失败仍返回 Unknown，只是 UI 额外知道了「这是个 agent」。
+pub fn is_agent_cmd(cmd: &str) -> bool {
+    detect_kind(cmd).is_some()
+}
 
 /// pi 的项目目录 slug：`D:\AI\TUIProjectManager` → `--D--AI-TUIProjectManager--`
 /// （`:` 和 `\` 各换成 `-`，两端再各包一层 `-`，即 `--` + 内层 + `--`）。
@@ -238,10 +254,18 @@ pub fn pi_state_from_record(line: &str) -> Option<RunState> {
         "toolResult" => Some(RunState::Busy),
         "assistant" => {
             let stop = m.get("stopReason").and_then(|s| s.as_str()).unwrap_or("");
-            if stop == "toolUse" {
-                Some(RunState::Busy)
-            } else {
-                Some(RunState::Idle)
+            match stop {
+                "toolUse" | "tool_call" | "toolCalls" => Some(RunState::Busy),
+                // `aborted` = 用户按 Esc 打断 → 本轮已结束，必须判 Idle。
+                // 若在这里返回 None，pi_state_from_tail 会越过它去看更早的
+                // `assistant/toolUse`，把一个早就收工的会话钉成 Busy → 页签
+                // 永远 🔄（实测末条为 aborted 的会话有 3 个）。
+                "stop" | "end_turn" | "finished" | "complete" | "max_tokens" | "length" | "error" | "aborted" => {
+                    Some(RunState::Idle)
+                }
+                // 未知/空：不能确定是否结束 → 不判定，往前找更早一条确定的状态。
+                // （实测 694 个会话无一落到此分支，纯属版本前向兼容兜底。）
+                _ => None,
             }
         }
         "user" => Some(RunState::Idle),
@@ -270,14 +294,34 @@ fn pi_state_from_tail(text: &str) -> Option<RunState> {
 
 fn pi_state(dir: &str) -> Option<RunState> {
     let path = pi_session_file(dir)?;
-    let len = std::fs::metadata(&path).ok()?.len();
+    let meta = std::fs::metadata(&path).ok()?;
+    let len = meta.len();
     let take = TAIL_BYTES.min(len.max(1));
     let mut f = std::fs::File::open(&path).ok()?;
     use std::io::{Read, Seek};
     f.seek(std::io::SeekFrom::Start(len - take)).ok()?;
     let mut buf = Vec::with_capacity(take as usize);
     f.read_to_end(&mut buf).ok()?;
-    pi_state_from_tail(&String::from_utf8_lossy(&buf))
+    let st = pi_state_from_tail(&String::from_utf8_lossy(&buf))?;
+    // 时效闸门：Busy 必须「此刻仍在发生」才作数。pi 只在一轮起止时落盘会话
+    // 文件，工具运行期间文件不动；实测 19189 段 Busy 里 p99.9 = 238s、
+    // p100 = 1683s，故 300s 内仍可能是真在跑（长 bash / 编译）。
+    // 超过 PI_BUSY_FRESH_MS 文件一动不动 = 这一轮其实早已收工（用户 Ctrl+C、
+    // 关窗、崩溃），尾记录只是没被收尾的残留。此时还报 Busy，页签会在零输出
+    // 情况下永远 🔄——实测末条 Busy 的 63 个会话里 62 个静默超 120s，多半是
+    // 几天前的死会话。降级成 Idle，把判定交回输出窗口/✅。
+    if st == RunState::Busy {
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| crate::now_ms().saturating_sub(d.as_millis() as u64) <= PI_BUSY_FRESH_MS)
+            .unwrap_or(false);
+        if !fresh {
+            return Some(RunState::Idle);
+        }
+    }
+    Some(st)
 }
 
 // ── opencode：SQLite（经其 `opencode db` CLI） ────────────────────────────
@@ -484,6 +528,32 @@ mod tests {
     fn pi_user_message_is_idle() {
         let l = r#"{"type":"message","message":{"role":"user","content":[{"type":"text"}]}}"#;
         assert_eq!(pi_state_from_record(l), Some(RunState::Idle));
+    }
+
+    /// stopReason 未知时不强制判定，交给上游往前找确定状态。
+    #[test]
+    fn pi_unknown_stopreason_skips() {
+        let l = r#"{"type":"message","message":{"role":"assistant","stopReason":"thought","content":[]}}"#;
+        assert_eq!(pi_state_from_record(l), None);
+        let l2 = r#"{"type":"message","message":{"role":"assistant","stopReason":"","content":[]}}"#;
+        assert_eq!(pi_state_from_record(l2), None);
+    }
+
+    /// 回归锁：`aborted`（用户按 Esc 打断）必须判 Idle，绝不能返回 None。
+    /// 返回 None 会让 tail 越过它去看更早的 `assistant/toolUse`，把已收工的
+    /// 会话钉成 Busy → 终端零输出而页签永远 🔄。
+    #[test]
+    fn pi_aborted_is_idle_not_skipped() {
+        let l = r#"{"type":"message","message":{"role":"assistant","stopReason":"aborted","content":[]}}"#;
+        assert_eq!(pi_state_from_record(l), Some(RunState::Idle));
+        // 带一条更早的 toolUse：aborted 必须在它前面拦下，判 Idle 而非 Busy。
+        let tail = concat!(
+            r#"{"type":"message","message":{"role":"assistant","stopReason":"toolUse"}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","stopReason":"aborted"}}"#,
+            "\n"
+        );
+        assert_eq!(pi_state_from_tail(tail), Some(RunState::Idle));
     }
 
     /// custom/session 等非 message 记录要被跳过，看更早的 message 记录。

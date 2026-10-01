@@ -2095,6 +2095,30 @@ fn tool_entry_kind(
     }
 }
 
+/// 这一轮该工具会不会在设置页更新区画出入口（`tool_entry_button_ui` 同款判定）。
+///
+/// **必须把「正在下载」算作有入口**：下载按钮一点，`start_tool_download` 立刻把
+/// `latest` 清成 None（tag 交给后台作业）；工具若就装在本软件同级目录
+/// （opencode 就是 exe 旁边的 `opencode.exe`），此刻 has_update=false、
+/// missing=false、fresh_present=true → [`tool_entry_kind`] 给 None。只按它判
+/// “有没有入口”，`update_zone_ui` 的 `tools_pending` 会在下载**刚开始时变 false**
+/// → 整块更新区（连同下载中的「⬇ opencode 下载中…」和「✕ 取消」按钮）整块消失，
+/// 用户既看不到进度也**没法取消**（本程序自身那路把 `downloading` 计进了
+/// `self_pending`，所以只有工具下载会犯这个毛病）。
+fn tool_entry_visible(
+    downloading: bool,
+    has_update: bool,
+    missing: bool,
+    fresh_present: bool,
+    fresh_dir_ok: bool,
+) -> bool {
+    downloading
+        || !matches!(
+            tool_entry_kind(has_update, missing, fresh_present, fresh_dir_ok),
+            ToolEntryKind::None
+        )
+}
+
 /// 把缺失的同级默认路径补进配置（已存在的不动，用户改过的不会被覆写）。
 /// 返回 true = 配置有变化，需要落盘。
 fn fill_default_tool_paths(config: &mut config::Config) -> bool {
@@ -3294,6 +3318,7 @@ fn tab_icon(
         last_input,
         last_scroll,
         crate::runstate::RunState::Unknown,
+        false,
     )
 }
 
@@ -3302,7 +3327,7 @@ fn tab_icon(
 /// 抽象分层：`run_state` 是 agent 自己报的准信（pi 追会话 JSONL、opencode 读
 /// DB），对「模型思考十几秒不出字」「工具跑一分钟不出字」这类场景才判得对；
 /// `Unknown`（没装/没识别/读失败）时**原样回退上面的输出启发式**，一个字
-/// 都不改语义。
+/// 都不改语义——唯一例外是 `agent_hint`（见参数说明）。
 ///
 /// 合并口径（有意保守）：
 /// `Busy` → 直接 🔄，不查输出窗口：agent 明确在跑，哪怕终端一个字节没动。
@@ -3310,7 +3335,11 @@ fn tab_icon(
 /// 输出，不压就会常亮 🔄）；但 **✅/空 仍按 ≥3s 无输出算**：刚提交一条
 /// prompt 的瞬间 pi 末条记录就是 user（=Idle），若据此立刻判 done 会弹假
 /// 「任务完成」通知。
-/// 10 个参数与 `tab_icon` 一一对应（纯函数，便于测试逐项钉住），不拆结构体。
+/// `Unknown` + `agent_hint` → 同样压掉输出窗口那条 🔄：agent 状态读不出来
+/// （会话文件还没写出来 / cwd 对不上 / opencode 没装）时只能靠输出窗口，
+/// 而全屏 TUI 空闲时本来就在刷动画，3s 窗口会被顶满 → 终端零新输出而页签
+/// 常亮 🔄（用户报告：「pi 没有任何输出但显示的是刷新」）。✅/空 判据不变。
+/// 10+1 个参数与 `tab_icon` 一一对应（纯函数，便于测试逐项钉住），不拆结构体。
 #[allow(clippy::too_many_arguments)]
 fn tab_icon_with(
     exited: bool,
@@ -3323,6 +3352,7 @@ fn tab_icon_with(
     last_input: u64,
     last_scroll: u64,
     run_state: crate::runstate::RunState,
+    agent_hint: bool,
 ) -> Option<&'static str> {
     if exited {
         return Some("❌");
@@ -3338,7 +3368,10 @@ fn tab_icon_with(
     }
     // 权威「空闲」→ 不再用输出窗口判运行中：agent 停在输入框时终端仍在刷动画，
     // 否则页签会永远 🔄。✅/空 的判据不动（见上面合并口径）。
-    let authoritative_idle = run_state == crate::runstate::RunState::Idle;
+    // Unknown 且本页签确实是 agent（状态读不出来）时同样压掉：全屏 TUI 的
+    // 动画刷新会让输出窗口恒新，不压就是「零输出却永远 🔄」。
+    let authoritative_idle =
+        run_state == crate::runstate::RunState::Idle || (run_state == crate::runstate::RunState::Unknown && agent_hint);
     // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——其直接引发
     // 的回显/整屏重绘是用户操作引起、不是任务在跑 → 跳过运行中判定。命令
     // 真实输出晚于窗口即照常判 🔄（慢命令几乎总是超出窗口）。
@@ -4551,6 +4584,7 @@ impl ClientApp {
                         last_input,
                         last_scroll,
                         crate::runstate::RunState::from_slot(s.run_state.load(Ordering::Relaxed)),
+                        crate::runstate::is_agent_cmd(s.cmd.as_str()),
                     );
                     let title = s.title.clone();
                     let selected = self.current == i;
@@ -5804,7 +5838,10 @@ impl ClientApp {
         // None，那时得靠 update_done 把「重启应用」按钮留在横幅上。
         let self_pending =
             self.update_latest.is_some() || self.downloading || self.update_done;
-        let tools_pending = self.any_tool_entry_available();
+        // 有任一工具在下 → 也算“有事要办”（工具安装完 exe 就落在 exe 同级目录，
+        // 那时 `tool_entry_kind` 会给 None；只看它会让下载中的取消按钮凭空消失）。
+        let tools_busy = self.tools.iter().any(|t| t.downloading);
+        let tools_pending = tools_busy || self.any_tool_entry_available();
         if !self_pending && !tools_pending {
             return; // 都是最新、工具也都齐了：不画。
         }
@@ -5853,7 +5890,7 @@ impl ClientApp {
                 if tools_pending {
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(if self_pending {
+                        RichText::new(if self_pending || tools_busy {
                             "工具（pi / opencode）："
                         } else {
                             "⬇ 工具（pi / opencode）可安装 / 升级："
@@ -5876,14 +5913,12 @@ impl ClientApp {
         self.tools.iter().enumerate().any(|(i, t)| {
             let spec = &TOOL_SPECS[i];
             let fresh = fresh_tool_dir(spec);
-            !matches!(
-                tool_entry_kind(
-                    t.latest.is_some() && !t.missing,
-                    t.missing,
-                    fresh.as_ref().is_some_and(|d| d.join(spec.exe_name).is_file()),
-                    fresh.as_ref().is_some_and(|d| !d.as_os_str().is_empty()),
-                ),
-                ToolEntryKind::None
+            tool_entry_visible(
+                t.downloading,
+                t.latest.is_some() && !t.missing,
+                t.missing,
+                fresh.as_ref().is_some_and(|d| d.join(spec.exe_name).is_file()),
+                fresh.as_ref().is_some_and(|d| !d.as_os_str().is_empty()),
             )
         })
     }
@@ -8143,6 +8178,18 @@ mod tab_icon_tests {
         silent_ms: u64,
         st: RunState,
     ) -> Option<&'static str> {
+        icon_agent_agent_hint(ever, count, viewed, silent_ms, st, true)
+    }
+
+    /// [`icon_agent`] 且显式指定 agent_hint。
+    fn icon_agent_agent_hint(
+        ever: bool,
+        count: u32,
+        viewed: bool,
+        silent_ms: u64,
+        st: RunState,
+        agent_hint: bool,
+    ) -> Option<&'static str> {
         let now = 100_000u64;
         tab_icon_with(
             false,
@@ -8155,6 +8202,7 @@ mod tab_icon_tests {
             0,
             0,
             st,
+            agent_hint,
         )
     }
 
@@ -8182,7 +8230,8 @@ mod tab_icon_tests {
                 now,
                 now - 100, // 刚敲过键
                 0,
-                RunState::Busy
+                RunState::Busy,
+                true,
             ),
             Some("🔄")
         );
@@ -8201,11 +8250,34 @@ mod tab_icon_tests {
         );
         // 已查看 → 空
         assert_eq!(icon_agent(true, 10, true, 10_000, RunState::Idle), None);
-        // 同样参数下 Unknown 会亮 🔄（保底启发式），证明 Idle 确实压了它
-        assert_eq!(icon_agent(true, 10, false, 500, RunState::Unknown), Some("🔄"));
+        // 同样参数下 Unknown + 非 agent 页签会亮 🔄（保底启发式），证明 Idle 确实压了它
+        assert_eq!(
+            icon_agent_agent_hint(true, 10, false, 500, RunState::Unknown, false),
+            Some("🔄")
+        );
+    }
+
+    // 回归锁：Unknown **且本页签确实是 agent**（会话文件还没写出来 / cwd 对不上 /
+    // opencode 没装 → 状态读不出来）时，也必须压掉输出窗口那条 🔄。
+    // 用户报告「pi 没有任何输出但显示的是刷新」：全屏 TUI 空闲时一直刷光标/
+    // 动画，3s 输出窗口恒被顶满，不压就是常亮 🔄。
+    #[test]
+    fn unknown_agent_suppresses_output_running() {
+        // 刚「输出」过（<3s，全是 TUI 动画）→ 不该亮 🔄
+        assert_eq!(icon_agent(true, 10, false, 500, RunState::Unknown), None);
+        // 真停了 10s 且未查看 → ✅（判据不变）
+        assert_eq!(
+            icon_agent(true, 10, false, 10_000, RunState::Unknown),
+            Some("✅")
+        );
+        // 已查看 → 空
+        assert_eq!(icon_agent(true, 10, true, 10_000, RunState::Unknown), None);
+        // 零输出会话同样不假闪 🔄
+        assert_eq!(icon_agent(false, 0, false, 500, RunState::Unknown), None);
     }
 
     // Unknown（没装 agent / 读不到）必须逐位等价于旧启发式：回退保底机制。
+    // 注意：这里 agent_hint=false（非 agent 页签），语义与旧版完全一致。
     #[test]
     fn unknown_falls_back_to_heuristic() {
         for &(ever, count, viewed, silent) in &[
@@ -8216,7 +8288,7 @@ mod tab_icon_tests {
             (false, 0, false, 10_000),
         ] {
             assert_eq!(
-                icon_agent(ever, count, viewed, silent, RunState::Unknown),
+                icon_agent_agent_hint(ever, count, viewed, silent, RunState::Unknown, false),
                 icon(ever, count, viewed, silent),
                 "Unknown 必须等于启发式口径 ever={ever} count={count} viewed={viewed} silent={silent}"
             );
@@ -8228,11 +8300,11 @@ mod tab_icon_tests {
     fn exited_and_loading_beat_authoritative() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon_with(true, false, true, 10, false, now - 10_000, now, 0, 0, RunState::Busy),
+            tab_icon_with(true, false, true, 10, false, now - 10_000, now, 0, 0, RunState::Busy, true),
             Some("❌")
         );
         assert_eq!(
-            tab_icon_with(false, true, true, 10, false, now - 10_000, now, 0, 0, RunState::Idle),
+            tab_icon_with(false, true, true, 10, false, now - 10_000, now, 0, 0, RunState::Idle, true),
             Some("🔄")
         );
     }
@@ -8826,6 +8898,23 @@ mod update_tests {
         // 拿不到本软件目录（current_exe 失败）→ 无处可装，不给假入口
         assert_eq!(tool_entry_kind(false, true, false, false), K::None);
         assert_eq!(tool_entry_kind(false, false, false, false), K::None);
+    }
+
+    /// 回归锁：**下载中必须还画得出入口**（否则「✕ 取消」按钮跟着整块消失，
+    /// 用户没法取消）。
+    /// 本软件同级目录（has_update=false、missing=false、fresh_present=true）
+    /// → `tool_entry_kind` 判 None，只按它判就会把更新区收起来。
+    #[test]
+    fn tool_entry_visible_keeps_entry_during_download() {
+        use super::tool_entry_visible;
+        // 已装在同级目录、无新版的工具：平时无入口（不占版面）
+        assert!(!tool_entry_visible(false, false, false, true, true));
+        // 但下载中一定要有——否则取消按钮没处画
+        assert!(tool_entry_visible(true, false, false, true, true));
+        // 其余情形不受影响
+        assert!(tool_entry_visible(false, true, false, true, true));
+        assert!(tool_entry_visible(false, false, true, false, true));
+        assert!(!tool_entry_visible(false, false, true, false, false));
     }
 
     /// 自动配置启动命令时挑哪一条顶替：同义（按 tui_command_key）里只挑能**整体
