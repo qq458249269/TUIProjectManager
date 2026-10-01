@@ -27,7 +27,7 @@ fn setup_fonts(ctx: &Context) {
 struct Sim {
     /// 每帧开头清零；弹层里任一菜单项被点到时置 true。
     fired: bool,
-    /// 第一项「⚙ 设置」的矩形（弹层画出来那帧才有值）。
+    /// 第一项「🔄 检查更新」的矩形（弹层画出来那帧才有值）。
     item_rect: Option<Rect>,
     /// 「⋯ 更多」按钮矩形。
     more_rect: Option<Rect>,
@@ -57,12 +57,14 @@ fn frame(ctx: &Context, events: Vec<Event>, sim: &mut Sim) {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         // ⚠ 菜单项里**不能**调 ui.close()：那会直接置 CLOSE 标记，
                         // 绕过 close_behavior 把弹层关掉（就是本测试要防的回归）。
-                        let r = ui.selectable_label(false, "⚙ 设置");
+                        // 首项是「🔄 检查更新」：「⚙ 设置」已从本弹层移除（设置页签
+                        // 常驻在页签栏首页右边，见 app.rs::tab_bar）。
+                        let r = ui.selectable_label(false, "🔄 检查更新");
                         sim.item_rect = Some(r.rect);
                         if r.clicked() {
                             sim.fired = true;
                         }
-                        if ui.selectable_label(false, "🔄 检查更新").clicked() {
+                        if ui.selectable_label(false, "📂 打开用户目录").clicked() {
                             sim.fired = true;
                         }
                     });
@@ -137,7 +139,7 @@ fn clicking_menu_item_keeps_popup_open() {
 
     // 点第一项 → 触发，但弹层不能关。
     click_item(&ctx, &mut sim);
-    assert!(sim.fired, "点「⚙ 设置」应触发动作");
+    assert!(sim.fired, "点「🔄 检查更新」应触发动作");
     assert!(
         egui::Popup::is_id_open(&ctx, more_id()),
         "点弹层里的项后弹层必须还在（egui 默认 CloseOnClick 会关掉）"

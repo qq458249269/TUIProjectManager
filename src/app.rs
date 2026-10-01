@@ -3242,13 +3242,23 @@ pub struct ClientApp {
     spawn_rx: Option<Receiver<SpawnResult>>,
     /// 启动时待恢复的会话（同样推迟到首帧会话页签布局）。
     pending_restore: Vec<PendingLaunch>,
-    /// 恢复的会话处理完后一次性应用上次激活页签（消费一次）。
+/// 恢复上次激活的页签（消费一次）。
     restore_active: Option<usize>,
-/// 退出时设置页签开着：启动时**固定**插在首页之后（消费一次）。
-    restore_settings: bool,
     /// 会话页签区（首页/设置右侧那一段）的横向滚动偏移（px）。
-    /// 只滚会话页签：首页与设置常驻左侧，页签过多时才需要滚。
+    /// 只滚会话页签：首页与设置常驻左侧，页签过多时才需要滚。滚动**不画滚动条**。
     tab_scroll_x: f32,
+    /// 是否仍把当前页签强制滚进视野。
+    ///
+    /// 只在「导航」时为真（点击切页 / Ctrl+Tab / 新建 / 关闭 / 恢复 / 拖动重排 /
+    /// 改变窗口宽度）；滚轮拨过一次就置 false —— 用户正在自己看别的页签，每帧
+    /// 强行把当前页签拽回来等于滚轮完全失效（页签条纹丝不动，看着就是「滚不动」）。
+    tab_scroll_follow: bool,
+    /// 上次开启跟随时记录的 `current`：靠「切页了吗」重新武装跟随，避开逐处
+    /// 埋点（current 有十来处赋值，漏一处就表现为某个切页路径不跟随）。
+    tab_scroll_follow_at: usize,
+    /// 上一帧会话页签区的视口宽：窗口拉宽/缩小时重新跟随，否则当前页签可能被
+    /// 挤出可视区（用户又没拨过滚轮，不会自己滚回来）。
+    tab_scroll_view_w: f32,
     /// 启动恢复的会话按保存序暂存于此（save_i 槽位），全部完成后按序插入页签。
     /// 后台 spawn 完成顺序随机，逐条插入会因先到的高索引越界 panic，故先攒槽。
     restore_slots: Vec<Option<Result<Session, String>>>,
@@ -3525,23 +3535,20 @@ enum TabKind {
 }
 
 /// 计算持久化的 (active, settings_pos)，坐标系 = 恢复后的页签数组：
-/// 先推 [Home] + 存活会话，再在 settings_pos 处插入 Settings，最后
-/// current = active（见 ui() 恢复流程）。已退出页签不恢复，直接存
-/// self.current / 满页签索引会整体左移错位（active 落到隔壁页签）。
-/// settings_pos 是**插入前**坐标，active 是**插入后**最终坐标。
-///
-/// settings_pos 恒为 1：设置页签固定插在首页之后（见 `open_settings`）。
-/// 放在会话中间既难找，拖动后的位置还会在重启时丢掉（拖动只改内存，不落盘）。
+/// [Home, Settings] + 存活会话，已退出页签不恢复。最后 current = active（见 ui()
+/// 恢复流程）。直接存 self.current（满页签索引）会整体左移错位（active 落到
+/// 隔壁页签），故必须先滤掉已退出的。
+/// settings_pos 恒为 1：设置页签**常驻**在首页之后（见 App::new / tab_bar），
+/// 不再是「打开过才有、位置随拖动漂移」的东西。
 fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
     let settings_pos = 1usize;
-    let settings_open = kinds.contains(&TabKind::Settings);
     let mut pre = 1usize; // 下一个「插入前」槽位（1 = Home 之后）
     let mut active = 0usize; // 0 = Home / 无匹配
     for (i, k) in kinds.iter().enumerate() {
         if i == current && *k != TabKind::Home {
             active = if *k == TabKind::Settings {
                 settings_pos
-            } else if settings_open && pre >= settings_pos {
+            } else if pre >= settings_pos {
                 pre + 1
             } else {
                 pre
@@ -3620,6 +3627,37 @@ fn offset_to_show(off: f32, view_w: f32, content_w: f32, x: f32, w: f32) -> f32 
     shown.clamp(0.0, max_off)
 }
 
+/// 会话页签区横向偏移的**单帧决策**（纯函数，滚动行为全在这）：
+/// 返回 `(新偏移, 新的 follow)`。
+///
+/// `follow` = 是否仍把当前页签抢回视野。两边都能关：
+///  - 本帧拨了轮（`wheel != 0`）→ 置 false。用户正在自己看别的页签，每帧拿
+///    当前页签跑一遍 `offset_to_show` 就等于**拨一下就被抅回去**：当前页签正是
+///    左边那个时偏移恒为 0，滚轮彻底失灵（这就是「页签滚不动」的成因）。
+///  - 切页 / 改窗口宽度时由调用方重新置 true（此时用户要的是「跳到那一页」）。
+///
+/// `active_span` = 当前页签在内容坐标系里的 `[x, w]`（不在会话区则 None）。
+fn strip_offset(
+    off: f32,
+    wheel: f32,
+    follow: bool,
+    view_w: f32,
+    content_w: f32,
+    active_span: Option<(f32, f32)>,
+) -> (f32, bool) {
+    let max_off = (content_w - view_w).max(0.0);
+    let mut off = off.clamp(0.0, max_off);
+    let mut follow = follow;
+    if wheel != 0.0 {
+        off = (off - wheel).clamp(0.0, max_off);
+        follow = false;
+    }
+    if follow && let Some((x, w)) = active_span {
+        off = offset_to_show(off, view_w, content_w, x, w);
+    }
+    (off, follow)
+}
+
 /// 同页签 10s 一条的通知节流（TOAST_MIN_INTERVAL_MS）。通过即占位时间戳——
 /// 后续被「用户正盯着」「启动宽限」「已通知」分支静默吞掉也照占，宁可少弹。
 fn allow_toast(s: &Session, now_ms: u64) -> bool {
@@ -3683,7 +3721,9 @@ impl ClientApp {
         let saved_active = config.tabs.active;
         let mut app = Self {
             config,
-            tabs: vec![Tab::Home],
+            // 设置页签常驻：与首页一样是**页面**而不是会话，固定在下标 1（首页之后），
+            // 不用任何按钮去开（右下角「⋯ 更多」里的「⚙ 设置」已移除）。
+            tabs: vec![Tab::Home, Tab::Settings],
             current: 0,
             screen: Screen::Main,
             selected_project: 0,
@@ -3724,8 +3764,10 @@ impl ClientApp {
             spawning: Vec::new(),
             spawn_rx: None,
 restore_active: None,
-        restore_settings: false,
         tab_scroll_x: 0.0,
+        tab_scroll_follow: true,
+        tab_scroll_follow_at: 0,
+        tab_scroll_view_w: -1.0,
             last_term_size: (80, 24),
             titlebar_hwnd,
             last_theme_dark: initial_dark,
@@ -3782,16 +3824,26 @@ restore_active: None,
                 cmd,
             });
         }
-if saved_tabs.settings_open {
-            // 位置不再持久化：设置页签固定在首页之后（restore_coords 恒返回 1）。
-            app.restore_settings = true;
-        }
-        if !app.pending_restore.is_empty() || app.restore_settings {
+        // 设置页签常驻：启动时已在 tabs[1]（见 App::new），这里只需要把**旧配置**
+        // 里的 active 搬到新坐标系上——老版本可能压根没开过设置页签，那时
+        // active 是按「首页 + 会话」数的，新坐标在中间多出一个下标 1 的设置页签
+        // （首页本身仍是 0，别把它也 +1 了）。
+        let saved_active = if saved_tabs.settings_open || saved_active == 0 {
+            saved_active
+        } else {
+            saved_active.saturating_add(1)
+        };
+        if !app.pending_restore.is_empty() {
             // 注意：升级前的旧配置坐标含退出页签/设置页签偏移，首启可能落错
             // 一格——旧值无法换算（配置没存退出标记），落错时切回正确页签后
             // 第一次保存即写入 restore_coords 新格式，此后恢复正确（一次性）。
             app.restore_active = Some(saved_active);
+        } else {
+            // 没有会话可恢复也要把激活页签落到设置/首页上（老配置的 active=0
+            // 恰好是首页，1 恰好是设置，仍成立）。
+            app.restore_active = Some(saved_active.min(app.tabs.len() - 1));
         }
+
         // 每次启动自动检查一次更新。
         app.check_updates(true);
         app
@@ -3814,8 +3866,8 @@ if saved_tabs.settings_open {
             .collect();
         let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
         let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
-// 设置页签也记录：退出时开着则启动时插回首页之后（见 restore_settings）。
-        let settings_open = self.tabs.iter().any(|t| matches!(t, Tab::Settings));
+        // 设置页签常驻，落盘恒为 true（旧字段留着只为读老配置）。
+        let settings_open = true;
         let kinds: Vec<TabKind> = self
             .tabs
             .iter()
@@ -3903,22 +3955,19 @@ ui.ctx().fonts_mut(|f| {
         self.settings_new_command.clear();
         self.settings_tool_dirs = self.config.settings.tool_paths.clone();
         self.settings_new_tool_dir.clear();
-// 如果已有一个设置页签，跳转过去而不是重复添加。
-        if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
-            // 已在位则不动（idx == 1）；旧状态里它可能被拖到了会话中间 → 拉回
-            // 首页之后，保证「设置固定在第二个」这条不变量。
-            if idx != 1 {
-                let t = self.tabs.remove(idx);
-                self.tabs.insert(1, t);
+// 设置页签常驻：只在万一被拉离下标 1 时拉回来（重建路径），正常恒为 idx == 1。
+        let idx = match self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
+            Some(i) => i,
+            None => {
+                self.tabs.insert(1.min(self.tabs.len()), Tab::Settings);
+                1
             }
-            self.current = 1;
-        } else {
-            // 固定插在首页之后，不追加到末尾：设置是全局页面，不是某个项目的
-            // 一部分；夹在一堆会话页签中间既难找，重启恢复也拿不到它的位置
-            // （拖动只改内存）。
-            self.tabs.insert(1, Tab::Settings);
-            self.current = 1;
+        };
+        if idx != 1 {
+            let t = self.tabs.remove(idx);
+            self.tabs.insert(1, t);
         }
+        self.current = 1;
         self.term_focused = false;
     }
 
@@ -4352,7 +4401,8 @@ ui.ctx().fonts_mut(|f| {
     }
 
     fn close_session(&mut self, idx: usize) {
-        if idx == 0 || idx >= self.tabs.len() {
+        // 首页（0）与设置页签（常驻 1）是页面不是会话，不可关闭。
+        if idx <= 1 || idx >= self.tabs.len() {
             return;
         }
         // 将 child 和 master 都移到后台线程异步清理：
@@ -4381,16 +4431,12 @@ ui.ctx().fonts_mut(|f| {
     }
 
     /// 会话页签拖动落位：把 from 移到「原索引空间」的插入点 target（1..=len）。
-    /// 0 是固定的首页，不在可移动范围内。
+    /// 0 是固定的首页，1 是常驻的设置页签，都不在可移动范围内。
 fn move_tab(&mut self, from: usize, target: usize) {
         let len = self.tabs.len();
-        // 固定区不参与重排：首页恒在 0，设置恒在 1（开着时）。落点不得插到它
-        // 前面/中间，否则设置页签会被拖离首页之后，下次打开又被拉回去。
-        let fixed_end = if self.tabs.get(1).is_some_and(|t| matches!(t, Tab::Settings)) {
-            2
-        } else {
-            1
-        };
+        // 固定区不参与重排：首页恒在 0，设置恒在 1（常驻）。落点不得插到它
+        // 前面/中间，否则设置页签会被拖离首页之后。
+        let fixed_end = 2;
         if from < fixed_end || from >= len || target == 0 || target > len {
             return;
         }
@@ -4768,94 +4814,51 @@ let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                 ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
             }
 
-            // ── 固定区：设置页签（恒在首页之后）──
-            // 与首页一样常驻左侧：设置是全局页面，滚走就找不着了。
-            // 不可拖动：位置是固定的（open_settings 每次都插回下标 1），能被拖走
-            // 又会被拉回来，不如直接不响应拖动。
+            // ── 固定区：设置页签（恒在首页之后，与首页完全同款）──
+            // 常驻左侧：设置是全局页面，滚走就找不着了，所以没有「设置按钮」——
+            // 它就是页签栏第二个，点一下就进去。
+            // 尺寸与首页一致：同一个 Frame / 同一份内边距 / 只有文字，没有状态图标
+            // 槽也没有 ×（常驻页签不可关）；标题同为「emoji + 2 汉字」，宽度自然相等。
+            // 不可拖动：位置固定（下标 1），能被拖走又会被拉回来，不如直接不响应。
             if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
                 ui.add_space(4.0);
-                let title = "⚙ 设置";
                 let selected = self.current == i;
+                // 与首页同序：Noop 占位 → 内容 → 设底色 → 挂交互层。
                 let bg_idx = ui.painter().add(egui::Shape::Noop);
-                let (close_rect, frame_resp) = egui::Frame::new()
+                let resp = egui::Frame::new()
                     .corner_radius(4.0)
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(tab_margin)
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = TAB_GAP;
-                        let min_width = ui.text_style_height(&egui::TextStyle::Body) * 4.0;
-                        let title_w = *self.title_width_cache.entry(title.to_string()).or_insert_with(|| {
-                            ui.ctx().fonts_mut(|f| {
-                                f.layout_no_wrap(title.to_string(), tab_font.clone(), Color32::TRANSPARENT)
-                                    .size()
-                                    .x
-                            })
-                        });
-                        let s = TAB_GAP;
-                        let icon_title_w = slot_w + s + title_w;
-                        let slack = (min_width - icon_title_w - s - close_w).max(0.0);
-                        let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
-                            ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
-                        } else if slack > 0.0 {
-                            (slack, 0.0)
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        if pad_l > 0.0 {
-                            ui.add_space(pad_l);
-                        }
-                        let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                        ui.add_sized(
-                            egui::vec2(slot_w, row_h),
-                            egui::Label::new(" ").selectable(false),
-                        );
                         ui.add(
                             if selected {
-                                egui::Label::new(RichText::new(title).strong())
+                                egui::Label::new(RichText::new("⚙ 设置").strong())
                             } else {
-                                egui::Label::new(RichText::new(title))
+                                egui::Label::new("⚙ 设置")
                             }
                             .selectable(false),
-                        );
-                        if pad_m > 0.0 {
-                            ui.add_space(pad_m);
-                        }
-                        (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
-                    })
-                    .inner;
-                let rect = frame_resp.rect;
-                // 只感 click：固定页签不参与重排（同首页）。
-                let resp = ui.interact(rect, egui::Id::new("settings_tab"), egui::Sense::click());
-                // 只认指针点击：键盘回车不切页/不关页。
-                if resp.clicked_by(egui::PointerButton::Primary) {
-                    let pos = ui.ctx().pointer_interact_pos();
-                    if pos.is_some_and(|p| close_rect.contains(p)) {
-                        actions.push(TabAction::Close(i));
-                    } else {
-                        actions.push(TabAction::Activate(i));
-                    }
-                }
-                if resp.hovered()
-                    && ui
-                        .ctx()
-                        .pointer_interact_pos()
-                        .is_some_and(|p| close_rect.contains(p))
-                {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        )
+                    });
+                let rect = resp.response.rect;
+                // 只感 click：固定页签不参与重排、不响应拖动（同首页）。
+                let hit = ui.interact(rect, egui::Id::new("settings_tab"), egui::Sense::click());
+                // 只认指针点击：键盘回车不切页（同首页，见 tab_focus.rs）。
+                if hit.clicked_by(egui::PointerButton::Primary) && !selected {
+                    actions.push(TabAction::Activate(i));
                 }
                 let hovering = !selected
-                    && drag_index.is_none()
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                 let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                 ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
-                tab_rects.push((i, rect));
+                // 不进 tab_rects：拖动落位不许把会话插到设置页签前面/后面去。
             }
 
-            // ── 会话页签区：页签太多时**只滚这一段** ──
+            // ── 会话页签区：页签太多时**只滚这一段**（滚轮/触控板，无滚动条）──
             // 首页与设置常驻左侧；首页/设置**页面**上的滚轮也不归它（判定靠指针
             // 是否落在本行矩形内）。不需要真的用 ScrollArea：它靠「测量一遍 + 裁剪
             // 重画一遍」实现，而本函数每帧都在收集点击动作/拖动源，两遍会重复执行
-            // 副作用。这里改成：按量出来的宽度把布局起点左移 off，再按视口裁剪。
+            // 副作用；它还自带一条滚动条，页签栏这么窄一行，没必要占地方。
+            // 这里改成：按量出来的宽度把布局起点左移 off，再按视口裁剪。
             let avail = ui.available_rect_before_wrap();
             let view_w = avail.width().max(0.0);
             let geom = self.strip_geom_for_frame(
@@ -4871,23 +4874,46 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
             );
             let view =
                 egui::Rect::from_min_size(avail.min, egui::vec2(view_w, avail.height()));
-            let mut off = self.tab_scroll_x;
-            // 滚轮：竖滚轮 → 横移（鼠标最常见），触控板横扫同样生效。
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
-            if scroll != 0.0
-                && ui.ctx().pointer_interact_pos().is_some_and(|p| view.contains(p))
-            {
-                off -= scroll;
-                // 同一份位移不能再流向别的 ScrollArea（首页项目列表等）——照终端
-                // show_terminal 里的做法清掉。
-                ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+            // 重新武装跟随的两条非滚轮通道（都在切页 / 改视野之外的用户意图里）：
+            //  1. 切页（点击 / Ctrl+Tab / 新建 / 关闭 / 恢复 / 拖动重排）——靠比对
+            //     current 与上次武装时记下的下标，不用给十来处赋值点逐个埋点；
+            //  2. 窗口改宽改窄（用户没拨过滚轮，不重新跟随就会把当前页签挤没）。
+            if self.current != self.tab_scroll_follow_at || view_w != self.tab_scroll_view_w {
+                self.tab_scroll_follow = true;
+                self.tab_scroll_follow_at = self.current;
+                self.tab_scroll_view_w = view_w;
             }
-            // 当前页签必须留在视野里：Ctrl+Tab 切页、新建/关闭页签都靠它。
-            off = match geom.spans.iter().find(|(i, _, _)| *i == self.current) {
-Some((_, x, w)) => offset_to_show(off, view_w, geom.content_w, *x, *w),
-                None => off.clamp(0.0, (geom.content_w - view_w).max(0.0)),
+            // 滚轮：竖滚轮 → 横移（鼠标最常见），触控板横扫同样生效。只认指针落在
+            // 本行矩形内的滚轮 → 首页/设置**页面**上的滚轮不带动页签栏。
+            let wheel = ui.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
+            let wheel = if ui.ctx().pointer_interact_pos().is_some_and(|p| view.contains(p)) {
+                wheel
+            } else {
+                0.0
             };
+            let active_span = geom
+                .spans
+                .iter()
+                .find(|(i, _, _)| *i == self.current)
+                .map(|(_, x, w)| (*x, *w));
+            let (off, follow) = strip_offset(
+                self.tab_scroll_x,
+                wheel,
+                self.tab_scroll_follow,
+                view_w,
+                geom.content_w,
+                active_span,
+            );
+            if wheel != 0.0 {
+                // 这一份位移已经被本页签区吃掉，不能再流向别的 ScrollArea（首页
+                // 项目列表等）——照终端 show_terminal 里的做法清掉。两个轴都清：
+                // 横向那份也是本页签区吃掉的。
+                ui.input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                });
+            }
             self.tab_scroll_x = off;
+            self.tab_scroll_follow = follow;
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(view.left() - off, view.top()),
                 egui::pos2(
@@ -5228,12 +5254,19 @@ let s = TAB_GAP;
         for action in actions {
             match action {
                 TabAction::Activate(i) => {
-                    // 点击页签后清除「输出结束」对号。
-                    if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
-                        s.has_been_viewed.store(true, Ordering::Relaxed);
+                    if matches!(self.tabs.get(i), Some(Tab::Settings)) {
+                        // 设置页签常驻：点它 = 打开设置页。走 open_settings 是为了
+                        // 清掉上次没保存完的输入缓冲（新增框/编辑框的半截内容），
+                        // 否则关掉设置页再进来还挂着上次那半行。
+                        self.open_settings();
+                    } else {
+                        // 点击页签后清除「输出结束」对号。
+                        if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
+                            s.has_been_viewed.store(true, Ordering::Relaxed);
+                        }
+                        self.current = i;
+                        self.refresh_focus();
                     }
-                    self.current = i;
-                    self.refresh_focus();
                 }
                 TabAction::Close(i) => self.close_session(i),
                 TabAction::OpenDir(i) => {
@@ -5372,7 +5405,8 @@ let s = TAB_GAP;
     }
 
 /// 状态栏横向布局的一行：左侧消息（可截断），右侧固定簇（现在只剩「⋯ 更多」
-/// 一个按钮）永远可见。设置 / 检查更新 / 打开目录 / 深浅色都收进它的弹出层。
+/// 一个按钮）永远可见。检查更新 / 打开目录 / 深浅色都收进它的弹出层（设置
+/// 已改从页签栏的常驻「⚙ 设置」页签进，不再是按钮）。
 ///
 /// 右侧固定簇是 `Layout::right_to_left` **贴右边**画的，它不看左边已经占了
 /// 多宽 —— 左边放不下时不是换行而是直接盖上去。故先量出右侧簇的宽度，左段
@@ -5534,16 +5568,16 @@ let s = TAB_GAP;
                     });
                 });
             ui.style_mut().always_scroll_the_only_direction = saved_scroll_dir;
-            // 右下角固定簇只剩一个「⋯ 更多」按钮：设置 / 检查更新 / 打开目录 /
-            // 深浅色全部收进它的弹出层（原先挤在这一行的三个按钮点不准，也把
-            // 行宽吃掉了大半）。它是 right_to_left 里**最先添加**的那个 = 最右侧。
+            // 右下角固定簇只剩一个「⋯ 更多」按钮：检查更新 / 打开目录 / 深浅色
+            // 全部收进它的弹出层（原先挤在这一行的几个按钮点不准，也把行宽吃掉
+            // 了大半）。它是 right_to_left 里**最先添加**的那个 = 最右侧。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
                 let more_id = egui::Id::new("status_more_menu");
                 // Sense::CLICK 不含 FOCUSABLE 位：不参与键盘焦点循环（Tab/方向键不会选中它）。
                 let more_resp = ui
                     .add(egui::Button::new("⋯ 更多").sense(egui::Sense::CLICK))
-                    .on_hover_text("设置 / 检查更新 / 打开目录 / 深浅色切换");
+                    .on_hover_text("检查更新 / 打开目录 / 深浅色切换（设置请点页签栏的「⚙ 设置」）");
                 if more_resp.clicked() && ui.input(|i| i.pointer.any_click()) {
                     egui::Popup::toggle_id(ui.ctx(), more_id);
                 }
@@ -5563,12 +5597,8 @@ let s = TAB_GAP;
                         // 菜单项左对齐：Align::Min —— 状态栏本身是 right_to_left，
                         // 弹层内沿用 Align::RIGHT 会把文字甩到右边，左边空一大块。
                         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            if ui.selectable_label(false, "⚙ 设置")
-                                .on_hover_text("打开设置页：TUI 启动命令 / 工具更新路径 / 供应商与模型")
-                                .clicked()
-                            {
-                                self.open_settings();
-                            }
+                            // 「⚙ 设置」已删：设置页签常驻在页签栏首页右边（与首页
+                            // 同款同尺寸），点一下就进去，不需要再来一个按钮。
                             if ui.selectable_label(false, "🔄 检查更新")
                                 .on_hover_text("从 GitHub Release 检查本软件 + pi + opencode 的最新版本（启动/新开页签时也会自动检查）")
                                 .clicked()
@@ -5639,8 +5669,8 @@ let s = TAB_GAP;
                 ui.heading("项目列表");
                 ui.separator();
                 ui.horizontal(|ui| {
-                    // 「⚙ 设置」已挪到右下角「⋯ 更多」弹层里（所有按钮都收在一处），
-                    // 左侧面板这一行只留「＋ 添加」。
+                    // 设置是页签栏里常驻的「⚙ 设置」页签（首页右边），左侧面板
+                    // 这一行只留「＋ 添加」。
                     if ui.button("＋ 添加").clicked() {
                         self.input = Some(InputDialog::AddProject {
                             name: String::new(),
@@ -8299,11 +8329,8 @@ impl eframe::App for ClientApp {
             }
             // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
             // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
-            // 恢复 spawn 必须在本块之前执行：首帧先把 spawning 填上，否则单独恢复
-            // 设置页签（无会话）会在会话 spawn 前误触发，导致设置插到会话前面。
-if self.spawning.is_empty()
-                && (!self.restore_slots.is_empty() || self.restore_settings)
-            {
+            // 设置页签已在构造期就位于 tabs[1]（常驻），这里无需再插。
+if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                 let slots = std::mem::take(&mut self.restore_slots);
                 let mut restored = 0usize;
                 for slot in slots {
@@ -8318,18 +8345,17 @@ if self.spawning.is_empty()
                         None => {}
                     }
                 }
-// 退出时设置页签开着：固定插回首页之后（位置不再持久化）。
-                if self.restore_settings {
-                    self.restore_settings = false;
-                    self.tabs.insert(1, Tab::Settings);
+                if restored > 0 {
+                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
                 }
+            }
+            // 应用上次激活页签。与恢复 spawn 解耦：上次停在设置页（无会话）时也要
+            // 落位，故不挂在上面的 restore_slots 块里。
+            if self.spawning.is_empty() {
                 if let Some(active) = self.restore_active.take() {
                     self.current = active.min(self.tabs.len() - 1);
                     self.term_focused =
                         matches!(self.tabs.get(self.current), Some(Tab::Session(_)));
-                }
-                if restored > 0 {
-                    self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
                 }
             }
             if self.spawning.is_empty() {
@@ -8860,7 +8886,10 @@ mod settings_accordion_tests {
 
 #[cfg(test)]
 mod restore_coords_tests {
-    use super::{offset_to_show, restore_coords, strip_geom, tab_cycle_target, StripMetrics, Tab, TabKind};
+    use super::{
+        offset_to_show, restore_coords, strip_geom, strip_offset, tab_cycle_target, StripMetrics,
+        Tab, TabKind,
+    };
 
     /// 回归：Ctrl+(Shift+)Tab 只在页签之间循环，不得落到首页 / 设置页。
     ///
@@ -8974,7 +9003,7 @@ fn tab_cycle_never_lands_on_home_or_settings() {
     #[test]
 fn restore_indices_skip_exited_and_settings() {
         use TabKind::*;
-        // settings_pos 恒为 1：设置页签固定插在首页之后（位置不再持久化）。
+        // settings_pos 恒为 1：设置页签**常驻**在首页之后（位置不持久化，也不可拖）。
         // 恢复数组 = [Home, Settings, B, D]（A 已退出不恢复）。
         let kinds = [Home, Settings, Gone, Alive, Alive];
         assert_eq!(restore_coords(&kinds, 3), (2, 1)); // B → 2
@@ -8982,16 +9011,65 @@ fn restore_indices_skip_exited_and_settings() {
 assert_eq!(restore_coords(&kinds, 1), (1, 1)); // Settings 自身 → 1
         assert_eq!(restore_coords(&kinds, 2), (2, 1)); // 已退出 → 邻位（正好是 B）
         assert_eq!(restore_coords(&kinds, 0), (0, 1)); // Home → 0
-        // 无设置页签：坐标 = Home + 存活会话序（不因没设置而错位）。
-        let kinds = [Home, Alive, Alive];
-        assert_eq!(restore_coords(&kinds, 2), (2, 1));
+        // 只有设置页签、没开过项目：坐标仍然是 [Home, Settings]。
+        let kinds = [Home, Settings];
+        assert_eq!(restore_coords(&kinds, 0), (0, 1));
         assert_eq!(restore_coords(&kinds, 1), (1, 1));
-        // 旧配置里设置页签夹在会话中间（拖动过的老状态）：激活会话仍要落在它自己
-        // 上——会话一律排在固定的设置页签之后。
-        let kinds = [Home, Alive, Settings, Alive];
-        assert_eq!(restore_coords(&kinds, 1), (2, 1));
-        assert_eq!(restore_coords(&kinds, 3), (3, 1));
-        assert_eq!(restore_coords(&kinds, 2), (1, 1));
+    }
+
+    /// 回归：**滚轮拨得动页签条**（此前的 bug）。
+    ///
+    /// 旧实现每帧都拿当前页签跑 `offset_to_show` 把它抅回视野，于是只要当前
+    /// 页签被拨出视野（当前页签是左边那个时，直接恒为 0）滚轮就完全失灵，
+    /// 看着就是「页签怎么都滚不动」。新语义：拨轮接管并关掉跟随，直到切页 /
+    /// 改窗口宽度才重新武装。
+    #[test]
+fn wheel_scrolls_even_when_active_tab_is_out_of_view() {
+        // 视口 100、内容 300 → 可滚范围 [0, 200]。
+        let (view_w, content_w) = (100.0f32, 300.0f32);
+        // 当前页签在最左（x = 0, w = 60）且正在跟随：拨轮向下 → 偏移必须真的动。
+        let (off, follow) = strip_offset(0.0, -30.0, true, view_w, content_w, Some((0.0, 60.0)));
+        assert_eq!(off, 30.0, "滚轮应把偏移推下去（旧实现恒为 0）");
+        assert!(!follow, "拨过轮就不该再抢镜头");
+        // 继续拨（当前页签已在视野外）→ 照拨不误，不被抅回去。
+        let (off2, _) = strip_offset(off, -30.0, follow, view_w, content_w, Some((0.0, 60.0)));
+        assert_eq!(off2, 60.0);
+        // 反向拨 → 滚回来；到头就停。
+        let (back, _) = strip_offset(off2, 300.0, follow, view_w, content_w, Some((0.0, 60.0)));
+        assert_eq!(back, 0.0);
+        // 没有轮子输入 + 仍在跟随 → 维持「当前页签在视野内」（切页靠它）。
+        let (pinned, follow2) = strip_offset(0.0, 0.0, true, view_w, content_w, Some((250.0, 40.0)));
+        assert_eq!(pinned, 190.0, "当前页签在右缘外 → 贴右缘（250+40-100）");
+        assert!(follow2, "没拨轮就保持跟随");
+    }
+
+    /// 跟随只在重新武装时生效：切页（current 变）或视口改宽后，当前页签必须
+    /// 回到视野内；用户自己拨的偏移不被推翻。
+    #[test]
+    fn follow_rearms_on_tab_change() {
+        let m = StripMetrics { slot_w: 16.0, close_w: 8.0, min_width: 60.0, gap: 8.0, pad: 4.0 };
+        let g = strip_geom(&[(2, 30.0, true), (3, 30.0, true), (4, 30.0, true), (5, 30.0, true)], m);
+        let view_w = 100.0f32;
+        let (_, _, w) = g.spans[3];
+        let x_last = g.spans[3].1;
+        // 用户把偏移拨到 180（只看最后两个页签），此时 current 仍是 2（最左），
+        // 跟随已被滚轮关掉 → 原样保留，**不**被当前页签拽回去。
+        let (off, follow) =
+            strip_offset(180.0, 0.0, false, view_w, g.content_w, Some((0.0, g.spans[0].2)));
+        assert!(!follow);
+        assert_eq!(off, 180.0, "拨出来的偏移不该被当前页签抅回去");
+        // 切到中间那个页签 → 调用方重新武装 → 滚回它那一侧（而不是维持 180）。
+        let (_, x_mid, w_mid) = g.spans[1];
+        let (shown, _) = strip_offset(off, 0.0, true, view_w, g.content_w, Some((x_mid, w_mid)));
+        assert!(
+            shown <= x_mid + 1.0 && shown + view_w >= x_mid + w_mid - 1.0,
+            "跟随后当前页签应在视野内（shown={shown} x={x_mid} w={w_mid}）"
+        );
+        assert!(shown < off, "切到中间页签应向左滚回（而不是维持 180）");
+        // 切到最后一个页签 → 贴视口右缘（内容末尾那截露不全就不叫跟随）。
+        let (shown_last, _) =
+            strip_offset(off, 0.0, true, view_w, g.content_w, Some((x_last, w)));
+        assert_eq!(shown_last, g.content_w - view_w, "末尾页签应贴右缘");
     }
 }
 
