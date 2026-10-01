@@ -72,6 +72,9 @@ const POLL_MS: u64 = 1_200;
 /// opencode 查询结果缓存时长。`opencode db` 冷启约 1s，多个 opencode 页签各查
 /// 一次会把 CPU 顶满；缓存期内同目录直接复用，锁内串行 → 全局同时只有一条查询。
 const OC_CACHE_MS: u64 = 2_500;
+/// opencode 可执行文件路径的缓存时长（配置读/遍历目录不算便宜，但也不必每次
+/// 查询都做；装完新工具最多一分钟认得）。
+const EXE_CACHE_MS: u64 = 60_000;
 /// 读会话文件尾多少字节。末行可能被写了一半，最多也就一行（几 KB）。
 const TAIL_BYTES: u64 = 64 * 1024;
 
@@ -131,9 +134,52 @@ fn pi_sessions_root() -> PathBuf {
     home_dir().join(".pi").join("agent").join("sessions")
 }
 
-/// 该 cwd 下最近改动的会话文件。目录 slug 对不上就退回「扫全部项目目录、
-/// 取 mtime 最新的 jsonl」——slug 规则是照着本机目录名反推的，pi 改了也不至于
-/// 整个功能失效（最多认到别的项目，同目录同名冲突本来就极少）。
+/// 路径等价比较：统一 `/`→`\`、去尾部斜杠、Windows 下大小写不敏感。
+///
+/// 必须做：官方的关联字段（pi 会话头 `cwd`、opencode `session.directory`）
+/// 与页签启动目录**不一定逐字相同**——正斜杠/反斜杠、结尾斜杠、大小写都可能差。
+/// 直接字符串相等会把「能读到数据」判成「没这个会话」，静默退回启发式。
+fn path_eq(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.replace('/', "\\");
+        let s = s.trim_end_matches('\\').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    }
+    norm(a) == norm(b)
+}
+
+/// pi 会话文件的第一条记录就是 `{"type":"session","cwd":…,"id":…}`——**官方
+/// 给出的「这个会话属于哪个项目」**，比目录名反推的 slug 可靠。只读文件头
+/// 2KB 就够（那条记录很短）。
+fn pi_session_cwd(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; 2048];
+    let n = f.read(&mut head).ok()?;
+    let text = String::from_utf8_lossy(&head[..n]);
+    let first = text.lines().next()?;
+    let v: serde_json::Value = serde_json::from_str(first).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session") {
+        return None;
+    }
+    v.get("cwd")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+}
+
+/// 挑出属于该 cwd 的会话文件：候选按 mtime 从新到旧，**逐个用官方 `cwd` 字段
+/// 校验**，第一个对上的就是它。
+///
+/// 目录 slug 只是索引（照本机目录名反推的，pi 改了 slug 就失效），所以 slug
+/// 目录不存在/对不上时退回「扫全部项目目录」；两种路径最终都以会话头里的
+/// `cwd` 为准，不会认到别的项目的会话去。候选数封顶 [`PI_SCAN_LIMIT`]：
+/// 目录里堆了几百个旧会话时不必全扫。
+const PI_SCAN_LIMIT: usize = 40;
+
 fn pi_session_file(dir: &str) -> Option<PathBuf> {
     let root = pi_sessions_root();
     let mut dirs = vec![root.join(pi_project_slug(dir))];
@@ -142,9 +188,13 @@ fn pi_session_file(dir: &str) -> Option<PathBuf> {
         let Ok(rd) = std::fs::read_dir(&root) else {
             return None;
         };
-        dirs.extend(rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()));
+        dirs.extend(
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir()),
+        );
     }
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut cands: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for d in dirs {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
@@ -156,12 +206,16 @@ fn pi_session_file(dir: &str) -> Option<PathBuf> {
             }
             let Ok(md) = e.metadata() else { continue };
             let Ok(t) = md.modified() else { continue };
-            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                best = Some((t, p));
-            }
+            cands.push((t, p));
         }
     }
-    best.map(|(_, p)| p)
+    // 候选取最新的在前（mtime 降序），再逐个用官方 cwd 校验。
+    cands.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    cands
+        .into_iter()
+        .take(PI_SCAN_LIMIT)
+        .map(|(_, p)| p)
+        .find(|p| pi_session_cwd(p).is_some_and(|c| path_eq(&c, dir)))
 }
 
 /// pi 一条 `{"type":"message",...}` 记录 → 运行态。
@@ -228,20 +282,49 @@ fn pi_state(dir: &str) -> Option<RunState> {
 
 // ── opencode：SQLite（经其 `opencode db` CLI） ────────────────────────────
 
+/// 找到的 opencode 可执行（None = 确认没装）；旁边是找到它的时刻。
+type ExeCache = Option<(Option<PathBuf>, u64)>;
+
+/// 缓存命中判定：**必须先有记录**（`None` = 从没找过）。不能拿「(None, 0)」
+/// 当初值——`now_ms()` 首次调用返回 0，那样会命中「新鲜」而永远返回 None。
+/// 命中时返回记住的值（可能是 None = 确认没有 opencode）。
+fn cache_hit(cache: &ExeCache, now: u64) -> Option<Option<PathBuf>> {
+    let (p, at) = cache.as_ref()?;
+    (now.saturating_sub(*at) < EXE_CACHE_MS).then(|| p.clone())
+}
+
 /// opencode 可执行文件：先找本 exe 同级目录（更新器装哪儿就找哪儿），
-/// 再退 PATH。只在开跟踪线程时找一次。
+/// 再走**与检查更新/一键安装同款**的查找（设置页配的工具路径 → PATH，
+/// app::find_opencode_exe），最后才自己扫 PATH。结果缓存 60s：工具装完后
+/// 最多一分钟认得，不必每次查询都重读配置。
 fn opencode_exe() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
+    static CACHE: OnceLock<Mutex<ExeCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let now = crate::now_ms();
+    if let Ok(g) = cache.lock()
+        && let Some(hit) = cache_hit(&g, now)
     {
-        let p = dir.join(if cfg!(windows) { "opencode.exe" } else { "opencode" });
-        if p.is_file() {
-            return Some(p);
-        }
+        return hit;
     }
     let name = if cfg!(windows) { "opencode.exe" } else { "opencode" };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+    let mut found = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(name)))
+        .filter(|p| p.is_file());
+    if found.is_none() {
+        found = crate::app::find_opencode_exe();
+    }
+    if found.is_none()
+        && let Some(path) = std::env::var_os("PATH")
+    {
+        found = std::env::split_paths(&path)
+            .map(|d| d.join(name))
+            .find(|p| p.is_file());
+    }
+    if let Ok(mut g) = cache.lock() {
+        *g = Some((found.clone(), now));
+    }
+    found
 }
 
 /// 全局 opencode 缓存：目录 → (状态, 查询时刻)。锁内串行查询，保证同一时刻
@@ -295,7 +378,11 @@ fn oc_query(dir: &str) -> Option<RunState> {
     // 同目录可能有多条会话（新建/恢复/子会话）→ 取最后一条 part 最新的那条。
     let mut best: Option<(u64, Option<RunState>)> = None;
     for r in rows {
-        if r.get("dir").and_then(|d| d.as_str()) != Some(dir) {
+        if !r
+            .get("dir")
+            .and_then(|d| d.as_str())
+            .is_some_and(|d| path_eq(d, dir))
+        {
             continue;
         }
         let ts = r.get("last_ts").and_then(|t| t.as_u64()).unwrap_or(0);
@@ -450,6 +537,56 @@ mod tests {
         assert_eq!(newest["last_reason"].as_str(), Some("stop"));
     }
 
+    /// 路径等价：正/反斜杠、结尾斜杠、大小写差异都得当成同一个目录，
+    /// 否则官方字段里明明是这个项目，我们却判定「没这个会话」而静默退回启发式。
+    #[test]
+    fn path_eq_tolerates_separator_and_case() {
+        assert!(path_eq(r"D:\AI\x", "D:/AI/x"));
+        assert!(path_eq(r"D:\AI\x\", r"d:\ai\x"));
+        assert!(path_eq(r"D:\AI\x", r"D:\AI\x\"));
+        assert!(!path_eq(r"D:\AI\x", r"D:\AI\y"));
+        assert!(!path_eq(r"D:\AI\x", r"D:\AI\x\sub"));
+    }
+
+    /// 会话头里的 `cwd` 是官方给的归属字段；解析它才能把文件认到页签上。
+    #[test]
+    fn pi_session_cwd_reads_official_header() {
+        let dir = std::env::temp_dir().join("tpm-pi-hdr");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("s.jsonl");
+        std::fs::write(
+            &p,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"01a0\",\"timestamp\":\"2026-09-30T23:17:01.862Z\",\"cwd\":\"D:\\\\AI\\\\TUIProjectManager\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(pi_session_cwd(&p).as_deref(), Some(r"D:\AI\TUIProjectManager"));
+        // 非会话文件（直接是 message）→ None，不能硬当归属字段用
+        let q = dir.join("q.jsonl");
+        std::fs::write(&q, "{\"type\":\"message\"}\n").unwrap();
+        assert_eq!(pi_session_cwd(&q), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缓存语义回归锁：没有记录 = 没找过，**不能当命中**（曾经用 (None, 0)
+    /// 当初值，now_ms() 首次返回 0 → 永远命中「新鲜」→ 永远返回 None）。
+    #[test]
+    fn exe_cache_needs_a_record_before_hitting() {
+        let none: ExeCache = None;
+        assert_eq!(cache_hit(&none, 0), None, "没记录就不是命中");
+        assert_eq!(cache_hit(&none, 1_000_000), None);
+        // 有记录但已记住「没有」→ 命中并返回 None（省掉重复查找）
+        let known_absent = Some((None, 1_000u64));
+        assert_eq!(cache_hit(&known_absent, 1_000), Some(None));
+        // 过期 → 重新找
+        assert_eq!(cache_hit(&known_absent, 1_000 + EXE_CACHE_MS), None);
+        // 命中且确有 exe → 原样返回
+        let found = Some((Some(PathBuf::from("opencode.exe")), 500u64));
+        assert_eq!(
+            cache_hit(&found, 600),
+            Some(Some(PathBuf::from("opencode.exe")))
+        );
+    }
+
     /// 状态槽位往返；0 必须回到 Unknown（触发回退）。
     #[test]
     fn slot_roundtrip() {
@@ -466,5 +603,32 @@ mod tests {
         start_tracking("cmd.exe", "C:\\", slot.clone(), done);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(slot.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// 手工验证用（`cargo test -- --ignored live_`）：对着本机真实数据跑一遍
+    /// 两个官方状态源，确认能认到会话并给出状态。CI/别的机器上没有这些
+    /// 文件，默认不跑。
+    #[test]
+    #[ignore]
+    fn live_probe_against_real_files() {
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        println!("cwd = {cwd}");
+        match pi_session_file(&cwd) {
+            Some(p) => {
+                println!("pi 会话文件 = {}", p.display());
+                println!("pi 官方 cwd = {:?}", pi_session_cwd(&p));
+                println!("pi 状态 = {:?}", pi_state(&cwd));
+            }
+            None => println!("pi：没找到属于该 cwd 的会话（回退启发式）"),
+        }
+        println!("config_path exists = {}", crate::config::config_path().exists());
+        println!("find_opencode_exe = {:?}", crate::app::find_opencode_exe());
+        println!("opencode 可执行 = {:?}", opencode_exe());
+        println!("opencode 状态 = {:?}", oc_state(&cwd));
     }
 }

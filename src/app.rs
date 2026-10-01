@@ -2177,6 +2177,21 @@ fn find_tool_exe(spec: &ToolSpec, entries: &[PathBuf], use_path: bool) -> Option
     cands.into_iter().find(|p| p.is_file())
 }
 
+/// 给 runstate（页签运行态跟踪）用：按「检查更新 / 一键安装」**完全同款**的
+/// 顺序找 opencode 的 exe——设置页配的工具路径 → PATH。别处再写一份查找
+/// 逻辑就会出现「装更新时找得到、读状态时找不到」的分裂。
+pub(crate) fn find_opencode_exe() -> Option<PathBuf> {
+    let spec = TOOL_SPECS.iter().find(|s| s.id == "opencode")?;
+    let cfg = crate::config::load();
+    let entries: Vec<PathBuf> = cfg
+        .settings
+        .tool_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    find_tool_exe(spec, &entries, true)
+}
+
 /// 从一段输出里抠出版本号（首个「数字+点」形态的 token，去掉 v 前缀）：
 /// pi --version → 0.87.1，opencode --version → 1.18.32。抠不到返回空串。
 fn parse_version_token(text: &str) -> String {

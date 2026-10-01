@@ -61,10 +61,10 @@
 
 页签运行状态（🔄 / ✅ / 空 / ❌）走一层抽象接口 `src/runstate.rs`：**默认保底**是原来的输出启发式（最近 3s 有输出即 🔄，仅凭终端内容判定，适用普通 shell 命令），**pi / opencode 页签则读 agent 自己的权威状态源**：
 
-- **pi / oh-my-pi**（`RunState` 抽象的第一个实现）：追尾会话 JSONL `~/.pi/agent/sessions/<项目slug>/<会话>.jsonl` 的最后一条 message 记录。`assistant+stopReason=toolUse`（工具在跑）或 `toolResult`（还在接着生成）→ **Busy**；`assistant+stop` 或 `user` → **Idle**。模型思考/长工具期间终端一个字节都不出，旧口径必然误判成「完成」并弹通知。
-- **opencode**：经它自带的 `opencode db "SQL" --format json` 读库里的 `session`/`part` 表（不必自己解 SQLite）：最后一条 part 是 `step-finish`+`reason=stop` → **Idle**，其余 → **Busy**。一次查询冷启约 1s，故走**全局缓存 + 锁内串行**（多个 opencode 页签最多一条查询在跑）。
+- **pi / oh-my-pi**（`RunState` 抽象的第一个实现）：追尾会话 JSONL `~/.pi/agent/sessions/<项目slug>/<会话>.jsonl` 的最后一条 message 记录。`assistant+stopReason=toolUse`（工具在跑）或 `toolResult`（还在接着生成）→ **Busy**；`assistant+stop` 或 `user` → **Idle**。模型思考/长工具期间终端一个字节都不出，旧口径必然误判成「完成」并弹通知。**归属靠官方字段而非目录名反推**：目录 slug（照本机目录名反推的）只当索引，候选文件按 mtime 从新到旧逐个读**头一条 `{"type":"session","cwd":…}`** 校验 `cwd` 等于页签目录（路径比较统一斜杠、去尾斜杠、Windows 下大小写不敏感），故不会认到别的项目的会话去。
+- **opencode**：经它自带的 `opencode db "SQL" --format json` 读库里的 `session`/`part` 表（不必自己解 SQLite）：同目录（`session.directory`）取最后一条 part 最新的那条会话，最后一条 part 是 `step-finish`+`reason=stop` → **Idle**，其余 → **Busy**。一次查询冷启约 1s，故走**全局缓存 + 锁内串行**（多个 opencode 页签最多一条查询在跑）；`opencode.exe` 的查找与「检查更新 / 一键安装」**同款**（同级目录 → 设置页配的工具路径 → PATH），不会出现「装更新时找得到、读状态时找不到」的分裂。
 - 读不到 / 工具没装 / 命令认不出 → 一律 **Unknown，原样回退输出启发式**，不丢状态。判定合并口径见 `tab_icon_with`：`Busy` 直接 🔄（压过输出窗口），`Idle` 压掉输出窗口那条 🔄（pi 停在输入框时动画一直在刷，不压会常亮 🔄），但 ✅/空 仍按「≥3s 无输出」算——刚提交 prompt 的瞬间就是 Idle，提前判完成会弹假通知。
-- 状态由每个会话自己的后台线程（1.2s 一轮）写进 `Session::run_state`（`Arc<AtomicU8>`），UI 只读原子量，不加锁等待；会话退出（`exited` 置位）线程自动收尾。
+- 状态由每个会话自己的后台线程（1.2s 一轮）写进 `Session::run_state`（`Arc<AtomicU8>`），UI 只读原子量，不加锁等待；会话退出（`exited` 置位）线程自动收尾。手工验证入口：`cargo test --bin tui-project-manager -- --ignored --nocapture live_probe`（对着本机真实会话文件/数据库各读一遍，默认不跑）。
 
 ## 配置
 
