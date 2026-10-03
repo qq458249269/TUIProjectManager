@@ -56,6 +56,62 @@ fn offset_to_show(off: f32, view_w: f32, content_w: f32, x: f32, w: f32) -> f32 
     shown.clamp(0.0, max_off)
 }
 
+// ── 视口两端的滚动箭头（照抄 app.rs::strip_arrows / strip_arrow_scroll / strip_arrow）──
+
+const TAB_ARROW_W: f32 = 16.0;
+
+fn strip_arrows(off: f32, view_w: f32, content_w: f32) -> (bool, bool) {
+    let max_off = (content_w - view_w).max(0.0);
+    if max_off <= 0.5 {
+        return (false, false);
+    }
+    (off > 0.5, off < max_off - 0.5)
+}
+
+fn strip_arrow_scroll(off: f32, view_w: f32, content_w: f32, left: bool) -> f32 {
+    let max_off = (content_w - view_w).max(0.0);
+    let step = (view_w * 0.6).clamp(48.0, 220.0);
+    (if left { off - step } else { off + step }).clamp(0.0, max_off)
+}
+
+fn strip_arrow(ui: &egui::Ui, view: egui::Rect, left: bool) -> bool {
+    if view.width() < TAB_ARROW_W * 2.0 {
+        return false;
+    }
+    let zone = if left {
+        egui::Rect::from_min_max(
+            view.left_top(),
+            view.left_top() + egui::vec2(TAB_ARROW_W, view.height()),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            view.right_top() - egui::vec2(TAB_ARROW_W, 0.0),
+            view.right_top(),
+        )
+    };
+    let bg = ui.visuals().panel_fill;
+    ui.painter().add(egui::Shape::gradient_rect(
+        zone,
+        if left {
+            egui::epaint::Direction::LeftToRight
+        } else {
+            egui::epaint::Direction::RightToLeft
+        },
+        [bg, Color32::TRANSPARENT],
+    ));
+    let c = egui::pos2(zone.center().x, view.center().y);
+    let (hw, hh) = (3.5, 6.0);
+    let tip = egui::pos2(c.x + if left { hw } else { -hw }, c.y);
+    let tail = egui::pos2(c.x + if left { -hw } else { hw }, 0.0);
+    let stroke = egui::Stroke::new(1.4, ui.visuals().weak_text_color());
+    ui.painter()
+        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, -hh)], stroke));
+    ui.painter()
+        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, hh)], stroke));
+    ui.interact(zone, egui::Id::new(("tab_strip_arrow", left)), egui::Sense::click())
+        .clicked_by(egui::PointerButton::Primary)
+}
+
 struct App {
     titles: Vec<String>,
     current: usize,
@@ -66,8 +122,12 @@ struct App {
     cache: std::collections::HashMap<String, f32>,
     /// 本帧视口宽 / 内容宽 / 读到的位移，供断言与调试。
     view_log: (f32, f32, f32),
-    /// 首页、设置两个固定页签的矩形（断言设置与首页同尺寸）。
+/// 首页、设置两个固定页签的矩形（断言设置与首页同尺寸）。
     fixed_rects: Vec<Rect>,
+    /// 本帧两端箭头的显隐（左, 右）。
+    arrows: (bool, bool),
+    /// 本帧两端箭头的热区（左, 右；None = 未显示）。
+    arrow_zones: [Option<Rect>; 2],
     /// 虚拟时钟：egui 的滚轮位移是「摊到几十帧」的平滑量，不推进时间就永远衰不
     /// 干净，测不出「拨完之后跟随重新武装」。
     now: f64,
@@ -84,9 +144,11 @@ impl App {
             tab_scroll_follow: true,
             tab_scroll_follow_at: current,
             tab_scroll_view_w: -1.0,
-            cache: Default::default(),
+cache: Default::default(),
             view_log: (0.0, 0.0, 0.0),
             fixed_rects: Vec::new(),
+            arrows: (false, false),
+            arrow_zones: [None, None],
             now: 0.0,
             win_w: 800.0,
         }
@@ -204,6 +266,29 @@ impl App {
                         ui.add(egui::Label::new("×").selectable(false));
                     });
             }
+            // 视口两端的滚动箭头（照抄 app.rs：页签之后画，才盖得住半截页签）。
+            self.arrows = strip_arrows(off, view_w, geom.content_w);
+            let mut arrow = None;
+            if self.arrows.0 && strip_arrow(&ui, view, true) {
+                arrow = Some(true);
+            }
+            if self.arrows.1 && strip_arrow(&ui, view, false) {
+                arrow = Some(false);
+            }
+            if let Some(left) = arrow {
+                self.tab_scroll_x = strip_arrow_scroll(off, view_w, geom.content_w, left);
+                self.tab_scroll_follow = false;
+            }
+            self.arrow_zones = [
+                self.arrows.0.then(|| egui::Rect::from_min_max(
+                    view.left_top(),
+                    view.left_top() + egui::vec2(TAB_ARROW_W, view.height()),
+                )),
+                self.arrows.1.then(|| egui::Rect::from_min_max(
+                    view.right_top() - egui::vec2(TAB_ARROW_W, 0.0),
+                    view.right_top(),
+                )),
+            ];
         });
     }
 
@@ -368,3 +453,140 @@ fn settings_tab_matches_home_tab_size() {
     // 设置页签固定在首页右边，不参与会话区滚动。
     assert!(settings.left() > home.right());
 }
+
+// ── 视口两端的滚动箭头 ──
+
+fn press(pos: Pos2) -> Event {
+    Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+fn release(pos: Pos2) -> Event {
+    Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+/// 在第 idx 端箭头（0 左 / 1 右）的热区中心点一下。
+fn click_arrow(ctx: &Context, app: &mut App, idx: usize) {
+    let z = app.arrow_zones[idx].expect("该端箭头这一帧应该是显示的");
+    let c = z.center();
+    frame(ctx, vec![press(c)], app);
+    frame(ctx, vec![release(c)], app);
+}
+
+#[test]
+fn no_arrow_when_everything_fits() {
+    let ctx = font_ctx();
+    // 3 个页签远小于视口：压根没得滚，两端都不该挂箭头（否则是假提示）。
+    let mut app = App::new(3, 2);
+    frame(&ctx, vec![], &mut app);
+    frame(&ctx, vec![], &mut app);
+    assert_eq!(app.arrows, (false, false), "放得下就不该有滚动箭头");
+}
+
+#[test]
+fn arrow_follows_scroll_position() {
+    let ctx = font_ctx();
+    let mut app = App::new(14, 2);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    let (view_w, content_w, _) = app.view_log;
+    let max_off = content_w - view_w;
+    assert!(max_off > 100.0, "得有得滚才有箭头可言");
+    // 在最左：只有右箭头。
+    assert_eq!(app.arrows, (false, true));
+
+    // 滚到中间：两端都有。
+    app.tab_scroll_x = max_off * 0.5;
+    app.tab_scroll_follow = false;
+    frame(&ctx, vec![], &mut app);
+    assert_eq!(app.arrows, (true, true));
+
+    // 滚到最右：左箭头留着，右箭头收掉（抵到头了还提示「还能往右」是骗人）。
+    app.tab_scroll_x = max_off;
+    frame(&ctx, vec![], &mut app);
+    assert_eq!(app.arrows, (true, false));
+}
+
+#[test]
+fn arrow_hidden_by_float_residue_at_end() {
+    // 纯函数：抵到两端时 off 与 max_off 常差最后一点浮点残差，
+    // 没有 0.5px 容差箭头就赖着不走（app.rs 里 strip_arrows 的存在理由）。
+    let (view_w, content_w) = (400.0, 700.0);
+    let max_off = content_w - view_w;
+    assert_eq!(strip_arrows(max_off - 1e-4, view_w, content_w), (true, false));
+    assert_eq!(strip_arrows(1e-4, view_w, content_w), (false, true));
+    assert_eq!(strip_arrows(0.0, view_w, content_w), (false, true));
+    // 内容不宽于视口 → 一律不出箭头。
+    assert_eq!(strip_arrows(0.0, 400.0, 400.0), (false, false));
+    assert_eq!(strip_arrows(12.0, 400.0, 380.0), (false, false));
+}
+
+#[test]
+fn arrow_click_scrolls_by_a_page() {
+    let ctx = font_ctx();
+    let mut app = App::new(14, 2);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+let (view_w, _content_w, _) = app.view_log;
+    assert_eq!(app.tab_scroll_x, 0.0);
+
+    // 点右箭头 → 往右翻大半屏；同时别把镜头抢回当前页签（否则点了就弹回去）。
+    click_arrow(&ctx, &mut app, 1);
+    let after_right = app.tab_scroll_x;
+    assert!(
+        after_right >= 48.0 && after_right <= view_w * 0.6 + 1.0,
+        "点右箭头应翻大半屏，实际 {after_right}"
+    );
+    assert!(!app.tab_scroll_follow, "用户自己在翻页，别再抢镜头");
+    frame(&ctx, vec![], &mut app);
+    assert!(app.tab_scroll_x >= after_right - 1.0, "翻过去的偏移不该被复位");
+    assert_eq!(app.arrows, (true, true));
+
+    // 点左箭头 → 原路翻回来。
+    click_arrow(&ctx, &mut app, 0);
+    assert!(
+        app.tab_scroll_x < after_right - 1.0,
+        "点左箭头应往回翻，实际 {} → {}",
+        after_right,
+        app.tab_scroll_x
+    );
+}
+
+#[test]
+fn arrow_click_lands_on_end() {
+    // 一步迈不到底：连点几下要能贴到两端，而不是在半路磨。
+    let (view_w, content_w) = (300.0, 700.0);
+    let mut off = 0.0;
+    for _ in 0..20 {
+        off = strip_arrow_scroll(off, view_w, content_w, false);
+    }
+    assert!((off - (content_w - view_w)).abs() < 0.01, "应贴到最右，实际 {off}");
+    for _ in 0..20 {
+        off = strip_arrow_scroll(off, view_w, content_w, true);
+    }
+    assert!(off.abs() < 0.01, "应贴到最左，实际 {off}");
+}
+
+#[test]
+fn arrow_zone_beats_the_half_tab_underneath() {
+    // 箭头画在页签之后并自带热区：点在箭头上不能激活/拖动下面那个半截页签，
+    // 否则「点箭头」会被解读成「点那个页签」。这里盯住滚动确实发生了。
+    let ctx = font_ctx();
+    let mut app = App::new(14, 2);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    assert_eq!(app.current, 2, "起始当前页签不变");
+    click_arrow(&ctx, &mut app, 1);
+    assert!(app.tab_scroll_x > 0.0, "箭头热区应吃掉这次点击（滚动了）");
+    assert_eq!(app.current, 2, "点箭头不该切页");
+}
+

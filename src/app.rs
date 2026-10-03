@@ -82,6 +82,19 @@ const ANIM_BUSY_MS: u64 = 250;
 /// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
 /// 随 ✅ 离开复位），靠 10s 节流防周期输出/退出-完成连发轰炸（用户拍板）。
 const TOAST_MIN_INTERVAL_MS: u64 = 10_000;
+/// 「任务完成」系统通知的**静默门槛**，比页签图标用的 [`OUTPUT_END_MS`] 宽得多。
+///
+/// 为什么要分开：图标与系统通知的代价不对等。图标错了刷新一眼就过去了，而
+/// 通知是**打断式**的（弹系统toast + 任务栏闪烁），误报一次就是「任务没干完就报
+/// 完成」的信任崩塌。纯输出启发式在 agent 回合**中途**的静默极常见：
+///   · 按下回车到首个 token 到达（模型排队 + TTS）常 >3s；
+///   · 跑一条几秒到几十秒不出字的命令（编译 / 等待网络 / sleep）；
+///   · 工具执行期间 TUI 只在有变化时重绘，动画通道本来就是一阵一阵的。
+/// 这些静默在信息上与「回合真跑完了」**不可区分**（屏幕启发式的固有边界，同
+/// ANIM_BUSY_MS 注释里的 ①），所以通知侧只能靠更长的静默来换误报率：
+/// 静默 ≥10s + ✅ 稳定 2s 才报，即真实回合结束后约 12s 提醒一次。
+/// 宁可迟报不可误报——就这一个数可调（用户反馈“老是错误弹任务完成”）。
+const TOAST_QUIET_MS: u64 = 10_000;
 /// 后台页签收割子进程（try_wait）的低频间隔：孙进程继承 ConPTY 句柄时管道
 /// 不 EOF，reader 判不了退出，只能低频轮询进程状态（每帧 syscall 不值得）。
 const BG_REAP_MS: u64 = 3_000;
@@ -3564,6 +3577,10 @@ fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
 /// 页签栏里页签内外的固定空隙（绘制与滚动量算共用一份数字，避免两处漂移）。
 const TAB_GAP: f32 = 4.0;
 
+/// 视口两端滚动箭头的热区/底衬宽（见 strip_arrow）。16px ≈ 一个「‹」加左右留白，
+/// 不至于把页签正文挡太多。
+const TAB_ARROW_W: f32 = 16.0;
+
 /// 一行页签的横向度量（绘制公式与滚动量算共用）。
 #[derive(Clone, Copy)]
 struct StripMetrics {
@@ -3656,6 +3673,101 @@ fn strip_offset(
         off = offset_to_show(off, view_w, content_w, x, w);
     }
     (off, follow)
+}
+
+/// 会话页签区视口两端的滚动箭头显隐（纯函数，测试照抄这份）：`(左, 右)`。
+///
+/// 内容不比视口宽（压根没得滚）时两端都不出箭头；贴到一端时那一端也收起来——
+/// 留 0.5px 容差吃掉浮点残差，否则 `off` 与 `max_off` 差最后 1e-4 像素也会被判成
+/// 「还能往回滚」，箭头就在到头后赖着不走。
+fn strip_arrows(off: f32, view_w: f32, content_w: f32) -> (bool, bool) {
+    let max_off = (content_w - view_w).max(0.0);
+    if max_off <= 0.5 {
+        return (false, false);
+    }
+    (off > 0.5, off < max_off - 0.5)
+}
+
+/// 点箭头后的目标偏移（纯函数）：走「大半屏」一步，一步迈到头就直接贴到那一端，
+/// 免得大页签时连点几次还在半路磨。
+fn strip_arrow_scroll(off: f32, view_w: f32, content_w: f32, left: bool) -> f32 {
+    let max_off = (content_w - view_w).max(0.0);
+    let step = (view_w * 0.6).clamp(48.0, 220.0);
+    (if left { off - step } else { off + step }).clamp(0.0, max_off)
+}
+
+/// 页签区视口一端的滚动箭头（chevron）。`left` = 画左端那一支。
+/// 返回是否被点击（点击 = 翻半屏）。
+///
+/// chevron 用两条线段画，不走字体：egui 内嵌字体（HACK）里 ‹ / ◀ / ‧ 这类符号
+/// **未必有字形**，缺字形等于没提示——与「× 不用 U+2715」同一条理由（见 tab_bar）。
+fn strip_arrow(ui: &egui::Ui, view: egui::Rect, left: bool) -> bool {
+    // 太窄就别挤了（两个箭头会叠在一起）。
+    if view.width() < TAB_ARROW_W * 2.0 {
+        return false;
+    }
+    let zone = if left {
+        egui::Rect::from_min_max(
+            view.left_top(),
+            view.left_top() + egui::vec2(TAB_ARROW_W, view.height()),
+        )
+    } else {
+        // 只减 x：连高度一起减会让 from_min_max 把上下角排序成一个退化矩形
+        // （箭头跑到视口外，点击永远打不中）。
+        egui::Rect::from_min_max(
+            view.right_top() - egui::vec2(TAB_ARROW_W, 0.0),
+            view.right_top(),
+        )
+    };
+    // 底衬：从视口边缘的实色渐变到内侧的透明。两件事：盖住被视口切掉一半的页签
+    // （半截字很难看），同时天然表达「那边还有页签」。底色取 panel_fill——
+    // 页签栏正是 Panel::top("tab_bar")，底色同一个值，不会露出接缝。
+    let bg = ui.visuals().panel_fill;
+    ui.painter().add(egui::Shape::gradient_rect(
+        zone,
+        // `from` 色在**外缘**：左端 = 左→右，右端 = 右→左。
+        if left {
+            egui::epaint::Direction::LeftToRight
+        } else {
+            egui::epaint::Direction::RightToLeft
+        },
+        [bg, Color32::TRANSPARENT],
+    ));
+    let hovered = ui.rect_contains_pointer(zone);
+    let color = if hovered {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let c = egui::pos2(zone.center().x, view.center().y);
+    let (hw, hh) = (3.5, 6.0); // 半宽 / 半高
+    let tip = egui::pos2(c.x + if left { hw } else { -hw }, c.y);
+    let tail = egui::pos2(c.x + if left { -hw } else { hw }, 0.0);
+    let stroke = egui::Stroke::new(if hovered { 1.8 } else { 1.4 }, color);
+    ui.painter()
+        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, -hh)], stroke));
+    ui.painter()
+        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, hh)], stroke));
+    // 交互：整条 zone 都是热区；只认指针点击（键盘 Enter/Space 不该翻页，
+    // 与页签本身同一套口径，见 tab_focus.rs）。
+    let resp = ui.interact(
+        zone,
+        egui::Id::new(("tab_strip_arrow", left)),
+        egui::Sense::click(),
+    );
+    let clicked = resp.clicked_by(egui::PointerButton::Primary);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    clicked
+}
+
+/// 通知侧额外的静默门槛（纯函数，便于单测）：只在 ✅ 之外再要求一段更长的
+/// 无实质输出，见 [`TOAST_QUIET_MS`] 的理由（agent 回合中途静默 ≠ 回合结束）。
+/// 从没收到过实质输出（时间戳仍是初始值）的会话直接否决——那种情况是
+/// 「压根没输出」，不该走完成通知。
+fn toast_quiet_enough(last_real_output_ms: u64, now_ms: u64) -> bool {
+    last_real_output_ms != 0 && now_ms.saturating_sub(last_real_output_ms) > TOAST_QUIET_MS
 }
 
 /// 同页签 10s 一条的通知节流（TOAST_MIN_INTERVAL_MS）。通过即占位时间戳——
@@ -4550,6 +4662,14 @@ fn move_tab(&mut self, from: usize, target: usize) {
                     } else if since == 0 {
                         s.done_since_ms.store(now_ms, Ordering::Relaxed);
                     } else if now_ms.saturating_sub(since) > DONE_STABLE_MS
+                        // 通知侧的额外静默门槛（比 ✅ 图标的 3s 宽，见
+                        // TOAST_QUIET_MS）：✅ 是给眼睛看的、错了刷新一下就好，
+                        // 系统通知是打断式的，agent 回合中途的静默（等首个 token /
+                        // 跑一条不出字的命令）必须挡住。
+                        && toast_quiet_enough(
+                            s.last_real_output_ms.load(Ordering::Relaxed),
+                            now_ms,
+                        )
                         && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
                         // 未查看门槛：启动即 viewed=true，闲置页签（无新输出轮）
                         // 不提醒；用户没看过的真任务输出轮才弹（阅读循环在加载
@@ -5190,6 +5310,26 @@ let s = TAB_GAP;
                     // 占位页签不响应点击/拖拽：只展示，防止拖动后位置错乱。
                     tab_rects.push((i, rect));
                 }
+            }
+
+            // ── 视口两端的滚动箭头 ──
+            // 页签多到一行放不下时，纯滚轮用户根本不知道「那边还有」：画一个箭头
+            // 提示还能往哪边滚（显隐见 strip_arrows），顺带让它可点，按大半屏翻。
+            // 必须画在页签**之后**：底衬的渐变要盖住被视口切了一半的页签，chevron
+            // 也要压在文字之上；egui 的命中取最后注册的那个，于是这 16px 里点到的
+            // 是箭头而不是下面那个残缺页签（正是想要的手势）。
+            let mut arrow: Option<bool> = None; // true = 点左箭头
+            if strip_arrows(off, view_w, geom.content_w).0 && strip_arrow(&ui, view, true) {
+                arrow = Some(true);
+            }
+            if strip_arrows(off, view_w, geom.content_w).1 && strip_arrow(&ui, view, false) {
+                arrow = Some(false);
+            }
+            if let Some(left) = arrow {
+                self.tab_scroll_x = strip_arrow_scroll(off, view_w, geom.content_w, left);
+                // 与拨滚轮同一条规矩：用户自己在看别的页签，别把镜头抢回当前页签
+                // （否则点一下就弹回去，箭头等于没用）。
+                self.tab_scroll_follow = false;
             }
         });
 
@@ -8450,7 +8590,8 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
-        state_due, tab_icon, ANIM_BUSY_MS, ICON_EMPTY, SNAP_EXITED, STATE_CHECK_MS,
+        state_due, tab_icon, toast_quiet_enough, ANIM_BUSY_MS, ICON_EMPTY, OUTPUT_END_MS,
+        SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
     };
 
     fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
@@ -8648,6 +8789,28 @@ mod tab_icon_tests {
         assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, 0, now - 100, 0), Some("✅"));
         // 滚动窗口与输入窗口互不干扰：输入回声例外只由 last_input 触发。
         assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100, 0), None);
+    }
+
+    /// 通知侧的静默门槛必须**严于**页签图标（用户反馈「老是错误弹任务完成」）：
+    /// agent 回合中途静默（等首个 token / 跑一条不出字的命令）会先满足 ✅ 的 3s，
+    /// 但不该立刻报「任务完成」。
+    #[test]
+    fn toast_needs_more_silence_than_the_icon() {
+        let now = 100_000u64;
+        // ✅ 已经亮了（静默 > OUTPUT_END_MS），通知仍被拦住。
+        assert_eq!(tab_icon(false, false, true, 10, false, now - 5_000, now, 0, 0, 0), Some("✅"));
+        assert!(!toast_quiet_enough(now - 5_000, now));
+        // 静默越过 TOAST_QUIET_MS 才放行通知（+ DONE_STABLE_MS 才是实际报出的时刻）。
+        assert!(!toast_quiet_enough(now - TOAST_QUIET_MS, now));
+        assert!(toast_quiet_enough(now - TOAST_QUIET_MS - 1, now));
+        assert!(TOAST_QUIET_MS > OUTPUT_END_MS);
+    }
+
+    /// 从没收到过实质输出的会话（last_real 仍是初始 0）不得走完成通知：0 距
+    /// now 恒「远超门槛」，不显式否决就会把零输出会话判成静默超久。
+    #[test]
+    fn never_output_session_never_toasts() {
+        assert!(!toast_quiet_enough(0, 100_000));
     }
 }
 
