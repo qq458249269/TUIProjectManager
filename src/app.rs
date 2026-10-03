@@ -3577,9 +3577,17 @@ fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
 /// 页签栏里页签内外的固定空隙（绘制与滚动量算共用一份数字，避免两处漂移）。
 const TAB_GAP: f32 = 4.0;
 
-/// 视口两端滚动箭头的热区/底衬宽（见 strip_arrow）。16px ≈ 一个「‹」加左右留白，
-/// 不至于把页签正文挡太多。
-const TAB_ARROW_W: f32 = 16.0;
+/// 页签区视口两端滚动按钮的槽宽（见 strip_scroll_btn / strip_btn_reserve）。
+///
+/// 按钮**占布局位**，不叠在页签上：两端各留这么宽，页签视口相应变窄，页签正文
+/// 一个字都不会被盖住（旧实现拿 16px 渐变底衬压在视口边缘，正好把被切掉半截的
+/// 页签吃掉）。18px ≈ 一个 14px 字形加左右留白，够当热区也不抢地方。
+const TAB_SCROLL_BTN_W: f32 = 18.0;
+
+/// 会话页签视口的宽度下界：窄到这个数以内就不预留滚动按钮了（见
+/// strip_btn_reserve）——按钮的职责是**不让页签被遮挡**，反过来把仅剩的页签挤
+/// 没了就本末倒置，这时只剩滚轮。
+const TAB_SCROLL_MIN_STRIP_W: f32 = 48.0;
 
 /// 一行页签的横向度量（绘制公式与滚动量算共用）。
 #[derive(Clone, Copy)]
@@ -3680,6 +3688,14 @@ fn strip_offset(
 /// 内容不比视口宽（压根没得滚）时两端都不出箭头；贴到一端时那一端也收起来——
 /// 留 0.5px 容差吃掉浮点残差，否则 `off` 与 `max_off` 差最后 1e-4 像素也会被判成
 /// 「还能往回滚」，箭头就在到头后赖着不走。
+/// 会话页签区视口两端的滚动**按钮**是否可点（纯函数，测试照抄这份）：`(左, 右)`。
+///
+/// 内容不比视口宽（压根没得滚）时两端都不可点；贴到一端时那一端也收起来——
+/// 留 0.5px 容差吃掉浮点残差，否则 `off` 与 `max_off` 差最后 1e-4 像素也会被判成
+/// 「还能往回滚」，按钮到头后还能点却不动。
+///
+/// 与 [`strip_btn_reserve`] 的分工：本函数管**能不能点**，那边管**占不占位**。
+/// 占位一旦出现就固定，到头的那一端只是画成灰的。
 fn strip_arrows(off: f32, view_w: f32, content_w: f32) -> (bool, bool) {
     let max_off = (content_w - view_w).max(0.0);
     if max_off <= 0.5 {
@@ -3688,7 +3704,7 @@ fn strip_arrows(off: f32, view_w: f32, content_w: f32) -> (bool, bool) {
     (off > 0.5, off < max_off - 0.5)
 }
 
-/// 点箭头后的目标偏移（纯函数）：走「大半屏」一步，一步迈到头就直接贴到那一端，
+/// 点按钮后的目标偏移（纯函数）：走「大半屏」一步，一步迈到头就直接贴到那一端，
 /// 免得大页签时连点几次还在半路磨。
 fn strip_arrow_scroll(off: f32, view_w: f32, content_w: f32, left: bool) -> f32 {
     let max_off = (content_w - view_w).max(0.0);
@@ -3696,70 +3712,75 @@ fn strip_arrow_scroll(off: f32, view_w: f32, content_w: f32, left: bool) -> f32 
     (if left { off - step } else { off + step }).clamp(0.0, max_off)
 }
 
-/// 页签区视口一端的滚动箭头（chevron）。`left` = 画左端那一支。
-/// 返回是否被点击（点击 = 翻半屏）。
+/// 会话页签区是否要给两端**预留滚动按钮位**，返回该预留的总宽（纯函数，
+/// 测试照抄这份）。0 = 不预留（视口就是全部可用宽）。
 ///
-/// chevron 用两条线段画，不走字体：egui 内嵌字体（HACK）里 ‹ / ◀ / ‧ 这类符号
-/// **未必有字形**，缺字形等于没提示——与「× 不用 U+2715」同一条理由（见 tab_bar）。
-fn strip_arrow(ui: &egui::Ui, view: egui::Rect, left: bool) -> bool {
-    // 太窄就别挤了（两个箭头会叠在一起）。
-    if view.width() < TAB_ARROW_W * 2.0 {
-        return false;
+/// 判据：`content_w > view_w - 两端按钮总宽`，即「扣掉按钮后仍然放不下」。用
+/// 这个而不是「`content_w > view_w`」：后者会在内容量刚好卡在两端按钮之间时预留
+/// 出两个永远点不动的死按钮（内容已经装得下了）。
+///
+/// 视口窄到连按钮位本身都摆不下时返回 0（不预留）：宁可只剩滚轮，也不能让按钮把
+/// 页签挤没了——按钮的职责是**不让页签被遮挡**，反过来把页签挤掉就本末倒置。
+fn strip_btn_reserve(view_w: f32, content_w: f32) -> f32 {
+    let two = TAB_SCROLL_BTN_W * 2.0;
+    if view_w < TAB_SCROLL_MIN_STRIP_W + two {
+        return 0.0;
     }
-    let zone = if left {
-        egui::Rect::from_min_max(
-            view.left_top(),
-            view.left_top() + egui::vec2(TAB_ARROW_W, view.height()),
-        )
+    if content_w > view_w - two {
+        two
     } else {
-        // 只减 x：连高度一起减会让 from_min_max 把上下角排序成一个退化矩形
-        // （箭头跑到视口外，点击永远打不中）。
-        egui::Rect::from_min_max(
-            view.right_top() - egui::vec2(TAB_ARROW_W, 0.0),
-            view.right_top(),
-        )
-    };
-    // 底衬：从视口边缘的实色渐变到内侧的透明。两件事：盖住被视口切掉一半的页签
-    // （半截字很难看），同时天然表达「那边还有页签」。底色取 panel_fill——
-    // 页签栏正是 Panel::top("tab_bar")，底色同一个值，不会露出接缝。
-    let bg = ui.visuals().panel_fill;
-    ui.painter().add(egui::Shape::gradient_rect(
-        zone,
-        // `from` 色在**外缘**：左端 = 左→右，右端 = 右→左。
-        if left {
-            egui::epaint::Direction::LeftToRight
-        } else {
-            egui::epaint::Direction::RightToLeft
-        },
-        [bg, Color32::TRANSPARENT],
-    ));
-    let hovered = ui.rect_contains_pointer(zone);
-    let color = if hovered {
+        0.0
+    }
+}
+
+/// 页签区视口一端的滚动**按钮**。`left` = 画左端那一支。返回是否被点击
+/// （点击 = 翻半屏）。
+///
+/// 关键区别：**它不叠在页签上**。槽位是布局位（见 [`strip_btn_reserve`]），页签
+/// 视口从按钮右侧开始，页签正文一个字都不会被盖住——旧实现拿 16px 渐变底衬压在
+/// 视口边缘，被切掉半截的页签正好被底衬吃掉，等于拿「遮住」换「不跳动」。
+///
+/// 底衬只在悬停时画（透明 → widgets.hovered.bg_fill）：平时页签栏是平的，按钮
+/// 不抢视觉权重；鼠标移上去才亮起来，加上 PointingHand 光标——可点这事儿得看得见
+/// 摸得着，不然它就只是个装饰。禁用态（已经到头）连底都不画，只把字形调淡到
+/// 一眼看出点不动。
+fn strip_scroll_btn(ui: &egui::Ui, rect: egui::Rect, left: bool, enabled: bool) -> bool {
+    let hovered = enabled && ui.rect_contains_pointer(rect);
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let color = if !enabled {
+        // 到头的一端：仍占位（页签不跳），但明显不可点。
+        ui.visuals().weak_text_color().gamma_multiply(0.35)
+    } else if hovered {
         ui.visuals().strong_text_color()
     } else {
         ui.visuals().weak_text_color()
     };
-    let c = egui::pos2(zone.center().x, view.center().y);
-    let (hw, hh) = (3.5, 6.0); // 半宽 / 半高
-    let tip = egui::pos2(c.x + if left { hw } else { -hw }, c.y);
-    let tail = egui::pos2(c.x + if left { -hw } else { hw }, 0.0);
-    let stroke = egui::Stroke::new(if hovered { 1.8 } else { 1.4 }, color);
-    ui.painter()
-        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, -hh)], stroke));
-    ui.painter()
-        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, hh)], stroke));
-    // 交互：整条 zone 都是热区；只认指针点击（键盘 Enter/Space 不该翻页，
+    // 用字形（◀ ▶）而不是两条线段画 chevron：setup_fonts 已把 seguiemj.ttf
+    // （Segoe UI Emoji）/ seguisym.ttf（Segoe UI Symbol）挂成**逐字形**兜底，
+    // 实探（tests 里按字体图集像素验过，UV 矩形里是完整实心三角形）U+25C0 /
+    // U+25B6 在这里有字形。走字体就不用自己调笔画粗细/颜色，悬停、禁用、深浅
+    // 主题全都自动跟着走。
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if left { "◀" } else { "▶" },
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+    );
+    // 交互：整个槽位都是热区；只认指针点击（键盘 Enter/Space 不该翻页，
     // 与页签本身同一套口径，见 tab_focus.rs）。
     let resp = ui.interact(
-        zone,
-        egui::Id::new(("tab_strip_arrow", left)),
+        rect,
+        egui::Id::new(("tab_strip_scroll_btn", left)),
         egui::Sense::click(),
     );
-    let clicked = resp.clicked_by(egui::PointerButton::Primary);
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    clicked
+    enabled && resp.clicked_by(egui::PointerButton::Primary)
 }
 
 /// 通知侧额外的静默门槛（纯函数，便于单测）：只在 ✅ 之外再要求一段更长的
@@ -4675,7 +4696,7 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         // 不提醒；用户没看过的真任务输出轮才弹（阅读循环在加载
                         // 期后每轮新输出复位 viewed）。「任务完成」只属于主页签
                         // 之外、用户还没看过的新内容，消除「没任何输出却弹」误报。
-                        && !s.has_been_viewed.load(Ordering::Relaxed)
+&& !s.has_been_viewed.load(Ordering::Relaxed)
                         && allow_toast(s, now_ms)
                         && !s.done_notified.swap(true, Ordering::Relaxed)
                         // 启动宽限期：刚启动的会话（含首轮输出）静默；
@@ -4683,8 +4704,14 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
                             >= STARTUP_GRACE_MS
                     {
-                        crate::notify_run_finished(&s.title, "任务完成");
-                        crate::flash_taskbar(self.titlebar_hwnd);
+                        // 设置页的总开关（默认关）：这条通知的判据只有「静默 +
+                        // 画面不动」，在 agent 回合中途与「真跑完了」不可区分，
+                        // 误报代价（打断式系统通知）是信任崩塌。页签 ✅ 不受影
+                        // 响，见 config::Settings::notify_task_done 的理由。
+                        if self.config.settings.notify_task_done {
+                            crate::notify_run_finished(&s.title, "任务完成");
+                            crate::flash_taskbar(self.titlebar_hwnd);
+                        }
                     }
                 } else {
                     // 离开完成态（新一轮输出/启动加载中/已退出）→ 清稳定计时并
@@ -4980,7 +5007,7 @@ let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
             // 副作用；它还自带一条滚动条，页签栏这么窄一行，没必要占地方。
             // 这里改成：按量出来的宽度把布局起点左移 off，再按视口裁剪。
             let avail = ui.available_rect_before_wrap();
-            let view_w = avail.width().max(0.0);
+            let full_w = avail.width().max(0.0);
             let geom = self.strip_geom_for_frame(
                 ui,
                 tab_font.clone(),
@@ -4992,8 +5019,25 @@ let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
 pad: tab_margin.left as f32 + tab_margin.right as f32,
                 },
             );
-            let view =
-                egui::Rect::from_min_size(avail.min, egui::vec2(view_w, avail.height()));
+            // ── 两端滚动按钮的**槽位**（不是叠加层）──
+            // 页签放不下时，在 avail 左右各扣一个按钮宽当「预���位」：视口从左按钮
+            // 右侧开始，于是页签正文永远不会被按钮遮住（旧实现把箭头 + 渐变底衬
+            // 压在视口上缘，正好吃掉被切掉的半截页签）。槽位算出后**固定不变**：
+            // 滚到头时那一端只是变灰，不缩回去，否则页签会在指针底下跳。
+            let btn_reserve = strip_btn_reserve(full_w, geom.content_w);
+            let view_w = (full_w - btn_reserve).max(0.0);
+            let view = egui::Rect::from_min_size(
+                egui::pos2(avail.left() + btn_reserve * 0.5, avail.min.y),
+                egui::vec2(view_w, avail.height()),
+            );
+            let btn_left = egui::Rect::from_min_size(
+                avail.left_top(),
+                egui::vec2(TAB_SCROLL_BTN_W, avail.height()),
+            );
+            let btn_right = egui::Rect::from_min_max(
+                egui::pos2(avail.right() - TAB_SCROLL_BTN_W, avail.top()),
+                avail.right_bottom(),
+            );
             // 重新武装跟随的两条非滚轮通道（都在切页 / 改视野之外的用户意图里）：
             //  1. 切页（点击 / Ctrl+Tab / 新建 / 关闭 / 恢复 / 拖动重排）——靠比对
             //     current 与上次武装时记下的下标，不用给十来处赋值点逐个埋点；
@@ -5034,6 +5078,30 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
             }
             self.tab_scroll_x = off;
             self.tab_scroll_follow = follow;
+
+            // ── 画两端滚动按钮（槽位已预留，视口外侧，不挡页签）──
+            // 画在页签**之前**：不叠加就没有「底衬要盖住页签」那层需要，按钮与页签
+            // 的矩形互不相交，命中也不会互相抢（egui 取最后注册的那个，之前是靠
+            // 「箭头后画所以抢到页签的点击」才实现的）。
+            // 必须用外层 ui（不是下面那个 clip 到 view 的 shadow child）：按钮在视口
+            // 之外，child 的裁剪矩形会把它们整个剪掉。
+            if btn_reserve > 0.0 {
+                let (can_l, can_r) = strip_arrows(off, view_w, geom.content_w);
+                let mut btn: Option<bool> = None; // true = 点左端
+                if strip_scroll_btn(ui, btn_left, true, can_l) {
+                    btn = Some(true);
+                }
+                if strip_scroll_btn(ui, btn_right, false, can_r) {
+                    btn = Some(false);
+                }
+                if let Some(left) = btn {
+                    self.tab_scroll_x =
+                        strip_arrow_scroll(off, view_w, geom.content_w, left);
+                    // 与拨滚轮同一条规矩：用户自己在看别的页签，别把镜头抢回当前
+                    // 页签（否则点一下就弹回去，按钮等于没用）。
+                    self.tab_scroll_follow = false;
+                }
+            }
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(view.left() - off, view.top()),
                 egui::pos2(
@@ -5310,26 +5378,6 @@ let s = TAB_GAP;
                     // 占位页签不响应点击/拖拽：只展示，防止拖动后位置错乱。
                     tab_rects.push((i, rect));
                 }
-            }
-
-            // ── 视口两端的滚动箭头 ──
-            // 页签多到一行放不下时，纯滚轮用户根本不知道「那边还有」：画一个箭头
-            // 提示还能往哪边滚（显隐见 strip_arrows），顺带让它可点，按大半屏翻。
-            // 必须画在页签**之后**：底衬的渐变要盖住被视口切了一半的页签，chevron
-            // 也要压在文字之上；egui 的命中取最后注册的那个，于是这 16px 里点到的
-            // 是箭头而不是下面那个残缺页签（正是想要的手势）。
-            let mut arrow: Option<bool> = None; // true = 点左箭头
-            if strip_arrows(off, view_w, geom.content_w).0 && strip_arrow(&ui, view, true) {
-                arrow = Some(true);
-            }
-            if strip_arrows(off, view_w, geom.content_w).1 && strip_arrow(&ui, view, false) {
-                arrow = Some(false);
-            }
-            if let Some(left) = arrow {
-                self.tab_scroll_x = strip_arrow_scroll(off, view_w, geom.content_w, left);
-                // 与拨滚轮同一条规矩：用户自己在看别的页签，别把镜头抢回当前页签
-                // （否则点一下就弹回去，箭头等于没用）。
-                self.tab_scroll_follow = false;
             }
         });
 
@@ -6231,19 +6279,53 @@ let s = TAB_GAP;
         // 一时刻只展开一块，点另一块就自动收起）：收起时只剩标题行 + 一句摘要
         // （条数 / 当前项），展开才画正文。
         self.load_settings_sec_once(ui);
-        self.commands_section_ui(ui);
+self.commands_section_ui(ui);
         self.tool_dirs_section_ui(ui);
         self.providers_section_ui(ui);
         ui.add_space(12.0);
+        self.notify_section_ui(ui);
         ui.separator();
         ui.add_space(6.0);
         // 帧率设置已整体移除（曾可调 30 FPS）：持续高帧率重绘会干扰 Windows
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒即弹「任务完成」通知（仅未查看过的真任务输出轮，闲置页签不弹）；周期输出横跳会重置计时。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
-        ui.add_space(12.0);
+ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入、软件重新获得焦点即消失；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，若下方「任务完成通知」开着，再满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才弹系统通知并闪烁任务栏。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
+ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+    }
+
+    /// 设置页的「通知」区：目前只有一项——「任务完成」系统通知开关。
+    ///
+    /// 为什么默认关（而不是调参调准）：这条通知的判据只有「终端静默 N 秒 +
+    /// 画面不在高频动」，而 agent 回合**中途**的静默（等首个 token、跑一条
+    /// 不出字的命令、工具执行期 TUI 只在有变化时重绘）与「回合真跑完了」在
+    /// 信息上不可区分。页签 ✅ 图标同样吃这条启发式，但它是给眼睛看的、错了
+    /// 刷新一眼就过去；系统通知是**打断式**的（弹 toast + 任务栏闪烁），误报
+    /// 一次就是信任崩塌。宁可默认不打扰，要的人自己开。
+    ///
+    /// 「运行结束」通知不归这里管：它的判据是子进程 try_wait（权威），不是
+    /// 启发式，所以一直开着。
+    fn notify_section_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("🔔 通知").strong());
+        ui.label(
+            RichText::new(
+                "「运行结束」（子进程真的退出时）始终弹通知。\n\
+                 「任务完成」靠终端静默启发式判断，与「回合中途的静默」无法区分，\
+                 容易误报，默认关闭；页签上的 ✅ 标记不受影响。",
+            )
+            .weak()
+            .small(),
+        );
+        let mut on = self.config.settings.notify_task_done;
+        if ui
+            .checkbox(&mut on, "任务完成时弹系统通知（并闪烁任务栏）")
+            .on_hover_text("按终端静默启发式判断回合结束，可能误报（宁可迟报不可误报）")
+            .changed()
+        {
+            self.config.settings.notify_task_done = on;
+            self.save_config("设置已自动保存".to_string());
+        }
     }
 
     /// 进设置页时读一次「上次展开哪一块」（egui persisted，与折叠状态一样跨重
@@ -8811,6 +8893,56 @@ mod tab_icon_tests {
     #[test]
     fn never_output_session_never_toasts() {
         assert!(!toast_quiet_enough(0, 100_000));
+    }
+}
+
+#[cfg(test)]
+mod strip_scroll_btn_tests {
+    use super::{strip_arrows, strip_arrow_scroll, strip_btn_reserve, TAB_SCROLL_BTN_W};
+
+    /// 预留判据是「扣掉两端按钮**仍然**放不下」：刚好多出来能装下时不该预留，
+    /// 否则会留下两个永远点不动的死按钮。
+    #[test]
+    fn reserve_only_when_content_still_overflows() {
+        let two = TAB_SCROLL_BTN_W * 2.0;
+        assert_eq!(strip_btn_reserve(400.0, 300.0), 0.0);
+        assert_eq!(strip_btn_reserve(400.0, 400.0 - two), 0.0);
+        assert_eq!(strip_btn_reserve(400.0, 400.0 - two + 1.0), two);
+    }
+
+    /// 视口窄到连按钮位都摆不下 → 不预留。按钮的职责是**不遮挡页签**，反过来
+    /// 把仅剩的页签挤没了就本末倒置（这时只剩滚轮）。
+    #[test]
+    fn no_reserve_when_view_too_narrow() {
+        let two = TAB_SCROLL_BTN_W * 2.0;
+        assert_eq!(strip_btn_reserve(two + 47.0, 900.0), 0.0);
+        assert_eq!(strip_btn_reserve(two + 48.0, 900.0), two);
+    }
+
+    /// 浮点残差：抵到两端时 off 与 max_off 差最后 1e-4 像素，没有容差按钮会赖着
+    /// 不走（到头了还能点却不动）。
+    #[test]
+    fn float_residue_at_end_disables_that_side() {
+        let (view_w, content_w) = (400.0, 700.0);
+        let max_off = content_w - view_w;
+        assert_eq!(strip_arrows(max_off - 1e-4, view_w, content_w), (true, false));
+        assert_eq!(strip_arrows(1e-4, view_w, content_w), (false, true));
+        assert_eq!(strip_arrows(12.0, 400.0, 380.0), (false, false));
+    }
+
+    /// 连点要能贴到两端，而不是在半路磨。
+    #[test]
+    fn repeated_clicks_land_on_the_ends() {
+        let (view_w, content_w) = (300.0, 700.0);
+        let mut off = 0.0;
+        for _ in 0..20 {
+            off = strip_arrow_scroll(off, view_w, content_w, false);
+        }
+        assert!((off - (content_w - view_w)).abs() < 0.01);
+        for _ in 0..20 {
+            off = strip_arrow_scroll(off, view_w, content_w, true);
+        }
+        assert!(off.abs() < 0.01);
     }
 }
 

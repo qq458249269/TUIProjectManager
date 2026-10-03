@@ -56,9 +56,27 @@ fn offset_to_show(off: f32, view_w: f32, content_w: f32, x: f32, w: f32) -> f32 
     shown.clamp(0.0, max_off)
 }
 
-// ── 视口两端的滚动箭头（照抄 app.rs::strip_arrows / strip_arrow_scroll / strip_arrow）──
+// ── 视口两端的滚动按钮（照抄 app.rs::strip_btn_reserve / strip_arrows /
+// strip_arrow_scroll / strip_scroll_btn）──
 
-const TAB_ARROW_W: f32 = 16.0;
+/// 按钮**占布局位**的槽宽；不叠在页签上（旧实现 TAB_ARROW_W=16
+/// 的渐变底衫正是叠在视口上缘、吃掉半截页签）。
+const TAB_SCROLL_BTN_W: f32 = 18.0;
+/// 视口窄到这个数以内就不预留按钮（宁可只剩滚轮，也不能把
+/// 页签挤没了）。
+const TAB_SCROLL_MIN_STRIP_W: f32 = 48.0;
+
+fn strip_btn_reserve(view_w: f32, content_w: f32) -> f32 {
+    let two = TAB_SCROLL_BTN_W * 2.0;
+    if view_w < TAB_SCROLL_MIN_STRIP_W + two {
+        return 0.0;
+    }
+    if content_w > view_w - two {
+        two
+    } else {
+        0.0
+    }
+}
 
 fn strip_arrows(off: f32, view_w: f32, content_w: f32) -> (bool, bool) {
     let max_off = (content_w - view_w).max(0.0);
@@ -74,42 +92,35 @@ fn strip_arrow_scroll(off: f32, view_w: f32, content_w: f32, left: bool) -> f32 
     (if left { off - step } else { off + step }).clamp(0.0, max_off)
 }
 
-fn strip_arrow(ui: &egui::Ui, view: egui::Rect, left: bool) -> bool {
-    if view.width() < TAB_ARROW_W * 2.0 {
-        return false;
+fn strip_scroll_btn(ui: &egui::Ui, rect: egui::Rect, left: bool, enabled: bool) -> bool {
+    let hovered = enabled && ui.rect_contains_pointer(rect);
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
     }
-    let zone = if left {
-        egui::Rect::from_min_max(
-            view.left_top(),
-            view.left_top() + egui::vec2(TAB_ARROW_W, view.height()),
-        )
+    let color = if !enabled {
+        ui.visuals().weak_text_color().gamma_multiply(0.35)
+    } else if hovered {
+        ui.visuals().strong_text_color()
     } else {
-        egui::Rect::from_min_max(
-            view.right_top() - egui::vec2(TAB_ARROW_W, 0.0),
-            view.right_top(),
-        )
+        ui.visuals().weak_text_color()
     };
-    let bg = ui.visuals().panel_fill;
-    ui.painter().add(egui::Shape::gradient_rect(
-        zone,
-        if left {
-            egui::epaint::Direction::LeftToRight
-        } else {
-            egui::epaint::Direction::RightToLeft
-        },
-        [bg, Color32::TRANSPARENT],
-    ));
-    let c = egui::pos2(zone.center().x, view.center().y);
-    let (hw, hh) = (3.5, 6.0);
-    let tip = egui::pos2(c.x + if left { hw } else { -hw }, c.y);
-    let tail = egui::pos2(c.x + if left { -hw } else { hw }, 0.0);
-    let stroke = egui::Stroke::new(1.4, ui.visuals().weak_text_color());
-    ui.painter()
-        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, -hh)], stroke));
-    ui.painter()
-        .add(egui::Shape::line_segment([tip, tail + egui::vec2(0.0, hh)], stroke));
-    ui.interact(zone, egui::Id::new(("tab_strip_arrow", left)), egui::Sense::click())
-        .clicked_by(egui::PointerButton::Primary)
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if left { "◀" } else { "▶" },
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+    );
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("tab_strip_scroll_btn", left)),
+        egui::Sense::click(),
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    enabled && resp.clicked_by(egui::PointerButton::Primary)
 }
 
 struct App {
@@ -124,10 +135,14 @@ struct App {
     view_log: (f32, f32, f32),
 /// 首页、设置两个固定页签的矩形（断言设置与首页同尺寸）。
     fixed_rects: Vec<Rect>,
-    /// 本帧两端箭头的显隐（左, 右）。
-    arrows: (bool, bool),
-    /// 本帧两端箭头的热区（左, 右；None = 未显示）。
-    arrow_zones: [Option<Rect>; 2],
+    /// 本帧两端按钮的可点性（左, 右）。
+    btns: (bool, bool),
+    /// 本帧两端按钮的槽位（左, 右；None = 未预留）。
+    btn_slots: [Option<Rect>; 2],
+    /// 本帧页签视口（两端按钮取位之间）。
+    view_rect: Rect,
+    /// 本帧页签的矩形（测「按钮不挡页签」用）。
+    tab_rects: Vec<Rect>,
     /// 虚拟时钟：egui 的滚轮位移是「摊到几十帧」的平滑量，不推进时间就永远衰不
     /// 干净，测不出「拨完之后跟随重新武装」。
     now: f64,
@@ -147,8 +162,10 @@ impl App {
 cache: Default::default(),
             view_log: (0.0, 0.0, 0.0),
             fixed_rects: Vec::new(),
-            arrows: (false, false),
-            arrow_zones: [None, None],
+            btns: (false, false),
+            btn_slots: [None, None],
+            view_rect: Rect::NOTHING,
+            tab_rects: Vec::new(),
             now: 0.0,
             win_w: 800.0,
         }
@@ -186,7 +203,7 @@ cache: Default::default(),
             ui.add_space(4.0);
 
             let avail = ui.available_rect_before_wrap();
-            let view_w = avail.width().max(0.0);
+            let full_w = avail.width().max(0.0);
             let m = StripMetrics {
                 slot_w,
                 close_w,
@@ -199,7 +216,21 @@ cache: Default::default(),
                 items.push((i + 2, self.title_w(ui, &t, &tab_font), true));
             }
             let geom = strip_geom(&items, m);
-            let view = egui::Rect::from_min_size(avail.min, egui::vec2(view_w, avail.height()));
+            // 两端按钮占位（不叠页签）：视口从左按钮右侧开始。
+            let btn_reserve = strip_btn_reserve(full_w, geom.content_w);
+            let view_w = (full_w - btn_reserve).max(0.0);
+            let view = egui::Rect::from_min_size(
+                egui::pos2(avail.left() + btn_reserve * 0.5, avail.min.y),
+                egui::vec2(view_w, avail.height()),
+            );
+            let btn_left = egui::Rect::from_min_size(
+                avail.left_top(),
+                egui::vec2(TAB_SCROLL_BTN_W, avail.height()),
+            );
+            let btn_right = egui::Rect::from_min_max(
+                egui::pos2(avail.right() - TAB_SCROLL_BTN_W, avail.top()),
+                avail.right_bottom(),
+            );
             let max_off = (geom.content_w - view_w).max(0.0);
             if self.current != self.tab_scroll_follow_at || view_w != self.tab_scroll_view_w {
                 self.tab_scroll_follow = true;
@@ -221,6 +252,29 @@ cache: Default::default(),
             }
             self.tab_scroll_x = off;
             self.view_log = (view_w, geom.content_w, scroll);
+            self.view_rect = view;
+            // 按钮画在页签**之前**（用外层 ui，不是下面 clip 到 view 的 shadow
+            // child）：与页签矩形互不相交，既不遮也不抢命中。
+            if btn_reserve > 0.0 {
+                self.btns = strip_arrows(off, view_w, geom.content_w);
+                let mut btn = None;
+                if strip_scroll_btn(ui, btn_left, true, self.btns.0) {
+                    btn = Some(true);
+                }
+                if strip_scroll_btn(ui, btn_right, false, self.btns.1) {
+                    btn = Some(false);
+                }
+                if let Some(left) = btn {
+                    self.tab_scroll_x = strip_arrow_scroll(off, view_w, geom.content_w, left);
+                    self.tab_scroll_follow = false;
+                }
+            } else {
+                self.btns = (false, false);
+            }
+            self.btn_slots = [
+                (btn_reserve > 0.0).then_some(btn_left),
+                (btn_reserve > 0.0).then_some(btn_right),
+            ];
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(view.left() - off, view.top()),
                 egui::pos2(view.left() - off + geom.content_w.max(view_w), view.bottom()),
@@ -235,10 +289,11 @@ cache: Default::default(),
                     ),
             );
             ui.set_clip_rect(view);
+            self.tab_rects.clear();
             for t in self.titles.clone() {
                 ui.add_space(TAB_GAP);
                 let title_w = self.title_w(&ui, &t, &tab_font);
-                let _ = egui::Frame::new()
+                let rect = egui::Frame::new()
                     .corner_radius(4.0)
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(tab_margin)
@@ -264,31 +319,11 @@ cache: Default::default(),
                             ui.add_space(pad_m);
                         }
                         ui.add(egui::Label::new("×").selectable(false));
-                    });
+                    })
+                    .response
+                    .rect;
+                self.tab_rects.push(rect);
             }
-            // 视口两端的滚动箭头（照抄 app.rs：页签之后画，才盖得住半截页签）。
-            self.arrows = strip_arrows(off, view_w, geom.content_w);
-            let mut arrow = None;
-            if self.arrows.0 && strip_arrow(&ui, view, true) {
-                arrow = Some(true);
-            }
-            if self.arrows.1 && strip_arrow(&ui, view, false) {
-                arrow = Some(false);
-            }
-            if let Some(left) = arrow {
-                self.tab_scroll_x = strip_arrow_scroll(off, view_w, geom.content_w, left);
-                self.tab_scroll_follow = false;
-            }
-            self.arrow_zones = [
-                self.arrows.0.then(|| egui::Rect::from_min_max(
-                    view.left_top(),
-                    view.left_top() + egui::vec2(TAB_ARROW_W, view.height()),
-                )),
-                self.arrows.1.then(|| egui::Rect::from_min_max(
-                    view.right_top() - egui::vec2(TAB_ARROW_W, 0.0),
-                    view.right_top(),
-                )),
-            ];
         });
     }
 
@@ -474,102 +509,172 @@ fn release(pos: Pos2) -> Event {
     }
 }
 
-/// 在第 idx 端箭头（0 左 / 1 右）的热区中心点一下。
-fn click_arrow(ctx: &Context, app: &mut App, idx: usize) {
-    let z = app.arrow_zones[idx].expect("该端箭头这一帧应该是显示的");
+/// 在第 idx 端按钮（0 左 / 1 右）的槽位中心点一下。
+fn click_scroll_btn(ctx: &Context, app: &mut App, idx: usize) {
+    let z = app.btn_slots[idx].expect("该端按钮这一帧应该是预留着的");
     let c = z.center();
     frame(ctx, vec![press(c)], app);
     frame(ctx, vec![release(c)], app);
 }
 
 #[test]
-fn no_arrow_when_everything_fits() {
+fn no_scroll_btn_when_everything_fits() {
     let ctx = font_ctx();
-    // 3 个页签远小于视口：压根没得滚，两端都不该挂箭头（否则是假提示）。
+    // 3 个页签远小于视口：根本没得滚，两端都不该预留按钮槽（否则既占了地方
+    // 又是假提示）。
     let mut app = App::new(3, 2);
     frame(&ctx, vec![], &mut app);
     frame(&ctx, vec![], &mut app);
-    assert_eq!(app.arrows, (false, false), "放得下就不该有滚动箭头");
+    assert_eq!(app.btn_slots, [None, None], "放得下就不该有滚动按钮");
+    assert_eq!(app.btns, (false, false));
 }
 
 #[test]
-fn arrow_follows_scroll_position() {
+fn btn_reserve_only_when_needed() {
+    // 纯函数：预留判据是「扣掉按钮仍放不下」。
+    let two = TAB_SCROLL_BTN_W * 2.0;
+    // 宽度余量（扣掉按钮还宽很多）→ 不预留。
+    assert_eq!(strip_btn_reserve(400.0, 300.0), 0.0);
+    // 宽度刚好占满两个按钮位 → 不预留（否则留下两个死按钮）。
+    assert_eq!(strip_btn_reserve(400.0, 400.0 - two), 0.0);
+    // 超出一丁点 → 预留两端。
+    assert_eq!(strip_btn_reserve(400.0, 400.0 - two + 1.0), two);
+    assert_eq!(strip_btn_reserve(400.0, 900.0), two);
+    // 视口窄到连按钮位都摆不下 → 不预留（保页签，保滚轮）。
+    assert_eq!(strip_btn_reserve(TAB_SCROLL_MIN_STRIP_W + two - 0.5, 900.0), 0.0);
+    assert_eq!(strip_btn_reserve(TAB_SCROLL_MIN_STRIP_W + two, 900.0), two);
+}
+
+#[test]
+fn scroll_btns_never_cover_tabs() {
+    // 核心要求：按钮只占布局位，绝不叠在页签上。旧实现拿 16px 渐变底衬压在视口
+    // 边缘，正好把被切掉半截的页签吃掉（本次修改要解决的就是这个）。这里直接
+    // 花几何时间比较按钮槽位与每个页签的矩形。
+    let ctx = font_ctx();
+    let mut app = App::new(14, 2);
+    for x in [700.0, 500.0, 300.0, 120.0] {
+        frame(&ctx, vec![Event::PointerMoved(Pos2::new(x, 12.0))], &mut app);
+        let l = app.btn_slots[0].expect("应预留");
+        let r = app.btn_slots[1].expect("应预留");
+        assert!(!app.tab_rects.is_empty());
+        // 按钮与视口不相交（视口就是「扣掉两端按钮」之后剩下的那条）。
+        assert!(l.intersect(app.view_rect).width() <= 0.0);
+        assert!(r.intersect(app.view_rect).width() <= 0.0);
+        for t in &app.tab_rects {
+            // 页签的 frame 矩形会比视口宽（被裁剪的部分画不出来），真正上屏的只有
+            // 它与视口的交集 —— 就用这块「可见区域」去断言按钮没盖住页签。
+            let painted = t.intersect(app.view_rect);
+            if painted.width() <= 0.0 {
+                continue;
+            }
+            assert!(
+                painted.left() >= l.right() - 0.01,
+                "左按钮盖住了页签可见部分：{:?} vs {:?}",
+                l,
+                painted
+            );
+            assert!(
+                painted.right() <= r.left() + 0.01,
+                "右按钮盖住了页签可见部分：{:?} vs {:?}",
+                r,
+                painted
+            );
+        }
+        // 视口也应走在两个按钮之间（不被按钮咬掉一截）。
+        assert!(app.view_rect.left() >= l.right() - 0.01);
+        assert!(app.view_rect.right() <= r.left() + 0.01);
+    }
+}
+
+#[test]
+fn scroll_btn_state_follows_scroll_position() {
     let ctx = font_ctx();
     let mut app = App::new(14, 2);
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
     let (view_w, content_w, _) = app.view_log;
     let max_off = content_w - view_w;
-    assert!(max_off > 100.0, "得有得滚才有箭头可言");
-    // 在最左：只有右箭头。
-    assert_eq!(app.arrows, (false, true));
+    assert!(max_off > 100.0, "得有得滚才有按钮可言");
+    // 在最左：只有右按钮可点。
+    assert_eq!(app.btns, (false, true));
 
-    // 滚到中间：两端都有。
+    // 滚到中间：两端都可点。
     app.tab_scroll_x = max_off * 0.5;
     app.tab_scroll_follow = false;
     frame(&ctx, vec![], &mut app);
-    assert_eq!(app.arrows, (true, true));
+    assert_eq!(app.btns, (true, true));
 
-    // 滚到最右：左箭头留着，右箭头收掉（抵到头了还提示「还能往右」是骗人）。
+    // 滚到最右：左按钮可点，右端禁用（抵到头了还提示「还能往右」是骗人）。
+    // **槽位不变**：若它一收回就会把页签在指针底下拉一下。
     app.tab_scroll_x = max_off;
     frame(&ctx, vec![], &mut app);
-    assert_eq!(app.arrows, (true, false));
+    assert_eq!(app.btns, (true, false));
+    assert!(
+        app.btn_slots.iter().all(|s| s.is_some()),
+        "到了端槽位仍在"
+    );
 }
 
 #[test]
-fn arrow_hidden_by_float_residue_at_end() {
-    // 纯函数：抵到两端时 off 与 max_off 常差最后一点浮点残差，
-    // 没有 0.5px 容差箭头就赖着不走（app.rs 里 strip_arrows 的存在理由）。
+fn btn_hidden_by_float_residue_at_end() {
+    // 纯函数：抵到两端时 off 与 max_off 常差最后一点浮点残差，没有 0.5px 容差
+    // 按钮就赖着不走（app.rs 里 strip_arrows 的存在理由）。
     let (view_w, content_w) = (400.0, 700.0);
     let max_off = content_w - view_w;
     assert_eq!(strip_arrows(max_off - 1e-4, view_w, content_w), (true, false));
     assert_eq!(strip_arrows(1e-4, view_w, content_w), (false, true));
     assert_eq!(strip_arrows(0.0, view_w, content_w), (false, true));
-    // 内容不宽于视口 → 一律不出箭头。
+    // 内容不宽于视口 → 一律不可点。
     assert_eq!(strip_arrows(0.0, 400.0, 400.0), (false, false));
     assert_eq!(strip_arrows(12.0, 400.0, 380.0), (false, false));
 }
 
 #[test]
-fn arrow_click_scrolls_by_a_page() {
+fn scroll_btn_click_scrolls_by_a_page() {
     let ctx = font_ctx();
     let mut app = App::new(14, 2);
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
-let (view_w, _content_w, _) = app.view_log;
+    let (view_w, _content_w, _) = app.view_log;
     assert_eq!(app.tab_scroll_x, 0.0);
 
-    // 点右箭头 → 往右翻大半屏；同时别把镜头抢回当前页签（否则点了就弹回去）。
-    click_arrow(&ctx, &mut app, 1);
+    // 点右按钮 → 往右翻大半屏；同时别把镜头抢回当前页签。
+    click_scroll_btn(&ctx, &mut app, 1);
     let after_right = app.tab_scroll_x;
     assert!(
         after_right >= 48.0 && after_right <= view_w * 0.6 + 1.0,
-        "点右箭头应翻大半屏，实际 {after_right}"
+        "点右按钮应翻大半屏，实际 {after_right}"
     );
     assert!(!app.tab_scroll_follow, "用户自己在翻页，别再抢镜头");
     frame(&ctx, vec![], &mut app);
-    assert!(app.tab_scroll_x >= after_right - 1.0, "翻过去的偏移不该被复位");
-    assert_eq!(app.arrows, (true, true));
+    assert!(
+        app.tab_scroll_x >= after_right - 1.0,
+        "翻过去的偏移不该被复位"
+    );
+    assert_eq!(app.btns, (true, true));
 
-    // 点左箭头 → 原路翻回来。
-    click_arrow(&ctx, &mut app, 0);
+    // 点左按钮 → 原路翻回来。
+    click_scroll_btn(&ctx, &mut app, 0);
     assert!(
         app.tab_scroll_x < after_right - 1.0,
-        "点左箭头应往回翻，实际 {} → {}",
+        "点左按钮应往回翻，实际 {} → {}",
         after_right,
         app.tab_scroll_x
     );
 }
 
 #[test]
-fn arrow_click_lands_on_end() {
+fn scroll_btn_click_lands_on_end() {
     // 一步迈不到底：连点几下要能贴到两端，而不是在半路磨。
     let (view_w, content_w) = (300.0, 700.0);
     let mut off = 0.0;
     for _ in 0..20 {
         off = strip_arrow_scroll(off, view_w, content_w, false);
     }
-    assert!((off - (content_w - view_w)).abs() < 0.01, "应贴到最右，实际 {off}");
+    assert!(
+        (off - (content_w - view_w)).abs() < 0.01,
+        "应贴到最右，实际 {off}"
+    );
     for _ in 0..20 {
         off = strip_arrow_scroll(off, view_w, content_w, true);
     }
@@ -577,16 +682,28 @@ fn arrow_click_lands_on_end() {
 }
 
 #[test]
-fn arrow_zone_beats_the_half_tab_underneath() {
-    // 箭头画在页签之后并自带热区：点在箭头上不能激活/拖动下面那个半截页签，
-    // 否则「点箭头」会被解读成「点那个页签」。这里盯住滚动确实发生了。
+fn disabled_scroll_btn_does_nothing() {
+    // 到了端的那一端保留槽位但不可点：点它必须既不滚动也不切页。
+    let ctx = font_ctx();
+    let mut app = App::new(14, 2);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
+    assert!(!app.btns.0, "起始在最左，左按钮应禁用");
+    click_scroll_btn(&ctx, &mut app, 0);
+    assert_eq!(app.tab_scroll_x, 0.0, "禁用的按钮点了不应动");
+    assert_eq!(app.current, 2, "也不应误触到页签切换");
+}
+
+#[test]
+fn scroll_btn_does_not_steal_tab_click() {
+    // 按钮不再是「打在它下面的页签上」：槽位在视口之外，与页签矩形不交，命中也
+    // 不会被抢走。这里盯「点按钮不切页」。
     let ctx = font_ctx();
     let mut app = App::new(14, 2);
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
     frame(&ctx, vec![Event::PointerMoved(Pos2::new(700.0, 12.0))], &mut app);
     assert_eq!(app.current, 2, "起始当前页签不变");
-    click_arrow(&ctx, &mut app, 1);
-    assert!(app.tab_scroll_x > 0.0, "箭头热区应吃掉这次点击（滚动了）");
-    assert_eq!(app.current, 2, "点箭头不该切页");
+    click_scroll_btn(&ctx, &mut app, 1);
+    assert!(app.tab_scroll_x > 0.0, "按钮应吃掉这次点击（滚动了）");
+    assert_eq!(app.current, 2, "点按钮不该切页");
 }
-
