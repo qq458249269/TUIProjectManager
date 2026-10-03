@@ -3339,6 +3339,20 @@ pub struct ClientApp {
 }
 
 
+/// 「用户此刻正看着这个页签」（纯函数，便于单测）。
+///
+/// 必须是**当前页签**且**应用在前台**两个条件同时成立。为什么不能只看「当前页签」：
+/// Alt-Tab 出去 / 点别的程序 / 本窗口被别的窗口盖住时，人根本不在屏幕前那个页签上，
+/// 尽管它还是 `current`。把当前页签无脑当成「已查看」会导出一个很坑的结果：
+/// **失焦期间当前页签既不亮 ✅ 也不弹完成通知** —— 任务在后台跑完了，等人回到这个
+/// 窗口时该提示的那一下已经错过，只能自己一个个页签翻过去找（用户报告的现象）。
+///
+/// 有了它，「已查看」就统一成「人正看着」这一个语义：✅ 图标与完成通知都只排除
+/// 这一种情况，失焦时当前页签与后台页签一视同仁。
+fn watched(is_current: bool, app_fg: bool) -> bool {
+    is_current && app_fg
+}
+
 /// 页签状态图标（纯函数；参数与 [`Session`] 的输出时间戳一一对应，便于逐项钉住）。
 ///
 /// 一律只看**通用输出启发式**，不按 agent 分家：不追 pi 的会话 JSONL、不查
@@ -4669,13 +4683,13 @@ fn move_tab(&mut self, from: usize, target: usize) {
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
                 // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在
                 // 🔄↔边界横跳时（再有输出 → done=false → 清零）重置计时。
-                // 静默判据：仅「当前页签且应用在前台」（用户正盯着）才清零
-                // 计时不打扰；失焦/切走后重新计时，与 update_exited 的「运行
-                // 结束」语义一致——用户报告的现象（当前页签任务完成、窗口
-                // 失焦不推通知）即由旧图标门 + viewed 耦合导致，已解耦。
+                // 静默判据：仅「用户正看着」（当前页签**且**应用在前台）才清零
+                // 计时不打扰；**失焦或切走**都重新计时，与 update_exited 的「运行
+                // 结束」语义一致。失焦的当前页签同样要计时：人不在屏幕前，任务
+                // 跑完了就该弹（watched）。
                 if done {
                     let since = s.done_since_ms.load(Ordering::Relaxed);
-                    if i == self.current && app_fg {
+                    if watched(i == self.current, app_fg) {
                         // 用户正盯着：视为已知晓，清零计时（切走/失焦后再重新
                         // 计 DONE_STABLE_MS）。done_notified 不动——本轮已看见
                         // 内容，不再弹窗。
@@ -4759,7 +4773,7 @@ fn move_tab(&mut self, from: usize, target: usize) {
                 if s.exited.load(Ordering::Acquire)
                     && allow_toast(s, now_ms)
                     && !s.notified.swap(true, Ordering::Relaxed)
-                    && !(i == self.current && app_fg)
+                    && !watched(i == self.current, app_fg)
                 {
                     // 启动宽限期：创建后 10 秒内退出也静默（刚启动就崩/秒退
                     // 不打扰），notified 已置位因此宽限期后也不会补弹。
@@ -6312,7 +6326,9 @@ ui.add_space(12.0);
             RichText::new(
                 "「运行结束」（子进程真的退出时）始终弹通知。\n\
                  「任务完成」靠终端静默启发式判断，与「回合中途的静默」无法区分，\
-                 容易误报，默认关闭；页签上的 ✅ 标记不受影响。",
+                 容易误报，默认关闭；页签上的 ✅ 标记不受影响。\n\
+                 免除提醒的只有「人正看着」的那一页（当前页签**且**应用在前台）；\n\
+                 应用失焦时当前页签同样会亮 ✅、同样会弹通知。",
             )
             .weak()
             .small(),
@@ -8105,16 +8121,20 @@ impl eframe::App for ClientApp {
         }
 
         // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
-        // 当前页签同时置「已查看」→ ✅ 图标只属于后台页签，一处覆盖所有切换
-        // 路径。done_notified 的复位/武装在 update_done_states 的 ✅ 分支。
+        // 「已查看」只在**人正看着**（当前页签 + 应用在前台）时置 true → ✅ 图标与
+        // 完成通知都只排除这一种情况。**失焦时当前页签不再享有豁免**（watched），
+        // 与后台页签一视同仁，否则会出现「当前页签在后台跑完了，回来时什么提示都
+        // 没有」。done_notified 的复位/武装在 update_done_states 的 ✅ 分支。
+        let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
         for (i, t) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = t {
-                if i == self.current {
+                if watched(i == self.current, app_fg) {
                     s.has_been_viewed.store(true, Ordering::Relaxed);
-                    s.foreground.store(true, Ordering::Relaxed);
-                } else {
-                    s.foreground.store(false, Ordering::Relaxed);
                 }
+                // foreground 只管「是不是当前页签」（update_exited 用它决定退出
+                // 判定的频率），**不**跟着 app_fg 走：改它会让失焦时退出回收退到
+                // 低频轮询，与本需求无关。
+                s.foreground.store(i == self.current, Ordering::Relaxed);
             }
         }
 
@@ -8893,6 +8913,34 @@ mod tab_icon_tests {
     #[test]
     fn never_output_session_never_toasts() {
         assert!(!toast_quiet_enough(0, 100_000));
+    }
+}
+
+#[cfg(test)]
+mod watched_tests {
+    use super::watched;
+
+    /// 「人正看着」必须同时满足当前页签 + 应用在前台。这两条各自单独都会坑：
+    /// 只看「当前页签」→ 失焦时当前页签跑完了不亮 ✅ 也不弹通知；
+    /// 只看「应用在前台」→ 后台页签的完成被吃掉（那才是主体场景）。
+    #[test]
+    fn needs_both_current_and_foreground() {
+        assert!(watched(true, true), "正在看当前页签");
+        // 失焦：即使它是当前页签，人也不在屏幕前 → 不算已查看（本次需求）。
+        assert!(!watched(true, false), "失焦的当前页签不该享有豁免");
+        // 前台但切到别的页签了：那一页在屏幕上看不见 → 不豁免。
+        assert!(!watched(false, true), "后台页签不该享有豁免");
+        assert!(!watched(false, false));
+    }
+
+    /// 前台 → 失焦那一刻，「正看着」从 true 变 false（✅ 与完成通知随之解禁）；
+    /// 回到前台立即恢复豁免。回归：曾经只有「是不是当前页签」一个条件。
+    #[test]
+    fn toggles_with_window_focus() {
+        // 当前页签在后台跑完了：人失焦期间它既亮 ✅ 又能弹通知。
+        assert!(!watched(true, false));
+        // 人一回到窗口，立刻重新享有豁免（✅ 清掉、不再打扰）。
+        assert!(watched(true, true));
     }
 }
 
