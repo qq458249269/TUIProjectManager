@@ -137,12 +137,6 @@ pub struct Session {
     /// 含转义/动画块：页签 🔄 图标用——动画重绘也算在跑（spinner/状态栏
     /// 刷新保持旋转）。
     pub last_output_ms: Arc<AtomicU64>,
-    /// 最近一块**实质内容**输出的绝对时间戳：仅非动画块刷新。完成/通知判据
-    /// 用这个而非 last_output_ms——周期转义重绘（tmux 状态栏、光标/屏幕刷新）
-    /// 只刷 last_output_ms 不产生内容，若完成判定用全量输出，这类会话会周期
-    /// 横跳 done → 复位 done_notified → 每 ~10s 弹一次「任务完成」（用户报告：
-    /// 失焦后无内容却循环弹通知）。
-    pub last_real_output_ms: Arc<AtomicU64>,
     /// 累计输出次数（读取线程写、UI 线程读），用于判断是否有持续输出活动。
     pub output_count: Arc<AtomicU32>,
     /// 累计实质输出字节数（非动画块的可打印字节，读取线程写、UI 线程读）。
@@ -150,19 +144,15 @@ pub struct Session {
     /// 动画不属于可打印字节）时，「运行结束」/「任务完成」都不弹通知
     /// （见 app.rs MIN_OUTPUT_BYTES）。
     pub out_bytes: Arc<AtomicU64>,
-    /// 是否收到过任何输出块（含动画/转义块；读取线程写、UI 线程读）。
-    /// 页签判定「内容驱动 🔄」的门：零输出会话（spawn 后从未读到数据）不因
-    /// last_output_ms 初始化为 spawn 时刻而假闪 🔄 3 秒。
-    pub ever_output: Arc<AtomicBool>,
-    /// 「已查看」标记：true = 用户已经看过当前内容（见 = 空状态）。
+/// 「已查看」标记：true = 用户已经看过当前内容（见 = 空状态）。
     /// 启动即 true（spawn 产物不需要提醒）；读取线程在「加载期之后」的每轮
-    /// 新实质输出时复位 false → 完成通知/✅ 只属于用户没看过的真任务输出轮；
-    /// 点击页签 / Ctrl+Tab / **人正看着时**（当前页签 + 应用在前台，前台每帧
-    /// 同步）置回 true。
+    /// 新内容输出时复位 false → 完成通知/✅ 只属于用户没看过的真输出轮；
+    /// 点击/切换到该页签（TabAction::Activate、Ctrl+Tab）、在终端里做任何
+    /// 交互（点击/拖选/滚轮/打字，terminal.rs show_terminal 入口统一记账）
+    /// 置回 true。
     ///
-    /// 注意「正看着」要求**同时**是当前页签且应用在前台：失焦（Alt-Tab / 点别的
-    /// 程序 / 窗口被盖住）时人不在屏幕前，哪怕它还是 `current` 也不算已看，
-    /// 于是该页签在后台跑完照样亮 ✅、照样弹完成通知（见 app.rs `watched`）。
+    /// 语义是「**有没有交互过**」，不是「是不是当前页签」：当前页签跑完同样
+    /// 亮 ✅（用户要求），一碰就消。系统通知另有 watched() 管「正盯着不打扰」。
     pub has_been_viewed: Arc<AtomicBool>,
     /// 终端是否处于备用屏（ALT_SCREEN / DECSET 1049）。
     /// htop/vim/opencode/nano 等全屏 TUI 启用，普通 shell 不启用。
@@ -179,12 +169,15 @@ pub struct Session {
     /// (解析代数, 行, 列)。代数没变就直接复用，
     /// 免去每帧 rows×cols 的全屏网格扫描。offset 恒为 0。
     pub caret_scan: Option<(u64, Line, Column)>,
-/// 最近一块**纯动画**输出（转义重绘 / spinner / 时钟 / 进度条）的绝对时间戳。
-    /// 只由动画块刷新，0 = 从未见过动画输出。
-    /// 用途：屏幕启发式里唯一能分开「还在思考/跑命令」与「真停了」的分量——
-    /// 动画在高频来（spinner ~80-150ms 一帧）说明界面还在动，不能判完成；
-    /// 而空闲时的光标闪烁是稀疏的。完成判定见 app.rs 的 ANIM_BUSY_MS。
-    pub last_anim_ms: Arc<AtomicU64>,
+    /// 最近一次**屏幕可见字符真的变了**的时刻（reader 逐块比对可见格快照）。
+    /// 「在动」的唯一可靠信号：spinner/时钟/进度条都改字符，而纯转义重绘
+    /// （整屏重画同样的字）不改——后者正是字节启发式把静止画面误判成「在跑」
+    /// 的根源。0 = 从未变过。
+    pub last_screen_change_ms: Arc<AtomicU64>,
+    /// 最近一次「**成规模**内容变化」的时刻：单块变化 ≥ [`MIN_CONTENT_CELLS`]
+    /// 个可见格。完成/🔄 内容窗口只认它——秒表、时钟、动画小数位这类每次只改
+    /// 1~3 格的周期性刷新不算内容（否则永远「有内容」→ 🔄 常驻、✅ 亮不出来）。
+    pub last_content_ms: Arc<AtomicU64>,
     /// 「运行/完成」状态快照的上次重算时刻（毫秒）。门限 STATE_CHECK_MS（1s）：
     /// 每个页签最快一秒重算一次，其余帧复用快照——降低检测频率，也让图标不再
     /// 亚秒抖动（🔄↔✅ 来回闪）。
@@ -566,6 +559,15 @@ static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe
 /// 统一走 loading_active()：超过窗口后无论标志是否仍为 true 都不再显示加载态。
 const LOADING_MAX_MS: u64 = 5_000;
 
+/// 一块输出里至少这么多可见格变了，才算「内容变化」（刷 last_content_ms）。
+///
+/// 分档理由：命令输出/回答正文一次变几十上百格；秒表、时钟、动画小数位一次只
+/// 变 1~3 格，却每秒都来。若把它们也算内容，画面再静止 `last_content` 也永远
+/// 新鲜 → 🔄 常驻、✅ 亮不出来。4 格是分界：词级流式输出（4~6 格）算内容，
+/// 单字符 tick 不算。
+/// ponytail: 逐字动画（如逐格点阵 loader）会漏判成「静止」——真出现再降到 2。
+const MIN_CONTENT_CELLS: usize = 4;
+
 #[cfg(windows)]
 fn ensure_bundled_conpty() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -775,13 +777,12 @@ pub fn spawn(
     // 启动即「已查看」：启动属下的 shell 提示符/横幅不算需要提醒的新内容，
     // 之后每轮新实质输出由 reader 复位成未查看（见读循环 loading 分支）。
     let has_been_viewed = Arc::new(AtomicBool::new(true));
-    let ever_output = Arc::new(AtomicBool::new(false));
     let now_ts = crate::now_ms();
     let last_output_ms = Arc::new(AtomicU64::new(now_ts));
-    let last_real_output_ms = Arc::new(AtomicU64::new(now_ts));
     let last_input_ms = Arc::new(AtomicU64::new(0));
     let last_scroll_ms = Arc::new(AtomicU64::new(0));
-    let last_anim_ms = Arc::new(AtomicU64::new(0));
+    let last_screen_change_ms = Arc::new(AtomicU64::new(0));
+    let last_content_ms = Arc::new(AtomicU64::new(0));
     // 状态快照：首帧由 app.rs 的 refresh_tab_state 填（门限 1s）。
     let state_check_ms = Arc::new(AtomicU64::new(0));
     let state_icon = Arc::new(AtomicU8::new(0));
@@ -802,13 +803,12 @@ pub fn spawn(
         let output_count = output_count.clone();
         let reader_out_bytes = out_bytes.clone();
         let last_output_ms = last_output_ms.clone();
-        let reader_last_real_output = last_real_output_ms.clone();
-        let reader_last_anim = last_anim_ms.clone();
+    let reader_last_screen_change = last_screen_change_ms.clone();
+    let reader_last_content = last_content_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
         let reader_viewed = has_been_viewed.clone();
-        let reader_ever_output = ever_output.clone();
         let reader_alt_screen = alt_screen.clone();
         let reader_cursor_hidden = cursor_hidden.clone();
         let parse_gen = parse_gen.clone();
@@ -826,7 +826,9 @@ pub fn spawn(
             // read 块大小（块切分抖动是旧分类误判源）。
             let mut class_esc: u64 = 0;
             let mut class_bytes: u64 = 0;
-            let mut last_chunk_ms: u64 = 0;
+let mut last_chunk_ms: u64 = 0;
+            // 上一次的可见格字符（快照同序）：逐块比对得出「屏幕真的变了没」。
+            let mut prev_screen: Vec<char> = Vec::new();
             // 跨块拼接缓冲：OMP 等程序的终端查询序列可能被 read() 切分到相邻块，
             // reply_to_queries 逐块扫描会漏掉。保留尾部未完成的转义序列，
             // 下一块拼接后重扫。
@@ -879,7 +881,6 @@ pub fn spawn(
                             }
                         }
                         last_output_ms.store(now_ms, Ordering::Relaxed);
-                        reader_ever_output.store(true, Ordering::Relaxed);
                         // 兜底：启动超时后强制退出加载态。TUI 首屏若整块几乎全是
                         // 转义序列（ConPTY 握手/清屏/定位），启发式会把它误判为
                         // 「动画」而永不置 false → 页签 🔄 常驻，即使终端画面早已
@@ -933,11 +934,9 @@ pub fn spawn(
                             // 纯动画块（转义重绘/spinner/时钟）：刷「画面还在动」
                             // 时间戳。高频来 ⇒ 还在思考/跑命令，完成判定据此否决
                             // （空闲时的光标闪烁稀疏，不会误否决，见 ANIM_BUSY_MS）。
-                            reader_last_anim.store(now_ms, Ordering::Relaxed);
                         } else {
                             // 实质内容块：刷「最近实质内容」时间戳——完成/通知判据
                             // 只认它（周期转义重绘不产生实质内容 → 永不误判完成）。
-                            reader_last_real_output.store(now_ms, Ordering::Relaxed);
                             // 累计实质输出字节（非动画块的可打印字节）：
                             // 「任务完成」/「运行结束」通知的过滤判据。
                             reader_out_bytes.fetch_add(printable as u64, Ordering::Relaxed);
@@ -1095,7 +1094,36 @@ pub fn spawn(
                                         cells.push((p, indexed.cell.clone()));
                                     }
                                 }
-                                // Arc 替换：旧 Arc 由持引用方（UI 渲染帧）释放，零深拷贝。
+// ── 屏幕变化检测
+                                // 逐格比字符。变化 ≥MIN_CONTENT_CELLS 格 = 成规模内容
+                                // （命令输出、回答正文）；1~3 格的周期刷新（秒表/时钟/
+                                // spinner 帧）只刷新「画面在动」，不刷新内容时间戳。
+                                // 整屏重画同样的字 = 零变化，一个时间戳都不刷——
+                                // 这正是「明明静止却常亮 🔄、✅ 永远不亮」的成因。
+                                {
+                                    let now_chars: Vec<char> = cells
+                                        .iter()
+                                        .map(|(_, c)| if c.c == '\0' { ' ' } else { c.c })
+                                        .collect();
+                                    let diff = if prev_screen.len() == now_chars.len() {
+                                        now_chars
+                                            .iter()
+                                            .zip(&prev_screen)
+                                            .filter(|(a, b)| a != b)
+                                            .count()
+                                    } else {
+                                        // 尺寸变了（resize / 换页）：整体按变化算。
+                                        now_chars.len()
+                                    };
+                                    prev_screen = now_chars;
+                                    if diff > 0 {
+                                        reader_last_screen_change.store(now_ms, Ordering::Relaxed);
+                                        if diff >= MIN_CONTENT_CELLS {
+                                            reader_last_content.store(now_ms, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+// Arc 替换：旧 Arc 由持引用方（UI 渲染帧）释放，零深拷贝。
                                 // 静止检测不再做 grid 比较：纯内容制靠 last_output_ms。
                                 *reader_snapshot.lock().unwrap() = Arc::new(TermSnapshot {
                                     cells,
@@ -1156,8 +1184,6 @@ pub fn spawn(
         output_count,
         out_bytes,
         last_output_ms,
-        ever_output,
-        last_real_output_ms,
         has_been_viewed,
         alt_screen,
         cursor_hidden,
@@ -1166,7 +1192,8 @@ pub fn spawn(
         gpu: None,
         last_input_ms,
         last_scroll_ms,
-        last_anim_ms,
+        last_screen_change_ms,
+        last_content_ms,
         state_check_ms,
         state_icon,
         state_done,

@@ -702,6 +702,12 @@ pub fn show_terminal(
     term_focused: &mut bool,
     wheel: &Wheel,
 ) {
+    // ── 交互即「已查看」：在终端里点击/拖选/右键/滚轮/打字/粘贴都算看过当前
+    // 页签 → 页签 ✅ 立刻清空（用户要求：当前页签也亮 ✅，一交互才消）。
+    // 记账点只此一处：键盘/IME/点击转发的精细时间戳仍走 stamp_user_input。
+    if ui.input(|i| !i.events.is_empty()) {
+        sess.has_been_viewed.store(true, Ordering::Relaxed);
+    }
     // 字体度量缓存：字号/DPI 不变时跳过 fonts_mut 锁查询。
     let font_id = FontId::monospace(TERM_FONT_SIZE);
     let ppp = ui.ctx().pixels_per_point();

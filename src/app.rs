@@ -32,13 +32,12 @@ const IDLE_HEARTBEAT_MS: u64 = 500;
 /// 回归 3 次，见 921f062/0ae5904）。根治 = 锁死 10 FPS，杜绝再被调高。
 const BUSY_FRAME_MS: u64 = 100;
 
-/// 页签状态判定：仅凭终端内容（last_output_ms，reader 每收到一块输出即
-/// 刷新）。最近 3 秒内有输出 → 运行中；3 秒无内容 → 视为「输出结束/完成」。
-/// 不做进程树 CPU 采样，不做网格/光标/锁存启发——后台任何「固定刷新」
-/// （周期重绘、CPU 轮询、TUI 思考间隙）都不再影响判定；滚动/翻页/裁窗只改
-/// 视口、不产生内容 → 天然不计更新状态。
-/// 代价即本方案：后台 TUI 静默思考 / 网络等待（>3s 无输出）会被判为完成；
-/// 用户要求以终端内容为准，出现该情况即 3s 后亮 ✅/弹通知（后果已知晓）。
+/// 页签状态判定：只看**屏幕可见格的变化**（reader 逐块比对快照，见
+/// session.rs MIN_CONTENT_CELLS）。最近 3 秒内有成规模内容变化 → 运行中；
+/// 3 秒无内容 → 视为「输出结束/完成」。整屏重画同样的字（转义重绘）不算变化，
+/// 1~3 格的秒表/时钟也不算内容——两者曾让静止画面永远「有内容」，于是 🔄 常驻、
+/// ✅ 亮不出来。不做进程树 CPU 采样，不按 agent 分家。
+/// 代价即本方案：静默思考 / 网络等待（>3s 屏幕不动）会被判为完成。
 const OUTPUT_END_MS: u64 = 3_000;
 /// 用户驱动回显例外（✂ 不吞任务真实输出）：键盘/IME/粘贴、点击/中键转发都写
 /// last_input_ms（terminal.rs 统一走 stamp_user_input 记账）→ 直接引发的回显
@@ -63,21 +62,14 @@ const DONE_STABLE_MS: u64 = 2_000;
 /// 三个**事件驱动**的例外不排队，立即重算：首次判定、退出/加载态翻转（❌ 与
 /// 启动 🔄 必须即时）、出现新的实质内容（命令刚跑起来 🔄 要立刻亮）。
 const STATE_CHECK_MS: u64 = 1_000;
-/// 动画活性阈值：最近 ANIM_BUSY_MS 内出现过**纯动画**输出 ⇒ 判定「画面还在高频
-/// 动」⇒ **还在思考/还在跑命令，不判完成**（不亮 ✅、不发完成通知）。
+/// 动画活性阈值：最近 ANIM_BUSY_MS 内**屏幕可见格发生过变化** ⇒ 画面还在动
+/// （spinner/时钟/进度条/流式打字，帧间隔 ~80-150ms）⇒ **还在思考/还在跑命令**，
+/// 不判完成（不亮 ✅、不发完成通知）。
 ///
-/// 这是纯屏幕启发式里唯一能分开「思考中」与「真停了」的分量，不依赖任何 agent
-/// 私有协议（不追 JSONL、不查 DB）：思考期 agent 都在刷 spinner/时钟/进度条，
-/// 帧间隔 ~80-150ms；空闲时的光标闪烁是 ~0.5-1s 一次。
-/// 阈值 250ms 正好卡在两者之间：任取 1s 里的采样点，spinner 恒落在窗口内
-/// （→ 恒判「在动」），而光标闪烁绝大多数采样点落在窗口外（→ 照常判完成），
-/// 于是不再出现「pi 回合跑完 🔄 直接变空、✅ 永远亮不出来」。
-///
-/// 两侧的已知误差（都是「屏幕启发式」的固有边界，只能靠调 ANIM_BUSY_MS 换）:
-/// ① 真·全程无输出也无动画的长命令（静默编译）3s 后仍会判完成——屏幕一动不动
-///    时，与「跑完了」在信息上不可区分；
-/// ② 空闲时仍高频刷动画的全屏 TUI 会常亮 🔄——这是「不误报完成」的对价：
-///    宁可少亮一次 ✅，也不在思考/执行途中谎报完成。
+/// 阈值 250ms 卡在「思考期高频动画」与「1Hz 秒表/光标闪烁」之间：前者的采样点
+/// 恒落在窗口内（→ 恒判在动），后者绝大多数落在窗口外（→ 照常判完成）。
+/// 这是纯屏幕启发式的固有边界：全程无输出也无动画的长命令（静默编译）3s 后仍会
+/// 判完成；空闲时仍高频刷动画的全屏 TUI 会常亮 🔄——宁可少亮一次 ✅，也不谎报。
 const ANIM_BUSY_MS: u64 = 250;
 /// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
 /// 随 ✅ 离开复位），靠 10s 节流防周期输出/退出-完成连发轰炸（用户拍板）。
@@ -3339,95 +3331,68 @@ pub struct ClientApp {
 }
 
 
-/// 「用户此刻正看着这个页签」（纯函数，便于单测）。
+/// 「用户此刻正盯着这个页签」（纯函数，便于单测）。**只管通知，不管图标**。
 ///
 /// 必须是**当前页签**且**应用在前台**两个条件同时成立。为什么不能只看「当前页签」：
-/// Alt-Tab 出去 / 点别的程序 / 本窗口被别的窗口盖住时，人根本不在屏幕前那个页签上，
-/// 尽管它还是 `current`。把当前页签无脑当成「已查看」会导出一个很坑的结果：
-/// **失焦期间当前页签既不亮 ✅ 也不弹完成通知** —— 任务在后台跑完了，等人回到这个
-/// 窗口时该提示的那一下已经错过，只能自己一个个页签翻过去找（用户报告的现象）。
+/// Alt-Tab 出去 / 点别的程序 / 本窗口被别的窗口盖住时，人根本不在屏幕前那个页签上。
+/// 有了它，「正在被盯着」这一种情况才不弹**系统通知**（打断式）。
 ///
-/// 有了它，「已查看」就统一成「人正看着」这一个语义：✅ 图标与完成通知都只排除
-/// 这一种情况，失焦时当前页签与后台页签一视同仁。
+/// 注意它**不再**参与 ✅ 图标判定：当前页签跑完同样亮 ✅（用户要求），看过与否
+/// 只看有没有真实交互（has_been_viewed，由点击/切页签/终端内输入统一置位）。
 fn watched(is_current: bool, app_fg: bool) -> bool {
     is_current && app_fg
 }
 
-/// 页签状态图标（纯函数；参数与 [`Session`] 的输出时间戳一一对应，便于逐项钉住）。
+/// 页签状态图标（纯函数；参数与 [`Session`] 的屏幕时间戳一一对应，便于逐项钉住）。
 ///
-/// 一律只看**通用输出启发式**，不按 agent 分家：不追 pi 的会话 JSONL、不查
-/// opencode 的 DB、不认 TUI 是不是全屏动画（曾按 pi/opencode 各写一套权威状态
-/// 通道，实测两边都判错：pi 会话文件与终端 cwd 对不上就永远读不到状态，opencode
-/// 得另起进程查 DB；而图标语义只要求「大概在跑 / 大概跑完了」，输出启发式已经
-/// 够用，少一条通道就少一份错乱的来源）。
+/// 一律只看**屏幕可见格的变化**，不按 agent 分家、不追 JSONL/DB：reader 逐块
+/// 把可见格字符与上次快照比对，给出两个时间戳——
+/// `last_screen` = 最近一帧**屏幕变了**（哪怕只改 1 格）；`last_content` = 最近
+/// 一次**成规模变化**（≥ MIN_CONTENT_CELLS 格）。
 ///
-/// 只看两块时间戳，都由 reader 刷：
-/// `last_real` = 最近一块**实质内容**（非动画块）；`last_anim` = 最近一块**纯
-/// 动画**输出（spinner/时钟/进度条），0 = 从未有过动画。
+/// 为什么不用「收到字节 / 转义占比」：全屏 TUI 每帧把整屏同样的字重画一遍，
+/// 字节一直来、转义占比也判不准，于是「静止画面」被判成「一直在跑」→ 🔄 常驻、
+/// ✅ 永远亮不出来。屏幕上没变，就是没在跑——唯一无法伪造的信号。
 ///
 /// 判定链（自上而下，先到先得）：
 /// ❌ 进程已退出 / 🔄 启动加载中 → 压过一切。
-/// 🔄 最近 3s 内有实质内容 **或** 画面还在高频动 → 运行中。
-///   · 内容窗口走 last_real：空闲的全屏 TUI（停在输入框）只刷动画，
-///     拿全量输出当「在跑」会让页签永远 🔄（最初那个 bug）。
-///   · 动画通道（高频 spinner/时钟/进度条）覆盖「长命令一行字都不吐」：
-///     思考/跑命令期间界面在动 ⇒ 准确识别为不是结束状态（见 [`ANIM_BUSY_MS`]）。
-///   · ever_output 门挡住「刚 spawn 的新鲜时间戳」假闪；最近 1.5s 打字、
-///     500ms 滚轮回显不算（那是用户自己弄出来的，只压内容窗口不压动画通道）。
-/// ✅ 有实质输出、用户没查看、已静默 ≥3s、且画面不在高频动 → 完成/待查看。
-/// 其余（已查看 / 从无实质输出）→ 空。
-///
-/// 🔄 与 ✅ 由同一个「画面在动」量分开，互斥且不重叠：动画通道点亮 🔄 的同时
-/// 关掉 ✅，所以不会出现「思考中却亮 ✅」也不会「跑完了还常亮 🔄」。
+/// 🔄 画面 ≤ANIM_BUSY_MS 就变过（spinner/时钟/进度条/流式打字都落这里）
+///   或 最近 3s 内有成规模内容变化 → 运行中。
+///   · 最近 1.5s 打字、500ms 滚轮回显不算「在跑」（用户自己弄出来的）。
+/// ✅ 有内容、未查看、成规模内容已 ≥3s 未变、画面也不在高频动 → 完成/待查看。
+/// 其余（已查看 / 从无内容）→ 空。
 #[allow(clippy::too_many_arguments)]
 fn tab_icon(
     exited: bool,
     loading: bool,
-    ever_output: bool,
     count: u32,
     viewed: bool,
-    last_real: u64,
+    last_content: u64,
+    last_screen: u64,
     now_ms: u64,
     last_input: u64,
     last_scroll: u64,
-    last_anim: u64,
 ) -> Option<&'static str> {
-    // 画面还在高频动 ⇒ 界面在动（spinner/时钟/进度条），不是「静默跑完了」。
-    // 一次采样定生死：spinner 每 ~100ms 一帧，1s 门限下采样恒落在窗口内；
-    // 空闲时光标闪烁稀疏，绝大多数采样落在窗口外 → 照常判完成（见 ANIM_BUSY_MS）。
-    let screen_busy = last_anim != 0 && now_ms.saturating_sub(last_anim) < ANIM_BUSY_MS;
     if exited {
         return Some("❌");
     }
     if loading {
         return Some("🔄");
     }
-    // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——其直接引发
-    // 的回显/整屏重绘是用户操作引起、不是任务在跑 → 跳过运行中判定。命令
-    // 真实输出晚于窗口即照常判 🔄（慢命令几乎总是超出窗口）。
+    // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——输入回显本身
+    // 会改屏幕，但那是用户自己弄的，不代表任务在跑。
     let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
     let scroll_echo = last_scroll != 0 && now_ms.saturating_sub(last_scroll) < SCROLL_ECHO_MS;
-    // 有实质内容（最近一块距今 ≤3s）→ 运行中。动画重绘不算「在跑」（那是界面
-    // 在动，内容没变——见上面 🔄 的两条通道）；本地滚动/翻页不产生输出，不会
-    // 点亮它。ever_output 门：从未收到任何输出的会话（时间戳仍是 spawn 的初始
-    // 值）不因「初始即新鲜」假闪 🔄，启动加载由 loading 分支负责。
-    let fresh_content = ever_output && now_ms.saturating_sub(last_real) <= OUTPUT_END_MS;
-    if !typing && !scroll_echo && fresh_content {
+    // 画面在高频动 ⇒ 界面在动（spinner/时钟/进度条/流式打字）→ 不是结束态。
+    // 一次采样定生死：spinner 每 ~100ms 一帧，1s 门限下采样恒落在窗口内。
+    let screen_busy = last_screen != 0 && now_ms.saturating_sub(last_screen) < ANIM_BUSY_MS;
+    // 成规模内容最近 ≤3s → 运行中。秒表/时钟这类 1~3 格的小刷新不算内容。
+    let fresh_content = last_content != 0 && now_ms.saturating_sub(last_content) <= OUTPUT_END_MS;
+    if !typing && !scroll_echo && (fresh_content || screen_busy) {
         return Some("🔄");
     }
-    // 画面高频动 → 运行中（思考/长工具/静默构建）。不受打字·滚轮例外影响：
-    // 那两条只压「人工回显」，而动画不是回显。
-    if screen_busy {
-        return Some("🔄");
-    }
-    // 无内容 ≥3s → 完成；有实质输出（count>0）且用户未查看才亮 ✅。
-    // 陈旧判据与 🔄 互补：打字期内新鲜回显不落 ✅，只能走空（旧代码语义）。
-    // screen_busy 已在上面被 🔄 吃掉，这里自然不会误亮 ✅。
-    if count > 0
-        && !viewed
-        && !screen_busy
-        && now_ms.saturating_sub(last_real) > OUTPUT_END_MS
-    {
+    // 无内容 ≥3s → 完成；有内容（count>0）且用户未查看才亮 ✅。
+    if count > 0 && !viewed && now_ms.saturating_sub(last_content) > OUTPUT_END_MS {
         return Some("✅");
     }
     // 空：无内容可看 / 已查看过。
@@ -3503,32 +3468,31 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
     let snap = s.state_icon.load(Ordering::Relaxed);
     let exited = s.exited.load(Ordering::Acquire);
     let loading = s.loading_active(now_ms);
-    let real_out = s.last_real_output_ms.load(Ordering::Relaxed);
+let real_out = s.last_content_ms.load(Ordering::Relaxed);
     if !state_due(last_check, now_ms, real_out, snap, exited, loading) {
         return;
     }
     s.state_check_ms.store(now_ms, Ordering::Relaxed);
-    let last_anim = s.last_anim_ms.load(Ordering::Relaxed);
     let code = icon_code(tab_icon(
         exited,
         loading,
-        s.ever_output.load(Ordering::Relaxed),
         s.output_count.load(Ordering::Relaxed),
         !s.has_been_viewed.load(Ordering::Relaxed),
         real_out,
+        s.last_screen_change_ms.load(Ordering::Relaxed),
         now_ms,
         s.last_input_ms.load(Ordering::Relaxed),
         s.last_scroll_ms.load(Ordering::Relaxed),
-        last_anim,
     ));
     let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
     s.state_icon.store(code | flags, Ordering::Relaxed);
-    // 完成态（通知判据）与图标同源同刻：退出/加载中不算、动画高频动不算、
-    // 实质内容静默 ≥3s 才算。✅ 额外要求「有实质输出 + 未查看」，通知那侧则
-    // 另有 out_bytes / viewed / 节流等门槛（见 update_done_states）。
+    // 完成态（通知判据）与图标同源同刻：退出/加载中不算、画面高频动不算、
+    // 成规模内容静默 ≥3s 才算。通知那侧另有 out_bytes / viewed / 10s 静默
+    // 等门槛（见 update_done_states）。
     let done = !exited
         && !loading
-        && (last_anim == 0 || now_ms.saturating_sub(last_anim) >= ANIM_BUSY_MS)
+        && (s.last_screen_change_ms.load(Ordering::Relaxed) == 0
+            || now_ms.saturating_sub(s.last_screen_change_ms.load(Ordering::Relaxed)) >= ANIM_BUSY_MS)
         && now_ms.saturating_sub(real_out) > OUTPUT_END_MS;
     s.state_done.store(done, Ordering::Relaxed);
 }
@@ -3798,11 +3762,10 @@ fn strip_scroll_btn(ui: &egui::Ui, rect: egui::Rect, left: bool, enabled: bool) 
 }
 
 /// 通知侧额外的静默门槛（纯函数，便于单测）：只在 ✅ 之外再要求一段更长的
-/// 无实质输出，见 [`TOAST_QUIET_MS`] 的理由（agent 回合中途静默 ≠ 回合结束）。
-/// 从没收到过实质输出（时间戳仍是初始值）的会话直接否决——那种情况是
-/// 「压根没输出」，不该走完成通知。
-fn toast_quiet_enough(last_real_output_ms: u64, now_ms: u64) -> bool {
-    last_real_output_ms != 0 && now_ms.saturating_sub(last_real_output_ms) > TOAST_QUIET_MS
+/// 无内容变化，见 [`TOAST_QUIET_MS`] 的理由（agent 回合中途静默 ≠ 回合结束）。
+/// 从未有内容（时间戳仍是初始 0）的会话直接否决——那是「压根没输出」。
+fn toast_quiet_enough(last_content_ms: u64, now_ms: u64) -> bool {
+    last_content_ms != 0 && now_ms.saturating_sub(last_content_ms) > TOAST_QUIET_MS
 }
 
 /// 同页签 10s 一条的通知节流（TOAST_MIN_INTERVAL_MS）。通过即占位时间戳——
@@ -4670,14 +4633,14 @@ fn move_tab(&mut self, from: usize, target: usize) {
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
                 // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
-                // 非启动加载中、最近一块**实质内容**输出停止 ≥3s、画面不在高频动。
-                // last_real_output_ms 只看非动画块：周期转义重绘（tmux 状态栏、
-                // 光标/屏幕刷新）不会让它刷新 → 这类会话不会因 done 横跳而循环弹
-                // 「任务完成」+ 闪烁；last_anim 负责把「还在思考/跑命令」的高频
-                // 动画挡在完成之外（见 ANIM_BUSY_MS）。四条判据与图标**共用同一份
-                // 快照**（最快 1s 重算一次，见 refresh_tab_state），两者不会打脸。
+                // 非启动加载中、成规模内容变化停止 ≥3s、画面不在高频动。
+                // 内容时间戳只被「≥MIN_CONTENT_CELLS 格的变化」刷新：转义重绘、
+                // 秒表、时钟都不会让它新鲜 → 这类会话不会因 done 横跳而循环弹
+                // 「任务完成」+ 闪烁；画面高频动负责把「还在思考/跑命令」挡在完成
+                // 之外（见 ANIM_BUSY_MS）。四条判据与图标**共用同一份快照**
+                // （最快 1s 重算一次，见 refresh_tab_state），两者不会打脸。
                 // 未查看门槛在弹窗条件里（viewed 语义：启动即已见，仅新输出轮
-                // 复位，见下）。
+                // 复位 / 用户交互置回，见下）。
                 refresh_tab_state(s, now_ms);
                 let done = s.state_done.load(Ordering::Relaxed);
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
@@ -4701,15 +4664,15 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         // TOAST_QUIET_MS）：✅ 是给眼睛看的、错了刷新一下就好，
                         // 系统通知是打断式的，agent 回合中途的静默（等首个 token /
                         // 跑一条不出字的命令）必须挡住。
-                        && toast_quiet_enough(
-                            s.last_real_output_ms.load(Ordering::Relaxed),
+&& toast_quiet_enough(
+                            s.last_content_ms.load(Ordering::Relaxed),
                             now_ms,
                         )
                         && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
                         // 未查看门槛：启动即 viewed=true，闲置页签（无新输出轮）
-                        // 不提醒；用户没看过的真任务输出轮才弹（阅读循环在加载
-                        // 期后每轮新输出复位 viewed）。「任务完成」只属于主页签
-                        // 之外、用户还没看过的新内容，消除「没任何输出却弹」误报。
+                        // 不提醒；用户没交互过的真输出轮才弹（reader 在加载期后
+                        // 每轮新内容复位 viewed，交互再置回）。消除「没任何输出
+                        // 却弹」误报。
 && !s.has_been_viewed.load(Ordering::Relaxed)
                         && allow_toast(s, now_ms)
                         && !s.done_notified.swap(true, Ordering::Relaxed)
@@ -5145,11 +5108,11 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     // 状态图标：固定宽度单字符。
                     let viewed = s.has_been_viewed.load(Ordering::Relaxed);
                     let now_ms = crate::now_ms();
-                    // ── 状态判定：仅凭终端内容 ──
-                    // last_output_ms 由 reader 每收一块输出刷新；滚动/翻页只改
-                    // 视口不产生输出 → 不计更新状态。周期重绘/CPU 采样/锁存等
-                    // 后台固定刷新全部退出判定（见 tab_icon）：有内容 → 🔄，
-                    // 3s 无内容 → 完成（✅/空）。用户驱动例外：最近 1.5s 内
+// ── 状态判定：仅凭屏幕可见格的变化 ──
+                    // reader 逐块比对可见格快照（见 session.rs MIN_CONTENT_CELLS）：
+                    // 成规模变化 ≤3s → 🔄，停了 ≥3s → ✅/空；整屏重画同样的字、
+                    // 秒表时钟的小刷新都不算内容。滚动/翻页只改视口不产生 PTY
+                    // 输出 → 不计更新状态。用户驱动例外：最近 1.5s 内
                     // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）或
                     // 500ms 内转发过滚轮（last_scroll_ms）→ 直接引发的回显不
                     // 算任务在跑 → 跳过 🔄；真实输出晚于窗口照常判 🔄。
@@ -8120,17 +8083,12 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 前台标记每帧同步（覆盖所有切换路径：点击/Ctrl+Tab/关闭/拖拽/恢复）。
-        // 「已查看」只在**人正看着**（当前页签 + 应用在前台）时置 true → ✅ 图标与
-        // 完成通知都只排除这一种情况。**失焦时当前页签不再享有豁免**（watched），
-        // 与后台页签一视同仁，否则会出现「当前页签在后台跑完了，回来时什么提示都
-        // 没有」。done_notified 的复位/武装在 update_done_states 的 ✅ 分支。
-        let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
+// 「已查看」不再每帧跟随「当前页签+前台」：当前页签跑完也要亮 ✅
+        // （用户要求）。它只由**真实交互**置位：点/切页签（TabAction::Activate、
+        // Ctrl+Tab）、在终端里点击/选中/滚轮/打字（terminal.rs show_terminal
+        // 入口统一记账）。没交互过就一直算「未查看」→ 后台与当前页签一致。
         for (i, t) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = t {
-                if watched(i == self.current, app_fg) {
-                    s.has_been_viewed.store(true, Ordering::Relaxed);
-                }
                 // foreground 只管「是不是当前页签」（update_exited 用它决定退出
                 // 判定的频率），**不**跟着 app_fg 走：改它会让失焦时退出回收退到
                 // 低频轮询，与本需求无关。
@@ -8696,226 +8654,234 @@ mod tab_icon_tests {
         SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
     };
 
-    fn icon(ever: bool, count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
+    /// 只喂「内容静默时长」：画面时间戳与内容同步（普通命令输出场景）。
+    fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, ever, count, viewed, now.saturating_sub(silent_ms), now, 0, 0, 0)
+        tab_icon(
+            false,
+            false,
+            count,
+            viewed,
+            now.saturating_sub(silent_ms),
+            now.saturating_sub(silent_ms),
+            now,
+            0,
+            0,
+        )
     }
 
-    // 最近 3s 内有内容 → 🔄。动画块同样刷新 last_output_ms → 周期重绘/旋转
-    // 期间保持运行；count=0（纯动画会话）只要有输出照样 🔄。
+    // 最近 3s 内有内容 → 🔄。
     #[test]
     fn content_within_3s_shows_running() {
-        assert_eq!(icon(true, 10, false, 2_000), Some("🔄"));
-        assert_eq!(icon(true, 0, false, 2_000), Some("🔄"));
+        assert_eq!(icon(10, false, 2_000), Some("🔄"));
+        // count=0 但确有内容变化：仍算在跑（用户刚敲完命令，输出一行提示符）。
+        assert_eq!(icon(0, false, 2_000), Some("🔄"));
     }
 
     // 边界：恰好 3s 内仍有内容 → 🔄；超过 3s → 完成。
     #[test]
     fn three_sec_boundary() {
-        assert_eq!(icon(true, 10, false, 3_000), Some("🔄"));
-        assert_eq!(icon(true, 10, false, 3_001), Some("✅"));
+        assert_eq!(icon(10, false, 3_000), Some("🔄"));
+        assert_eq!(icon(10, false, 3_001), Some("✅"));
     }
 
-    // 3s 无内容 + 有实质输出 + 未查看 → ✅（完成/待查看）。
+    // 3s 无内容 + 有内容 + 未查看 → ✅（完成/待查看）。
     #[test]
     fn content_stopped_3s_shows_done() {
-        assert_eq!(icon(true, 10, false, 10_000), Some("✅"));
+        assert_eq!(icon(10, false, 10_000), Some("✅"));
     }
 
-    // 已查看（点击过页签/切走前台同步）→ ✅ 消失；viewed 不复位，后续不再重复亮 ✅。
+    // 已查看（点击过页签/切走前台同步）→ ✅ 消失。
     #[test]
     fn done_clears_after_viewed() {
-        assert_eq!(icon(true, 10, true, 10_000), None);
+        assert_eq!(icon(10, true, 10_000), None);
     }
 
-    // 从未有实质输出（count=0，纯动画/零输出会话）→ 3s 无内容后落空，不亮 ✅。
+    // 从未有内容（count=0，零输出会话）→ 3s 无内容后落空，不亮 ✅。
     #[test]
     fn no_content_never_shows_done() {
-        assert_eq!(icon(true, 0, false, 10_000), None);
+        assert_eq!(icon(0, false, 10_000), None);
     }
 
-    // 零输出会话（spawn 后从未读到任何数据块）不假闪 🔄：last_output_ms 仍是
-    // spawn 时刻（对 now 而言“新鲜”），若没有 ever_output 门会在前 3s 闪 🔄。
+    // 零输出会话不假闪 🔄：last_content=0（「从未变化过」）不参与新鲜度判定。
     #[test]
     fn never_output_never_flashes_running() {
         let now = 100_000u64;
-        // loading 未结束 → 🔄 由加载态负责（正常）；加载结束后零输出 → 空。
-        assert_eq!(tab_icon(false, false, false, 0, false, now - 500, now, 0, 0, 0), None);
-        assert_eq!(tab_icon(false, false, false, 0, false, now - 10_000, now, 0, 0, 0), None);
+        assert_eq!(tab_icon(false, false, 0, false, 0, 0, now, 0, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, false, 10, false, now - 10_000, now, 0, 0, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, false, 10, false, now - 10_000, now, 0, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, 10, false, 0, 0, now, 0, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, 10, false, 0, 0, now, 0, 0), Some("🔄"));
     }
 
-    // 输入驱动例外：最近 1.5s 内用户输过键，回显即使刷新 last_output_ms
-    // 也不判运行中 → 空；窗口过期（或从未输入）后按内容判 🔄。
+    // 输入驱动例外：最近 1.5s 内用户输过键，输入回显不判运行中；窗口过期后
+    // 按内容判 🔄。
     #[test]
     fn typing_echo_not_running() {
         let now = 100_000u64;
-        // 1s 前刚输入过（回显新鲜）→ 不亮 🔄，落空。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_000, 0, 0), None);
-        // 输入窗口边界：不敢 1.5s 整（< INPUT_ACTIVE_MS 才算），恰过期即恢复。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, now - 1_501, 0, 0), Some("🔄"));
-        // 无输入历史（last_input=0，鼠标选择/拖拽等）→ 正常判 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 1_000, now, 0, 0, 0), Some("🔄"));
+        let f = |last_input| {
+            tab_icon(false, false, 10, false, now - 1_000, now - 1_000, now, last_input, 0)
+        };
+        assert_eq!(f(now - 1_000), None);
+        assert_eq!(f(now - 1_501), Some("🔄")); // 窗口过期
+        assert_eq!(f(0), Some("🔄")); // 从未输入
     }
 
-    // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、但内容已停
-    // ≥3s）→ ✅ 保持可见，不因打字闪空。
+    // 输入窗口不吞 ✅：任务完成后开始敲新命令（输入窗口内、内容已停 ≥3s）→ ✅ 保持。
     #[test]
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, now - 500, 0, 0), Some("✅"));
-        assert_eq!(tab_icon(false, false, true, 10, true, now - 10_000, now, now - 500, 0, 0), None);
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, now, now - 500, 0),
+            Some("✅")
+        );
+        assert_eq!(
+            tab_icon(false, false, 10, true, now - 10_000, now - 10_000, now, now - 500, 0),
+            None
+        );
     }
 
-    /// 动画活性判定：思考/跑命令期间界面在高频动（spinner/时钟/进度条，帧间隔
-    /// ~100ms）→ 判**运行中**（🔄），绝不判完成。这是用户要求「思考或执行命令
-    /// 时也能准确识别到不是结束状态」的落点，且不依赖任何 agent 私有协议
-    /// （不追 JSONL、不查 DB）——只看屏幕还在不在动。
+    /// 画面高频动 → 🔄（spinner/时钟/进度条/流式打字，帧间隔 ~100ms），绝不判
+    /// 完成。1s 采样点上 spinner 相位无关：任意 0~150ms 的变化年龄都判「在动」。
     #[test]
     fn screen_animation_means_running_not_done() {
         let now = 100_000u64;
-        // 静默 10s、动画 100ms 前刚来（spinner 在动）→ 🔄 而不是 ✅。
-        assert_eq!(
-            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - 100),
-            Some("🔄"),
-            "画面还在高频动 = 还在思考/跑命令，不能判完成"
-        );
-        // 动画停 300ms（超过 ANIM_BUSY_MS）→ 照常亮 ✅（回合真跑完了）。
-        assert_eq!(
-            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - 300),
-            Some("✅")
-        );
-        // 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」，靠 < 而非 <=。
-        assert_eq!(
-            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - ANIM_BUSY_MS),
-            Some("✅")
-        );
-        // 1s 采样点上的 spinner 相位无关：任意 0-150ms 的动画年龄都判「在动」。
+        // 内容早已静默 10s，但画面 100ms 前还在变（spinner 在动）→ 🔄。
         for ago in [0u64, 40, 99, 150] {
             assert_eq!(
-                tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, now - ago),
+                tab_icon(false, false, 10, false, now - 10_000, now - ago, now, 0, 0),
                 Some("🔄"),
-                "spinner 每 ~100ms 一帧，1s 门限下采样必落在 ANIM_BUSY_MS 内（ago={ago}）"
+                "画面还在高频动 = 还在思考/跑命令（ago={ago}）"
             );
         }
-        // 「画面在动」也压掉 ✅ 这条通道之外的误判：动画+已查看仍不亮 ✅。
+        // 变化停 300ms（> ANIM_BUSY_MS）→ 照常亮 ✅（回合真跑完了）。
         assert_eq!(
-            tab_icon(false, false, true, 10, true, now - 10_000, now, 0, 0, now - 100),
-            Some("🔄")
+            tab_icon(false, false, 10, false, now - 10_000, now - 300, now, 0, 0),
+            Some("✅")
         );
-    }
-
-    /// 从未出现动画输出的普通 shell 命令（last_anim=0）不受否决影响：语义与
-    /// 纯静默判据完全一致（不能让普通命令的 ✅ 判据变严）。
-    #[test]
-    fn never_seen_animation_keeps_silent_done() {
-        let now = 100_000u64;
+        // 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」（用 < 而非 <=）。
         assert_eq!(
-            tab_icon(false, false, true, 10, false, now - 10_000, now, 0, 0, 0),
+            tab_icon(
+                false,
+                false,
+                10,
+                false,
+                now - 10_000,
+                now - ANIM_BUSY_MS,
+                now,
+                0,
+                0
+            ),
             Some("✅")
         );
     }
 
-    /// 活性否决不越过更高优先级：动画在动但刚有实质内容 → 仍是 🔄（运行中）。
+    /// 全屏 TUI 的秒表/时钟：**每 1s 改 1~3 格**（不成规模内容）。
+    /// 回归：旧判据把这些周期刷新算成「有内容」→ 画面再静止也 🔄 常驻、
+    /// ✅ 永远亮不出来。现在内容时间戳不被它刷新 ⇒ 3s 后 ✅ 如期亮起。
+    #[test]
+    fn small_periodic_ticks_do_not_hold_running() {
+        let now = 100_000u64;
+        // 每秒一跳：上一次跳在 1s 前（>250ms，不算「在动」），内容已停 10s → ✅。
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 10_000, now - 1_000, now, 0, 0),
+            Some("✅"),
+            "1Hz 秒表/时钟只改几个格，不该永远钉在 🔄"
+        );
+    }
+
+    /// 整屏重画同样的字 = 屏幕零变化：两个时间戳都不该被刷新，于是安静下来
+    /// 3s 后就是 ✅（旧判据只看到「字节一直在来」→ 永远 🔄）。
+    #[test]
+    fn identical_repaint_is_not_progress() {
+        let now = 100_000u64;
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 5_000, now - 5_000, now, 0, 0),
+            Some("✅")
+        );
+    }
+
+    /// 动画活性否决不越过更高优先级：画面在动 + 刚有内容 → 🔄；加载/退出同理。
     #[test]
     fn screen_animation_does_not_override_running() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, true, 10, false, now - 500, now, 0, 0, now - 100),
-            Some("🔄")
-        );
-        // 加载中/已退出同理压过一切。
-        assert_eq!(
-            tab_icon(false, true, true, 10, false, now - 10_000, now, 0, 0, now - 100),
+            tab_icon(false, false, 10, false, now - 500, now - 100, now, 0, 0),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(true, false, true, 10, false, now - 10_000, now, 0, 0, now - 100),
+            tab_icon(false, true, 10, false, now - 10_000, now - 100, now, 0, 0),
+            Some("🔄")
+        );
+        assert_eq!(
+            tab_icon(true, false, 10, false, now - 10_000, now - 100, now, 0, 0),
             Some("❌")
         );
     }
 
-    /// 1s 门限：默认最快一秒重算一次快照（降频），但三条事件通道立即放行——
-    /// 首次、退出/加载态翻转、新实质内容（动画不算，否则 spinner 把门限顶掉）。
+    /// 1s 门限：默认最快一秒重算一次快照，但三条事件通道立即放行——
+    /// 首次、退出/加载态翻转、新内容。
     #[test]
     fn state_snapshot_rechecks_at_most_once_a_second() {
         let now = 100_000u64;
         let idle = ICON_EMPTY;
-        // 首次：必算。
         assert!(state_due(0, now, 0, idle, false, false));
-        // 刚算过（200ms 前）且什么都没变 → 不算。
         assert!(!state_due(now - 200, now, now - 10_000, idle, false, false));
-        // 差一毫秒到 1s → 还差一口气。
         assert!(!state_due(now - STATE_CHECK_MS + 1, now, now - 10_000, idle, false, false));
-        // 满 1s → 算。
         assert!(state_due(now - STATE_CHECK_MS, now, now - 10_000, idle, false, false));
-        // 事件通道：新实质内容晚于上次判定 → 立即算（命令刚跑起来 🔄 要立刻亮）。
         assert!(state_due(now - 200, now, now - 100, idle, false, false));
-        // 事件通道：退出/加载态翻转（快照里没有这两位）→ 立即算（❌ 不能等下一秒）。
         assert!(state_due(now - 200, now, now - 10_000, idle, true, false));
         assert!(state_due(now - 200, now, now - 10_000, idle, false, true));
-        // 快照里已是退出态、现在仍退出 → 不重复算（没有无谓的每帧重算）。
         let snap_exit = idle | SNAP_EXITED;
         assert!(!state_due(now - 200, now, now - 10_000, snap_exit, true, false));
     }
 
-    // 滚动/翻页只改视口、不改 last_output_ms → 不计更新状态：滚动后无新内容
-    // 仍按内容判据落 ✅/空，滚动本身不点亮 🔄（见 app.rs 图标循环注释）。
+    // 滚动/翻页只改视口、不产生 PTY 输出 → 不计更新状态：滚动后仍按内容判 ✅/空。
     #[test]
     fn scrolling_does_not_count_as_update() {
-        assert_eq!(icon(true, 10, false, 10_000), Some("✅")); // 未查看：滚动后仍是完成
-        assert_eq!(icon(true, 10, true, 10_000), None); // 已查看：滚动后仍空
+        assert_eq!(icon(10, false, 10_000), Some("✅"));
+        assert_eq!(icon(10, true, 10_000), None);
     }
 
-    // 滚动转发回显例外（last_scroll_ms 专用 500ms 短窗）：滚动转发 TUI 后立即
-    // 到达的重绘回显（last_out 新）→ 不亮 🔄（滚动查看历史不误亮运行中）；
-    // 窗口过期后真实输出照常判 🔄（持续滚动看日志时页签仍实时刷新运行状态）。
-    // 本地缓冲滚动不写 last_scroll（=0）→ 不产生例外，滚不滚动都不影响判定。
+    // 滚动转发回显例外（500ms 短窗）：TUI 被滚轮触发整屏重绘 → 不亮 🔄；
+    // 窗口过期后真实输出照常判 🔄。本地缓冲滚动不写 last_scroll（=0）→ 无例外。
     #[test]
     fn scroll_echo_window_only_swallows_prompt_redraw() {
         let now = 100_000u64;
-        // 500ms 内转发过滚轮 + 输出新鲜（TUI 重绘回显）→ 吞掉，不亮 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 100, 0), None);
-        // 滚动窗口边界：恰过期（501ms）即按内容恢复 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, now - 501, 0), Some("🔄"));
-        // 无滚动记录（本地缓冲滚动 / 从未转发，last_scroll=0）→ 输出新鲜照常 🔄。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, 0, 0, 0), Some("🔄"));
-        // 滚动例外不吞 ✅：滚动时内容早已停、未查看 → 仍按内容判完成。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 10_000, now, 0, now - 100, 0), Some("✅"));
-        // 滚动窗口与输入窗口互不干扰：输入回声例外只由 last_input 触发。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 100, now, now - 100, now - 100, 0), None);
+        let f = |last_scroll, last_screen| {
+            tab_icon(false, false, 10, false, now - 100, last_screen, now, 0, last_scroll)
+        };
+        assert_eq!(f(now - 100, now - 100), None); // 例外生效
+        assert_eq!(f(now - 501, now - 100), Some("🔄")); // 窗口过期
+        assert_eq!(f(0, now - 100), Some("🔄")); // 无滚动记录
+        // 例外不吞 ✅：内容早停、未查看 → 仍判完成。
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, now, 0, now - 100),
+            Some("✅")
+        );
     }
 
-    /// 通知侧的静默门槛必须**严于**页签图标（用户反馈「老是错误弹任务完成」）：
-    /// agent 回合中途静默（等首个 token / 跑一条不出字的命令）会先满足 ✅ 的 3s，
-    /// 但不该立刻报「任务完成」。
+    /// 通知侧静默门槛必须**严于**页签图标（用户反馈「老是错误弹任务完成」）。
     #[test]
     fn toast_needs_more_silence_than_the_icon() {
         let now = 100_000u64;
-        // ✅ 已经亮了（静默 > OUTPUT_END_MS），通知仍被拦住。
-        assert_eq!(tab_icon(false, false, true, 10, false, now - 5_000, now, 0, 0, 0), Some("✅"));
+        assert_eq!(icon(10, false, 5_000), Some("✅"));
         assert!(!toast_quiet_enough(now - 5_000, now));
-        // 静默越过 TOAST_QUIET_MS 才放行通知（+ DONE_STABLE_MS 才是实际报出的时刻）。
         assert!(!toast_quiet_enough(now - TOAST_QUIET_MS, now));
         assert!(toast_quiet_enough(now - TOAST_QUIET_MS - 1, now));
         assert!(TOAST_QUIET_MS > OUTPUT_END_MS);
     }
 
-    /// 从没收到过实质输出的会话（last_real 仍是初始 0）不得走完成通知：0 距
-    /// now 恒「远超门槛」，不显式否决就会把零输出会话判成静默超久。
+    /// 从未有内容（时间戳仍是初始 0）不得走完成通知：0 距 now 恒「远超门槛」。
     #[test]
     fn never_output_session_never_toasts() {
         assert!(!toast_quiet_enough(0, 100_000));
     }
 }
-
 #[cfg(test)]
 mod watched_tests {
     use super::watched;
