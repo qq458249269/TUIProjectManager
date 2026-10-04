@@ -693,6 +693,28 @@ fn stamp_user_input(sess: &Session) {
     sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
 }
 
+/// 本帧是否发生了**真实交互**（决定当前页签的 ✅ 该不该抹掉）。
+///
+/// 不能只看 `!events.is_empty()`：窗口焦点变化（Alt-Tab、点别的程序再点回来）
+/// 与光标移动（鼠标扫过窗口、离开窗口）都会产生事件，可它们都不代表「人正
+/// 看着这个页签」。旧实现把这些也算已查看 → 窗口刚恢复到屏幕前的那一帧就把
+/// ✅ 抹掉，用户永远看不到失焦期间跑完的当前页签（页签栏、终端输入两条路都
+/// 记 viewed，只有这里挡一次）。
+///
+/// 判定取反列举：未知/新增事件默认算交互（维持旧行为，不因 egui 升级漏判）。
+fn user_interacted(events: &[egui::Event]) -> bool {
+    events.iter().any(|e| {
+        !matches!(
+            e,
+            egui::Event::WindowFocused(_)
+                | egui::Event::ModifiersChanged(_)
+                | egui::Event::PointerMoved(_)
+                | egui::Event::MouseMoved(_)
+                | egui::Event::PointerGone
+        )
+    })
+}
+
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
 pub fn show_terminal(
     ui: &mut egui::Ui,
@@ -704,8 +726,10 @@ pub fn show_terminal(
 ) {
     // ── 交互即「已查看」：在终端里点击/拖选/右键/滚轮/打字/粘贴都算看过当前
     // 页签 → 页签 ✅ 立刻清空（用户要求：当前页签也亮 ✅，一交互才消）。
+    // 焦点变化/光标移动不算交互（见 user_interacted）：否则失焦期间跑完的当前
+    // 页签，✅ 会在窗口恢复焦点的那一帧被抹掉，等于白亮。
     // 记账点只此一处：键盘/IME/点击转发的精细时间戳仍走 stamp_user_input。
-    if ui.input(|i| !i.events.is_empty()) {
+    if ui.input(|i| user_interacted(&i.events)) {
         sess.has_been_viewed.store(true, Ordering::Relaxed);
     }
     // 字体度量缓存：字号/DPI 不变时跳过 fonts_mut 锁查询。
@@ -2064,6 +2088,47 @@ fn dark_adapt_lightens_dark_colors() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 失焦/回焦与光标移动不是「已查看」：否则窗口恢复焦点的那一帧抹掉 ✅，
+    /// 用户看不到失焦期间当前页签跑完（回归钉住）。
+    #[test]
+    fn focus_and_pointer_motion_are_not_interaction() {
+        assert!(!user_interacted(&[]));
+        assert!(!user_interacted(&[egui::Event::WindowFocused(false)]));
+        assert!(!user_interacted(&[egui::Event::WindowFocused(true)]));
+        assert!(!user_interacted(&[egui::Event::ModifiersChanged(
+            egui::Modifiers::default()
+        )]));
+        assert!(!user_interacted(&[egui::Event::PointerMoved(egui::pos2(1.0, 2.0))]));
+        assert!(!user_interacted(&[egui::Event::MouseMoved(egui::vec2(3.0, 4.0))]));
+        assert!(!user_interacted(&[egui::Event::PointerGone]));
+        // 真交互仍然记账。
+        assert!(user_interacted(&[egui::Event::Text("a".into())]));
+        assert!(user_interacted(&[egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]));
+        assert!(user_interacted(&[egui::Event::PointerButton {
+            pos: egui::pos2(1.0, 2.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }]));
+        assert!(user_interacted(&[
+            egui::Event::WindowFocused(true),
+            egui::Event::PointerMoved(egui::pos2(1.0, 2.0)),
+            egui::Event::MouseMoved(egui::vec2(3.0, 4.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::default(),
+                phase: egui::TouchPhase::End,
+            },
+        ]));
+    }
 
     fn key_bytes(k: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
         encode_key(k, ctrl, alt, shift, false)
