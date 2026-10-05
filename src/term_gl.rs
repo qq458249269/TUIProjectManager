@@ -21,8 +21,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+use alacritty_terminal::vte::ansi::{Color, Rgb};
 use eframe::egui;
-use egui::{Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureOptions, Vec2};
 
 /// 图集边长（物理像素）。1024×1024 RGBA ≈ 4MB 显存；CJK 字形约 28px 高，
 /// 可容纳上千个不同字符，满页开新页（页号随 quad 记录）。
@@ -120,8 +121,30 @@ fn cached_fonts(sources: &[FontSource], px: f32, full: bool) -> Vec<Arc<fontdue:
     guard.last().unwrap().2.clone()
 }
 
+// 纹理上传统计（TUIPM_TEX_DEBUG=1 启用）：验证「脏矩形上传」真的把
+// 每帧 4MiB 整页重传降成了单字形级别的小区域。
+static TEX_UPLOAD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tex_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TUIPM_TEX_DEBUG").is_ok())
+}
+
+fn count_upload(px: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = TEX_UPLOAD_N.fetch_add(1, Relaxed) + 1;
+    TEX_UPLOAD_BYTES.fetch_add(px as u64, Relaxed);
+    if tex_debug() && n.is_multiple_of(100) {
+        eprintln!(
+            "[tex] uploads={n} avg={:.1}KiB",
+            TEX_UPLOAD_BYTES.load(Relaxed) as f64 / n as f64 / 1024.0,
+        );
+    }
+}
+
 /// 单个字形的图集记录。UV 指向图集内的位图矩形；
-/// dx 相对格子左缘、dy 相对基线的位图左上角偏移（逻辑点，dy 恒 ≤ 0）。
+/// dx 相对格子左缘
 #[derive(Clone, Copy)]
 pub struct GlyphSlot {
     pub u0: f32,
@@ -169,10 +192,13 @@ pub struct GlyphAtlas {
     rh: u32,
     /// 页满标记：放不下任何新字形。分页打开新页，不再整体清空重灌。
     full: bool,
-    /// char → 槽位（含负缓存：w==0 的空槽）。
+/// char → 槽位（含负缓存：w==0 的空槽）。
     map: HashMap<char, GlyphSlot>,
     /// 内容版本：光栅化新字形后 +1，纹理已上传方据此决定是否重传。
     version: u64,
+    /// 自上次上传以来被写脏的像素矩形（含 (0,0) 白素区）。None = 整页上传
+    /// （新建页）。上传成功后由 page_texture 清空。
+    dirty: Option<Rect>,
 }
 
 impl GlyphAtlas {
@@ -215,6 +241,7 @@ impl GlyphAtlas {
             full: false,
             map: HashMap::with_capacity(256),
             version: 0,
+            dirty: None, // 整页（None）首次上传
         };
         atlas.paint_white_texel();
         atlas
@@ -222,6 +249,24 @@ impl GlyphAtlas {
 
     fn paint_white_texel(&mut self) {
         self.rgba[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        // 不标脏：dirty 初始为 None = 首次整页上传（含这枚白素）。
+    }
+
+    /// 记脏矩形（像素坐标取整，闭区间含端点 → 半开区间给上传用）。
+    fn mark_dirty(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let r = Rect::from_min_size(
+            Pos2::new(x as f32, y as f32),
+            Vec2::new(w as f32, h as f32),
+        );
+        self.dirty = Some(match self.dirty {
+            Some(cur) => cur.union(r),
+            None => r,
+        });
+    }
+
+    /// 取出脏矩形并清零（整页脏时返回 None = 整页上传）。
+    pub fn take_dirty(&mut self) -> Option<Rect> {
+        self.dirty.take()
     }
 
     /// 图集是否为空（尚未光栅化任何字形）。首帧懒预热据此判断。
@@ -341,6 +386,7 @@ impl GlyphAtlas {
                         self.rgba[o + 3] = c;
                     }
                 }
+                self.mark_dirty(ax, ay, gw, gh);
                 let wf = self.w as f32;
                 let hf = self.h as f32;
                 let x0 = ax as f32 + GLYPH_PAD as f32;
@@ -368,9 +414,25 @@ impl GlyphAtlas {
     pub fn image(&self) -> ColorImage {
         ColorImage::from_rgba_premultiplied([self.w as usize, self.h as usize], &self.rgba)
     }
+
+    /// 脏矩形子图的 egui 纹理镜像（半开区间像素矩形）。
+    fn sub_image(&self, r: Rect) -> ColorImage {
+        let x0 = r.min.x as u32;
+        let y0 = r.min.y as u32;
+        let w = ((r.max.x as u32) - x0).max(1);
+        let h = ((r.max.y as u32) - y0).max(1);
+        let stride = self.w as usize * 4;
+        let mut pixels = Vec::with_capacity((w * h) as usize * 4);
+        for y in y0..y0 + h {
+            let start = y as usize * stride + x0 as usize * 4;
+            pixels.extend_from_slice(&self.rgba[start..start + w as usize * 4]);
+        }
+        ColorImage::from_rgba_premultiplied([w as usize, h as usize], &pixels)
+    }
 }
 
-/// 一个待提交的字形/实心 quad。
+/// 一个待提交的字形/实心 quad（尺寸约 36 字节，按值复制负载下线为取布局变量）。
+#[derive(Clone, Copy)]
 pub struct CellQuad {
     pub rect: Rect,
     pub uv0: Pos2,
@@ -378,13 +440,10 @@ pub struct CellQuad {
     pub color: Color32,
 }
 
-/// 把 quad 列表组装成 egui Mesh（两个三角形一格）。
-pub fn build_mesh(quads: &[CellQuad], texture_id: egui::TextureId) -> Mesh {
-    let mut mesh = Mesh::with_texture(texture_id);
+/// 把一行的 quad 接在 mesh 顶点尾部（索引由调用方统一生成）。
+fn push_quad_vertices(mesh: &mut Mesh, quads: &[CellQuad]) {
     mesh.vertices.reserve(quads.len() * 4);
-    mesh.indices.reserve(quads.len() * 6);
     for q in quads {
-        let vi = mesh.vertices.len() as u32;
         let r = q.rect;
         let v = |pos: Pos2, uv: Pos2| egui::epaint::Vertex { pos, uv, color: q.color };
         mesh.vertices.extend([
@@ -393,9 +452,16 @@ pub fn build_mesh(quads: &[CellQuad], texture_id: egui::TextureId) -> Mesh {
             v(r.right_bottom(), q.uv1),
             v(r.left_bottom(), Pos2::new(q.uv0.x, q.uv1.y)),
         ]);
-        mesh.indices.extend_from_slice(&[vi, vi + 1, vi + 2, vi, vi + 2, vi + 3]);
     }
-    mesh
+}
+
+/// 写入第 pg 页的逐行顶点区间（记 quad 序号，不是顶点号）。
+fn store_ranges(row_vertex: &mut Vec<Vec<(u32, u32)>>, pg: usize, ranges: &[(u32, u32)]) {
+    if row_vertex.len() <= pg {
+        row_vertex.resize_with(pg + 1, Vec::new);
+    }
+    row_vertex[pg].clear();
+    row_vertex[pg].extend_from_slice(ranges);
 }
 
 /// FNV-1a 搅拌一步。
@@ -403,6 +469,20 @@ pub fn build_mesh(quads: &[CellQuad], texture_id: egui::TextureId) -> Mesh {
 pub fn hash_mix(h: &mut u64, v: u64) {
     *h ^= v;
     *h = h.wrapping_mul(0x100_0000_01b3);
+}
+
+/// 行指纹用的原始颜色 key：不解析、不做主题适配，直接把三种色型拼成一个
+/// u64（高位区分色型，避免不同色型的数值相撞）。与 hash_mix 同处，供
+/// session.rs 构建快照时顺手算行指纹（渲染端不再重扫全屏格）。
+#[inline]
+pub fn raw_color_key(c: Color) -> u64 {
+    match c {
+        Color::Spec(Rgb { r, g, b }) => {
+            0x4000_0000_0000_0000 | ((r as u64) << 16) | ((g as u64) << 8) | b as u64
+        }
+        Color::Indexed(i) => 0x8000_0000_0000_0000 | i as u64,
+        Color::Named(n) => 0xc000_0000_0000_0000 | n as u64,
+    }
 }
 
 // ── 进程级共享图集（多页签复用）──
@@ -498,8 +578,11 @@ impl SharedAtlas {
     }
 
     /// 取该页纹理 id，位图有新字形时**原地**重传。
-    /// 用 `TextureHandle::set` 而非 `ctx.load_texture`：后者换新 id 并释放旧
-    /// 纹理，其他页签缓存的 mesh 会指向已释放的纹理 id（渲染成空白/回退纹理）。
+    /// 用 `TextureHandle::set` / `set_partial` 而非 `ctx.load_texture`：后者换新
+    /// id 并释放旧纹理，其他页签缓存的 mesh 会指向已释放的纹理 id（渲染成空白/
+    /// 回退纹理）。已有纹理的页只传脏矩形（`set_partial`），否则每出现一个新
+    /// 字形就要重传整页 4MiB —— 流式中文输出时这是 UI 线程最大的单点开销。
+    /// 新页（tex 为 None）必须整传：首次 sub-image 上传不分配纹理存储。
     fn page_texture(&mut self, pg: usize, ctx: &egui::Context) -> egui::TextureId {
         let page = &mut self.pages[pg];
         if let Some(t) = &page.tex
@@ -507,15 +590,30 @@ impl SharedAtlas {
         {
             return t.id();
         }
-        let img = page.atlas.image();
-        match &mut page.tex {
-            Some(t) => t.set(img, TextureOptions::LINEAR),
-            None => {
-                page.tex = Some(ctx.load_texture(
-                    format!("term_glyph_atlas_{pg}"),
-                    img,
-                    TextureOptions::LINEAR,
-                ));
+        // 无论整传还是脏区传，脏标记都在此消费（整传后无需再传）。
+        let dirty = page.atlas.take_dirty();
+        if page.tex.is_some()
+            && let Some(r) = dirty
+        {
+            let x0 = r.min.x as usize;
+            let y0 = r.min.y as usize;
+            page.tex
+                .as_mut()
+                .unwrap()
+                .set_partial([x0, y0], page.atlas.sub_image(r), TextureOptions::LINEAR);
+            count_upload(r.width() as usize * r.height() as usize);
+        } else {
+            let img = page.atlas.image();
+            count_upload(page.atlas.w as usize * page.atlas.h as usize);
+            match &mut page.tex {
+                Some(t) => t.set(img, TextureOptions::LINEAR),
+                None => {
+                    page.tex = Some(ctx.load_texture(
+                        format!("term_glyph_atlas_{pg}"),
+                        img,
+                        TextureOptions::LINEAR,
+                    ));
+                }
             }
         }
         page.uploaded = page.atlas.version;
@@ -587,14 +685,20 @@ pub struct AtlasHandle(Arc<Mutex<SharedAtlas>>);
 /// 与共享图集无任何引用关系，故帧借用它不构成别名（见 TermFrame）。
 #[derive(Default)]
 struct TabBuffers {
-    /// 上一帧每格哈希（rows×cols，索引 vline*cols+col，未访问格保持 0）。
-    prev_hash: Vec<u64>,
-    /// 本帧哈希写入缓冲（跨帧复用分配）。
-    hash_scratch: Vec<u64>,
-    /// 本帧 quad 收集缓冲（跨帧复用分配），按页分桶。
-    quads: Vec<Vec<CellQuad>>,
-    /// 静止帧复用的已提交网格（纹理 id + Arc<Mesh>）。
-    meshes: Vec<(egui::TextureId, Arc<Mesh>)>,
+    /// 本帧每行的内容指纹（UI 每行写一次；长度 = rows）。
+    row_hash: Vec<u64>,
+    /// 上一帧每行的内容指纹。
+    prev_row_hash: Vec<u64>,
+    /// 本帧每行是否变化（set_row_hash 时算好）。
+    row_dirty: Vec<bool>,
+    /// 本帧 quad 收集缓冲（跨帧复用分配）：行 → 图集页 → quad。
+    row_quads: Vec<Vec<Vec<CellQuad>>>,
+    /// 每个图集页里每行对应的顶点区间（起始顶点索引, quad 数），供增量重建。
+    row_vertex: Vec<Vec<(u32, u32)>>,
+    /// 已提交网格（按图集页索引；None = 该页本帧无 quad）。
+    meshes: Vec<Option<Arc<Mesh>>>,
+    /// 上一帧的帧级指纹（几何/主题/选区/图集世代，见 set_frame_sig）。
+    frame_sig: u64,
 }
 
 /// 每页签的 GPU 批渲染句柄。`None` = 尚未初始化或初始化失败（整格走 galley 回落）。
@@ -602,6 +706,9 @@ struct TabBuffers {
 pub struct TermGpu {
     /// 进程级共享图集（同字体链 + 物理字号的所有页签共用一份）。
     atlas: AtlasHandle,
+    /// 字体参数世代：每次重建图集 +1。图集换代后旧的逐行顶点/指纹基线作废，
+    /// 渲染侧把它排进帧参数指纹。
+    epoch: u64,
     /// 换图集所需的原始字体字节（Arc 共享，DPI 变化时用）。
     sources: Vec<FontSource>,
     font_size_pt: f32,
@@ -614,9 +721,10 @@ impl TermGpu {
     /// 字体链为空返回 None（整格 galley 回落）。
     pub fn new(ctx: &egui::Context, font_size_pt: f32, ppp: f32) -> Option<Self> {
         let sources = cached_font_data(ctx); // 进程级零拷贝，见 FONT_DATA_CACHE
-        let atlas = AtlasHandle(shared_atlas(&sources, font_size_pt, ppp)?);
+let atlas = AtlasHandle(shared_atlas(&sources, font_size_pt, ppp)?);
         Some(Self {
             atlas,
+            epoch: 1,
             sources,
             font_size_pt,
             params_ppp: ppp,
@@ -636,36 +744,52 @@ impl TermGpu {
         if self.params_ppp == ppp && self.font_size_pt == font_size_pt {
             return;
         }
-        self.atlas =
+self.atlas =
             AtlasHandle(shared_atlas(&self.sources, font_size_pt, ppp).expect("字体源非空"));
         self.font_size_pt = font_size_pt;
         self.params_ppp = ppp;
-        self.buf.prev_hash.clear();
+        // 字形位图与纹理 id 全换：旧的逐行指纹基线作废（否则所有行都可能被
+        // 判为「没变」而复用到旧顶点）。
+self.buf.prev_row_hash.clear();
         self.buf.meshes.clear();
-        for q in &mut self.buf.quads {
-            q.clear();
+        self.buf.row_vertex.clear();
+        self.epoch += 1;
+    }
+
+    /// 字体图集世代号（换字体/DPI 时自增）。
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// 挂帧级指纹：与上帧不同则作废逐行指纹基线（所有行当帧重算）。
+    pub fn set_frame_sig(&mut self, sig: u64) {
+        if self.buf.frame_sig != sig {
+            self.buf.frame_sig = sig;
+            self.buf.prev_row_hash.clear();
         }
     }
 
-    /// 帧入口：哈希缓冲对齐 rows×cols、清空各页 quad 桶，并取一帧的图集访问权。
+    /// 帧入口：逐行缓冲对齐 rows、清空各行 quad 桶，并取一帧的图集访问权。
     /// `handle` 须是本帧之前由 `atlas_handle()` 取出的同一份句柄（见其注释）。
+    ///
+    /// 先用 `set_frame_sig()` 挂上帧级指纹：行指纹只含格子**内容**，几何/主题/
+    /// 选区/图集世代的变化只能由它作废旧指纹基线——否则「内容没变但格子位置
+    /// 变了」（挪窗口、改选区）的行会命中干净行而复用旧顶点。
     pub fn begin_frame<'a>(
         &'a mut self,
         handle: &'a AtlasHandle,
         rows: usize,
-        cols: usize,
     ) -> TermFrame<'a> {
-        let needed = rows * cols;
-        if self.buf.hash_scratch.len() >= needed {
-            // 已有足够容量 → fill(0) 重置，无重分配。
-            self.buf.hash_scratch[..needed].fill(0);
-            self.buf.hash_scratch.truncate(needed);
-        } else {
-            self.buf.hash_scratch.clear();
-            self.buf.hash_scratch.resize(needed, 0);
-        }
-        for q in &mut self.buf.quads {
-            q.clear();
+        self.buf.row_hash.clear();
+        self.buf.row_hash.resize(rows, 0);
+        self.buf.row_dirty.clear();
+        self.buf.row_dirty.resize(rows, true);
+        self.buf.row_quads.clear();
+        self.buf.row_quads.resize_with(rows, Vec::new);
+        for row in &mut self.buf.row_quads {
+            for q in row.iter_mut() {
+                q.clear();
+            }
         }
         // 每帧一次锁（单 UI 线程、零竞争），之后逐格零锁开销。
         let atlas = handle.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -688,10 +812,12 @@ impl TermFrame<'_> {
         self.atlas.is_empty()
     }
 
-    /// 记录一格的静止帧 diff 哈希。
+/// 记录一行的内容指纹并当场判它是否变化（行级 dirty 的唯一判据）。
+    /// UI 只渲染 dirty 行；`end_frame` 也只重建 dirty 行对应的顶点。
     #[inline]
-    pub fn set_hash(&mut self, idx: usize, h: u64) {
-        self.buf.hash_scratch[idx] = h;
+    pub fn set_row_hash(&mut self, row: usize, h: u64) {
+        self.buf.row_hash[row] = h;
+        self.buf.row_dirty[row] = self.buf.prev_row_hash.get(row) != Some(&h);
     }
 
     /// 查询/光栅化字形，返回 (页号, 槽位)。空槽（w==0）由调用方回落 galley。
@@ -712,37 +838,112 @@ impl TermFrame<'_> {
         self.atlas.underline_rel(pg, cell_h)
     }
 
-    /// 往指定页收一个 quad（跨帧复用分配）。
+/// 往指定行的指定图集页收一个 quad（跨帧复用分配）。
     ///
     /// 桶随页号自增：帧缓冲是页签私有的，与共享图集的页数没有同步机制，
     /// 而新页由 `glyph()` 在末页满时按需开出（页号可越过桶的现有长度）。
     /// 缺失即 `get_mut` 落空会把整格字形静默丢掉（表现为「终端整片白」）。
     #[inline]
-    pub fn push_quad(&mut self, pg: usize, q: CellQuad) {
-        if pg >= self.buf.quads.len() {
-            self.buf.quads.resize_with(pg + 1, Vec::new);
+    pub fn push_quad(&mut self, row: usize, pg: usize, q: CellQuad) {
+        let buckets = &mut self.buf.row_quads[row];
+        if pg >= buckets.len() {
+            buckets.resize_with(pg + 1, Vec::new);
         }
-        self.buf.quads[pg].push(q);
+        buckets[pg].push(q);
     }
 
-    /// 帧尾判定 + 网格组装。返回本帧应提交的 (纹理, Mesh) 列表；静止帧返回
-    /// 上一帧的同一批 Arc（调用方 clone 后照常 add——egui 每帧都要画，
-    /// 省的是 CPU 侧 quad→mesh 组装）。纹理缺失或位图有新字形时原地重传
-    /// （共享纹理 id 不变，其他页签缓存的 mesh 继续有效）。
-    pub fn end_frame(&mut self, ctx: &egui::Context) -> &[(egui::TextureId, Arc<Mesh>)] {
-        if self.buf.prev_hash != self.buf.hash_scratch {
-            self.buf.prev_hash.clear();
-            self.buf.prev_hash.extend_from_slice(&self.buf.hash_scratch);
-            self.buf.meshes.clear();
-            for pg in 0..self.atlas.pages.len() {
-                // 空桶页跳过：该页无新字形，旧 mesh 继续有效。
-                let Some(quads) = self.buf.quads.get(pg).filter(|q| !q.is_empty()) else {
-                    continue;
-                };
-                let tid = self.atlas.page_texture(pg, ctx);
-                let mesh = build_mesh(quads, tid);
-                self.buf.meshes.push((tid, Arc::new(mesh)));
+    /// 帧尾：逐行增重建网格。返回本帧应提交的网格（按图集页索引，None =
+    /// 该页无 quad）；全行未变时返回上一帧的同一批 Arc（调用方 clone 后照常
+    /// add——egui 每帧都要画，省的是 CPU 侧 quad→mesh 组装）。
+    /// 纹理缺失或位图有新字形时原地重传（共享纹理 id 不变，其他页签缓存的
+    /// mesh 继续有效）。
+    pub fn end_frame(&mut self, ctx: &egui::Context) -> &[Option<Arc<Mesh>>] {
+        let rows = self.buf.row_hash.len();
+        // 全部行未变：零组装，直接重放上一帧的同一批 Arc<Mesh>。
+        if !self.buf.row_dirty.iter().any(|&d| d) {
+            return &self.buf.meshes;
+        }
+        let old_meshes = std::mem::take(&mut self.buf.meshes);
+        let old_vertex = std::mem::take(&mut self.buf.row_vertex);
+        self.buf.prev_row_hash.clear();
+        self.buf.prev_row_hash.extend_from_slice(&self.buf.row_hash);
+        self.buf.meshes.resize_with(self.atlas.pages.len().max(self.buf.meshes.len()), || None);
+        for pg in 0..self.atlas.pages.len() {
+            let page_quads: Vec<&[CellQuad]> = (0..rows)
+                .map(|r| {
+                    self.buf.row_quads[r].get(pg).map(|q| q.as_slice()).unwrap_or(&[])
+                })
+                .collect();
+            let old_mesh = old_meshes.get(pg).and_then(|m| m.as_ref());
+            let old_ranges = old_vertex.get(pg);
+            // dirty 行里只要有一行在本页产生 quad，才需要重建本页网格；否则
+            // （变化全在本页之外，如纯背景色变化）旧网格整体有效，整页照搬。
+            let touches = self
+                .buf
+                .row_dirty
+                .iter()
+                .enumerate()
+                .any(|(r, &d)| d && !page_quads[r].is_empty());
+            if old_mesh.is_some() && !touches {
+                self.buf.meshes[pg] = old_mesh.cloned();
+                if let Some(rs) = old_ranges {
+                    store_ranges(&mut self.buf.row_vertex, pg, rs);
+                }
+                continue;
             }
+            if !touches && old_mesh.is_none() {
+                // 本页既无脏行 quad 也无旧网格（可能是别的页签刷出的新页）：
+                // 不要为本页签用不到的纹理白分 4MiB 显存。
+                self.buf.meshes[pg] = None;
+                continue;
+            }
+            // 首帧（无旧网格）与增量重建走同一条路径：老网格缺席或该行区间
+            // 缺失时该行只能重新生成——未变行没渲染 quad，此时无 quad 可生成，
+            // 所以每帧都必须记下区间（row_vertex），否则整行字形会消失。
+            let tid = self.atlas.page_texture(pg, ctx);
+            let mut mesh = Mesh::with_texture(tid);
+            let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(rows);
+            let mut quad_total = 0usize;
+            for (r, dirty) in self.buf.row_dirty.iter().copied().enumerate() {
+                let reused = match (dirty, old_mesh, old_ranges.and_then(|rs| rs.get(r))) {
+                    (false, Some(old), Some(&(s, n))) => Some((old, s, n)),
+                    _ => None,
+                };
+                let (start, n) = match reused {
+                    // 未变的行：整段顶点从旧网格 memcpy 过来（不重算字形位置）。
+                    Some((old, s, n)) => {
+                        let from = s as usize * 4;
+                        // 区间记的是 quad 序号，顶点偏移要 ×4。
+                        let start = mesh.vertices.len() as u32 / 4;
+                        mesh.vertices
+                            .extend_from_slice(&old.vertices[from..from + n as usize * 4]);
+                        (start, n)
+                    }
+                    None => {
+                        let start = mesh.vertices.len() as u32 / 4;
+                        push_quad_vertices(&mut mesh, page_quads[r]);
+                        (start, page_quads[r].len() as u32)
+                    }
+                };
+                quad_total += n as usize;
+                ranges.push((start, n));
+            }
+            // 顶点数不变 → 索引整体照抄。顶点按「行序 → 行内 quad 序」连续
+            // 追加，索引是纯序号模式（0,1,2,0,2,3 …），与每行各自的区间无关：
+            // 只要 quad 总数没变，逐行区间移位也不会让索引指错行。
+if let Some(old) = old_mesh.filter(|o| o.vertices.len() == mesh.vertices.len()) {
+                mesh.indices.clone_from(&old.indices);
+            } else {
+                mesh.indices.reserve(quad_total * 6);
+                for &(start, n) in &ranges {
+                    for i in 0..n {
+                        let vi = (start + i) * 4;
+                        mesh.indices.extend_from_slice(&[vi, vi + 1, vi + 2, vi, vi + 2, vi + 3]);
+                    }
+                }
+            }
+            store_ranges(&mut self.buf.row_vertex, pg, &ranges);
+            self.buf.meshes[pg] = Some(Arc::new(mesh));
         }
         &self.buf.meshes
     }
@@ -756,7 +957,7 @@ mod tests {
         GlyphAtlas::new(&[(Arc::new(epaint_default_fonts::HACK_REGULAR.to_vec()), 0)], 14.0, ppp)
     }
 
-    /// ASCII 字形应成功光栅化入库，且二次查询走缓存返回同一槽位。
+/// ASCII 字形应成功光栅化入库，且二次查询走缓存返回同一槽位。
     #[test]
     fn ascii_glyph_rasterizes_and_caches() {
         let mut a = test_atlas(1.0);
@@ -771,12 +972,37 @@ mod tests {
         assert_eq!(a.version, v_before + 1, "新增字形应推进版本号");
     }
 
-    /// 缺字形（emoji）应得空槽（负缓存），调用方回落 galley 路径。
+/// 缺字形（emoji）应得空槽（负缓存），调用方回落 galley 路径。
     #[test]
     fn missing_glyph_returns_empty_slot() {
         let mut a = test_atlas(1.0);
         let s = a.glyph('\u{1F600}'); // 😀 Hack 无此字形
         assert_eq!(s.w, 0.0, "缺字形应为空槽");
+    }
+
+    /// 脏矩形上传：子图内容必须与整页镜像逐字节一致（否则字形显示为
+    /// 错位的其它字形），且取走后清零、新字形重新标脏。
+    #[test]
+    fn dirty_rect_sub_image_matches_full() {
+        let mut a = test_atlas(1.0);
+        a.glyph('A');
+        let r = a.take_dirty().expect("光栅化后应标脏");
+        assert!(r.width() < 64.0 && r.height() < 64.0, "脏区应远小于整页: {r:?}");
+        let sub = a.sub_image(r);
+        let full = a.image();
+        let (x0, y0, fw, sw, sh) = (r.min.x as usize, r.min.y as usize, full.width(), sub.width(), sub.height());
+        for y in 0..sh {
+            for x in 0..sw {
+                assert_eq!(
+                    sub.pixels[y * sw + x],
+                    full.pixels[(y + y0) * fw + x + x0],
+                    "({x},{y}) 子图与整页不一致",
+                );
+            }
+        }
+        assert!(a.take_dirty().is_none(), "取走脏区后应清零");
+        a.glyph('B');
+        assert!(a.take_dirty().is_some(), "新字形应重新标脏");
     }
 
     /// 基线应在格子内部（内容行高垂直居中）。
@@ -788,19 +1014,23 @@ mod tests {
         assert!(a.underline_rel(20.0) > b);
     }
 
-    /// Mesh 组装：quad 数 × 4 顶点 × 6 索引，索引引用合法。
+    /// Mesh 顶点组装：quad 数 × 4 顶点，索引在 end_frame 里统一生成。
     #[test]
-    fn build_mesh_layout() {
+    fn quad_vertices_layout() {
         let quads = [CellQuad {
             rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(10.0, 20.0)),
             uv0: Pos2::ZERO,
             uv1: Pos2::new(1.0, 1.0),
             color: Color32::WHITE,
         }];
-        let m = build_mesh(&quads, egui::TextureId::Managed(0));
+        let mut m = Mesh::with_texture(egui::TextureId::Managed(0));
+        push_quad_vertices(&mut m, &quads);
         assert_eq!(m.vertices.len(), 4);
-        assert_eq!(m.indices.len(), 6);
-        assert!(m.is_valid());
+        // 左上、右上、右下、左下，索引生成后 6 个。
+        assert_eq!(m.vertices[0].pos, Pos2::new(0.0, 0.0));
+        assert_eq!(m.vertices[1].pos, Pos2::new(10.0, 0.0));
+        assert_eq!(m.vertices[2].pos, Pos2::new(10.0, 20.0));
+        assert_eq!(m.vertices[3].pos, Pos2::new(0.0, 20.0));
     }
 
     /// 哈希搅拌确定性 + 对不同输入产生不同值（防碰撞冒烟）。
@@ -908,6 +1138,7 @@ mod tests {
         let src = hack_sources();
         let mk = || TermGpu {
             atlas: AtlasHandle(shared_atlas(&src, 16.0, 1.0).unwrap()),
+            epoch: 1,
             sources: src.clone(),
             font_size_pt: 16.0,
             params_ppp: 1.0,
@@ -917,14 +1148,14 @@ mod tests {
         assert!(Arc::ptr_eq(&a.atlas.0, &b.atlas.0), "两页签应共用同一份共享图集");
         let (ha, hb) = (a.atlas_handle(), b.atlas_handle());
         {
-            let mut fa = a.begin_frame(&ha, 2, 4);
+            let mut fa = a.begin_frame(&ha, 2);
             assert!(fa.glyph('W').1.w > 0.0, "'W' 应光栅化成功");
-            fa.set_hash(3, 0xabcd);
+            fa.set_row_hash(1, 0xabcd);
         }
-        // 帧缓冲私有：哈希只写进了 A 的缓冲（B 未开帧，仍为空）。
-        assert_eq!(a.buf.hash_scratch[3], 0xabcd);
-        assert!(b.buf.hash_scratch.is_empty() && b.buf.prev_hash.is_empty());
-        let mut fb = b.begin_frame(&hb, 1, 4);
+        // 帧缓冲私有：行指纹只写进了 A 的缓冲（B 未开帧，仍为空）。
+        assert_eq!(a.buf.row_hash[1], 0xabcd);
+        assert!(b.buf.row_hash.is_empty() && b.buf.prev_row_hash.is_empty());
+        let mut fb = b.begin_frame(&hb, 1);
         assert!(!fb.is_empty(), "共享图集已含 'W'，B 页签无需再预热/重光栅化");
         assert!(fb.glyph('W').1.w > 0.0, "B 页签应命中 A 已光栅化的字形");
     }
@@ -940,16 +1171,19 @@ mod tests {
         let src = hack_sources();
         let mut g = TermGpu {
             atlas: AtlasHandle(shared_atlas(&src, 16.0, 1.0).unwrap()),
+            epoch: 1,
             sources: src.clone(),
             font_size_pt: 16.0,
             params_ppp: 1.0,
             buf: TabBuffers::default(),
         };
         let h = g.atlas_handle();
-        let mut f = g.begin_frame(&h, 1, 1);
+        let mut f = g.begin_frame(&h, 1);
         let (pg, slot) = f.glyph('W');
         assert!(slot.w > 0.0, "槽位应有可见笔画");
+        f.set_row_hash(0, 1);
         f.push_quad(
+            0,
             pg,
             CellQuad {
                 rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(slot.w, slot.h)),
@@ -959,8 +1193,146 @@ mod tests {
             },
         );
         let meshes = f.end_frame(&ctx).to_vec();
-        assert_eq!(meshes.len(), 1, "首帧（桶为空）也必须提交一个字形网格");
-        assert_eq!(meshes[0].1.vertices.len(), 4, "网格应含一个 quad 的 4 个顶点");
+let mesh = meshes[0].as_ref().expect("首帧（桶为空）也必须提交一个字形网格");
+        assert_eq!(mesh.vertices.len(), 4, "网格应含一个 quad 的 4 个顶点");
+        ctx.tex_manager().write().take_delta().clear();
+    }
+
+    /// 行级增量网格必须与「全行重建」逐字段一致。
+    /// 未变行的顶点是整段 memcpy 过来的，若区间/行序错位，画面会整行串位
+    /// 且这种错误只在部分行变化时出现——满屏重建永远看不出来。
+    #[test]
+    fn row_incremental_mesh_matches_full_rebuild() {
+        let ctx = egui::Context::default();
+        let src = hack_sources();
+        let mk = || TermGpu {
+            atlas: AtlasHandle(shared_atlas(&src, 16.0, 1.0).unwrap()),
+            epoch: 1,
+            sources: src.clone(),
+            font_size_pt: 16.0,
+            params_ppp: 1.0,
+            buf: TabBuffers::default(),
+        };
+        let mut g = mk();
+        let h = g.atlas_handle();
+        let emit = |f: &mut TermFrame, row: usize, hash: u64, ch: char, x: f32| {
+            f.set_row_hash(row, hash);
+            let (pg, slot) = f.glyph(ch);
+            assert!(slot.w > 0.0, "字形应已入库");
+            f.push_quad(
+                row,
+                pg,
+                CellQuad {
+                    rect: Rect::from_min_size(Pos2::new(x, 0.0), egui::vec2(slot.w, slot.h)),
+                    uv0: Pos2::new(slot.u0, slot.v0),
+                    uv1: Pos2::new(slot.u1, slot.v1),
+                    color: Color32::WHITE,
+                },
+            );
+        };
+        let mesh_of = |f: &mut TermFrame| -> Arc<Mesh> {
+            f.end_frame(&ctx)[0].as_ref().expect("应有网格").clone()
+        };
+
+        // 帧1：两行各一个字。
+        let mut f = g.begin_frame(&h, 2);
+        emit(&mut f, 0, 10, 'A', 0.0);
+        emit(&mut f, 1, 11, 'B', 0.0);
+        let m1 = mesh_of(&mut f);
+        drop(f);
+
+        // 帧2：只改第 1 行，第 0 行零 quad（命中整段复用）。
+        let mut f = g.begin_frame(&h, 2);
+        f.set_row_hash(0, 10);
+        emit(&mut f, 1, 12, 'C', 0.0);
+        let m2 = mesh_of(&mut f);
+        drop(f);
+        assert!(!Arc::ptr_eq(&m1, &m2), "有脏行时应重建网格");
+        assert_eq!(m2.vertices.len(), 8);
+        assert_eq!(&m2.vertices[..4], &m1.vertices[..4], "未变行的顶点应原样复用");
+
+        // 帧3：只改第 0 行。
+        let mut f = g.begin_frame(&h, 2);
+        emit(&mut f, 0, 13, 'D', 0.0);
+        f.set_row_hash(1, 12);
+        let m3 = mesh_of(&mut f);
+        drop(f);
+        assert_eq!(&m3.vertices[4..], &m2.vertices[4..], "第 1 行未变，顶点应原样复用");
+
+        // 帧4：同样内容但两行全标脏（走全量重建）→ 顶点/索引必须与帧3一致。
+        let mut f = g.begin_frame(&h, 2);
+        emit(&mut f, 0, 14, 'D', 0.0);
+        emit(&mut f, 1, 15, 'C', 0.0);
+        let m4 = mesh_of(&mut f);
+        drop(f);
+        assert_eq!(m3.vertices.len(), m4.vertices.len());
+        assert!(m3.vertices == m4.vertices, "增量重建的顶点应与全量重建逐字段一致");
+        assert!(m3.indices == m4.indices, "索引应一致");
+
+        // 全静止帧：不重建，直接重放同一批 Arc。
+        let mut f = g.begin_frame(&h, 2);
+        f.set_row_hash(0, 14);
+        f.set_row_hash(1, 15);
+        let m5 = mesh_of(&mut f);
+        drop(f);
+assert!(Arc::ptr_eq(&m4, &m5), "静止帧应零组装");
+
+// 中间行清空、末行补 quad：总 quad 数不变、逐行区间整体移位，增量结果
+        // 必须与全量重建逐字段一致（含照抄的索引）。
+        let mut g3 = mk();
+        let h3 = g3.atlas_handle();
+        let emit3 = |f: &mut TermFrame, row: usize, hash: u64, ch: char, x: f32| {
+            f.set_row_hash(row, hash);
+            let (pg, slot) = f.glyph(ch);
+            f.push_quad(
+                row,
+                pg,
+                CellQuad {
+                    rect: Rect::from_min_size(Pos2::new(x, 0.0), egui::vec2(slot.w, slot.h)),
+                    uv0: Pos2::new(slot.u0, slot.v0),
+                    uv1: Pos2::new(slot.u1, slot.v1),
+                    color: Color32::WHITE,
+                },
+            );
+        };
+        let mut f = g3.begin_frame(&h3, 3);
+        emit3(&mut f, 0, 30, 'A', 0.0);
+        emit3(&mut f, 1, 31, 'B', 0.0);
+        emit3(&mut f, 2, 32, 'C', 0.0);
+        let _base = mesh_of(&mut f); // 必须收帧，prev_row_hash/旧网格才有基准
+        drop(f);
+        let mut f = g3.begin_frame(&h3, 3);
+        f.set_row_hash(0, 30); // 首行未变（整段复用）
+        f.set_row_hash(1, 33); // 中间行清空
+        emit3(&mut f, 2, 34, 'D', 0.0);
+        emit3(&mut f, 2, 34, 'E', 10.0);
+        let m6 = mesh_of(&mut f);
+        drop(f);
+        let mut g4 = mk(); // 全量重建基准
+        let h4 = g4.atlas_handle();
+        let emit4 = |f: &mut TermFrame, row: usize, hash: u64, ch: char, x: f32| {
+            f.set_row_hash(row, hash);
+            let (pg, slot) = f.glyph(ch);
+            f.push_quad(
+                row,
+                pg,
+                CellQuad {
+                    rect: Rect::from_min_size(Pos2::new(x, 0.0), egui::vec2(slot.w, slot.h)),
+                    uv0: Pos2::new(slot.u0, slot.v0),
+                    uv1: Pos2::new(slot.u1, slot.v1),
+                    color: Color32::WHITE,
+                },
+            );
+        };
+        let mut f = g4.begin_frame(&h4, 3);
+        emit4(&mut f, 0, 30, 'A', 0.0);
+        f.set_row_hash(1, 33);
+        emit4(&mut f, 2, 34, 'D', 0.0);
+        emit4(&mut f, 2, 34, 'E', 10.0);
+        let m7 = mesh_of(&mut f);
+        drop(f);
+        assert_eq!(m6.vertices, m7.vertices, "顶点应与全量重建一致");
+assert_eq!(m6.indices, m7.indices, "索引应与全量重建一致");
         ctx.tex_manager().write().take_delta().clear();
     }
 }

@@ -32,6 +32,29 @@ const IDLE_HEARTBEAT_MS: u64 = 500;
 /// 回归 3 次，见 921f062/0ae5904）。根治 = 锁死 10 FPS，杜绝再被调高。
 const BUSY_FRAME_MS: u64 = 100;
 
+/// 交互活跃时的帧间隔（~60 FPS）：打字回显、滚轮、拖选、按键按住是卡顿唯一
+/// 能被感知的位置（输出在途时反而 100ms 足够，流式字块按 10 FPS 跳出不违和）。
+/// 与上面那条悬停激活矛盾不冲突：键盘/滚轮/鼠标按下这些事件本身就先把窗口
+/// 激活了，悬停激活根本没在发生；而「无输入、只输出」的场景仍走 BUSY_FRAME_MS，
+/// 那才是悬停会失效的窗口。
+/// ponytail: 交互帧率上限 = 16ms（显示刷新率）；若将来帧间隔还需更快，
+/// 上限提到本常量即可，不涉及渲染路径改动。
+const INTERACT_FRAME_MS: u64 = 16;
+
+/// 帧间隔决策：交互活跃 > 输出在途 > 全静止。纯函数，便于自检。
+/// busy 里的 10 FPS 不是拍脑袋：无输入的持续高帧率重绘实测干扰 Windows 悬停
+/// 激活窗口（30 FPS 失效、10 正常，见 921f062/0ae5904），所以帧率只对「窗口
+/// 已被激活」的时刻放开。要更高输出帧率先根治那个干扰源，再动 BUSY_FRAME_MS。
+fn frame_delay_ms(interacting: bool, busy: bool) -> u64 {
+    if interacting {
+        INTERACT_FRAME_MS
+    } else if busy {
+        BUSY_FRAME_MS
+    } else {
+        IDLE_HEARTBEAT_MS
+    }
+}
+
 /// 页签状态判定：只看**屏幕可见格的变化**（reader 逐块比对快照，见
 /// session.rs MIN_CONTENT_CELLS）。最近 3 秒内有成规模内容变化 → 运行中；
 /// 3 秒无内容 → 视为「输出结束/完成」。整屏重画同样的字（转义重绘）不算变化，
@@ -3287,9 +3310,11 @@ pub struct ClientApp {
     /// 每帧都要画"目录存在/不存在"，直接 is_dir() 是每帧每项目一次磁盘
     /// 调用（网络盘上明显拖帧），TTL 内复用结果。
     dir_exists_cache: HashMap<String, (bool, Instant)>,
-    /// 页签标题排版宽度缓存：title → 宽度。标题几乎不变，避免每页签每帧
+/// 页签标题排版宽度缓存：title → 宽度。标题几乎不变，避免每页签每帧
     /// 一次全量 layout_no_wrap 测宽。
     title_width_cache: HashMap<String, f32>,
+    /// 页签图标槽 / 关闭按钮的固定宽度（🔄 与 × 全进程一样），字体变了才重算。
+    tab_metrics: Option<(egui::FontId, f32, f32)>,
     /// pi 模型配置（编辑态）。
     pi_models: config::ModelsConfig,
     /// oh-my-pi 模型配置（编辑态）。
@@ -3337,8 +3362,8 @@ pub struct ClientApp {
 /// Alt-Tab 出去 / 点别的程序 / 本窗口被别的窗口盖住时，人根本不在屏幕前那个页签上。
 /// 有了它，「正在被盯着」这一种情况才不弹**系统通知**（打断式）。
 ///
-/// 注意它**不再**参与 ✅ 图标判定：当前页签跑完同样亮 ✅（用户要求），看过与否
-/// 只看有没有真实交互（has_been_viewed，由点击/切页签/终端内输入统一置位）。
+/// 注意它**不参与** ✅ 图标判定：当前（激活）页签跑完同样亮 ✅（用户要求）。
+/// 看过与否只影响「任务完成」系统通知，不影响图标。
 fn watched(is_current: bool, app_fg: bool) -> bool {
     is_current && app_fg
 }
@@ -3359,14 +3384,14 @@ fn watched(is_current: bool, app_fg: bool) -> bool {
 /// 🔄 画面 ≤ANIM_BUSY_MS 就变过（spinner/时钟/进度条/流式打字都落这里）
 ///   或 最近 3s 内有成规模内容变化 → 运行中。
 ///   · 最近 1.5s 打字、500ms 滚轮回显不算「在跑」（用户自己弄出来的）。
-/// ✅ 有内容、未查看、成规模内容已 ≥3s 未变、画面也不在高频动 → 完成/待查看。
-/// 其余（已查看 / 从无内容）→ 空。
+/// ✅ 有内容、成规模内容已 ≥3s 未变、画面也不在高频动 → 完成/待查看。
+/// 其余（从无内容）→ 空。**与「是否已查看 / 是否是激活页签」无关**：
+/// 激活页签跑完也要亮 ✅，看过也不熄（用户要求）。
 #[allow(clippy::too_many_arguments)]
 fn tab_icon(
     exited: bool,
     loading: bool,
     count: u32,
-    viewed: bool,
     last_content: u64,
     last_screen: u64,
     now_ms: u64,
@@ -3391,11 +3416,11 @@ fn tab_icon(
     if !typing && !scroll_echo && (fresh_content || screen_busy) {
         return Some("🔄");
     }
-    // 无内容 ≥3s → 完成；有内容（count>0）且用户未查看才亮 ✅。
-    if count > 0 && !viewed && now_ms.saturating_sub(last_content) > OUTPUT_END_MS {
+// 无内容 ≥3s → 完成；有过内容且静默 ≥3s → ✅（不再看「已查看」）。
+    if count > 0 && now_ms.saturating_sub(last_content) > OUTPUT_END_MS {
         return Some("✅");
     }
-    // 空：无内容可看 / 已查看过。
+// 空：无内容可看。
     None
 }
 
@@ -3473,11 +3498,10 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
         return;
     }
     s.state_check_ms.store(now_ms, Ordering::Relaxed);
-    let code = icon_code(tab_icon(
+let code = icon_code(tab_icon(
         exited,
         loading,
         s.output_count.load(Ordering::Relaxed),
-        s.has_been_viewed.load(Ordering::Relaxed),
         real_out,
         s.last_screen_change_ms.load(Ordering::Relaxed),
         now_ms,
@@ -3486,16 +3510,16 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
     ));
     let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
     s.state_icon.store(code | flags, Ordering::Relaxed);
-    // 完成态与图标同源同刻、同一份判据：只有「会亮 ✅」的快照才允许进入
+// 完成态与图标同源同刻、同一份判据：只有「会亮 ✅」的快照才允许进入
     // 「任务完成」通知分支——退出/加载中不算、画面高频动不算、用户驱动的
-    // 输入/滚轮回显窗口不算、成规模内容静默 ≥3s 才算、已查看不算。通知那侧
-    // 另有 out_bytes / viewed / 10s 静默等门槛（见 update_done_states）。
+    // 输入/滚轮回显窗口不算、成规模内容静默 ≥3s 才算。通知那侧另有
+    // out_bytes / viewed / 10s 静默等门槛（见 update_done_states）。
     s.state_done.store(code == ICON_DONE, Ordering::Relaxed);
 }
 
-/// 读快照出图标：退出/加载中即时纠正（事件驱动，不受 1s 门限约束）；
-/// 已查看则把 ✅ 立刻抹掉（用户刚看过就不该还亮着待查看）。
-fn tab_icon_from_snap(s: &crate::session::Session, viewed: bool) -> Option<&'static str> {
+/// 读快照出图标：退出/加载中即时纠正（事件驱动，不受 1s 门限约束）。
+/// 「已查看 / 当前是激活页签」都不再抹 ✅——跑完就该一直亮着（用户要求）。
+fn tab_icon_from_snap(s: &crate::session::Session) -> Option<&'static str> {
     let snap = s.state_icon.load(Ordering::Relaxed);
     if snap & SNAP_EXITED != 0 {
         return Some("❌");
@@ -3503,11 +3527,7 @@ fn tab_icon_from_snap(s: &crate::session::Session, viewed: bool) -> Option<&'sta
     if snap & SNAP_LOADING != 0 {
         return Some("🔄");
     }
-    let code = snap & SNAP_CODE_MASK;
-    if viewed && code == ICON_DONE {
-        return None;
-    }
-    icon_from_code(code)
+    icon_from_code(snap & SNAP_CODE_MASK)
 }
 
 /// Tab 的轻量投影（Tab 持有 Session，坐标换算只需这四类）。
@@ -3884,6 +3904,7 @@ restore_active: None,
             ctx,
             dir_exists_cache: HashMap::new(),
             title_width_cache: HashMap::new(),
+            tab_metrics: None,
             pi_models: config::load_pi_models(),
             omp_models: config::load_omp_models(),
             opencode_models,
@@ -4037,19 +4058,28 @@ fn strip_geom_for_frame(
         m: StripMetrics,
     ) -> StripGeom {
         let mut items: Vec<(usize, f32, bool)> = Vec::new();
-        for (i, tab) in self.tabs.iter().enumerate().skip(1) {
+        // 拆开字段借用：tabs 只读、title_width_cache 可写，于是键能直接借用
+        // 标题串（String: Borrow<str>）而不用逐页签 clone（原实现每页签每帧两次
+        // title.clone()）。
+        let (tabs, cache) = (&self.tabs, &mut self.title_width_cache);
+        for (i, tab) in tabs.iter().enumerate().skip(1) {
             let (title, has_close) = match tab {
-                Tab::Session(s) => (s.title.clone(), true),
-                Tab::Placeholder { title } => (title.clone(), false),
+                Tab::Session(s) => (&s.title, true),
+                Tab::Placeholder { title } => (title, false),
                 _ => continue, // 首页/设置在固定区，不参与排布
             };
-            let w = *self.title_width_cache.entry(title.clone()).or_insert_with(|| {
-ui.ctx().fonts_mut(|f| {
-                    f.layout_no_wrap(title, font.clone(), Color32::TRANSPARENT)
-                        .size()
-                        .x
-                })
-            });
+            let w = match cache.get(title.as_str()) {
+                Some(&w) => w,
+                None => {
+                    let w = ui.ctx().fonts_mut(|f| {
+                        f.layout_no_wrap(title.to_string(), font.clone(), Color32::TRANSPARENT)
+                            .size()
+                            .x
+                    });
+                    cache.insert(title.clone(), w);
+                    w
+                }
+            };
             items.push((i, w, has_close));
         }
         strip_geom(&items, m)
@@ -4877,18 +4907,25 @@ fn move_tab(&mut self, from: usize, target: usize) {
         // 字体度量整帧一次（原实现每个页签内部做三次全量排版测宽）：
         // 图标槽与 × 的宽度对所有页签相同；标题宽度按字符串缓存，标题
         // 不变时零排版成本。
+// 图标槽与 × 的宽度对所有页签相同，且与标题无关：字体没变就不重排。
         let tab_font = egui::TextStyle::Body.resolve(ui.style());
-
-        let slot_w = ui.ctx().fonts_mut(|f| {
-            f.layout_no_wrap("🔄".to_string(), tab_font.clone(), Color32::TRANSPARENT)
-                .size()
-                .x
-        });
-        let close_w = ui.ctx().fonts_mut(|f| {
-            f.layout_no_wrap("×".to_string(), tab_font.clone(), Color32::TRANSPARENT)
-                .size()
-                .x
-        });
+        let (slot_w, close_w) = match self.tab_metrics {
+            Some((ref f, a, b)) if *f == tab_font => (a, b),
+            _ => {
+                let (a, b) = ui.ctx().fonts_mut(|f| {
+                    (
+                        f.layout_no_wrap("🔄".to_string(), tab_font.clone(), Color32::TRANSPARENT)
+                            .size()
+                            .x,
+                        f.layout_no_wrap("×".to_string(), tab_font.clone(), Color32::TRANSPARENT)
+                            .size()
+                            .x,
+                    )
+                });
+                self.tab_metrics = Some((tab_font.clone(), a, b));
+                (a, b)
+            }
+        };
 
         ui.horizontal(|ui| {
             // 首页固定最左：不可拖动、不可关闭。
@@ -5091,8 +5128,7 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                 }
                 if let Tab::Session(s) = tab {
                     ui.add_space(TAB_GAP);
-                    // 状态图标：固定宽度单字符。
-                    let viewed = s.has_been_viewed.load(Ordering::Relaxed);
+// 状态图标：固定宽度单字符。
                     let now_ms = crate::now_ms();
 // ── 状态判定：仅凭屏幕可见格的变化 ──
                     // reader 逐块比对可见格快照（见 session.rs MIN_CONTENT_CELLS）：
@@ -5105,7 +5141,7 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
                     // 新实质内容这三类事件不等门限（见 state_due）。
                     refresh_tab_state(s, now_ms);
-                    let icon = tab_icon_from_snap(s, viewed);
+let icon = tab_icon_from_snap(s);
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
@@ -5411,7 +5447,7 @@ let s = TAB_GAP;
                         // 否则关掉设置页再进来还挂着上次那半行。
                         self.open_settings();
                     } else {
-                        // 点击页签后清除「输出结束」对号。
+// 点击页签 → 视为已看过（只影响「任务完成」通知，不熄 ✅）。
                         if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
                             s.has_been_viewed.store(true, Ordering::Relaxed);
                         }
@@ -5517,6 +5553,9 @@ let s = TAB_GAP;
                 s.caret_scan = None;
                 s.cached_render_shapes = None;
                 s.cached_ansi_rgb = None;
+                // 索引色烘焙表取 adapt_*(dark)：主题切换时必须作废，
+                // 否则深/浅适配的旧表会钉住新主题的颜色。
+                s.cached_color_lut = None;
                 // 只推给应答过 OSC 10/11/4 颜色查询的会话（opencode 等）。
                 // shell/cmd 从不查询这类序列，收到 `ESC]10;...ESC\` 会把 OSC 终止符
                 // 的 `\` 直接回显成“自动输入了反斜杠”，不能广播。
@@ -8041,7 +8080,7 @@ impl eframe::App for ClientApp {
             if let Some(target) = tab_cycle_target(&self.tabs, self.current, tab_fwd) {
                 self.current = target;
                 self.refresh_focus();
-                // 切入口即视为已查看（✅/`任务完成`通知清零，与点击页签一致；
+// 切入口即视为已查看（只影响 `任务完成` 通知，与点击页签一致；
                 // 前台每帧同步与 update_done_states 随本帧随后生效）。
                 if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
                     s.has_been_viewed.store(true, Ordering::Relaxed);
@@ -8049,8 +8088,8 @@ impl eframe::App for ClientApp {
             }
         }
 
-        // 「已查看」不再每帧跟随「当前页签+前台」：当前页签跑完也要亮 ✅
-        // （用户要求）。它只由**真实交互**置位：点/切页签（TabAction::Activate、
+// 「已查看」只管**系统通知**（弹不弹「任务完成」），不管 ✅ 图标：当前页签
+        // 跑完也要亮 ✅（用户要求）。它只由**真实交互**置位：点/切页签（TabAction::Activate、
         // Ctrl+Tab）、在终端里点击/选中/滚轮/打字（terminal.rs show_terminal
         // 入口统一记账，窗口焦点变化与光标移动不算交互）。没交互过就一直算
         // 「未查看」→ 后台与当前页签一致。
@@ -8093,10 +8132,20 @@ impl eframe::App for ClientApp {
         // 帧率顶到 CPU 全速，干扰 winit hover 跟踪 → 悬停激活失效）：
         // SessionListener 只发合并信号（容量 1），此处消费后按配置帧率唤醒。
         // 后台页签不消费信号（画面不可见，切回那帧自然重绘）。
-        let mut busy = self.downloading
+let mut busy = self.downloading
             || !self.spawning.is_empty()
             || self.theme_settle_at.is_some()
             || ctx.input(|i| i.pointer.any_down());
+        // 交互活跃：最近有键盘/IME/粘贴输入，或 500ms 内有滚轮。优先级高于
+        // busy（输出在途时也先保证回显跟手）。
+        let now_ms = crate::now_ms();
+        let interacting = self.tabs.get(self.current).is_some_and(|t| {
+            let Tab::Session(s) = t else { return false };
+            let li = s.last_input_ms.load(Ordering::Relaxed);
+            let ls = s.last_scroll_ms.load(Ordering::Relaxed);
+            (li != 0 && now_ms.saturating_sub(li) < INPUT_ACTIVE_MS)
+                || (ls != 0 && now_ms.saturating_sub(ls) < SCROLL_ECHO_MS)
+        });
         if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
             // 仅前台页签消费合并信号：解析线程有新输出待画时按配置帧率刷新。
             if s.redraw_rx.try_recv().is_ok() {
@@ -8114,14 +8163,7 @@ impl eframe::App for ClientApp {
                 }
             }
         }
-        let delay_ms = if busy {
-            // 固定 10 FPS（100ms）。ponytail: 曾开放 30/60 FPS 档，但高帧率持续
-            // 重绘实测干扰 Windows 悬停激活窗口（10 FPS 正常、30 失效）；如需
-            // 更高帧率先根治该干扰源，再放开这里。
-            BUSY_FRAME_MS
-        } else {
-            IDLE_HEARTBEAT_MS
-        };
+let delay_ms = frame_delay_ms(interacting, busy);
         ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
@@ -8622,13 +8664,12 @@ mod tab_icon_tests {
     };
 
     /// 只喂「内容静默时长」：画面时间戳与内容同步（普通命令输出场景）。
-    fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
+    fn icon(count: u32, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(
+tab_icon(
             false,
             false,
             count,
-            viewed,
             now.saturating_sub(silent_ms),
             now.saturating_sub(silent_ms),
             now,
@@ -8640,49 +8681,43 @@ mod tab_icon_tests {
     // 最近 3s 内有内容 → 🔄。
     #[test]
     fn content_within_3s_shows_running() {
-        assert_eq!(icon(10, false, 2_000), Some("🔄"));
+        assert_eq!(icon(10, 2_000), Some("🔄"));
         // count=0 但确有内容变化：仍算在跑（用户刚敲完命令，输出一行提示符）。
-        assert_eq!(icon(0, false, 2_000), Some("🔄"));
+        assert_eq!(icon(0, 2_000), Some("🔄"));
     }
 
     // 边界：恰好 3s 内仍有内容 → 🔄；超过 3s → 完成。
     #[test]
     fn three_sec_boundary() {
-        assert_eq!(icon(10, false, 3_000), Some("🔄"));
-        assert_eq!(icon(10, false, 3_001), Some("✅"));
+        assert_eq!(icon(10, 3_000), Some("🔄"));
+        assert_eq!(icon(10, 3_001), Some("✅"));
     }
 
-    // 3s 无内容 + 有内容 + 未查看 → ✅（完成/待查看）。
+// 3s 无内容 + 有内容 → ✅（完成/待查看；激活页签、已查看均不再抹掉）。
     #[test]
     fn content_stopped_3s_shows_done() {
-        assert_eq!(icon(10, false, 10_000), Some("✅"));
-    }
-
-    // 已查看（点击过页签/切走前台同步）→ ✅ 消失。
-    #[test]
-    fn done_clears_after_viewed() {
-        assert_eq!(icon(10, true, 10_000), None);
+        assert_eq!(icon(10, 10_000), Some("✅"));
     }
 
     // 从未有内容（count=0，零输出会话）→ 3s 无内容后落空，不亮 ✅。
     #[test]
     fn no_content_never_shows_done() {
-        assert_eq!(icon(0, false, 10_000), None);
+        assert_eq!(icon(0, 10_000), None);
     }
 
     // 零输出会话不假闪 🔄：last_content=0（「从未变化过」）不参与新鲜度判定。
     #[test]
     fn never_output_never_flashes_running() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, 0, false, 0, 0, now, 0, 0), None);
+        assert_eq!(tab_icon(false, false, 0, 0, 0, now, 0, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, 0, 0, now, 0, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, 0, 0, now, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, 10, 0, 0, now, 0, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, 10, 0, 0, now, 0, 0), Some("🔄"));
     }
 
     // 输入驱动例外：最近 1.5s 内用户输过键，输入回显不判运行中；窗口过期后
@@ -8691,7 +8726,7 @@ mod tab_icon_tests {
     fn typing_echo_not_running() {
         let now = 100_000u64;
         let f = |last_input| {
-            tab_icon(false, false, 10, false, now - 1_000, now - 1_000, now, last_input, 0)
+            tab_icon(false, false, 10, now - 1_000, now - 1_000, now, last_input, 0)
         };
         assert_eq!(f(now - 1_000), None);
         assert_eq!(f(now - 1_501), Some("🔄")); // 窗口过期
@@ -8703,12 +8738,8 @@ mod tab_icon_tests {
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, now, now - 500, 0),
+tab_icon(false, false, 10, now - 10_000, now - 10_000, now, now - 500, 0),
             Some("✅")
-        );
-        assert_eq!(
-            tab_icon(false, false, 10, true, now - 10_000, now - 10_000, now, now - 500, 0),
-            None
         );
     }
 
@@ -8720,29 +8751,19 @@ mod tab_icon_tests {
         // 内容早已静默 10s，但画面 100ms 前还在变（spinner 在动）→ 🔄。
         for ago in [0u64, 40, 99, 150] {
             assert_eq!(
-                tab_icon(false, false, 10, false, now - 10_000, now - ago, now, 0, 0),
+                tab_icon(false, false, 10, now - 10_000, now - ago, now, 0, 0),
                 Some("🔄"),
                 "画面还在高频动 = 还在思考/跑命令（ago={ago}）"
             );
         }
         // 变化停 300ms（> ANIM_BUSY_MS）→ 照常亮 ✅（回合真跑完了）。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 300, now, 0, 0),
+            tab_icon(false, false, 10, now - 10_000, now - 300, now, 0, 0),
             Some("✅")
         );
-        // 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」（用 < 而非 <=）。
+// 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」（用 < 而非 <=）。
         assert_eq!(
-            tab_icon(
-                false,
-                false,
-                10,
-                false,
-                now - 10_000,
-                now - ANIM_BUSY_MS,
-                now,
-                0,
-                0
-            ),
+            tab_icon(false, false, 10, now - 10_000, now - ANIM_BUSY_MS, now, 0, 0),
             Some("✅")
         );
     }
@@ -8755,7 +8776,7 @@ mod tab_icon_tests {
         let now = 100_000u64;
         // 每秒一跳：上一次跳在 1s 前（>250ms，不算「在动」），内容已停 10s → ✅。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 1_000, now, 0, 0),
+            tab_icon(false, false, 10, now - 10_000, now - 1_000, now, 0, 0),
             Some("✅"),
             "1Hz 秒表/时钟只改几个格，不该永远钉在 🔄"
         );
@@ -8767,7 +8788,7 @@ mod tab_icon_tests {
     fn identical_repaint_is_not_progress() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 5_000, now - 5_000, now, 0, 0),
+            tab_icon(false, false, 10, now - 5_000, now - 5_000, now, 0, 0),
             Some("✅")
         );
     }
@@ -8777,15 +8798,15 @@ mod tab_icon_tests {
     fn screen_animation_does_not_override_running() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 500, now - 100, now, 0, 0),
+            tab_icon(false, false, 10, now - 500, now - 100, now, 0, 0),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(false, true, 10, false, now - 10_000, now - 100, now, 0, 0),
+            tab_icon(false, true, 10, now - 10_000, now - 100, now, 0, 0),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(true, false, 10, false, now - 10_000, now - 100, now, 0, 0),
+            tab_icon(true, false, 10, now - 10_000, now - 100, now, 0, 0),
             Some("❌")
         );
     }
@@ -8809,9 +8830,8 @@ mod tab_icon_tests {
 
     // 滚动/翻页只改视口、不产生 PTY 输出 → 不计更新状态：滚动后仍按内容判 ✅/空。
     #[test]
-    fn scrolling_does_not_count_as_update() {
-        assert_eq!(icon(10, false, 10_000), Some("✅"));
-        assert_eq!(icon(10, true, 10_000), None);
+fn scrolling_does_not_count_as_update() {
+        assert_eq!(icon(10, 10_000), Some("✅"));
     }
 
     // 滚动转发回显例外（500ms 短窗）：TUI 被滚轮触发整屏重绘 → 不亮 🔄；
@@ -8820,14 +8840,14 @@ mod tab_icon_tests {
     fn scroll_echo_window_only_swallows_prompt_redraw() {
         let now = 100_000u64;
         let f = |last_scroll, last_screen| {
-            tab_icon(false, false, 10, false, now - 100, last_screen, now, 0, last_scroll)
+            tab_icon(false, false, 10, now - 100, last_screen, now, 0, last_scroll)
         };
         assert_eq!(f(now - 100, now - 100), None); // 例外生效
         assert_eq!(f(now - 501, now - 100), Some("🔄")); // 窗口过期
         assert_eq!(f(0, now - 100), Some("🔄")); // 无滚动记录
         // 例外不吞 ✅：内容早停、未查看 → 仍判完成。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, now, 0, now - 100),
+            tab_icon(false, false, 10, now - 10_000, now - 10_000, now, 0, now - 100),
             Some("✅")
         );
     }
@@ -8836,7 +8856,7 @@ mod tab_icon_tests {
     #[test]
     fn toast_needs_more_silence_than_the_icon() {
         let now = 100_000u64;
-        assert_eq!(icon(10, false, 5_000), Some("✅"));
+        assert_eq!(icon(10, 5_000), Some("✅"));
         assert!(!toast_quiet_enough(now - 5_000, now));
         assert!(!toast_quiet_enough(now - TOAST_QUIET_MS, now));
         assert!(toast_quiet_enough(now - TOAST_QUIET_MS - 1, now));
@@ -8849,6 +8869,23 @@ mod tab_icon_tests {
         assert!(!toast_quiet_enough(0, 100_000));
     }
 }
+#[cfg(test)]
+mod frame_delay_tests {
+    use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS};
+
+    /// 帧间隔优先级：交互 > 输出在途 > 全静止。顺序错了就是两个真实故障：
+    /// 交互判据排在 busy 之后 → 输出时打字回显仍按 100ms（延迟感）；
+    /// busy 与静止混为一谈 → 输出在途时落回 500ms 心跳（字块跳成慢动作）。
+    #[test]
+    fn priority_interact_over_busy_over_idle() {
+        assert_eq!(frame_delay_ms(true, true), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(true, false), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, true), BUSY_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, false), IDLE_HEARTBEAT_MS);
+        assert!(INTERACT_FRAME_MS < BUSY_FRAME_MS && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS);
+    }
+}
+
 #[cfg(test)]
 mod watched_tests {
     use super::watched;

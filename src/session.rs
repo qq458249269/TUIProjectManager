@@ -19,14 +19,20 @@ use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
+use crate::term_gl::{hash_mix, raw_color_key};
+
 // ── 无锁快照：reader 线程生成，UI 线程通过 AtomicPtr 加载，零锁竞争 ──
 
 /// 终端渲染快照：包含 UI 渲染一帧所需的全部数据。
 #[allow(dead_code)]
 /// reader 线程在处理完 PTY 输出后生成，通过 AtomicPtr 原子交换给 UI 线程。
 pub struct TermSnapshot {
-    /// 可见格子 (point, cell)。
+/// 可见格子 (point, cell)。
     pub cells: Vec<(Point, Cell)>,
+    /// 每可视行（vline = line + offset）的行指纹，下标即 vline。
+    /// 在构建快照时顺手算（cells 本来就要逐格 clone）：渲染端据此判定行级
+    /// 增量，不用再重扫 rows×cols 个格子。内容相同的行指纹必相同，反之不必。
+    pub row_hashes: Vec<u64>,
     /// 显示偏移。
     pub offset: usize,
     /// 光标位置。
@@ -35,10 +41,11 @@ pub struct TermSnapshot {
     pub cursor_shape: CursorShape,
     /// 选区（用于复制和渲染）。
     pub selection: Option<TermSelection>,
-    /// 选区范围（用于渲染高亮）。
+/// 选区范围（用于渲染高亮）。
     pub sel_range: Option<SelectionRange>,
-    /// 选中的文本（用于复制）。
-    pub selected_text: Option<String>,
+    // 原 selected_text 字段已删：全代码零读取，但 build_snapshot 每块输出都
+    // 跑一次 selection_to_string()——长回滚区上选着东西时每 64KiB 输出重建
+    // 整段选中文本。复制路径另有实现，不依赖这里。
     /// 光标是否可见。
     pub show_cursor: bool,
     /// 调色盘。
@@ -48,6 +55,71 @@ pub struct TermSnapshot {
     /// 光标格的字符和标志（Block 光标反色重绘用）。
     pub cursor_cell_char: char,
     pub cursor_cell_flags: alacritty_terminal::term::cell::Flags,
+    /// 产出这份快照时的 parse_gen。UI 用它而不是读当前的 parse_gen：
+    /// reader 先推进 gen 再解析（此期间 UI 可能拿到「gen 已变、快照还是旧的」
+    /// 的组合），拿 ambient gen 当「我渲染的就是这个」会把旧画面钉成静止帧。
+    pub snap_gen: u64,
+}
+
+/// 从 term 当前状态构造完整快照（可见格+ 元数据）。
+/// reader 线程与 UI 线程共用：后台页签解析时跳过整屏克隆，页签切回前台那帧
+/// 由 UI 线程就地重建（reader 阻塞在 read() 上，收不到命令）。
+pub fn build_snapshot(t: &Term<SessionListener>, snap_gen: u64) -> TermSnapshot {
+    let content = t.renderable_content();
+    let offset = content.display_offset;
+    let selection = t.selection.clone();
+    let sel = selection.as_ref().and_then(|s| s.to_range(t));
+    let show = t.mode().contains(TermMode::SHOW_CURSOR);
+    let mode = *t.mode();
+    let cpoint = content.cursor.point;
+    let (cc, cf) = {
+        let cell = &t.grid()[cpoint];
+        (cell.c, cell.flags)
+    };
+let mut cells = Vec::new();
+    // 行指纹：cells 按 vline 升序（display_iter 自下而上，vline = line+offset），
+    // 遇行号变化就封口上一行。种子带 vline，滚动换位也算内容变化。
+    let mut row_hashes: Vec<u64> = Vec::new();
+    let mut cur_line = i32::MIN;
+    let mut rh = 0u64;
+    for indexed in content.display_iter {
+        let p = indexed.point;
+        let v = p.line.0 + offset as i32;
+        if v < 0 {
+            continue;
+        }
+        if v != cur_line {
+            if cur_line != i32::MIN {
+                row_hashes.push(rh);
+            }
+            cur_line = v;
+            rh = 0xcbf2_9ce4_8422_2325 ^ v as u64;
+        }
+        let cell = indexed.cell;
+        hash_mix(&mut rh, raw_color_key(cell.fg));
+        hash_mix(&mut rh, raw_color_key(cell.bg));
+        hash_mix(&mut rh, cell.flags.bits() as u64);
+        hash_mix(&mut rh, cell.c as u64 ^ (p.column.0 as u64) << 24);
+        cells.push((p, cell.clone()));
+    }
+    if cur_line != i32::MIN {
+        row_hashes.push(rh);
+    }
+    TermSnapshot {
+        cells,
+        row_hashes,
+        offset,
+        cursor_point: content.cursor.point,
+        cursor_shape: content.cursor.shape,
+        selection,
+sel_range: sel,
+        show_cursor: show,
+        colors: *content.colors,
+        mode,
+        cursor_cell_char: cc,
+        cursor_cell_flags: cf,
+        snap_gen,
+    }
 }
 
 #[allow(dead_code)]
@@ -67,6 +139,17 @@ static ECHO_MAX_MS: AtomicU32 = AtomicU32::new(0);
 fn latency_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
+}
+
+/// 终端一行的渲染缓存（指纹不变则整行重放）。
+#[derive(Default)]
+pub struct RowCache {
+    /// 行内容指纹（仅原始字段；不含主题/几何/选区，那些在 row_cache_sig 里）。
+    pub hash: u64,
+    /// 本行的背景 Shape（已按 run 合并）。
+    pub bg: Vec<egui::Shape>,
+    /// 本行 galley 回落字形的 Shape（GPU quad 不在此处）。
+    pub fg: Vec<egui::Shape>,
 }
 
 /// 一个在应用内页签中运行的终端会话。
@@ -144,9 +227,10 @@ pub struct Session {
     /// 动画不属于可打印字节）时，「运行结束」/「任务完成」都不弹通知
     /// （见 app.rs MIN_OUTPUT_BYTES）。
     pub out_bytes: Arc<AtomicU64>,
-/// 「已查看」标记：true = 用户已经看过当前内容（见 = 空状态）。
+/// 「已查看」标记：true = 用户已经看过当前内容（只影响 `任务完成` 系统
+    /// 通知，不影响 ✅ 图标——激活页签跑完也照亮）。
     /// 启动即 true（spawn 产物不需要提醒）；读取线程在「加载期之后」的每轮
-    /// 新内容输出时复位 false → 完成通知/✅ 只属于用户没看过的真输出轮；
+    /// 新内容输出时复位 false → 完成通知只属于用户没看过的真输出轮；
     /// 点击/切换到该页签（TabAction::Activate、Ctrl+Tab）、在终端里做任何
     /// 交互（点击/拖选/滚轮/打字，terminal.rs show_terminal 入口统一记账）
     /// 置回 true。
@@ -214,6 +298,8 @@ pub struct Session {
     pub last_preedit: String,
     /// 静止帧缓存：跳过 clone 时复用上一帧的 ANSI 查找表（256 项 Color32）。
     pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
+    /// 索引色「解析 + 主题适配」预烘焙表（fg/bg 各 256 项）。
+    pub cached_color_lut: Option<([egui::Color32; 256], [egui::Color32; 256])>,
     /// 上一帧快照对应的 parse_gen：用于检测 snapshot 是否有新内容，跳过无变化帧的重渲染。
     pub last_snapshot_gen: u64,
     /// 上一帧快照偏移：仅 offset 变化时做 O(rows) 的 point.line 平移，
@@ -223,7 +309,13 @@ pub struct Session {
     pub cached_metrics: Option<(f32, f32, f32)>,
     /// 静止帧缓存：完整渲染结果（bg_shapes + GPU mesh + fg_shapes），
     /// snapshot_changed=false 时直接重放，跳过逐格渲染循环。
-    pub cached_render_shapes: Option<Vec<egui::Shape>>,
+pub cached_render_shapes: Option<Vec<egui::Shape>>,
+    /// 行级渲染缓存：每行内容指纹 + 该行的背景 Shape + galley 回落字形。
+    /// 流式输出时只有一两行变，其余行直接重放，不再重跑逐格循环。
+    pub row_cache: Vec<RowCache>,
+    /// 生成 row_cache 时的帧参数指纹（主题/几何/选区/字体图集世代）；与当前
+    /// 帧不一致则整份缓存作废。
+    pub row_cache_sig: u64,
     /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
     /// 字形位图与纹理全进程共享（见 term_gl::SHARED_ATLASES），本字段只留
     /// 本页签私有的帧缓冲，多页签不再各占一份 4MB 图集。
@@ -231,6 +323,9 @@ pub struct Session {
     /// 会话是否仍在启动中（首次有实际输出后置 false）。
     /// UI 线程据此显示旋转 ⚙️ 加载动画。
     pub loading: Arc<AtomicBool>,
+    /// 快照里的 cells 已过期：后台页签解析时 reader 只刷时间戳、不重建整屏
+    /// 格子（画面不可见）。该页签切回前台时 UI 用当前网格重建一帧并清此标记。
+    pub cells_stale: Arc<AtomicBool>,
 }
 
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
@@ -407,8 +502,8 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
 /// 不影响真正的 ESC 转义序列；只处理无 ESC 前缀的 `[数字;数字u` 残片。
 /// 替换规则与 `strip_ansi` 的孤儿逻辑一致：每个连续残片段替换为
 /// 单个空格（残片后已有空白则吞掉多余空白）。
-fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+/// 结果追加到调用方缓冲（reader 每块复用同一份，避免每块新分配）。
+fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8]) {
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
@@ -498,6 +593,13 @@ fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
+}
+
+/// 测试用包装：一次性缓冲版本（生产路径走 into 版复用缓冲）。
+#[cfg(test)]
+fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    strip_orphan_csi_u_bytes_into(&mut out, bytes);
     out
 }
 
@@ -757,19 +859,21 @@ pub fn spawn(
     // 快照 + 命令通道
     let snapshot = Arc::new(std::sync::Mutex::new(Arc::new(TermSnapshot {
         cells: Vec::new(),
+        row_hashes: Vec::new(),
         offset: 0,
         cursor_point: Point::new(Line(0), Column(0)),
         cursor_shape: CursorShape::Block,
         selection: None,
-        sel_range: None,
-        selected_text: None,
+sel_range: None,
         show_cursor: true,
         colors: Colors::default(),
         mode: TermMode::empty(),
         cursor_cell_char: ' ',
         cursor_cell_flags: alacritty_terminal::term::cell::Flags::empty(),
+        snap_gen: 0,
     })));
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<TermCommand>();
+    let cells_stale = Arc::new(AtomicBool::new(false));
 
     let output_count = Arc::new(AtomicU32::new(0));
     let out_bytes = Arc::new(AtomicU64::new(0));
@@ -813,6 +917,7 @@ pub fn spawn(
         let reader_cursor_hidden = cursor_hidden.clone();
         let parse_gen = parse_gen.clone();
         let reader_snapshot = snapshot.clone();
+        let reader_cells_stale = cells_stale.clone();
         let reader_cmd_rx = cmd_rx;
         let mut reader = pair
             .master
@@ -833,6 +938,14 @@ let mut last_chunk_ms: u64 = 0;
             // reply_to_queries 逐块扫描会漏掉。保留尾部未完成的转义序列，
             // 下一块拼接后重扫。
             let mut query_leftover: Vec<u8> = Vec::new();
+            // 每块输出复用的缓冲（原来每块新分配：merged/清理后的副本/字符快照），
+            // rows×cols 级别的小对象循环里反复 malloc 是后台多页签下的主要开销。
+            let mut merged: Vec<u8> = Vec::with_capacity(0x10_000);
+            let mut stripped: Vec<u8> = Vec::with_capacity(0x10_000);
+            let mut now_chars: Vec<char> = Vec::new();
+            // 是否至少发布过一次整屏格子：后台页签在首次发布前也必须先给一份，
+            // 否则 tab 切回来既无格子也无重建触发点（renderable_content 迭代需 term）。
+            let mut published_once = false;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -940,10 +1053,10 @@ let mut last_chunk_ms: u64 = 0;
                             // 累计实质输出字节（非动画块的可打印字节）：
                             // 「任务完成」/「运行结束」通知的过滤判据。
                             reader_out_bytes.fetch_add(printable as u64, Ordering::Relaxed);
-                            // 新一轮实质输出 → 清「已查看」：本轮输出停止 3s 后
-                            // ✅ 才重新亮起（图标只属于后台新输出）。done_notified
-                            // 在离开 ✅ 时复位（app.rs update_done_states），重复
-                            // 弹窗由同页签 10s 节流兜底（TOAST_MIN_INTERVAL_MS）。
+// 新一轮实质输出 → 清「已查看」：本轮输出停止 3s 后才允许
+                            // 再弹 `任务完成`。done_notified 在离开 ✅ 时复位
+                            // （app.rs update_done_states），重复弹窗由同页签
+                            // 10s 节流兜底（TOAST_MIN_INTERVAL_MS）。
                             // 加载期内不清：启动即 viewed=true，首块提示符若也复位
                             // 成 false，纯闲置页签会永远「未查看」→ 无人查看也弹
                             // 「任务完成」通知+闪烁（用户报告：没任何输出却弹）。
@@ -968,12 +1081,9 @@ let mut last_chunk_ms: u64 = 0;
                         let is_fg = reader_fg.load(Ordering::Relaxed);
                         // 跨块拼接：把上次残留的未完成转义序列拼到本次块前面，
                         // 保证 reply_to_queries 能识别被 read() 切断的查询。
-                        let merged: Vec<u8> = if query_leftover.is_empty() {
-                            buf[..n].to_vec()
-                        } else {
-                            query_leftover.extend_from_slice(&buf[..n]);
-                            std::mem::take(&mut query_leftover)
-                        };
+                        merged.clear();
+                        merged.extend_from_slice(&query_leftover);
+                        merged.extend_from_slice(&buf[..n]);
                         // 提取尾部未完成的转义序列：从最后一个 ESC 开始到块尾
                         // 若该段不含 CSI/OSC 终结字节，则是不完整的，保留到下块。
                         query_leftover.clear();
@@ -994,7 +1104,10 @@ let mut last_chunk_ms: u64 = 0;
                         // 清理孤儿 CSI-u 残片：kitty 键盘协议回显的 `[13;5u`、
                         // `[57442;1:3u` 等无 ESC 前缀的残片会被 VT parser 当字面文本
                         // 渲染成可见乱码。在喂给 parser 前整段清理。
-                        let merged = strip_orphan_csi_u_bytes(&merged);
+                        let merged: &[u8] = {
+                            strip_orphan_csi_u_bytes_into(&mut stripped, &merged);
+                            &stripped
+                        };
                         // ── 分块处理：每次最多 CHUNK_SIZE 字节后释放 term 锁，
                         //    让 UI 线程有机会获取读锁做渲染/响应输入。
                         //    VT parser 内部状态（部分序列缓冲）独立于 term 锁，
@@ -1031,10 +1144,10 @@ let mut last_chunk_ms: u64 = 0;
                             // 无需频繁释放锁给 UI，降低锁竞争频率）。
                             let reply = {
                                 let mut t = term.write().unwrap();
-                                parser.advance(&mut *t, &merged);
+                                parser.advance(&mut *t, merged);
                                 reply_to_queries(
                                     &t,
-                                    &merged,
+                                    merged,
                                     theme_dark.load(Ordering::Relaxed),
                                 )
                             }; // ← term 锁在此释放
@@ -1060,85 +1173,92 @@ let mut last_chunk_ms: u64 = 0;
                             }
                         }
                         // ── 生成无锁快照：短暂加锁克隆可见格子 + 元数据，
-                        //    然后通过 AtomicPtr 原子交换给 UI 线程。UI 线程
+                        //    然后通过 Arc 原子交换给 UI 线程。UI 线程
                         //    load() 时零锁竞争，彻底消除渲染卡顿。
                         {
                             if let Ok(t) = term.read() {
-                                let content = t.renderable_content();
-                                let offset_val = content.display_offset;
-                                let colors = *content.colors;
-                                let cursor = content.cursor;
-                                let selection = t.selection.clone();
-                                let sel = selection.as_ref().and_then(|s| s.to_range(&t));
-                                let selected_text = t.selection_to_string();
-                                let show = t.mode().contains(TermMode::SHOW_CURSOR);
-                                let mode = *t.mode();
-                                // 实时写 TUI 状态：reader 每次处理输出后更新，
-                                // 后台页签不再依赖最近一次前台渲染留下的旧值
-                                // (terminal.rs 只渲染当前页签，切走后这些标志
-                                // 冻结 → 后台页签图标/长锁存判反)。
-                                reader_alt_screen
-                                    .store(mode.contains(TermMode::ALT_SCREEN), Ordering::Relaxed);
-                                reader_cursor_hidden.store(!show, Ordering::Relaxed);
-                                let cpoint = cursor.point;
-                                let (cc, cf) = {
-                                    let cell = &t.grid()[cpoint];
-                                    (cell.c, cell.flags)
-                                };
-                                // 只克隆可见行的格子
-                                let mut cells = Vec::new();
-                                for indexed in content.display_iter {
-                                    let p = indexed.point;
-                                    let vline = p.line.0 + offset_val as i32;
-                                    if vline >= 0 {
-                                        cells.push((p, indexed.cell.clone()));
-                                    }
-                                }
-// ── 屏幕变化检测
-                                // 逐格比字符。变化 ≥MIN_CONTENT_CELLS 格 = 成规模内容
-                                // （命令输出、回答正文）；1~3 格的周期刷新（秒表/时钟/
-                                // spinner 帧）只刷新「画面在动」，不刷新内容时间戳。
-                                // 整屏重画同样的字 = 零变化，一个时间戳都不刷——
-                                // 这正是「明明静止却常亮 🔄、✅ 永远不亮」的成因。
-                                {
-                                    let now_chars: Vec<char> = cells
-                                        .iter()
-                                        .map(|(_, c)| if c.c == '\0' { ' ' } else { c.c })
-                                        .collect();
-                                    let diff = if prev_screen.len() == now_chars.len() {
-                                        now_chars
-                                            .iter()
-                                            .zip(&prev_screen)
-                                            .filter(|(a, b)| a != b)
-                                            .count()
-                                    } else {
-                                        // 尺寸变了（resize / 换页）：整体按变化算。
-                                        now_chars.len()
-                                    };
-                                    prev_screen = now_chars;
-                                    if diff > 0 {
-                                        reader_last_screen_change.store(now_ms, Ordering::Relaxed);
-                                        if diff >= MIN_CONTENT_CELLS {
-                                            reader_last_content.store(now_ms, Ordering::Relaxed);
+                                // 后台页签不重建整屏格子（每块 rows×cols 次Cell 克隆
+                                // + 分配，画面根本不可见）：只刷元数据/时间戳并标
+                                // cells_stale，UI 切回该页签那帧就地重建。
+                                // 只做屏幕变化检测（图标/通知判据）与元数据发布。
+                                let publish = is_fg || !published_once;
+                                if publish {
+                                    let cur_gen = parse_gen.load(Ordering::Relaxed);
+                                    let snap = build_snapshot(&t, cur_gen);
+                                    reader_alt_screen
+                                        .store(snap.mode.contains(TermMode::ALT_SCREEN), Ordering::Relaxed);
+                                    reader_cursor_hidden.store(!snap.show_cursor, Ordering::Relaxed);
+                                    // ── 屏幕变化检测
+                                    // 逐格比字符。变化 ≥MIN_CONTENT_CELLS 格 = 成规模内容
+                                    // （命令输出、回答正文）；1~3 格的周期刷新（秒表/时钟/
+                                    // spinner 帧）只刷新「画面在动」，不刷新内容时间戳。
+                                    // 整屏重画同样的字 = 零变化，一个时间戳都不刷——
+                                    // 这正是「明明静止却常亮 🔄、✅ 永远不亮」的成因。
+                                    {
+                                        now_chars.clear();
+                                        now_chars.extend(snap.cells.iter().map(|(_, c)| {
+                                            if c.c == '\0' { ' ' } else { c.c }
+                                        }));
+                                        let diff = if prev_screen.len() == now_chars.len() {
+                                            now_chars
+                                                .iter()
+                                                .zip(&prev_screen)
+                                                .filter(|(a, b)| a != b)
+                                                .count()
+                                        } else {
+                                            // 尺寸变了（resize / 换页）：整体按变化算。
+                                            now_chars.len()
+                                        };
+                                        std::mem::swap(&mut prev_screen, &mut now_chars);
+                                        if diff > 0 {
+                                            reader_last_screen_change.store(now_ms, Ordering::Relaxed);
+                                            if diff >= MIN_CONTENT_CELLS {
+                                                reader_last_content.store(now_ms, Ordering::Relaxed);
+                                            }
                                         }
                                     }
+                                    published_once = true;
+                                    reader_cells_stale.store(false, Ordering::Relaxed);
+                                    *reader_snapshot.lock().unwrap() = Arc::new(snap);
+                                } else {
+                                    let content = t.renderable_content();
+                                    let offset_val = content.display_offset;
+                                    let mode = *t.mode();
+                                    let show = mode.contains(TermMode::SHOW_CURSOR);
+                                    reader_alt_screen
+                                        .store(mode.contains(TermMode::ALT_SCREEN), Ordering::Relaxed);
+                                    reader_cursor_hidden.store(!show, Ordering::Relaxed);
+                                    // 只比字符，不克隆格子：prev_screen 就地推进。
+                                    {
+                                        now_chars.clear();
+                                        now_chars.extend(content.display_iter.filter_map(|ix| {
+                                            // 与 build_snapshot 同一过滤（负行不入快照）：
+                                            // 两端口径不一致会让切页时误判整屏变化。
+                                            if (ix.point.line.0 + offset_val as i32) < 0 {
+                                                return None;
+                                            }
+                                            Some(if ix.cell.c == '\0' { ' ' } else { ix.cell.c })
+                                        }));
+                                        let diff = if prev_screen.len() == now_chars.len() {
+                                            now_chars
+                                                .iter()
+                                                .zip(&prev_screen)
+                                                .filter(|(a, b)| a != b)
+                                                .count()
+                                        } else {
+                                            // 尺寸变了（resize / 换页）：整体按变化算。
+                                            now_chars.len()
+                                        };
+                                        std::mem::swap(&mut prev_screen, &mut now_chars);
+                                        if diff > 0 {
+                                            reader_last_screen_change.store(now_ms, Ordering::Relaxed);
+                                            if diff >= MIN_CONTENT_CELLS {
+                                                reader_last_content.store(now_ms, Ordering::Relaxed);
+                                            }
+}
+                                    }
+                                    reader_cells_stale.store(true, Ordering::Relaxed);
                                 }
-// Arc 替换：旧 Arc 由持引用方（UI 渲染帧）释放，零深拷贝。
-                                // 静止检测不再做 grid 比较：纯内容制靠 last_output_ms。
-                                *reader_snapshot.lock().unwrap() = Arc::new(TermSnapshot {
-                                    cells,
-                                    offset: offset_val,
-                                    cursor_point: cursor.point,
-                                    cursor_shape: cursor.shape,
-                                    selection,
-                                    sel_range: sel,
-                                    selected_text,
-                                    show_cursor: show,
-                                    colors,
-                                    mode,
-                                    cursor_cell_char: cc,
-                                    cursor_cell_flags: cf,
-                                });
                             }
                         }
                         if is_fg {
@@ -1188,6 +1308,7 @@ let mut last_chunk_ms: u64 = 0;
         alt_screen,
         cursor_hidden,
         parse_gen: parse_gen.clone(),
+        cells_stale,
         caret_scan: None,
         gpu: None,
         last_input_ms,
@@ -1203,8 +1324,11 @@ let mut last_chunk_ms: u64 = 0;
         mouse_gesture_sel: false,
         last_preedit: String::new(),
         cached_ansi_rgb: None,
+        cached_color_lut: None,
         cached_metrics: None,
-        cached_render_shapes: None,
+cached_render_shapes: None,
+        row_cache: Vec::new(),
+        row_cache_sig: 0,
         last_snapshot_gen: 0,
         last_snapshot_offset: 0,
         loading,
@@ -1258,52 +1382,24 @@ pub fn refresh_snapshot(sess: &mut Session) {
     let gen_changed = cur_gen != sess.last_snapshot_gen;
     let offset_changed = cur_offset != sess.last_snapshot_offset;
 
-    if !gen_changed && !offset_changed {
+    if !gen_changed && !offset_changed && !sess.cells_stale.load(Ordering::Relaxed) {
         return;
     }
 
     // 任何变化（gen 或 offset）都需从 term grid 重建 cells：
     // - gen 变化：新 PTY 输出改变了内容
     // - offset 变化：滚动改变了可见区域
+    // - cells_stale：后台页签期间 reader 跳过了整屏克隆，切回前台就地补一帧
     if let Ok(t) = term.read() {
-        let content = t.renderable_content();
-        let offset_val = content.display_offset;
-        let colors = *content.colors;
-        let cursor = content.cursor;
-        let selection = t.selection.clone();
-        let sel = selection.as_ref().and_then(|s| s.to_range(&t));
-        let selected_text = t.selection_to_string();
-        let show = t.mode().contains(TermMode::SHOW_CURSOR);
-        let mode = *t.mode();
-        let cpoint = cursor.point;
-        let (cc, cf) = {
-            let cell = &t.grid()[cpoint];
-            (cell.c, cell.flags)
-        };
-        let mut cells = Vec::new();
-        for indexed in content.display_iter {
-            let p = indexed.point;
-            let vline = p.line.0 + offset_val as i32;
-            if vline >= 0 {
-                cells.push((p, indexed.cell.clone()));
-            }
-        }
         // 单份数据进 Arc 快照：UI 渲染期持 Arc，零额外副本（旧 AtomicPtr 方案
         // 这里同时持有 snapshot_scratch + snapshot.cells 两份全屏格）。
-        *snapshot.lock().unwrap() = Arc::new(TermSnapshot {
-            cells,
-            offset: offset_val,
-            cursor_point: cursor.point,
-            cursor_shape: cursor.shape,
-            selection,
-            sel_range: sel,
-            selected_text,
-            show_cursor: show,
-            colors,
-            mode,
-            cursor_cell_char: cc,
-            cursor_cell_flags: cf,
-        });
+        let snap = build_snapshot(&t, cur_gen);
+        let offset_val = snap.offset;
+        *snapshot.lock().unwrap() = Arc::new(snap);
+sess.cells_stale.store(false, Ordering::Relaxed);
+        // 快照自带它真实的 parse_gen：用 ambient cur_gen 会在
+        // 「gen 已推进、reader 尚未发布」的瞬间把旧快照标成最新，
+        // 下一帧 terminal.rs 的静止帧快路径就永久钉住旧画面。
         sess.last_snapshot_gen = cur_gen;
         sess.last_snapshot_offset = offset_val;
         sess.cached_render_shapes = None;
@@ -1315,7 +1411,74 @@ mod tests {
 use super::*;
 use alacritty_terminal::term::cell::Flags;
 
-/// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
+    /// 行级增量渲染的前置假设：快照 cells 必须按 vline（point.line.0 + offset）
+    /// 升序排列，且 vline 0 就是首行。terminal.rs 按行切分区间的 while 循环
+    /// 只靠这个序，序乱 = 整屏错位。
+    #[test]
+    fn snapshot_cells_are_vline_ascending() {
+        let listener = SessionListener {
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let mut term = Term::new(Config::default(), &TermSize::new(4, 3), listener);
+        let mut p: Processor = Default::default();
+        for (i, row) in ["AAA", "BBB", "CCC"].iter().enumerate() {
+            let mut bytes = row.as_bytes().to_vec();
+            if i < 2 {
+                bytes.extend_from_slice(b"\r\n");
+            }
+            p.advance(&mut term, &bytes);
+        }
+        let snap = build_snapshot(&term, 7);
+        let mut prev = i32::MIN;
+        for (pt, _) in &snap.cells {
+            let v = pt.line.0 + snap.offset as i32;
+            assert!(v >= prev, "cells 行序降序/乱序: {prev} -> {v}");
+            prev = v;
+        }
+        let mut heads: std::collections::BTreeMap<i32, char> = std::collections::BTreeMap::new();
+        for (pt, c) in &snap.cells {
+            if pt.column.0 == 0 {
+                heads.insert(pt.line.0 + snap.offset as i32, c.c);
+            }
+        }
+        let got: Vec<(i32, char)> = heads.iter().map(|(k, ch)| (*k, *ch)).collect();
+assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
+    }
+
+    /// 快照自带的行指纹：渲染端按它判行级增量（不再自己扫全屏格）。守卫性质：
+    /// 内容不变 → 指纹逐行不变；改一格 → 只影响那一行。
+    #[test]
+    fn snapshot_row_hashes_track_content() {
+        fn mk() -> Term<SessionListener> {
+            let listener = SessionListener {
+                redraw: std::sync::mpsc::sync_channel(1).0,
+                ctx: eframe::egui::Context::default(),
+                foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            };
+            let mut term = Term::new(Config::default(), &TermSize::new(4, 3), listener);
+            let mut p: Processor = Default::default();
+            for row in ["AAA", "BBB", "CCC"] {
+                p.advance(&mut term, row.as_bytes());
+                p.advance(&mut term, b"\r\n");
+            }
+            term
+        }
+        let a = build_snapshot(&mk(), 1);
+        assert_eq!(a.row_hashes.len(), 3, "行数应等于可视行数");
+        let b = build_snapshot(&mk(), 2);
+        assert_eq!(a.row_hashes, b.row_hashes, "内容相同 → 指纹相同");
+        let mut c = mk();
+        let mut p: Processor = Default::default();
+        p.advance(&mut c, b"\x1b[2;2HX"); // 只改第 2 行第 2 列
+        let s = build_snapshot(&c, 3);
+        assert_eq!(s.row_hashes[0], a.row_hashes[0], "未变行不应被牵连");
+        assert_ne!(s.row_hashes[1], a.row_hashes[1], "改动行指纹必须变");
+        assert_eq!(s.row_hashes[2], a.row_hashes[2], "未变行不应被牵连");
+    }
+
+    /// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
     /// 终端是否交互）。
     #[test]
     fn reply_to_queries_standard() {
@@ -1364,11 +1527,8 @@ use alacritty_terminal::term::cell::Flags;
         let cfg = TermConfig { scrolling_history: 1000, ..Default::default() };
         let mut term = Term::new(cfg, &TermSize::new(120, 40), VoidListener);
         let mut p: alacritty_terminal::vte::ansi::Processor = Default::default();
-        // 灌入远超历史的输出：120 列 × 12000 行（每行「A」+ 换行）。
-        let mut line = Vec::new();
-        for _ in 0..120 {
-            line.push(b'A');
-        }
+// 灌入远超历史的输出：120 列 × 12000 行（每行 120 个「A」+ 换行）。
+        let mut line = vec![b'A'; 120];
         line.push(b'\r');
         line.push(b'\n');
         for _ in 0..12000 {

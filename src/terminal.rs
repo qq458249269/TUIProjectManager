@@ -4,6 +4,7 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
@@ -13,6 +14,7 @@ use portable_pty::PtySize;
 
 use crate::session::{Session, SessionListener, TermCommand};
 use crate::session::TermSnapshot;
+use crate::session::RowCache;
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
 use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw, set_clipboard_string};
@@ -39,6 +41,11 @@ fn color_for(dark: bool, dark_c: Color32, light_c: Color32) -> Color32 {
 /// 深背景 → 白；亮灰/白前景 → 黑；过亮的饱和前景（亮黄、亮青、亮绿、亮紫…）
 /// 在白底上对比不足，按通道等比压暗（保留色相）到半亮度保证可读。
 fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
+    (adapt_fg_light(fg), adapt_bg_light(bg))
+}
+
+/// 浅色主题下的前景调整（与背景无关，见 adapt_to_dark 的同构注释）。
+fn adapt_fg_light(c: Color32) -> Color32 {
     let lum = |c: Color32| {
         0.2126 * c.r() as f32 / 255.0
             + 0.7152 * c.g() as f32 / 255.0
@@ -49,21 +56,52 @@ fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
         let min = c.r().min(c.g()).min(c.b()) as f32;
         max - min < 32.0
     };
-    let mut f = fg;
-    let mut b = bg;
-    if lum(b) < 0.30 {
-        b = TERM_BG_LIGHT;
-    }
-    if lum(f) > 0.72 && neutral(f) {
-        f = Color32::BLACK;
-    } else if lum(f) > 0.55 {
+    let fl = lum(c);
+    if fl > 0.72 && neutral(c) {
+        Color32::BLACK
+    } else if fl > 0.55 {
         // 亮饱和色（如 ANSI 亮黄 #FFFF00）白底上几乎看不见，压到半亮度：
         // 色相不变，对比足够，且不会被误打成黑色。
-        f = Color32::from_rgb(
-            (f.r() as f32 * 0.5) as u8,
-            (f.g() as f32 * 0.5) as u8,
-            (f.b() as f32 * 0.5) as u8,
-        );
+        Color32::from_rgb(
+            (c.r() as f32 * 0.5) as u8,
+            (c.g() as f32 * 0.5) as u8,
+            (c.b() as f32 * 0.5) as u8,
+        )
+    } else {
+        c
+    }
+}
+
+/// 浅色主题下的背景调整：过暗的底色提亮为白底。
+fn adapt_bg_light(c: Color32) -> Color32 {
+    let lum =
+        0.2126 * c.r() as f32 / 255.0 + 0.7152 * c.g() as f32 / 255.0 + 0.0722 * c.b() as f32 / 255.0;
+    if lum < 0.30 { TERM_BG_LIGHT } else { c }
+}
+
+/// 索引色 → 256 项 RGB 查表（来自 OSC 主题色；未设置的索引为 TRANSPARENT，
+/// 逐格时退 `resolve` 的默认分支）。gen 未变时由 `sess.cached_ansi_rgb` 跨帧
+/// 复用；该缓存被清（主题切换广播）时也必须重算，否则复用的是
+/// `unwrap_or(TRANSPARENT)` 的假表。
+fn ansi_rgb_table(colors: &Colors) -> [Color32; 256] {
+    let mut rgb = [Color32::TRANSPARENT; 256];
+    for i in 0..256usize {
+        if let Some(Rgb { r, g, b }) = colors[i] {
+            rgb[i] = Color32::from_rgb(r, g, b);
+        }
+    }
+    rgb
+}
+
+/// 「解析 + 主题适配」的 256 项烘焙表（show_terminal 逐格热路径的查表）。
+/// 结果取决于 `dark`：主题切换必须作废旧缓存，否则深色适配的表会钉在浅色主题上。
+fn index_luts(ansi_rgb: &[Color32; 256], dark: bool) -> ([Color32; 256], [Color32; 256]) {
+    let mut f = [Color32::TRANSPARENT; 256];
+    let mut b = [Color32::TRANSPARENT; 256];
+    for i in 0..256usize {
+        let c = ansi_rgb[i];
+        f[i] = if dark { adapt_fg_dark(c) } else { adapt_fg_light(c) };
+        b[i] = if dark { adapt_bg_dark(c) } else { adapt_bg_light(c) };
     }
     (f, b)
 }
@@ -71,6 +109,15 @@ fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
 /// 深色主题下提亮过暗的颜色（色相不变），保证与深画布底色有足够对比。
 /// 过亮的颜色在深底上一般对比足够，不额外压暗；浅色主题压暗见 `adapt_to_light`。
 fn adapt_to_dark(fg: Color32, bg: Color32) -> (Color32, Color32) {
+    // 前景与背景的调整相互独立（fg 只看自身亮度与中性度，bg 只看自身亮度），
+    // 调用方据此逐通道预烘焙 256 项索引色表，见 show_terminal 的 fg_lut/bg_lut。
+    (adapt_fg_dark(fg), adapt_bg_dark(bg))
+}
+
+/// 深色主题下的前景调整：过暗的提亮到目标亮度 0.4（色相不变：灰保持灰、
+/// 蓝变浅蓝，而非通道放大把纯蓝吹成 255 却仍只有 0.07 亮度）；过亮中性
+/// 前景归一为白。
+fn adapt_fg_dark(c: Color32) -> Color32 {
     let lum = |c: Color32| {
         0.2126 * c.r() as f32 / 255.0
             + 0.7152 * c.g() as f32 / 255.0
@@ -81,24 +128,23 @@ fn adapt_to_dark(fg: Color32, bg: Color32) -> (Color32, Color32) {
         let min = c.r().min(c.g()).min(c.b()) as f32;
         max - min < 32.0
     };
-    let mut f = fg;
-    let mut b = bg;
-    // 背景过浅将沉暗，维持深色主题纯度。
-    if lum(b) > 0.75 {
-        b = TERM_BG_DARK;
-    }
-    // 前景过暗（ANSI 黑/深灰/深蓝…）在深底几近不可见：混合向白提亮到目标
-    // 亮度 0.4（色相比不变：灰保持灰、蓝变浅蓝，而非通道放大把纯蓝吹成 255
-    // 却仍只有 0.07 亮度）。过亮中性前景归一为白。
-    let fl = lum(f);
-    if fl > 0.72 && neutral(f) {
-        f = Color32::WHITE;
+    let fl = lum(c);
+    if fl > 0.72 && neutral(c) {
+        Color32::WHITE
     } else if fl < 0.22 {
         let t = ((0.4 - fl) / (1.0 - fl)).clamp(0.0, 0.6);
         let mix = |v: u8| (v as f32 + (255.0 - v as f32) * t).round() as u8;
-        f = Color32::from_rgb(mix(f.r()), mix(f.g()), mix(f.b()));
+        Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
+    } else {
+        c
     }
-    (f, b)
+}
+
+/// 深色主题下的背景调整：过浅的底色沉暗，维持纯度。
+fn adapt_bg_dark(c: Color32) -> Color32 {
+    let lum =
+        0.2126 * c.r() as f32 / 255.0 + 0.7152 * c.g() as f32 / 255.0 + 0.0722 * c.b() as f32 / 255.0;
+if lum > 0.75 { TERM_BG_DARK } else { c }
 }
 
 /// 终端右键菜单动作。
@@ -1452,6 +1498,11 @@ pub fn show_terminal(
     // ── 从快照加载渲染数据：Arc clone（原子计数，非深拷贝）──
     // reader 线程替换快照时旧 Arc 由本帧自持的引用保活，渲染期无并发 drop；
     // 帧末 Arc 释放，旧快照数据随之回收（旧方案每输出块 O(rows×cols) clone）。
+    // 后台页签期间 reader 只刷时间戳、不重建整屏格子；切回前台时
+    // 快照里的 cells 已过期，就地重建一帧（reader 阻塞在 read() 上收不到命令）。
+    if sess.cells_stale.load(Ordering::Relaxed) {
+        crate::session::refresh_snapshot(sess);
+    }
     let snap_arc = { let g = sess.snapshot.lock().unwrap(); g.clone() };
     let snap: &TermSnapshot = &snap_arc;
     let offset = snap.offset;
@@ -1490,28 +1541,35 @@ pub fn show_terminal(
         sess.cached_render_shapes = None;
     }
 
-    // ── parse_gen 驱动的静止帧优化：内容未变时跳过逐格重渲染 ──
-    let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
-    let gen_changed = cur_gen != sess.last_snapshot_gen;
+    // ── 快照 gen 驱动的静止帧优化：内容未变时跳过逐格重渲染 ──
+    // 用快照自带的 gen（不是当前 parse_gen）：reader 先推进 gen 再解析，
+    // ambient gen 可能已经变而快照还是旧的。
+    let gen_changed = snap.snap_gen != sess.last_snapshot_gen;
     // 直接借用快照内 cells（Arc 自持，无并发 drop），零 clone。
     let snapshot_cells = &snap.cells;
 
     // ── 预计算 ANSI 256 色查找表：parse_gen 未变时复用缓存，跳过 256 次循环 ──
-    let ansi_rgb = if gen_changed {
-        let colors_vec = &snap.colors;
-        let mut rgb: [Color32; 256] = [Color32::TRANSPARENT; 256];
-        for i in 0..256usize {
-            if let Some(Rgb { r, g, b }) = colors_vec[i] {
-                rgb[i] = Color32::from_rgb(r, g, b);
-            }
-        }
+    let ansi_rgb = if gen_changed || sess.cached_ansi_rgb.is_none() {
+        let rgb = ansi_rgb_table(&snap.colors);
         sess.cached_ansi_rgb = Some(rgb);
         rgb
     } else {
         sess.cached_ansi_rgb.unwrap_or([Color32::TRANSPARENT; 256])
     };
-    let default_fg = color_for(dark, Color32::WHITE, Color32::BLACK);
+let default_fg = color_for(dark, Color32::WHITE, Color32::BLACK);
     let default_bg = canvas_bg;
+
+    // ── 索引色预烘焙表：「解析 + 主题适配」的结果预先算好，逐格只查表 ──
+    // adapt_fg_*/adapt_bg_* 已拆成单通道纯函数（fg/bg 互不影响），所以
+    // 256 项表与逐格计算逐位等价。而逐格两次亮度浮点 + min/max 是这段循环
+    // 里最贵的一截，而终端内容几乎全是 Indexed 色。
+    let (fg_lut, bg_lut) = if gen_changed || sess.cached_color_lut.is_none() {
+        let t = index_luts(&ansi_rgb, dark);
+        sess.cached_color_lut = Some(t);
+        t
+    } else {
+        sess.cached_color_lut.unwrap_or(([Color32::TRANSPARENT; 256], [Color32::TRANSPARENT; 256]))
+    };
 
     // ── 网格层绘制：背景矩形与字形分两列收集、背景在前拼接。
     // 曾做过「静止帧形状缓存」（跨帧存 Shape 列表，内容未变直接重放），
@@ -1521,27 +1579,61 @@ pub fn show_terminal(
             // 背景与字形分两列收集：同底色相邻槽先在 bg_run 里合并成一个大矩形，
             // 合并跨格进行、只能循环结束后落笔——若与字形同列表会盖住字形。
             // 格子矩形互不重叠，全局「背景层在下」与逐格交错绘制结果一致。
+// ── 帧参数指纹（主题/几何/选区/字体图集世代）──
+    // 既是行级增量缓存的作废依据，也是整帧 Shape 重放的放行条件。
+    // 行级增量本身：流式输出时每帧只有一两行变，却要全量重跑 rows×cols 逐格
+    // 循环；指纹不变的行直接复用上一帧该行的 Shape（背景 run + galley 回落
+    // 字形），字形 quad 由 TermGpu 的逐行顶点区间整段 memcpy。行指纹来自快照
+    // （session.rs 构建时逐格顺手算），渲染端不重扫全屏格。
+        let gpu_epoch = sess.gpu.as_ref().map_or(0, |g| g.epoch());
+        let mut sig = 0xcbf2_9ce4_8422_2325u64;
+        hash_mix(&mut sig, dark as u64);
+        hash_mix(&mut sig, rows as u64 | (cols as u64) << 12);
+        hash_mix(&mut sig, cell_w.to_bits() as u64);
+        hash_mix(&mut sig, cell_h.to_bits() as u64);
+        hash_mix(&mut sig, rect.left().to_bits() as u64 ^ (rect.top().to_bits() as u64).rotate_left(19));
+        hash_mix(&mut sig, color_key(default_fg));
+        hash_mix(&mut sig, color_key(canvas_bg));
+        hash_mix(
+            &mut sig,
+            sel_range
+                .map(|r| {
+                    (r.start.line.0 as u64) << 40
+                        | (r.start.column.0 as u64) << 32
+                        | (r.end.line.0 as u64) << 16
+                        | r.end.column.0 as u64
+                })
+                .unwrap_or(u64::MAX),
+        );
+        hash_mix(&mut sig, gpu_epoch);
+
     // ── 静止帧快速路径：parse_gen 未变且缓存有效时，
     //    跳过逐格渲染循环和 GPU mesh 重建，直接提交缓存的 Shape 列表。
     //    CPU 省掉 rows×cols 次迭代，GPU 省掉 mesh 重新提交。
     let mut skip_render_loop = false;
+    // sig 也要相等：缓存的 Shape 是绝对坐标，挪窗口/改选区后重放 = 画在旧
+    // 位置（内容没变 ⇒ gen 没变 ⇒ 这条路径本来就会命中）。
     if !gen_changed
+        && sess.row_cache_sig == sig
         && let Some(cached) = &sess.cached_render_shapes
     {
         painter.add(egui::Shape::Vec(cached.clone()));
         skip_render_loop = true;
     }
-    if !skip_render_loop {
-            let mut bg_shapes: Vec<egui::Shape> = Vec::new();
-            let mut bg_run: Option<(Rect, Color32)> = None;
+if !skip_render_loop {
+        let mut bg_shapes: Vec<egui::Shape> = Vec::new();
             let mut fg_shapes: Vec<egui::Shape> = Vec::new();
-        // 本帧图集访问权：共享图集帧级加锁一次（单 UI 线程零竞争），页签私有
+// 本帧图集访问权：共享图集帧级加锁一次（单 UI 线程零竞争），页签私有
         // 缓冲借用到 end_frame，循环内逐格零锁。gpu 为 None（字体链为空）时无帧，
         // 全部格子走下方 galley 回落路径。
-        let mut frame = atlas_handle
-            .as_ref()
-            .zip(sess.gpu.as_mut())
-            .map(|(h, g)| g.begin_frame(h, rows, cols));
+        let mut row_cache = std::mem::take(&mut sess.row_cache);
+        let sig_ok = row_cache.len() == rows && sess.row_cache_sig == sig;
+        let mut frame = atlas_handle.as_ref().zip(sess.gpu.as_mut()).map(|(h, g)| {
+            // 帧级指纹变了 → 逐行指纹基线作废，本帧所有行重建（行指纹只含内容，
+            // 「位置/配色口径变了」这类变化只能由它兜）。
+            g.set_frame_sig(sig);
+            g.begin_frame(h, rows)
+        });
         // 首帧预热：图集为空（首个页签，或 DPI 变化后的新图集）时一次性光栅化
         // ASCII 可打印字符，避免首帧逐字光栅化的卡顿峰值。共享后第二个页签起
         // 图集已非空，零重复预热。
@@ -1552,199 +1644,254 @@ pub fn show_terminal(
                 fr.glyph(ch);
             }
         }
-    // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
-    // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
-    // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
-    // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
-    //
-    for (point, cell) in snapshot_cells {
-        let vline = point.line.0 + offset as i32;
-        if vline < 0 || vline >= rows as i32 {
-            continue;
-        }
-        // 随空格（宽字符占位格）直接跳过：它的 2 格槽矩形与前导格完全重叠，
-        // 槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，选区盖住
-        // 随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形画完后
-        // 盖住它 —— 就是选中时汉字“消失”的根因。它自身永远无字形，先走先跳。
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
-        let col = point.column.0;
-        let x = rect.left() + col as f32 * cell_w;
-        let y = rect.top() + vline as f32 * cell_h;
-        let wide = cell.flags.contains(Flags::WIDE_CHAR);
-        // 视觉槽：宽字符前导格占 2 格；其随空格（SPACER）连回前导格占满 2 格；
-        // 窄格 1 格。背景/选区/光标下划线统一按槽绘制——选区边界落在宽字符的
-        // 任意一列（含随空格）时整个汉字同色，不会再出现左半正常色、右半被高亮
-        // 盖住的“半字”效果。字形仍左对齐画在前导格起点（spacer 无字形）。
-        let (slot_col, slot_cells) = cjk_slot(col, wide, false);
-        let x_slot = rect.left() + slot_col as f32 * cell_w;
-        let slot_w = slot_cells as f32 * cell_w;
 
-        let underlined = cell.flags.contains(Flags::UNDERLINE);
-        let selected = sel_range.as_ref().is_some_and(|r| cell_selected(r, *point, cell));
-
-        // 用预计算查找表替换 resolve_color：Indexed/Named 走数组，Spec 直转。
-        let resolve = |c: Color, default: Color32| -> Color32 {
-            match c {
-                Color::Spec(Rgb { r, g, b }) => Color32::from_rgb(r, g, b),
-                Color::Indexed(i) => ansi_rgb.get(i as usize).copied().unwrap_or(default),
-                Color::Named(n) => {
-                    use alacritty_terminal::vte::ansi::NamedColor;
-                    match n {
-                        // Foreground/Background 是逻辑色：用主题默认色，
-                        // 不走 ansi_rgb（那里存的是终端配置的浅灰色默认值）。
-                        NamedColor::Foreground => default_fg,
-                        NamedColor::Background => default_bg,
-                        _ => ansi_rgb.get(n as usize).copied().unwrap_or(default),
-                    }
-                }
+        // 逐格渲染：每格钉在 col*cell_w 的精确位置，宽字符画满 2 格。
+        // 不能再用整行 LayoutJob 排版：CJK fallback 字体（msyh）的字形宽度实测
+        // 14pt，不等于等宽字体 M 的 2 倍（约 16.86pt），整行排版时每个宽字都会
+        // 让后面所有格子向左漂移约 2.9pt，光标/选区位置全部错位。
+        //
+        // 快照按行主序排列，先切出本行的格子区间。
+        let mut ci = 0usize;
+        for r in 0..rows {
+            while ci < snapshot_cells.len()
+                && (snapshot_cells[ci].0.line.0 + offset as i32) < r as i32
+            {
+                ci += 1;
             }
-        };
-        let (mut fg, mut bg) = (resolve(cell.fg, default_fg), resolve(cell.bg, default_bg));
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        // 浅/深主题下各取所需：浅色压暗过浅颜色、深色提亮过暗颜色（色相不变），
-        // 其余沿用 ANSI 原色 —— 保留终端原本的配色，只做可读性微调。
-        let (fg, bg) = if dark { adapt_to_dark(fg, bg) } else { adapt_to_light(fg, bg) };
-        // 选中格统一为浅灰底深字，深浅一致。
-        // （蓝底白字在旧代码里曾遮盖汉字：因为随空格在字形后涂背景，盖住了
-        // 前导格刚画的宽字 —— 见上文随空格在背景前跳过。）
-        let (fg, bg) = if selected {
-            (Color32::from_gray(24), Color32::from_gray(176))
-        } else {
-            (fg, bg)
-        };
-
-        let ch = if cell.c == '\0' { ' ' } else { cell.c };
-
-        // 哈希先行：空白快速跳过的格子也要入表，保证 rows×cols 全覆盖可 diff。
-        // GPU 路径未启用时跳过，省下每格的哈希开销。
-        if let Some(fr) = frame.as_mut()
-            && col < cols
-        {
-            let idx = vline as usize * cols + col;
-            let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (idx as u64);
-            hash_mix(&mut h, ch as u64);
-            hash_mix(&mut h, color_key(fg));
-            hash_mix(&mut h, color_key(bg));
-            hash_mix(
-                &mut h,
-                underlined as u64 | ((wide as u64) << 1) | ((selected as u64) << 2),
-            );
-            fr.set_hash(idx, h);
-        }
-
-        // 空白格快速跳过：默认底色、未选中（否则底色已是高亮灰）、无下划线的
-        // 空格无任何可见输出，连 LayoutJob 都不用建 —— 空屏帧的主要开销就在这。
-        if ch == ' ' && bg == canvas_bg && !underlined {
-            continue;
-        }
-
-        // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景。宽字槽宽占满
-        // 2 格（随空格已跳过，此处只画前导格），只靠字形背景（14pt）会露右半格。
-        // 同行相邻同底色槽并入当前 run（x 坐标由同一算式产生，相邻列精确相等）。
-        if bg != canvas_bg {
-            let slot = Rect::from_min_size(Pos2::new(x_slot, y), Vec2::new(slot_w, cell_h));
-            match bg_run.as_mut() {
-                Some((run, run_bg)) if *run_bg == bg && run.right() == slot.left() && run.top() == slot.top() => {
-                    run.max.x = slot.max.x;
-                }
-                _ => {
-                    if let Some((run, c)) = bg_run.take() {
-                        bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
-                    }
-                    bg_run = Some((slot, bg));
-                }
+            let row_start = ci;
+            while ci < snapshot_cells.len()
+                && (snapshot_cells[ci].0.line.0 + offset as i32) == r as i32
+            {
+                ci += 1;
             }
-        } else if let Some((run, c)) = bg_run.take() {
-            bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
-        }
+            let row_cells = &snapshot_cells[row_start..ci];
 
-        // GPU 批渲染优先：图集命中（含本次成功入库）直推 quad；空槽回落下方
-        // galley 路径（emoji 等缺字形格子逐格混合，不整屏切换）。
-        if let Some(fr) = frame.as_mut() {
-            let (pg, slot) = fr.glyph(ch);
-            if slot.w > 0.0 {
-                let baseline = y + fr.baseline_rel(pg, cell_h);
-                let uv_solid = GlyphAtlas::solid_uv();
-                // 位图与显示 1:1，但落点若是小数设备像素，LINEAR 采样会混入
-                // 邻素发虚 —— 原点对齐设备像素网格保证锐利。
-                let snap = |v: f32| (v * ppp).round() / ppp;
-                fr.push_quad(pg, CellQuad {
-                    rect: Rect::from_min_size(
-                        Pos2::new(snap(x + slot.dx), snap(baseline + slot.dy)),
-                        Vec2::new(slot.w, slot.h),
-                    ),
-                    uv0: Pos2::new(slot.u0, slot.v0),
-                    uv1: Pos2::new(slot.u1, slot.v1),
-                    color: fg,
-                });
-                if underlined {
-                    let uy = y + fr.underline_rel(pg, cell_h);
-                    fr.push_quad(pg, CellQuad {
-                        rect: Rect::from_min_size(
-                            Pos2::new(x_slot, uy),
-                            Vec2::new(slot_w, 1.0),
-                        ),
-                        uv0: uv_solid,
-                        uv1: uv_solid,
-                        color: fg,
-                    });
-                }
+            // 行指纹由快照携带（session.rs 构建快照时逐格顺手算，cells 本来
+            // 就要 clone）：渲染端不再重扫全屏格。选区不入指纹（reader 看不到
+            // 选区）——它已进帧 sig，选区一动全部行重建。快照里没有这一行
+            // （行数比快照长）时置哨兵值 → 必命中重建分支。
+            let rh = snap.row_hashes.get(r).copied().unwrap_or(u64::MAX);
+            if let Some(fr) = frame.as_mut() {
+                fr.set_row_hash(r, rh);
+            }
+            if sig_ok
+                && let Some(c) = row_cache.get(r)
+                && c.hash == rh
+            {
+                bg_shapes.extend_from_slice(&c.bg);
+                fg_shapes.extend_from_slice(&c.fg);
                 continue;
             }
-        }
+            let mut r_bg: Vec<egui::Shape> = Vec::new();
+            let mut r_fg: Vec<egui::Shape> = Vec::new();
+            // 背景 run 只在行内合并（run.top() 必须相等，跨行本就不合并）。
+            let mut bg_run: Option<(Rect, Color32)> = None;
+            for (point, cell) in row_cells {
+                        let vline = r as i32;
+                // 随空格（宽字符占位格）直接跳过：它的 2 格槽矩形与前导格完全重叠，
+                // 槽底色已由前导格涂满（cell_selected 对 WIDE_CHAR 右扩 1 格，选区盖住
+                // 随空格时前导格亦命中选中）。若在这里再 rect_filled，会在字形画完后
+                // 盖住它 —— 就是选中时汉字“消失”的根因。它自身永远无字形，先走先跳。
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let col = point.column.0;
+                let x = rect.left() + col as f32 * cell_w;
+                let y = rect.top() + vline as f32 * cell_h;
+                let wide = cell.flags.contains(Flags::WIDE_CHAR);
+                // 视觉槽：宽字符前导格占 2 格；其随空格（SPACER）连回前导格占满 2 格；
+                // 窄格 1 格。背景/选区/光标下划线统一按槽绘制——选区边界落在宽字符的
+                // 任意一列（含随空格）时整个汉字同色，不会再出现左半正常色、右半被高亮
+                // 盖住的“半字”效果。字形仍左对齐画在前导格起点（spacer 无字形）。
+                let (slot_col, slot_cells) = cjk_slot(col, wide, false);
+                let x_slot = rect.left() + slot_col as f32 * cell_w;
+                let slot_w = slot_cells as f32 * cell_w;
 
-        // 无缓存直排（回看/滚动路径零排版缓存，省 galley_cache + ascii 槽 ~5MB/页签）：
-        // 每帧每格一次 layout_job；静止帧靠 cached_render_shapes 整帧重放兜 CPU。
-        let mut format = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: fg,
-            underline: Stroke::NONE,
-            line_height: Some(cell_h),
-            ..Default::default()
-        };
-        if underlined && !wide {
-            format.underline = Stroke::new(1.0, fg);
-        }
-        let mut job = egui::text::LayoutJob::default();
-        if wide {
-            job.wrap.max_width = slot_w;
-        }
-        job.append(&ch.to_string(), 0.0, format);
-        let galley = painter.layout_job(job);
-        fg_shapes.push(egui::Shape::galley(Pos2::new(x, y), galley, Color32::WHITE));
+        let underlined = cell.flags.contains(Flags::UNDERLINE);
+                let selected = sel_range.as_ref().is_some_and(|r| cell_selected(r, *point, cell));
+        let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
-        if wide && underlined {
-            fg_shapes.push(egui::Shape::line_segment(
-                [Pos2::new(x, y + cell_h - 1.0), Pos2::new(x + slot_w, y + cell_h - 1.0)],
-                Stroke::new(1.0, fg),
-            ));
-        }
-    }
+        // 空白 + 画布默认底色（Named::Background 解析后就是 canvas_bg）+ 无下划线/
+                // 反色/选中/宽字符 → 零可见输出，连颜色解析都不用做。原实现要走完
+                // resolve + 两次主题适配才在后面 `continue`，而空屏帧里绝大多数格子
+                // 正是这种。哈希照写（否则 diff 表出空洞 = 每帧重建网格）。
+                let plain_blank = ch == ' '
+                    && !underlined
+                    && !selected
+                    && !wide
+                    && !cell.flags.contains(Flags::INVERSE)
+                    && cell.bg == Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background);
+        if plain_blank {
+                    // 行指纹已含本格内容，不需要再逐格写哈希。
+                    continue;
+                }
 
-    // 收尾：冲掉最后一个背景 run，背景层拼在字形层前面，整层一次性提交。
-    if let Some((run, c)) = bg_run.take() {
-        bg_shapes.push(egui::Shape::rect_filled(run, 0.0, c));
-    }
-    // GPU 字形层：内容变化才重建网格；静止帧直接重放上一帧的同一批 Arc<Mesh>，
-    // 跳过全部 quad 重建（egui 每帧仍会重画它，省的是 CPU 侧组装）。分页图集
-    // 可能有多页 mesh，逐个提交。纹理为全进程共享（重传原地更新，id 不变）。
-    if let Some(fr) = frame.as_mut() {
-        for (_tid, mesh) in fr.end_frame(ui.ctx()) {
-            bg_shapes.push(egui::Shape::Mesh(mesh.clone()));
+                // 用预计算查找表替换 resolve_color：Indexed/Named 走数组，Spec 直转。
+                let resolve = |c: Color, default: Color32| -> Color32 {
+                    match c {
+                        Color::Spec(Rgb { r, g, b }) => Color32::from_rgb(r, g, b),
+                        Color::Indexed(i) => ansi_rgb.get(i as usize).copied().unwrap_or(default),
+                        Color::Named(n) => {
+                            use alacritty_terminal::vte::ansi::NamedColor;
+                            match n {
+                                // Foreground/Background 是逻辑色：用主题默认色，
+                                // 不走 ansi_rgb（那里存的是终端配置的浅灰色默认值）。
+                                NamedColor::Foreground => default_fg,
+                                NamedColor::Background => default_bg,
+                                _ => ansi_rgb.get(n as usize).copied().unwrap_or(default),
+                            }
+                        }
+                    }
+                };
+                let (mut fg, mut bg) = match (cell.fg, cell.bg) {
+                    // 索引色（终端内容 99%）：解析 + 主题适配已在帧级 LUT 里烘好。
+                    (Color::Indexed(i), Color::Indexed(j)) => (
+                        fg_lut.get(i as usize).copied().unwrap_or(default_fg),
+                        bg_lut.get(j as usize).copied().unwrap_or(default_bg),
+                    ),
+                    (f0, b0) => {
+                        let (mut fg, mut bg) = (resolve(f0, default_fg), resolve(b0, default_bg));
+                        if cell.flags.contains(Flags::INVERSE) {
+                            std::mem::swap(&mut fg, &mut bg);
+                        }
+                        let (fg, bg) = if dark { adapt_to_dark(fg, bg) } else { adapt_to_light(fg, bg) };
+                        (fg, bg)
+                    }
+                };
+                if cell.flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                // 选中格统一为浅灰底深字，深浅一致。
+                // （蓝底白字在旧代码里曾遮盖汉字：因为随空格在字形后涂背景，盖住了
+                // 前导格刚画的宽字 —— 见上文随空格在背景前跳过。）
+                let (fg, bg) = if selected {
+                    (Color32::from_gray(24), Color32::from_gray(176))
+                } else {
+                    (fg, bg)
+                };
+
+                // 空白格快速跳过：默认底色、未选中（否则底色已是高亮灰）、无下划线的
+                // 空格无任何可见输出，连 LayoutJob 都不用建 —— 空屏帧的主要开销就在这。
+                if ch == ' ' && bg == canvas_bg && !underlined {
+                    continue;
+                }
+
+                // 背景与画布底色不同（选中/反色/自定义底色）时整格涂背景。宽字槽宽占满
+                // 2 格（随空格已跳过，此处只画前导格），只靠字形背景（14pt）会露右半格。
+                // 同行相邻同底色槽并入当前 run（x 坐标由同一算式产生，相邻列精确相等）。
+                if bg != canvas_bg {
+                    let slot = Rect::from_min_size(Pos2::new(x_slot, y), Vec2::new(slot_w, cell_h));
+                    match bg_run.as_mut() {
+                        Some((run, run_bg)) if *run_bg == bg && run.right() == slot.left() && run.top() == slot.top() => {
+                            run.max.x = slot.max.x;
+                        }
+                        _ => {
+                            if let Some((run, c)) = bg_run.take() {
+                                r_bg.push(egui::Shape::rect_filled(run, 0.0, c));
+                            }
+                            bg_run = Some((slot, bg));
+                        }
+                    }
+                } else if let Some((run, c)) = bg_run.take() {
+                    r_bg.push(egui::Shape::rect_filled(run, 0.0, c));
+                }
+
+                // GPU 批渲染优先：图集命中（含本次成功入库）直推 quad；空槽回落下方
+                // galley 路径（emoji 等缺字形格子逐格混合，不整屏切换）。
+                if let Some(fr) = frame.as_mut() {
+                    let (pg, slot) = fr.glyph(ch);
+                    if slot.w > 0.0 {
+                        let baseline = y + fr.baseline_rel(pg, cell_h);
+                        let uv_solid = GlyphAtlas::solid_uv();
+                        // 位图与显示 1:1，但落点若是小数设备像素，LINEAR 采样会混入
+                        // 邻素发虚 —— 原点对齐设备像素网格保证锐利。
+                        let snap = |v: f32| (v * ppp).round() / ppp;
+                        fr.push_quad(r, pg, CellQuad {
+                            rect: Rect::from_min_size(
+                                Pos2::new(snap(x + slot.dx), snap(baseline + slot.dy)),
+                                Vec2::new(slot.w, slot.h),
+                            ),
+                            uv0: Pos2::new(slot.u0, slot.v0),
+                            uv1: Pos2::new(slot.u1, slot.v1),
+                            color: fg,
+                        });
+                        if underlined {
+                            let uy = y + fr.underline_rel(pg, cell_h);
+                            fr.push_quad(r, pg, CellQuad {
+                                rect: Rect::from_min_size(
+                                    Pos2::new(x_slot, uy),
+                                    Vec2::new(slot_w, 1.0),
+                                ),
+                                uv0: uv_solid,
+                                uv1: uv_solid,
+                                color: fg,
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                // 无缓存直排（回看/滚动路径零排版缓存，省 galley_cache + ascii 槽 ~5MB/页签）：
+                // 每帧每格一次 layout_job；静止帧靠 cached_render_shapes 整帧重放兜 CPU。
+                let mut format = egui::TextFormat {
+                    font_id: font_id.clone(),
+                    color: fg,
+                    underline: Stroke::NONE,
+                    line_height: Some(cell_h),
+                    ..Default::default()
+                };
+                if underlined && !wide {
+                    format.underline = Stroke::new(1.0, fg);
+                }
+                let mut job = egui::text::LayoutJob::default();
+                if wide {
+                    job.wrap.max_width = slot_w;
+                }
+                job.append(&ch.to_string(), 0.0, format);
+let galley = painter.layout_job(job);
+                r_fg.push(egui::Shape::galley(Pos2::new(x, y), galley, Color32::WHITE));
+
+                if wide && underlined {
+                    r_fg.push(egui::Shape::line_segment(
+                        [Pos2::new(x, y + cell_h - 1.0), Pos2::new(x + slot_w, y + cell_h - 1.0)],
+                        Stroke::new(1.0, fg),
+                    ));
+                }
+            }
+            // 收尾：冲掉本行最后一个背景 run，并落进行缓存。
+            if let Some((run, c)) = bg_run.take() {
+                r_bg.push(egui::Shape::rect_filled(run, 0.0, c));
+            }
+if row_cache.len() <= r {
+                row_cache.resize_with(r + 1, RowCache::default);
+            }
+            row_cache[r] = RowCache { hash: rh, bg: r_bg, fg: r_fg };
+            bg_shapes.extend_from_slice(&row_cache[r].bg);
+            fg_shapes.extend_from_slice(&row_cache[r].fg);
         }
-    }
-    bg_shapes.extend(fg_shapes);
-    // 缓存完整渲染结果供静止帧重放：下帧 gen_changed=false 时直接提交，
-    // 跳过逐格渲染循环和 GPU mesh 重建。
-    // 先放掉帧借用：它可变借用了 sess.gpu，缓存字段在别的字段上。
-    drop(frame);
-    sess.cached_render_shapes = Some(bg_shapes.clone());
-    painter.add(egui::Shape::Vec(bg_shapes));
+// GPU 字形层：只有脏行才重建对应顶点（未变行整段 memcpy）；全静止时直接
+        // 重放上一帧的同一批 Arc<Mesh>。分页图集可能有多页 mesh，逐个提交。纹理为
+        // 全进程共享（重传原地更新，id 不变）。
+        if let Some(fr) = frame.as_mut() {
+            for mesh in fr.end_frame(ui.ctx()).iter().flatten() {
+                bg_shapes.push(egui::Shape::Mesh(mesh.clone()));
+            }
+        }
+        // 先放掉帧借用：它可变借用了 sess.gpu，行缓存字段在别的字段上。
+        drop(frame);
+        sess.row_cache = row_cache;
+        sess.row_cache_sig = sig;
+        bg_shapes.extend(fg_shapes);
+        // 缓存完整渲染结果供静止帧重放：下帧 gen_changed=false 时直接提交，
+        // 跳过逐格渲染循环和 GPU mesh 重建。
+        sess.cached_render_shapes = Some(bg_shapes.clone());
+        painter.add(egui::Shape::Vec(bg_shapes));
     } // end if !skip_render_loop
+
+    // 记下本帧实际渲染的快照 gen：下一帧同 gen 才可走缓存
+    // （原实现只在滚动后刷新这个值，gen 几乎永远不等 → 静止帧快速路径
+    //   事实上从不命中）。
+    sess.last_snapshot_gen = snap.snap_gen;
 
     // 光标：支持方块/下划线/竖线三种形状，带描边；失焦时画空心边框。
     // 定位策略分两种：
@@ -1932,7 +2079,11 @@ pub fn show_terminal(
     // 主题调色诊断（TUIPM_THEME_DEBUG=1 时启用）：抽样打印前几行非空格格子的
     // 原始 fg/bg 与适配后的最终色，用于定位切题后「黑底黑字」类问题出在
     // 哪一环（原始解析错 or 适配错）。另附每帧缓存命中状态。
-    if std::env::var("TUIPM_THEME_DEBUG").as_deref() == Ok("1") {
+    // 开关只读一次：原来每帧查一次环境变量（含一次 String 分配）。
+    static THEME_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let theme_debug =
+        *THEME_DEBUG.get_or_init(|| std::env::var("TUIPM_THEME_DEBUG").as_deref() == Ok("1"));
+    if theme_debug {
         static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let f = FRAME.fetch_add(1, Ordering::Relaxed);
         if f.is_multiple_of(30) {
@@ -2088,6 +2239,53 @@ fn dark_adapt_lightens_dark_colors() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 主题切换必须作废索引色烘焙表：表是 `dark` 的函数，不清缓存就会把
+    /// 深色适配的表钉在浅色主题上（broadcast_theme 清 cached_color_lut）。
+    #[test]
+    fn index_luts_depend_on_theme() {
+        let mut ansi = [Color32::TRANSPARENT; 256];
+        ansi[0] = Color32::WHITE; // 背景色：深色主题沉暗为 TERM_BG_DARK
+        ansi[1] = Color32::from_rgb(0, 0, 139); // 前景色：深色主题提亮
+        let dark = index_luts(&ansi, true);
+        let light = index_luts(&ansi, false);
+        assert_ne!(dark.1[0], light.1[0], "bg 适配必须随主题变");
+        assert_ne!(dark.0[1], light.0[1], "fg 适配必须随主题变");
+    }
+
+    /// 帧级 LUT 建立在「fg 适配与 bg 无关」上：不成立的话逐格查表会和原
+    /// 逐格计算在某些配色下分叉（白底 TUI 上 fg 压暗要与 bg 联动）。全 256
+    /// 索引色两两组合抽样验证：固定 bg 时 fg 结果不变，反之亦然。
+    #[test]
+    fn color_adapt_is_channel_separable() {
+        let probe = [
+            Color32::from_rgb(0, 0, 0),
+            Color32::from_rgb(30, 30, 30),
+            Color32::from_rgb(255, 255, 255),
+            Color32::from_rgb(255, 255, 0),
+            Color32::from_rgb(0, 0, 255),
+            Color32::from_rgb(250, 250, 250),
+            Color32::from_rgb(20, 60, 200),
+        ];
+        for &b0 in &probe {
+            for &b1 in &probe {
+                let (f0, _) = adapt_to_dark(Color32::from_rgb(200, 30, 30), b0);
+                let (f1, _) = adapt_to_dark(Color32::from_rgb(200, 30, 30), b1);
+                assert_eq!(f0, f1, "fg 结果随 bg 变了（深色）: {b0:?} vs {b1:?}");
+                let (f0, _) = adapt_to_light(Color32::from_rgb(200, 30, 30), b0);
+                let (f1, _) = adapt_to_light(Color32::from_rgb(200, 30, 30), b1);
+                assert_eq!(f0, f1, "fg 结果随 bg 变了（浅色）: {b0:?} vs {b1:?}");
+            }
+        }
+        for &f in &probe {
+            let (a, b) = adapt_to_dark(f, Color32::from_rgb(0, 0, 0));
+            assert_eq!(a, adapt_fg_dark(f));
+            assert_eq!(b, adapt_bg_dark(Color32::from_rgb(0, 0, 0)));
+            let (a, b) = adapt_to_light(f, Color32::from_rgb(255, 255, 255));
+            assert_eq!(a, adapt_fg_light(f));
+            assert_eq!(b, adapt_bg_light(Color32::from_rgb(255, 255, 255)));
+        }
+    }
 
     /// 失焦/回焦与光标移动不是「已查看」：否则窗口恢复焦点的那一帧抹掉 ✅，
     /// 用户看不到失焦期间当前页签跑完（回归钉住）。
