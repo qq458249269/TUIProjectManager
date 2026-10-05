@@ -3468,7 +3468,7 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
     let snap = s.state_icon.load(Ordering::Relaxed);
     let exited = s.exited.load(Ordering::Acquire);
     let loading = s.loading_active(now_ms);
-let real_out = s.last_content_ms.load(Ordering::Relaxed);
+    let real_out = s.last_content_ms.load(Ordering::Relaxed);
     if !state_due(last_check, now_ms, real_out, snap, exited, loading) {
         return;
     }
@@ -3477,7 +3477,7 @@ let real_out = s.last_content_ms.load(Ordering::Relaxed);
         exited,
         loading,
         s.output_count.load(Ordering::Relaxed),
-        !s.has_been_viewed.load(Ordering::Relaxed),
+        s.has_been_viewed.load(Ordering::Relaxed),
         real_out,
         s.last_screen_change_ms.load(Ordering::Relaxed),
         now_ms,
@@ -3486,15 +3486,11 @@ let real_out = s.last_content_ms.load(Ordering::Relaxed);
     ));
     let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
     s.state_icon.store(code | flags, Ordering::Relaxed);
-    // 完成态（通知判据）与图标同源同刻：退出/加载中不算、画面高频动不算、
-    // 成规模内容静默 ≥3s 才算。通知那侧另有 out_bytes / viewed / 10s 静默
-    // 等门槛（见 update_done_states）。
-    let done = !exited
-        && !loading
-        && (s.last_screen_change_ms.load(Ordering::Relaxed) == 0
-            || now_ms.saturating_sub(s.last_screen_change_ms.load(Ordering::Relaxed)) >= ANIM_BUSY_MS)
-        && now_ms.saturating_sub(real_out) > OUTPUT_END_MS;
-    s.state_done.store(done, Ordering::Relaxed);
+    // 完成态与图标同源同刻、同一份判据：只有「会亮 ✅」的快照才允许进入
+    // 「任务完成」通知分支——退出/加载中不算、画面高频动不算、用户驱动的
+    // 输入/滚轮回显窗口不算、成规模内容静默 ≥3s 才算、已查看不算。通知那侧
+    // 另有 out_bytes / viewed / 10s 静默等门槛（见 update_done_states）。
+    s.state_done.store(code == ICON_DONE, Ordering::Relaxed);
 }
 
 /// 读快照出图标：退出/加载中即时纠正（事件驱动，不受 1s 门限约束）；
@@ -4620,11 +4616,9 @@ fn move_tab(&mut self, from: usize, target: usize) {
     /// 挪进 logic() 与退出判定（update_exited）同源同帧执行——不再依赖页签栏
     /// 渲染，最小化/遮挡时也随 IDLE_HEARTBEAT_MS 心跳走，恢复后按已过时长补判。
     /// ponytail: 若系统挂起最小化时的 repaint 心跳，通知会延迟到唤醒后 500ms。
-    /// 触发判定**不靠 ✅ 图标**（旧实现以 icon==Some("✅") 为门，而图标要求
-    /// !viewed——当前正查看的页签任务完成后图标落空，永进不了完成分支，失焦
-    /// 也不弹通知）。改用独立判据：未退出、非加载中、内容停止超 OUTPUT_END_MS、
-    /// 有实质输出——当前页签且应用前台（用户正盯着）才清零静默，否则照弹。
-    /// 弹窗门槛补「未查看」：启动即 viewed=true，闲置页签（仅 shell 提示符、
+    /// 触发判定与页签 ✅ 图标**同一份完成态**（`Session::state_done`，
+    /// 由 `refresh_tab_state` 算；`state_done == true` 即该次快照的图标码为 ✅）。
+    /// 启动即 viewed=true，闲置页签（仅 shell 提示符、
     /// 无新输出轮）永不弹「任务完成」+ 任务栏闪烁；只有用户没看过的真任务
     /// 输出轮（阅读循环在加载期后复位 viewed）才提醒。
     fn update_done_states(&mut self, ctx: &egui::Context) {
@@ -4632,15 +4626,13 @@ fn move_tab(&mut self, from: usize, target: usize) {
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
-                // 完成态 = 进程还活着（exited 由 update_exited 处理「运行结束」）、
-                // 非启动加载中、成规模内容变化停止 ≥3s、画面不在高频动。
-                // 内容时间戳只被「≥MIN_CONTENT_CELLS 格的变化」刷新：转义重绘、
-                // 秒表、时钟都不会让它新鲜 → 这类会话不会因 done 横跳而循环弹
-                // 「任务完成」+ 闪烁；画面高频动负责把「还在思考/跑命令」挡在完成
-                // 之外（见 ANIM_BUSY_MS）。四条判据与图标**共用同一份快照**
-                // （最快 1s 重算一次，见 refresh_tab_state），两者不会打脸。
-                // 未查看门槛在弹窗条件里（viewed 语义：启动即已见，仅新输出轮
-                // 复位 / 用户交互置回，见下）。
+                // 完成态 = 与图标同一判据：只有图标码为 ✅ 的快照才为 true
+                // （进程还活着、非启动加载中、成规模内容变化停止 ≥3s、画面
+                // 不在高频动、未查看）。内容时间戳只被「≥MIN_CONTENT_CELLS 格
+                // 的变化」刷新：转义重绘、秒表、时钟都不会让它新鲜 → 这类会话
+                // 不会因 done 横跳而循环弹「任务完成」+ 闪烁；画面高频动负责
+                // 把「还在思考/跑命令」挡在完成之外（见 ANIM_BUSY_MS）。
+                // 最快 1s 重算一次，见 refresh_tab_state。
                 refresh_tab_state(s, now_ms);
                 let done = s.state_done.load(Ordering::Relaxed);
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
@@ -4681,14 +4673,8 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
                             >= STARTUP_GRACE_MS
                     {
-                        // 设置页的总开关（默认关）：这条通知的判据只有「静默 +
-                        // 画面不动」，在 agent 回合中途与「真跑完了」不可区分，
-                        // 误报代价（打断式系统通知）是信任崩塌。页签 ✅ 不受影
-                        // 响，见 config::Settings::notify_task_done 的理由。
-                        if self.config.settings.notify_task_done {
-                            crate::notify_run_finished(&s.title, "任务完成");
-                            crate::flash_taskbar(self.titlebar_hwnd);
-                        }
+                        crate::notify_run_finished(&s.title, "任务完成");
+                        crate::flash_taskbar(self.titlebar_hwnd);
                     }
                 } else {
                     // 离开完成态（新一轮输出/启动加载中/已退出）→ 清稳定计时并
@@ -6267,44 +6253,24 @@ self.commands_section_ui(ui);
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入即消失；失焦/回焦不算「看过」，窗口没回到屏幕前就不会被抹掉；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，若下方「任务完成通知」开着，再满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才弹系统通知并闪烁任务栏。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入即消失；失焦/回焦不算「看过」，窗口没回到屏幕前就不会被抹掉；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才弹系统通知并闪烁任务栏。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
 ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
 
-    /// 设置页的「通知」区：目前只有一项——「任务完成」系统通知开关。
-    ///
-    /// 为什么默认关（而不是调参调准）：这条通知的判据只有「终端静默 N 秒 +
-    /// 画面不在高频动」，而 agent 回合**中途**的静默（等首个 token、跑一条
-    /// 不出字的命令、工具执行期 TUI 只在有变化时重绘）与「回合真跑完了」在
-    /// 信息上不可区分。页签 ✅ 图标同样吃这条启发式，但它是给眼睛看的、错了
-    /// 刷新一眼就过去；系统通知是**打断式**的（弹 toast + 任务栏闪烁），误报
-    /// 一次就是信任崩塌。宁可默认不打扰，要的人自己开。
-    ///
-    /// 「运行结束」通知不归这里管：它的判据是子进程 try_wait（权威），不是
-    /// 启发式，所以一直开着。
+    /// 设置页的「通知」区：说明「运行结束」与「任务完成」通知的规则。
+    /// 「任务完成」系统通知已默认启用，此处不再提供开关。
     fn notify_section_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("🔔 通知").strong());
         ui.label(
             RichText::new(
-                "「运行结束」（子进程真的退出时）始终弹通知。\n\
-                 「任务完成」靠终端静默启发式判断，与「回合中途的静默」无法区分，\
-                 容易误报，默认关闭；页签上的 ✅ 标记不受影响。\n\
+                "「运行结束」（子进程真的退出时）始终弹通知，「任务完成」（终端静默启发式）默认弹通知并闪烁任务栏。\n\
                  免除提醒的只有「人正看着」的那一页（当前页签**且**应用在前台）；\n\
                  应用失焦时当前页签同样会亮 ✅、同样会弹通知。",
             )
             .weak()
             .small(),
         );
-        let mut on = self.config.settings.notify_task_done;
-        if ui
-            .checkbox(&mut on, "任务完成时弹系统通知（并闪烁任务栏）")
-            .on_hover_text("按终端静默启发式判断回合结束，可能误报（宁可迟报不可误报）")
-            .changed()
-        {
-            self.config.settings.notify_task_done = on;
-            self.save_config("设置已自动保存".to_string());
-        }
     }
 
     /// 进设置页时读一次「上次展开哪一块」（egui persisted，与折叠状态一样跨重

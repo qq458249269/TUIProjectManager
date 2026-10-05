@@ -131,23 +131,9 @@ pub struct Settings {
     /// 目录下的 pi / opencode 路径，用户可在设置页增删（换机器就改这里）。
     #[serde(default)]
     pub tool_paths: Vec<String>,
-/// 上面都找不到时，是否再扫 PATH。默认 true。
+    /// 上面都找不到时，是否再扫 PATH。默认 true。
     #[serde(default = "default_true")]
     pub tool_search_path: bool,
-    /// 是否在「任务完成」时弹系统通知（toast + 任务栏闪烁）。**默认关**。
-    ///
-    /// 为什么默认关：这条通知的判据只有一条——「终端静默 N 秒且画面不在高频
-    /// 动」（见 app.rs `TOAST_QUIET_MS`）。而 agent 回合**中途**的静默与
-    /// 「回合真跑完了」在信息上**不可区分**：按下回车到首个 token 到达（模型
-    /// 排队）、跑一条几十秒不出字的命令（编译/等网络）、工具执行期间 TUI 只在
-    /// 有变化时重绘——这些都会先命中静默判据。误报一次就是「任务没干完就报完成」
-    /// 的信任崩塌，而用户已经连续反馈多次误弹。
-    ///
-    /// 页签上的 ✅ 图标不受影响（它便宜、错了刷新一眼就过去），「运行结束」
-    /// 通知也不受影响（那条判据是子进程 try_wait，权威而非启发式）。要提醒就
-    /// 开着页签图标 + 任务栏；要系统级打断式提醒再手动打开本项。
-    #[serde(default)]
-    pub notify_task_done: bool,
 }
 
 impl Default for Settings {
@@ -158,9 +144,8 @@ impl Default for Settings {
             dark_mode: true,
             follow_system: false,
             history_lines: default_history_lines(),
-tool_paths: Vec::new(),
+            tool_paths: Vec::new(),
             tool_search_path: true,
-            notify_task_done: false,
         }
     }
 }
