@@ -77,12 +77,12 @@
 ```json
 "tui_commands": ["nvim", "lazygit", "cmd"],
     "tui_command": "nvim",
-    "history_lines": 1000
+    "history_lines": 500
   }
 }
 ```
 
-`settings.history_lines`：终端回看历史行数上限（100..=5000，默认 1000）。每行 ≈ 32B/格，120 列时 1000 行 ≈ 3.8MB/页签，按需调大（如 2000 ≈ 7.7MB）。
+`settings.history_lines`：终端回看历史行数上限（100..=5000，默认 500）。每行 ≈ 32B/格，120 列时 500 行 ≈ 1.9MB/页签，按需调大（如 2000 ≈ 7.7MB）。
 
 `settings.tui_commands`：启动命令列表。**添加 / 改名 / 加载时都先按等价键判重**（去首尾空白与引号 → 取命令本身 → 取路径末段文件名 → 去 `.exe` → 小写），所以 `nvim`、`NVIM`、`nvim.exe`、`D:\Tools\nvim.EXE` 视为同一条，不会重复入列；输入框边输边标黄提示「已存在」，点添加时只在状态栏提示、不入列。配置里已有的重复项在加载时自动去重（保留首条），选中的 `tui_command` 归一到列表里真实存在的那条。
 

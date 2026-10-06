@@ -74,10 +74,11 @@ fn default_follow_system() -> bool {
     false
 }
 
-/// 终端回看历史行数上限：2000 → 默认 1000（每页签约 -5.5MB，见 session.rs）。
+/// 终端回看历史行数上限：默认 500（每页签约 -1.9MB，见 session.rs）。
 /// 回看依赖终端自身 scrollback 操作，与渲染缓存无关。
+/// 默认 1000 → 500（每页签省 ~1.9MB，见 session.rs）。
 fn default_history_lines() -> u32 {
-    1000
+    500
 }
 
 /// 工具更新：找不到时是否再扫 PATH（默认开，兼容全局安装那份）。
@@ -122,7 +123,7 @@ pub struct Settings {
     /// 跟随系统主题：true 时按系统深浅动态切换（覆盖 dark_mode）。
     #[serde(default = "default_follow_system")]
     pub follow_system: bool,
-    /// 终端回看历史行数上限（100..=5000）。默认 1000。
+    /// 终端回看历史行数上限（100..=5000）。默认 500。
     #[serde(default = "default_history_lines")]
     pub history_lines: u32,
     /// 「检查更新」里 pi / opencode 的查找位置（**本机路径，不跨机器共用**）：

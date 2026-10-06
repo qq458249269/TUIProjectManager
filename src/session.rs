@@ -944,9 +944,9 @@ let reader_ctx = ctx.clone();
     // 开启 kitty 键盘协议跟踪：应用推 CSI > flags u 时仿真器记下 DISAMBIGUATE 位，
     // terminal.rs 据此决定组合回车是否发 CSI-u（协商过了才发，避免对端不认识
     // 被当字面文本插进输入框）。
-    // 滚动历史行数：默认 10000 → 2000。历史是每页签内存大头：
+    // 滚动历史行数：默认 500。历史是每页签内存大头：
     // 列宽 × 行数 × ~32B/格，120 列时 10000 行 ≈ 38MB，多页签线性翻倍。
-    // 2000 行（≈7.7MB/页签）对本工具场景（nvim/lazygit/htop/回看日志）足够；
+    // 500 行（≈1.9MB/页签）对本工具场景（nvim/lazygit/htop/回看日志）足够；
     // ponytail: 需要更长的历史时，把 scrolling_history 移入 config.json 设置项。
     let term_config = Config {
         kitty_keyboard: true,

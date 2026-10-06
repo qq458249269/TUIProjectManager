@@ -19,7 +19,7 @@
 | Release 产物 | **11.8 MB**（已 `lto` + `strip` + `opt-level=2` + `codegen-units=1`） |
 | Debug 产物 | 135.7 MB（dev 依赖已 `opt-level=3`，仅行号调试信息） |
 | 热路径 | 终端逐格渲染、10fps 主循环、字形图集 1024² RGBA（≈4MB 内存 + 4MB 显存，全进程共享） |
-| 单页签回看历史 | 1000 行 ≈ 3.8 MB（可配 100..=5000） |
+| 单页签回看历史 | 500 行 ≈ 1.9 MB（可配 100..=5000） |
 | 常驻内存大头 | 字形图集 4MB + 每页签回看 3.8MB + wgpu/DX12 设备（Intel 路径）或 glow（AMD/NVIDIA） |
 
 **判断：11.8 MB / 释放后约 20–40 MB RSS，在「带 GPU 渲染的桌面 GUI + ConPTY + VT 解析 + 字体栅格化」
