@@ -41,12 +41,25 @@ const BUSY_FRAME_MS: u64 = 100;
 /// 上限提到本常量即可，不涉及渲染路径改动。
 const INTERACT_FRAME_MS: u64 = 16;
 
-/// 帧间隔决策：交互活跃 > 输出在途 > 全静止。纯函数，便于自检。
+/// 滚轮期间的帧间隔（~20 FPS）。单独一档，不跟着打字走 60 FPS：
+/// 滚动是唯一一种「每帧都付全价」的操作——每个滚轮事件都要滚动仿真器缓冲 +
+/// `build_snapshot` 全屏重建，且行指纹种子含 vline ⇒ 滚动必然让整屏行缓存作废
+/// 逐格重渲染。锁改成非阻塞（try_wlock）之后不再卡死，但 60 FPS 下这活每秒干
+/// 60 遍纯属浪费：滚动本身是离散档位，一格 = 一次翻页，20 FPS 看不出区别
+/// （这正是 10.05.0001 之前的行为量级，它不卡）。
+/// ponytail: 觉得滚轮发涩就调到 33（30 FPS）；再往上就该去治行缓存的失效口径。
+const SCROLL_FRAME_MS: u64 = 50;
+
+/// 帧间隔决策：滚轮 > 交互活跃 > 输出在途 > 全静止。纯函数，便于自检。
 /// busy 里的 10 FPS 不是拍脑袋：无输入的持续高帧率重绘实测干扰 Windows 悬停
 /// 激活窗口（30 FPS 失效、10 正常，见 921f062/0ae5904），所以帧率只对「窗口
 /// 已被激活」的时刻放开。要更高输出帧率先根治那个干扰源，再动 BUSY_FRAME_MS。
-fn frame_delay_ms(interacting: bool, busy: bool) -> u64 {
-    if interacting {
+/// scrolling 排在 interacting 之前：滚动与打字重叠时也要按住 20 FPS 不放，
+/// 否则拖动选区+滚轮同开就能把帧率顶回 60。
+fn frame_delay_ms(interacting: bool, scrolling: bool, busy: bool) -> u64 {
+    if scrolling {
+        SCROLL_FRAME_MS
+    } else if interacting {
         INTERACT_FRAME_MS
     } else if busy {
         BUSY_FRAME_MS
@@ -8151,15 +8164,17 @@ let mut busy = self.downloading
             || !self.spawning.is_empty()
             || self.theme_settle_at.is_some()
             || ctx.input(|i| i.pointer.any_down());
-        // 交互活跃：最近有键盘/IME/粘贴输入，或 500ms 内有滚轮。优先级高于
+// 交互活跃：最近有键盘/IME/粘贴输入，或 500ms 内有滚轮。优先级高于
         // busy（输出在途时也先保证回显跟手）。
         let now_ms = crate::now_ms();
-        let interacting = self.tabs.get(self.current).is_some_and(|t| {
-            let Tab::Session(s) = t else { return false };
+let (interacting, scrolling) = self.tabs.get(self.current).map_or((false, false), |t| {
+            let Tab::Session(s) = t else { return (false, false) };
             let li = s.last_input_ms.load(Ordering::Relaxed);
             let ls = s.last_scroll_ms.load(Ordering::Relaxed);
-            (li != 0 && now_ms.saturating_sub(li) < INPUT_ACTIVE_MS)
-                || (ls != 0 && now_ms.saturating_sub(ls) < SCROLL_ECHO_MS)
+            (
+                li != 0 && now_ms.saturating_sub(li) < INPUT_ACTIVE_MS,
+                ls != 0 && now_ms.saturating_sub(ls) < SCROLL_ECHO_MS,
+            )
         });
         if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
             // 仅前台页签消费合并信号：解析线程有新输出待画时按配置帧率刷新。
@@ -8178,7 +8193,7 @@ let mut busy = self.downloading
                 }
             }
         }
-let delay_ms = frame_delay_ms(interacting, busy);
+let delay_ms = frame_delay_ms(interacting, scrolling, busy);
         ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
@@ -8886,18 +8901,28 @@ fn scrolling_does_not_count_as_update() {
 }
 #[cfg(test)]
 mod frame_delay_tests {
-    use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS};
+    use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS, SCROLL_FRAME_MS};
 
-    /// 帧间隔优先级：交互 > 输出在途 > 全静止。顺序错了就是两个真实故障：
+    /// 帧间隔优先级：滚轮 > 交互 > 输出在途 > 全静止。顺序错了就是两个真实故障：
     /// 交互判据排在 busy 之后 → 输出时打字回显仍按 100ms（延迟感）；
     /// busy 与静止混为一谈 → 输出在途时落回 500ms 心跳（字块跳成慢动作）。
+    /// 滚轮排在最前 → 拖选+滚轮同开就把帧率顶回 60 FPS，全屏重建白干 60 次/秒。
     #[test]
-    fn priority_interact_over_busy_over_idle() {
-        assert_eq!(frame_delay_ms(true, true), INTERACT_FRAME_MS);
-        assert_eq!(frame_delay_ms(true, false), INTERACT_FRAME_MS);
-        assert_eq!(frame_delay_ms(false, true), BUSY_FRAME_MS);
-        assert_eq!(frame_delay_ms(false, false), IDLE_HEARTBEAT_MS);
-        assert!(INTERACT_FRAME_MS < BUSY_FRAME_MS && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS);
+    fn priority_scroll_over_interact_over_busy_over_idle() {
+        assert_eq!(frame_delay_ms(false, false, true), BUSY_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, false, false), IDLE_HEARTBEAT_MS);
+        assert_eq!(frame_delay_ms(true, false, true), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(true, false, false), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, true, true), SCROLL_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, true, false), SCROLL_FRAME_MS);
+        // 滚动与打字重叠：仍按 20 FPS，不被 interacting 拉回 60。
+        assert_eq!(frame_delay_ms(true, true, true), SCROLL_FRAME_MS);
+        assert!(
+            INTERACT_FRAME_MS < SCROLL_FRAME_MS
+                && SCROLL_FRAME_MS < BUSY_FRAME_MS
+                && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS,
+            "帧率档必须单调"
+        );
     }
 }
 
