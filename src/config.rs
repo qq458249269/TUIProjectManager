@@ -261,7 +261,10 @@ pub fn save(config: &Config) -> Result<(), String> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(config_path(), json).map_err(|e| e.to_string())
+    // 先写临时文件再 rename：进程崩溃只会留 config.json.tmp，不会留半截 config.json。
+    let tmp = config_dir().join("config.json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, config_path()).map_err(|e| e.to_string())
 }
 
 // ── 模型配置（pi / oh-my-pi） ──────────────────────────────────────────

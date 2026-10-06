@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, SelectionType};
-use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Term, TermMode};
@@ -14,7 +14,7 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
-use crate::session::{Session, SessionListener, TermCommand, try_wlock};
+use crate::session::{CellSnap, Session, SessionListener, TermCommand, try_wlock};
 use crate::session::TermSnapshot;
 use crate::session::RowCache;
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
@@ -613,7 +613,7 @@ fn cjk_slot(col: usize, wide: bool, spacer: bool) -> (usize, usize) {
 }
 
 /// 判断单元格是否在选区内（宽字符前导格在选区右边界落在其空格上时也算选中）。
-fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
+fn cell_selected(range: &SelectionRange, point: Point, cell: &CellSnap) -> bool {
     range.contains(point)
         || (cell.flags.contains(Flags::WIDE_CHAR)
             && range.contains(Point::new(point.line, point.column + 1)))
@@ -626,12 +626,12 @@ fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
 /// `show_cursor=true`（cmd/nvim 等常规应用）永不需要表，直接返回 None 且
 /// **不构建** —— 这是每帧 rows×cols 次 HashMap 插入的去处。
 fn lookup_cell<'a>(
-    map: &mut Option<HashMap<(i32, usize), &'a Cell>>,
-    cells: &'a [(Point, Cell)],
+    map: &mut Option<HashMap<(i32, usize), &'a CellSnap>>,
+    cells: &'a [(Point, CellSnap)],
     show_cursor: bool,
     line: i32,
     col: usize,
-) -> Option<&'a Cell> {
+) -> Option<&'a CellSnap> {
     if show_cursor {
         return None;
     }
@@ -2028,7 +2028,7 @@ if row_cache.len() <= r {
     // 而扫描本身按 parse_gen 缓存命中 —— 静止帧、cmd/nvim 这类 SHOW_CURSOR 应用
     // 根本不进。原实现每帧无条件对全屏 rows×cols 做一次 HashMap 插入，
     // 在 pi/opencode（主力路径）纯属白做。
-    let mut cell_map: Option<HashMap<(i32, usize), &Cell>> = None;
+    let mut cell_map: Option<HashMap<(i32, usize), &CellSnap>> = None;
     let mut cursor_rect: Option<Rect> = None;
 
     {
@@ -2053,7 +2053,7 @@ if row_cache.len() <= r {
                 _ => None,
             };
             let found = cached.or_else(|| {
-                let is_caret = |cell: &Cell| {
+                let is_caret = |cell: &CellSnap| {
                     matches!(
                         (cell.fg, cell.bg),
                         (Color::Named(NamedColor::Black), Color::Named(NamedColor::White))
@@ -2587,10 +2587,10 @@ let term = Arc::new(RwLock::new(Term::new(
     /// 3) 命中/未命中语义与全量表一致。
     #[test]
     fn cell_lookup_is_lazy() {
-        let cells: Vec<(Point, Cell)> = (0..2)
+        let cells: Vec<(Point, CellSnap)> = (0..2)
             .flat_map(|r| {
                 (0..3).map(move |c| {
-                    let mut cell = Cell::default();
+                    let mut cell = CellSnap::default();
                     cell.c = char::from(b'a' + c);
                     (Point::new(Line(r), Column(c as usize)), cell)
                 })
@@ -2598,7 +2598,7 @@ let term = Arc::new(RwLock::new(Term::new(
             .collect();
 
         // 1) show_cursor：返回 None 且表始终不构建（静态帧的常态）。
-        let mut map: Option<HashMap<(i32, usize), &Cell>> = None;
+        let mut map: Option<HashMap<(i32, usize), &CellSnap>> = None;
         assert!(lookup_cell(&mut map, &cells, true, 0, 1).is_none());
         assert!(map.is_none(), "show_cursor 应用不得构建查找表");
 
@@ -2613,7 +2613,7 @@ let term = Arc::new(RwLock::new(Term::new(
 
     #[test]
     fn selection_highlight_predicate() {
-        let cell = Cell::default();
+        let cell = CellSnap::default();
         let range = SelectionRange::new(
             Point::new(Line(-2), Column(1)),
             Point::new(Line(-2), Column(3)),
@@ -2624,7 +2624,7 @@ let term = Arc::new(RwLock::new(Term::new(
         assert!(!cell_selected(&range, Point::new(Line(-2), Column(4)), &cell));
 
         // 宽字符前导格：选区右边界落在其空格（column+1）上时仍高亮。
-        let mut wide = Cell::default();
+        let mut wide = CellSnap::default();
         wide.flags.insert(Flags::WIDE_CHAR);
         let edge = SelectionRange::new(
             Point::new(Line(0), Column(0)),

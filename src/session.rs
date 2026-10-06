@@ -11,7 +11,29 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange};
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+/// 渲染快照格子：只保留逐格渲染需要的字段。
+/// 不携带 `Cell.extra`（Arc 超链接/稀有下划线色）：渲染路径零读取，
+/// 且 `Cell` 因此不能 Copy，`build_snapshot` 每格多一次 Arc clone/drop。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CellSnap {
+    pub c: char,
+    pub fg: Color,
+    pub bg: Color,
+    pub flags: alacritty_terminal::term::cell::Flags,
+}
+
+impl Default for CellSnap {
+    fn default() -> Self {
+        Self {
+            c: ' ',
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: alacritty_terminal::term::cell::Flags::empty(),
+        }
+    }
+}
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -28,7 +50,7 @@ use crate::term_gl::{hash_mix, raw_color_key};
 /// reader 线程在处理完 PTY 输出后生成，通过 AtomicPtr 原子交换给 UI 线程。
 pub struct TermSnapshot {
 /// 可见格子 (point, cell)。
-    pub cells: Vec<(Point, Cell)>,
+    pub cells: Vec<(Point, CellSnap)>,
     /// 每可视行（vline = line + offset）的行指纹，下标即 vline。
     /// 在构建快照时顺手算（cells 本来就要逐格 clone）：渲染端据此判定行级
     /// 增量，不用再重扫 rows×cols 个格子。内容相同的行指纹必相同，反之不必。
@@ -104,7 +126,10 @@ pub fn build_snapshot(t: &Term<SessionListener>, snap_gen: u64) -> TermSnapshot 
         hash_mix(&mut rh, raw_color_key(cell.bg));
         hash_mix(&mut rh, cell.flags.bits() as u64);
         hash_mix(&mut rh, cell.c as u64 ^ (p.column.0 as u64) << 24);
-        cells.push((p, cell.clone()));
+        cells.push((
+            p,
+            CellSnap { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags },
+        ));
     }
     if cur_line != i32::MIN {
         row_hashes.push(rh);

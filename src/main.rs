@@ -283,13 +283,32 @@ fn prefer_glow() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
+        // 先读缓存：WMI 查询要起 PowerShell，启动时同步跑会卡 200~800ms。
+        // 缓存位于 config 目录，7 天过期；缓存缺失/过期才同步查一次并回写。
+        let cache = crate::config::config_path()
+            .parent()
+            .map(|d| d.join("renderer.cache"));
+        if let Some(p) = cache.as_ref()
+            && let Ok(meta) = std::fs::metadata(p)
+            && meta.modified().ok().and_then(|t| t.elapsed().ok()).map(|e| e.as_secs() < 7 * 24 * 3600).unwrap_or(false)
+            && let Ok(s) = std::fs::read_to_string(p)
+        {
+            let s = s.trim();
+            if s == "glow" {
+                return true;
+            }
+            if s == "wgpu" {
+                return false;
+            }
+        }
+
+        use std::os::windows::process::CommandExt;
         // wgpu::Instance::new() 在本机（Intel UHD 630 + AMD 混合）无窗口句柄下建即崩
         // （0xc0000005），枚举更会加载老 Intel igvk64.dll 闪退，catch_unwind 都抓不住。
         // 改用 WMI 纯文本查询（与 toast 同款 powershell 调用）：只读系统信息，
         // 不加载任何 GPU 驱动。Intel 现像卡 → wgpu/DX12，否则 glow。
         // 检测失败 → 当 Intel 处理 → 老 wgpu/DX12 稳妥路径（glow 只是省内存的优化，
         // 拿不准时宁能不优化不能崩）。
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let script = "Get-CimInstance Win32_VideoController | %{ $_.Name }";
         let names = match std::process::Command::new("powershell")
@@ -307,7 +326,14 @@ fn prefer_glow() -> bool {
         // 有独显（AMD/NVIDIA）→ glow：独显 OGL 驱动稳定，兼省显存。
         // 纯 Intel / 未知 → wgpu/DX12：集显老 OGL 驱动会闪退（ig9icd64.dll），
         // DX12 用微软运行时+厂商驱动绕开；检测失败宁可不优化不能崩。
-        !has_intel || has_discrete
+        let glow = !has_intel || has_discrete;
+        if let Some(p) = cache.as_ref() {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, if glow { "glow" } else { "wgpu" });
+        }
+        glow
     }
     #[cfg(not(target_os = "windows"))]
     {
