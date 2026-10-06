@@ -352,6 +352,20 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
 }
 
+/// 连续读到几次 EOF 才退出读循环（纯函数，见 [`eof_should_exit`]）。
+const EOF_EXIT_STREAK: u32 = 3;
+
+/// 读到 EOF 时是否该退出读循环。`is_eof=false`（有数据/读错）清零计数：
+/// 瞬时读错不得当成退出（曾因此置永久 ❌）。
+fn eof_should_exit(is_eof: bool, streak: &mut u32) -> bool {
+    if !is_eof {
+        *streak = 0;
+        return false;
+    }
+    *streak += 1;
+    *streak >= EOF_EXIT_STREAK
+}
+
 /// 取写锁；已中毒时照旧拿（`into_inner`）。
 /// 解析 panic 被 `guarded` 拦下后锁即中毒：若此后各处走 `unwrap()` /
 /// `if let Ok(..)` 的失败分支，快照也永远刷新不了 = 画面继续冻结在最后一帧。
@@ -363,10 +377,34 @@ fn wlock<'a, T>(r: std::sync::LockResult<std::sync::RwLockWriteGuard<'a, T>>) ->
 }
 
 /// 取读锁；已中毒时照旧拿（见 `wlock`）。
-fn rlock<'a, T>(r: std::sync::LockResult<std::sync::RwLockReadGuard<'a, T>>) -> std::sync::RwLockReadGuard<'a, T> {
+/// 取读锁；已中毒时照旧拿（`into_inner`）。
+pub fn rlock<'a, T>(r: std::sync::LockResult<std::sync::RwLockReadGuard<'a, T>>) -> std::sync::RwLockReadGuard<'a, T> {
     match r {
         Ok(g) => g,
         Err(e) => e.into_inner(),
+    }
+}
+
+/// UI 线程版的取锁：**繁忙就拿不到，绝不排队等**。
+///
+/// 与 `wlock`/`rlock` 同一条中毒策略（`into_inner`），但对「锁被占」返回
+/// `None` 而不是阻塞：reader 每解析一块 PTY 输出就抢一次锁，而 `bf7b4d6` 的
+/// 16ms 交互帧间隔让滚动/拖选这类每帧都碰 term 的操作跑到 60 次/秒 ——
+/// 阻塞版直接把 UI 线程焊在锁上（滚轮拖死窗口就是这条路径）。
+/// 拿不到时调用方要么把活丢给 reader 的指令队列，要么跳过本帧。
+pub fn try_wlock<T>(m: &std::sync::RwLock<T>) -> Option<std::sync::RwLockWriteGuard<'_, T>> {
+    match m.try_write() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+/// 读侧同 [`try_wlock`]。
+pub fn try_rlock<T>(m: &std::sync::RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    match m.try_read() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
@@ -1011,8 +1049,14 @@ let mut last_chunk_ms: u64 = 0;
             // 43 次/秒，每次一个 push）95 秒必触。超预算的 push 直接丢弃：
             // 本工具本就不支持 kitty 协议（应答 ESC[?u = flags 0），
             // 栈内容不影响对端行为。
-            let mut kitty_push_budget: u32 = 64;
+let mut kitty_push_budget: u32 = 64;
             let mut now_chars: Vec<char> = Vec::new();
+            // 连续 EOF 计数：子进程已退出时管道立刻 EOF，不重试就是每50ms 空转
+            // 一条线程到进程结束（每个死页签漏一条）。真 EOF 连着来几次即认定
+            // 管道已关，退出读循环；读错（Err）仍按原样退避重试（瞬时读错曾被
+            // 当退出置永久 ❌，这条不能碰）。不置 exited：退出判定归 UI 的
+            // try_wait，reader 自行宣布退出会和它抢跑。
+let mut eof_streak: u32 = 0;
             // 是否至少发布过一次整屏格子：后台页签在首次发布前也必须先给一份，
             // 否则 tab 切回来既无格子也无重建触发点（renderable_content 迭代需 term）。
             let mut published_once = false;
@@ -1023,8 +1067,17 @@ let mut last_chunk_ms: u64 = 0;
             // 这里把 panic 收敛成「会话异常结束」：置 exited 让页签显示可重开的
             // 结束态，break 后 drop reader 关管道，不静默冻屏。原始 panic 仍由
             // main.rs 全局钩子记进 crash.log。
-            'read: loop {
-                match reader.read(&mut buf) {
+'read: loop {
+let read_res = reader.read(&mut buf);
+                // EOF 累计：连续三次读到 0 = 读侧已关（子进程退出），退出读循环，
+                // 不留一条每 50ms 醒一次、永远读到 EOF 的空转线程。读到数据或
+                // 读错即清零（读错走下方退避重试，瞬时读错不得当退出）。
+                // 不置 exited：退出判定归 UI 的 try_wait，reader 自行宣布退出会
+                // 和它抢跑。
+                if eof_should_exit(matches!(read_res, Ok(0)), &mut eof_streak) {
+                    break 'read;
+                }
+                match read_res {
                     Ok(0) | Err(_) => {
                         // 跨块残留一并刷入。
                         if !query_leftover.is_empty() {
@@ -1479,19 +1532,27 @@ impl Session {
 
 /// UI 线程滚动后立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
 /// 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
-/// 优化：若 parse_gen 未变（仅 offset 变化），只做 O(rows) 的 point.line 平移，
-/// 跳过 O(rows×cols) 的全量 Cell clone。
+///
+/// **全程不阻塞 UI**（fix: 滚轮拖死窗口）：原来 `term.read()` 是阻塞式，
+/// reader 每解析一块 PTY 输出就抢一次写锁，于是滚动（每帧必跑）和
+/// 持续输出的会话正面撞车，UI 线程排队等锁 → 窗口未响应。这里改 `try_read`：
+/// 抢不到就整帧跳过，`last_snapshot_offset` 保持陈旧 → 下一帧 `offset_changed`
+/// 仍为真会重试；reader 解析完本身也会 publish 一份带新 offset 的快照。
+/// 另：快照自带它真实的 parse_gen，用 ambient cur_gen 会在
+/// 「gen 已推进、reader 尚未发布」的瞬间把旧快照标成最新，
+/// 下一帧 terminal.rs 的静止帧快路径就永久钉住旧画面。
 pub fn refresh_snapshot(sess: &mut Session) {
-    let snapshot = &sess.snapshot;
-    let term = &sess.term;
-    let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
+let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
+    // 抢不到（reader 正在解析）→ 整帧跳过，下一帧 offset_changed 仍为真会重试。
+    let Some(t) = try_rlock(&sess.term) else { return };
+
     // 从终端 grid 直接读 display_offset：旧 snapshot 的 offset 未随滚动更新，
     // 用它检测不到纯滚动变化。
-    let cur_offset = term.read().map(|t| t.grid().display_offset()).unwrap_or(0);
+    let cur_offset = t.grid().display_offset();
     let gen_changed = cur_gen != sess.last_snapshot_gen;
     let offset_changed = cur_offset != sess.last_snapshot_offset;
-
-    if !gen_changed && !offset_changed && !sess.cells_stale.load(Ordering::Relaxed) {
+    let stale = sess.cells_stale.load(Ordering::Relaxed);
+    if !gen_changed && !offset_changed && !stale {
         return;
     }
 
@@ -1499,21 +1560,17 @@ pub fn refresh_snapshot(sess: &mut Session) {
     // - gen 变化：新 PTY 输出改变了内容
     // - offset 变化：滚动改变了可见区域
     // - cells_stale：后台页签期间 reader 跳过了整屏克隆，切回前台就地补一帧
-    {
-        let t = rlock(term.read());
-        // 单份数据进 Arc 快照：UI 渲染期持 Arc，零额外副本（旧 AtomicPtr 方案
-        // 这里同时持有 snapshot_scratch + snapshot.cells 两份全屏格）。
-        let snap = build_snapshot(&t, cur_gen);
-        let offset_val = snap.offset;
-        *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(snap);
-        sess.cells_stale.store(false, Ordering::Relaxed);
-        // 快照自带它真实的 parse_gen：用 ambient cur_gen 会在
-        // 「gen 已推进、reader 尚未发布」的瞬间把旧快照标成最新，
-        // 下一帧 terminal.rs 的静止帧快路径就永久钉住旧画面。
-        sess.last_snapshot_gen = cur_gen;
-        sess.last_snapshot_offset = offset_val;
-        sess.cached_render_shapes = None;
-    }
+    //
+    // 单份数据进 Arc 快照：UI 渲染期持 Arc，零额外副本（旧 AtomicPtr 方案
+    // 这里同时持有 snapshot_scratch + snapshot.cells 两份全屏格）。
+    let snap = build_snapshot(&t, cur_gen);
+    let offset_val = snap.offset;
+    drop(t);
+    *sess.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(snap);
+    sess.cells_stale.store(false, Ordering::Relaxed);
+    sess.last_snapshot_gen = cur_gen;
+    sess.last_snapshot_offset = offset_val;
+sess.cached_render_shapes = None;
 }
 
 #[cfg(test)]
@@ -1525,6 +1582,58 @@ use alacritty_terminal::term::cell::Flags;
     /// PTY 无人读 + 快照永不更新 → 画面永久冻结、进程还活着。
     /// 三条约定：`guarded` 拦下 panic；`wlock/rlock` 中毒后照旧可用
     /// （否则快照同样停更 = 冻屏换个姿势复现）。
+/// reader 退出的判定：子进程退出后管道一直 EOF，原实现每 50ms 空转一次
+    /// 到进程结束（每个死页签漏一条线程）。约定：
+    /// 1) 连续 EOF 达阈值 → 退出读循环；
+    /// 2) 任何一次非 EOF（有数据 / 读错）→ 计数清零重来（瞬时读错不是退出）。
+#[test]
+    fn eof_streak_exits_reader() {
+        let mut s = 0;
+        assert!(!eof_should_exit(true, &mut s));
+        assert!(!eof_should_exit(true, &mut s));
+        assert!(eof_should_exit(true, &mut s), "连续 EOF 达阈值应退出");
+
+        // 读错/有数据打断后重新计数，不会因历史 EOF 提前退出。
+        let mut s = 0;
+        assert!(!eof_should_exit(true, &mut s));
+        assert!(!eof_should_exit(false, &mut s));
+        assert!(!eof_should_exit(true, &mut s));
+        assert!(!eof_should_exit(true, &mut s));
+        assert!(eof_should_exit(true, &mut s));
+    }
+
+/// `try_wlock`/`try_rlock` 两条约定（roll: UI 线程不再阻塞取锁）：
+    /// 1) 锁被占 → None，**不得阻塞**（等锁=滚轮卡死那条路）；
+    /// 2) 锁中毒 → 照旧拿（into_inner）；否则解析 panic 毒过锁后
+    ///    UI 侧永远拿不到，快照停更 = 画面永久冻在最后一帧。
+    #[test]
+    fn try_locks_never_block_and_survive_poison() {
+        use std::sync::{Arc, RwLock};
+        let m = Arc::new(RwLock::new(7u32));
+
+        // 空闲：拿到。
+        assert_eq!(*try_wlock(&m).unwrap(), 7);
+        assert_eq!(*try_rlock(&m).unwrap(), 7);
+
+        // 被占：无锁 → None，不阻塞。
+        let w = m.write().unwrap();
+        assert!(try_wlock(&m).is_none(), "锁被占时不得等待");
+        assert!(try_rlock(&m).is_none());
+        drop(w);
+
+// 中毒：仍拿得到。
+        let m2 = {
+            let m2 = Arc::new(RwLock::new(1u32));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+                let g = m2.write().unwrap();
+                move || panic!("毒化")
+            }));
+            m2
+        };
+        assert!(try_wlock(&m2).is_some(), "中毒锁必须照旧可用");
+        assert!(try_rlock(&m2).is_some());
+    }
+
     #[test]
     fn parse_panic_is_contained_and_term_stays_usable() {
         let listener = SessionListener {

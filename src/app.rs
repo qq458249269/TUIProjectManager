@@ -4733,10 +4733,25 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         || now_ms.saturating_sub(s.last_reap_ms.load(Ordering::Relaxed))
                             >= BG_REAP_MS
                     {
-                        s.last_reap_ms.store(now_ms, Ordering::Relaxed);
-                        let child_exited = s.child
-                            .as_deref_mut()
-                            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+s.last_reap_ms.store(now_ms, Ordering::Relaxed);
+                        // 退出码记下来：❌ 只说明 `exited` 置位，出处有三条
+                        // （子进程真退出 / reader 撞 VT panic / 上层主动关会话），
+                        // 原实现把 status 丢进 `_`，页签只给一个 ❌，事后无法
+                        // 分辨是子进程自己退了还是我们杀的。诊断用，不影响判定。
+                        let child_exited = s.child.as_deref_mut().is_some_and(|c| {
+                            match c.try_wait() {
+                                Ok(Some(status)) => {
+                                    eprintln!(
+                                        "[exit] tab={} dir={} cmd={} status={status:?}",
+                                        s.title,
+                                        s.dir,
+                                        s.cmd
+                                    );
+                                    true
+                                }
+                                _ => false,
+                            }
+                        });
                         if child_exited {
                             s.exited.store(true, Ordering::Release);
                         }

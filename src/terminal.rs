@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -7,13 +8,13 @@ use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange, 
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use portable_pty::PtySize;
 
-use crate::session::{Session, SessionListener, TermCommand};
+use crate::session::{Session, SessionListener, TermCommand, try_wlock};
 use crate::session::TermSnapshot;
 use crate::session::RowCache;
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
@@ -34,6 +35,62 @@ const TERM_BG_LIGHT: Color32 = Color32::WHITE;
 
 fn color_for(dark: bool, dark_c: Color32, light_c: Color32) -> Color32 {
     if dark { dark_c } else { light_c }
+}
+
+// ── 帧耗时探针（TUIPM_PERF=1 启用，默认零开销：只读一个 OnceLock bool）──
+// 只测「滚轮滚动导致卡死」的三段嫌疑：
+//   lock  = UI 线程在滚轮路径上阻塞等 term 写锁的时长（reader 抢锁时长）
+//   snap  = refresh_snapshot 全量重建（每个滚轮事件必跑一次）
+//   frame = show_terminal 整帧（含上面两项 + 逐格渲染）
+fn perf_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TUIPM_PERF").as_deref() == Ok("1"))
+}
+const PERF_EVERY: u64 = 60;
+static PERF_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_WHEELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_LOCK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_LOCK_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAP_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_FRAME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_FRAME_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 本帧已累计的滚轮耗时（微秒），帧末并进全局统计。
+#[derive(Default, Clone, Copy)]
+struct PerfFrame {
+    wheels: u64,
+    lock_us: u64,
+    snap_us: u64,
+}
+
+/// 帧末汇总并按周期打印。`frame_us` = 本帧 show_terminal 全程。
+fn perf_report(f: PerfFrame, frame_us: u64) {
+    use std::sync::atomic::Ordering;
+    let n = PERF_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if f.wheels > 0 {
+        PERF_WHEELS.fetch_add(f.wheels, Ordering::Relaxed);
+        PERF_LOCK_US.fetch_add(f.lock_us, Ordering::Relaxed);
+        PERF_SNAP_US.fetch_add(f.snap_us, Ordering::Relaxed);
+        PERF_LOCK_MAX.fetch_max(f.lock_us, Ordering::Relaxed);
+        PERF_SNAP_MAX.fetch_max(f.snap_us, Ordering::Relaxed);
+    }
+    PERF_FRAME_US.fetch_add(frame_us, Ordering::Relaxed);
+    PERF_FRAME_MAX.fetch_max(frame_us, Ordering::Relaxed);
+    if n % PERF_EVERY != 0 {
+        return;
+    }
+    let w = PERF_WHEELS.swap(0, Ordering::Relaxed).max(1);
+    eprintln!(
+        "[perf] {PERF_EVERY}帧: frame avg={}us max={}us | wheel x{}: lock avg={}us max={}us, snap avg={}us max={}us",
+        PERF_FRAME_US.swap(0, Ordering::Relaxed) / PERF_EVERY,
+        PERF_FRAME_MAX.swap(0, Ordering::Relaxed),
+        w,
+        PERF_LOCK_US.swap(0, Ordering::Relaxed) / w,
+        PERF_LOCK_MAX.swap(0, Ordering::Relaxed),
+        PERF_SNAP_US.swap(0, Ordering::Relaxed) / w,
+        PERF_SNAP_MAX.swap(0, Ordering::Relaxed),
+    );
 }
 
 
@@ -785,14 +842,57 @@ fn user_interacted(events: &[egui::Event]) -> bool {
 }
 
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
+/// 滚轮/翻页落地：**绝不阻塞 UI 线程**。
+///
+/// 原来这里 `sess.term.write()` 是阻塞取锁，而 reader 每解析一块 PTY 输出就抢
+/// 一次写锁；叠加 `bf7b4d6` 引入的 16ms 交互帧间隔（滚动期间 interacting=true
+/// → 60 FPS），滚轮在持续输出的会话里每帧都排队等锁 → 窗口未响应。
+///
+/// 两条路互补，不丢滚动：
+/// - 拿到锁 → 直接滚（静默 shell 的常态：reader 阻塞在 read() 上，不持锁）；
+/// - 拿不到 → 一定意味着 reader 正在解析，它每块输出之间都会消费指令队列并紧接
+///   着 publish 一份带新 offset 的快照，于是滚动最迟下一块输出时生效。
+/// `cmd_tx` 是无界 channel，`send` 永不阻塞。中毒锁照旧用（见 [`try_wlock`]）：
+/// 解析 panic 毒过锁之后滚动不能跟着一起失效。
+fn scroll_now<L: alacritty_terminal::event::EventListener>(
+    term: &Arc<RwLock<Term<L>>>,
+    cmd_tx: &std::sync::mpsc::Sender<TermCommand>,
+    s: Scroll,
+) {
+    match try_wlock(term) {
+        Some(mut t) => t.scroll_display(s),
+        // 繁忙：一定意味着 reader 正在解析，改走指令队列。
+        None => {
+            let _ = cmd_tx.send(TermCommand::Scroll(s));
+        }
+    }
+}
+
+/// 复制选区并清除选中：**不阻塞 UI**。锁被 reader 占住时如实告知重试，
+/// 不等锁（等锁就是滚轮卡死的同一条路径）。
+fn copy_selection_now(sess: &Session, status: &mut Option<String>) -> bool {
+    let Some(mut t) = try_wlock(&sess.term) else {
+        *status = Some("终端正在输出，稍后再按一次复制".to_string());
+        return false;
+    };
+    let copied = copy_selection(&t, status);
+    if copied {
+        t.selection = None;
+    }
+    copied
+}
+
 pub fn show_terminal(
     ui: &mut egui::Ui,
     sess: &mut Session,
     dark: bool,
     status: &mut Option<String>,
     term_focused: &mut bool,
-    wheel: &Wheel,
+wheel: &Wheel,
 ) {
+    let perf = perf_on();
+    let perf_t0 = std::time::Instant::now();
+    let mut perf_f = PerfFrame::default();
     // ── 交互即「已查看」：在终端里点击/拖选/右键/滚轮/打字/粘贴都算看过当前
     // 页签 → 页签 ✅ 立刻清空（用户要求：当前页签也亮 ✅，一交互才消）。
     // 焦点变化/光标移动不算交互（见 user_interacted）：否则失焦期间跑完的当前
@@ -831,9 +931,13 @@ pub fn show_terminal(
 
     let needs_resize = sess.needs_resize;
     let resized = sess.grid_size != (cols as u16, rows as u16) || needs_resize;
-    if resized {
-        if let Ok(mut t) = sess.term.write() {
-            t.resize(TermSize::new(cols, rows));
+if resized {
+        match try_wlock(&sess.term) {
+            Some(mut t) => t.resize(TermSize::new(cols, rows)),
+            // reader 正在解析 → 改走指令队列（它在每块输出之间消费 Resize）。
+            None => {
+                let _ = sess.cmd_tx.send(TermCommand::Resize { cols, rows });
+            }
         }
         if let Some(m) = sess.master.as_ref() {
             let _ = m.resize(PtySize {
@@ -972,25 +1076,31 @@ pub fn show_terminal(
             WheelScroll::PageScroll(n) => {
                 // 普通 shell / 主屏 TUI → 翻仿真器缓冲里的历史显示偏移，
                 // 一格拨轮 = 一次翻页（Scroll::PageUp 即 +一屏行数，与 PageUp 键同量）。
-                if let Ok(mut t) = sess.term.write() {
-                    for _ in 0..n.unsigned_abs() {
-                        t.scroll_display(if n > 0 {
-                            Scroll::PageUp
-                        } else {
-                            Scroll::PageDown
-                        });
-                    }
+                let lock_t0 = perf.then(std::time::Instant::now);
+                for _ in 0..n.unsigned_abs() {
+scroll_now(&sess.term, &sess.cmd_tx, if n > 0 { Scroll::PageUp } else { Scroll::PageDown });
                 }
                 // 立即刷新快照：reader 线程在无 PTY 输出时不会生成新快照，
                 // 不更新的话下一帧渲染仍用旧 offset，滚动无可见效果。
+                let snap_t0 = perf.then(std::time::Instant::now);
                 crate::session::refresh_snapshot(sess);
+                if perf {
+                    perf_f.wheels += 1;
+                    perf_f.lock_us += lock_t0.unwrap().elapsed().as_micros() as u64;
+                    perf_f.snap_us += snap_t0.unwrap().elapsed().as_micros() as u64;
+                }
             }
             WheelScroll::LineScroll(n) => {
                 // 触摸板连续位移 → 按行滚（一次 Scroll::Delta 即可）。
-                if let Ok(mut t) = sess.term.write() {
-                    t.scroll_display(Scroll::Delta(n));
-                }
+                let lock_t0 = perf.then(std::time::Instant::now);
+scroll_now(&sess.term, &sess.cmd_tx, Scroll::Delta(n));
+                let snap_t0 = perf.then(std::time::Instant::now);
                 crate::session::refresh_snapshot(sess);
+                if perf {
+                    perf_f.wheels += 1;
+                    perf_f.lock_us += lock_t0.unwrap().elapsed().as_micros() as u64;
+                    perf_f.snap_us += snap_t0.unwrap().elapsed().as_micros() as u64;
+                }
             }
         }
         ui.ctx().request_repaint();
@@ -1079,7 +1189,7 @@ pub fn show_terminal(
         let is_true_click = primary_released && sess.click_press_pos.is_some_and(|p0| {
             latest_pos.is_some_and(|p1| p1.distance(p0) < 4.0)
         });
-        if let Ok(mut t) = sess.term.write() {
+if let Some(mut t) = try_wlock(&sess.term) {
             // 释放帧分类要用「本帧开始时的选区状态」：点击清除选区分支会把
             // selection 清成 None，之后就没法区分「取消选中点击」和「普通点击」了。
             let sel_at_frame_start = t.selection.is_some();
@@ -1206,8 +1316,12 @@ pub fn show_terminal(
                 // 手势结束后复位标记。
                 sess.mouse_gesture_sel = false;
             }
-            // 在同一次加锁内完成选区状态读取，消除与右键菜单之间的竞态窗口。
+// 在同一次加锁内完成选区状态读取，消除与右键菜单之间的竞态窗口。
             has_selection = t.selection.is_some();
+        } else {
+            // 锁被 reader 占住 → 本帧选区不更新，但要一帧后再试：否则拖选
+            // 末帧（mouse_gesture_sel 复位）被吞掉会留下一个拖不完的选区。
+            ui.ctx().request_repaint();
         }
     }
 
@@ -1243,18 +1357,8 @@ pub fn show_terminal(
         }
     });
     match menu_action {
-        Some(TermAction::Copy) => {
-            let copied = sess
-                .term
-                .write()
-                .map(|mut t| {
-                    let copied = copy_selection(&t, status);
-                    if copied {
-                        t.selection = None;
-                    }
-                    copied
-                })
-                .unwrap_or(false);
+Some(TermAction::Copy) => {
+            let copied = copy_selection_now(sess, status);
             if !copied {
                 *status = Some("没有可复制的选中文本".to_string());
             }
@@ -1305,10 +1409,8 @@ pub fn show_terminal(
                 .iter()
                 .map(|f| f.path().to_string_lossy().into_owned())
                 .collect();
-            if paste_file_paths(sess, &files, status)
-                && let Ok(mut t) = sess.term.write()
-            {
-                t.selection = None;
+if paste_file_paths(sess, &files, status) {
+                let _ = sess.cmd_tx.send(TermCommand::UpdateSelection(None));
             }
         }
     } else if has_hovered {
@@ -1394,13 +1496,11 @@ pub fn show_terminal(
                             && !mouse_reporting
                             && !alt_screen
                         {
-                            if let Ok(mut t) = sess.term.write() {
-                                t.scroll_display(if *key == egui::Key::PageUp {
-                                    Scroll::PageUp
-                                } else {
-                                    Scroll::PageDown
-                                });
-                            }
+scroll_now(&sess.term, &sess.cmd_tx, if *key == egui::Key::PageUp {
+                                Scroll::PageUp
+                            } else {
+                                Scroll::PageDown
+                            });
                             // 立即刷新快照：reader 线程在无 PTY 输出时不生成新快照，
                             // 快照 offset 不更新则滚动无可见效果；refresh_snapshot
                             // 内部同步清 cached_render_shapes 强制重绘。
@@ -1427,15 +1527,10 @@ pub fn show_terminal(
                             bytes_out.push(bytes);
                         }
                     }
-                    egui::Event::Copy => {
+egui::Event::Copy => {
                         // Ctrl+C / Ctrl+Insert → 复制选区并清除选中。剪贴板写入在后台线程，
                         // 规避 Windows 剪贴板被占用时 OpenClipboard 无限阻塞 UI 线程。
-                        if let Ok(mut t) = sess.term.write() {
-                            let copied = copy_selection(&t, status);
-                            if copied {
-                                t.selection = None;
-                            }
-                        }
+                        copy_selection_now(sess, status);
                     }
                     egui::Event::Cut => {
                         bytes_out.push(vec![0x18]); // Ctrl+X
@@ -2205,8 +2300,11 @@ if row_cache.len() <= r {
     // 鼠标操作时恢复帧率：选区拖动或鼠标按住时必须刷新画面。
     // logic() 在 ui() 之前执行，ctx.input() 可能读不到当前帧的指针状态，
     // 所以在 show_terminal 内部（ui 可用时）检测并触发重绘。
-    if ui.input(|i| i.pointer.any_down()) || has_selection {
+if ui.input(|i| i.pointer.any_down()) || has_selection {
         ui.ctx().request_repaint();
+    }
+    if perf {
+        perf_report(perf_f, perf_t0.elapsed().as_micros() as u64);
     }
 }
 
@@ -2268,6 +2366,52 @@ fn dark_adapt_lightens_dark_colors() {
 #[cfg(test)]
 mod tests {
     use super::*;
+use alacritty_terminal::vte::ansi::Processor;
+
+/// 滚动卡死回归（fix: 滚轮不阻塞 UI）：`scroll_now` 拿不到写锁时不得
+    /// 默默吞掉滚动，必须改走 reader 指令队列。两条约定：
+    /// 1) 锁空闲（reader 阻塞在 read() 上）→ 直接翻 offset，不发指令；
+    /// 2) 锁被占（reader 正在解析）→ 不阻塞、不改 offset，指令入队；且
+    ///    该指令被 reader 消费后 offset 必须真的动（否则滚动丢失）。
+#[test]
+    fn scroll_falls_back_to_reader_when_lock_busy() {
+        struct Void;
+        impl alacritty_terminal::event::EventListener for Void {}
+let term = Arc::new(RwLock::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &TermSize::new(20, 6),
+            Void,
+        )));
+        // 灌 100 行历史，scroll_display 才有东西可翻。
+        {
+            let mut t = term.write().unwrap();
+            let mut p: Processor = Default::default();
+            for i in 0..100 {
+                p.advance(&mut *t, format!("{i}\r\n").as_bytes());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // 1) 锁空闲：直接生效。
+        scroll_now(&term, &tx, Scroll::PageUp);
+        assert!(term.read().unwrap().grid().display_offset() > 0, "锁空闲时直接翻页");
+        assert!(rx.try_recv().is_err(), "锁空闲时不该发指令");
+
+// 2) 锁被占：UI 不阻塞、不改 offset，滚动改由 reader 代劳。
+        let before = term.read().unwrap().grid().display_offset();
+        let guard = term.write().unwrap(); // 同线程持写锁时不得再读（会死锁）
+        scroll_now(&term, &tx, Scroll::PageUp);
+        assert!(
+            matches!(rx.try_recv(), Ok(TermCommand::Scroll(Scroll::PageUp))),
+            "锁被占时滚动必须入队给 reader"
+        );
+        drop(guard);
+        let after = term.read().unwrap().grid().display_offset();
+        assert_eq!(before, after, "UI 侧不得在锁被占时偷偷改 offset");
+        // reader 消费该指令（session.rs 里的处理分支）→ offset 前进。
+        term.write().unwrap().scroll_display(Scroll::PageUp);
+        assert!(term.read().unwrap().grid().display_offset() > after, "指令落地后 offset 必须前进");
+    }
 
     /// 主题切换必须作废索引色烘焙表：表是 `dark` 的函数，不清缓存就会把
     /// 深色适配的表钉在浅色主题上（broadcast_theme 清 cached_color_lut）。
