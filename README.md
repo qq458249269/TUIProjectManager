@@ -173,11 +173,20 @@ rm version.txt
 
 ### TUI 输入框出现杂字（如 pi 输入框的 "CCCC"）
 
-我们**不**代答主 DA（`ESC[c`）：ConPTY 输入引擎处理 DA 时会把应答里的
-`c` 字符回显/泄漏成键盘文本，表现为输入框多出 `C`。
-查询应答只做被 ConPTY 干净消费的：DSR、DECRQM、kitty(`ESC[?u` → flags 0)、
-XTWINOPS 14、OSC 10/11/4 颜色。改动应答列表前先看
-`session.rs::reply_to_queries` 顶部注释。
+**已修（2026-10-06）**：根因是**我们重复应答了 DSR**。
+
+- 子进程发 `\x1b[6n`（光标位置查询）时，**ConPTY 自己就应答**（实测：
+  子进程输出流里能看到 ConPTY 注入的 `\x1b[6n`/`\x1b[c`，无需宿主参与）。
+- 宿主又回一份 `\x1b[row;colR` = 重复应答。ConPTY 把多余那份当成
+  **无主输入**直接塞回子进程 stdin，pi 把它当键序列插进输入框
+  → 输入框凭空多出 3~4 个 `C`。
+- 二分实测（`PI_TUI_WRITE_LOG` 数 `CCCC`）：应答 DSR = 3 次；不应答 = 0 次。
+- 现在 DA（`\x1b[c`）和 DSR（`\x1b[6n`）**都不应答**；
+  回归测试 `session::tests::reply_to_queries_ignores_dsr_cpr_query`。
+
+规律：**ConPTY 会应答的查询（DA/DSR/CPR），宿主一律不应答**；ConPTY 不管的
+（kitty `ESC[?u`、DECRQM、XTWINOPS、OSC 颜色）才由我们应答。
+改动 `reply_to_queries` 的应答列表前先对一下这条。
 
 ## 技术栈
 

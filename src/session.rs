@@ -420,7 +420,7 @@ impl EventListener for SessionListener {
 /// 查询序列可能跨块被截断：OMP 等程序的查询序列可能被 read() 切分到
 /// 相邻块中，扫描单块可能漏掉。调用方在外层已做跨块拼接（leftover 缓冲），
 /// 因此此函数只需处理完整/不完整序列即可。
-fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
+fn reply_to_queries(_term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
     // 高吞吐输出（AI 回答流）的绝大多数块根本没有转义序列：
     // 先做一次快速扫描，无 ESC 字节直接返回，省掉逐字节状态扫描。
     if !bytes.contains(&0x1b) {
@@ -498,17 +498,15 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
         let fin = bytes[j];
         i = j + 1;
         if (params.is_empty() || params == b"0") && fin == b'c' {
-            // Primary Device Attributes (DA)：不应答。
-            // ConPTY 对 DA 应答的消费时序不稳定——快速启动时响应到达时
-            // ConPTY 输入引擎已过匹配窗口，会把 ESC[?1;2c 泄漏为键盘输入
-            //（表现为终端杂字 C）。改为通过 TERM_PROGRAM 环境变量让 OMP
-            // 识别终端身份、跳过 DA 查询（见 spawn 函数）。
-        } else if params == b"6" && fin == b'n' {
-            // DSR 光标位置：汇报视口内光标行列（1-based）。
-            let cursor = term.renderable_content().cursor.point;
-            out.extend_from_slice(
-                format!("\x1b[{};{}R", cursor.line.0 + 1, cursor.column.0 + 1).as_bytes(),
-            );
+            // Primary Device Attributes (DA)：不应答。ConPTY 会应答子进程的
+            // DA 查询；我们再回一份属于重复应答，ConPTY 会把多余那份当作
+            // 无主输入转发给子进程。
+            //
+            // DSR（\x1b[6n）同理不应答：ConPTY 自己就应答光标位置查询。
+            // 我们多回的那份 CPR 会被当成无主输入塞进子进程 stdin，pi 会把它
+            // 当键序列插入输入框 —— 表现为输入框凭空多出 4 个 "C"
+            // （二分实测：应答 DSR = 3 次 CCCC，不应答 = 0 次）。
+            // 回归测试：reply_to_queries_ignores_dsr_cpr_query。
         } else if params.starts_with(b"?") && fin == b'u' {
             // kitty 键盘协议不支持：按协议回同样的 CSI ? u。
             out.extend_from_slice(b"\x1b[?u");
@@ -1627,6 +1625,22 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
     /// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
     /// 终端是否交互）。
     #[test]
+/// DSR（\x1b[6n）**不应答**：ConPTY 自己应答光标位置查询。我们多回的
+    /// 那份 CPR 被当成无主输入塞回子进程 stdin，pi 会把它当键序列插进输入框
+    /// （实测：应答 = 输入框凭空多出 3~4 个 "CCCC"，不应答 = 0）。
+    #[test]
+    #[test]
+    fn reply_to_queries_ignores_dsr_cpr_query() {
+        let listener = SessionListener {
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
+        assert!(reply_to_queries(&term, b"\x1b[6n", true).is_none(), "DSR 不应应答");
+        assert!(reply_to_queries(&term, b"\x1b[6n\x1b[c", true).is_none(), "DSR/DA 都不应答");
+    }
+
     fn reply_to_queries_standard() {
         let listener = SessionListener {
             redraw: std::sync::mpsc::sync_channel(1).0,
@@ -1634,12 +1648,11 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
             foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
-        // DA 不应答（ConPTY 时序错位会泄漏为键盘输入 C）；通过 TERM_PROGRAM 环境变量
-        // 让 OMP 跳过 DA 查询；DSR/DECRQM/kitty/像素尺寸/OSC 颜色照常应答。
+// DA 不应答（ConPTY 自己应答）；DSR/DECRQM/kitty/像素尺寸/OSC 颜色照常应答。
         let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
         let r = reply_to_queries(&term, bytes, true).unwrap().0;
         let s = String::from_utf8_lossy(&r);
-        assert!(s.contains("\x1b[1;1R") || s.contains(";1R"), "DSR 光标应答: {s}");
+        assert!(!s.contains("R\x1b"), "DSR 不应答（ConPTY 自己应答）: {s}");
         assert!(s.contains("\x1b[?2026;1$y"), "DECRQM 2026: {s}");
         assert!(s.contains("\x1b[?1000;1$y"), "DECRQM 1000: {s}");
         assert!(s.contains("\x1b[?u"), "kitty 键盘: {s}");
