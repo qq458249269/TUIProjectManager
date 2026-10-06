@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use alacritty_terminal::grid::Scroll;
@@ -559,6 +560,28 @@ fn cell_selected(range: &SelectionRange, point: Point, cell: &Cell) -> bool {
     range.contains(point)
         || (cell.flags.contains(Flags::WIDE_CHAR)
             && range.contains(Point::new(point.line, point.column + 1)))
+}
+
+/// 快照格子的 O(1) 查找表：`(line, col) → &Cell`（构建键含 vline 偏移，
+/// 与快照 cells 同序，见 build_snapshot）。
+///
+/// 惰性：表由调用方持有（`Option`），第一次真正查询才构建，之后整帧复用。
+/// `show_cursor=true`（cmd/nvim 等常规应用）永不需要表，直接返回 None 且
+/// **不构建** —— 这是每帧 rows×cols 次 HashMap 插入的去处。
+fn lookup_cell<'a>(
+    map: &mut Option<HashMap<(i32, usize), &'a Cell>>,
+    cells: &'a [(Point, Cell)],
+    show_cursor: bool,
+    line: i32,
+    col: usize,
+) -> Option<&'a Cell> {
+    if show_cursor {
+        return None;
+    }
+    let m = map.get_or_insert_with(|| {
+        cells.iter().map(|(p, c)| ((p.line.0, p.column.0), c)).collect()
+    });
+    m.get(&(line, col)).copied()
 }
 
 /// 按当前可用面积与等宽字体计算终端网格行列数。
@@ -1902,19 +1925,13 @@ if row_cache.len() <= r {
     //    方向键移动（实测 pi 停靠 (11,79)，输入在 (11,5)）。这类 TUI 会用
     //    “空白格 + 非默认前后景色”的单元格自绘真实输入光标（实测随方向键移动），
     //    所以先在该行找这种自绘光标格、画在那里；找不到才退回停靠位置。
-    // 用 HashMap 做 O(1) 查找，替代旧版 snapshot_cells.iter().find() 的 O(n) 线性扫描，
-    // 消除 rows×cols×snapshot_cells 的平方级开销。
-    use std::collections::HashMap;
-    // 只有关闭光标（pi 等 TUI 自绘光标）才需要网格查找表；cmd/nvim 等
-    // SHOW_CURSOR 应用跳过构建，省去每帧 rows×cols 次 HashMap 插入。
-    let cell_map: Option<HashMap<(i32, usize), &Cell>> = if show_cursor {
-        None
-    } else {
-        Some(snapshot_cells.iter()
-            .map(|(p, c)| ((p.line.0, p.column.0), c))
-            .collect())
-    };
+    // 网格查找表按需惰性构建：只有两处读它（自绘光标扫描 / on_spacer 取前导格），
+    // 而扫描本身按 parse_gen 缓存命中 —— 静止帧、cmd/nvim 这类 SHOW_CURSOR 应用
+    // 根本不进。原实现每帧无条件对全屏 rows×cols 做一次 HashMap 插入，
+    // 在 pi/opencode（主力路径）纯属白做。
+    let mut cell_map: Option<HashMap<(i32, usize), &Cell>> = None;
     let mut cursor_rect: Option<Rect> = None;
+
     {
         // 光标位置：
         // - SHOW_CURSOR 开启（cmd/nvim 等）：按 grid 光标位置，精确跟随方向键。
@@ -1950,7 +1967,13 @@ if row_cache.len() <= r {
                     let line = Line(r as i32 - disp_off as i32);
                     for col in 0..cols {
                         // O(1) HashMap 查找，替代 O(n) 线性扫描。
-                        if let Some(cell) = cell_map.as_ref().and_then(|m| m.get(&(line.0, col)))
+                        if let Some(cell) = lookup_cell(
+                            &mut cell_map,
+                            snapshot_cells,
+                            show_cursor,
+                            line.0,
+                            col,
+                        )
                             && is_caret(cell)
                         {
                             hit = Some(Point::new(line, Column(col)));
@@ -2013,9 +2036,15 @@ if row_cache.len() <= r {
                                 let ch = if on_spacer {
                                     // 从快照 HashMap O(1) 获取前导格字符。
                                     let prev = Column(cpoint.column.0.saturating_sub(1));
-                                    cell_map.as_ref().and_then(|m| m.get(&(cpoint.line.0, prev.0)))
-                                        .map(|c| c.c)
-                                        .unwrap_or(cursor_cell_char)
+                                    lookup_cell(
+                                        &mut cell_map,
+                                        snapshot_cells,
+                                        show_cursor,
+                                        cpoint.line.0,
+                                        prev.0,
+                                    )
+                                    .map(|c| c.c)
+                                    .unwrap_or(cursor_cell_char)
                                 } else {
                                     cursor_cell_char
                                 };
@@ -2401,6 +2430,37 @@ mod tests {
         assert_eq!(cjk_slot(6, false, true), (5, 2));
         // 随空格排到第 0 列（理论上不会发生）也不越界 panic。
         assert_eq!(cjk_slot(0, false, true), (0, 2));
+    }
+
+    /// 查找表惰性化回归：原实现每帧无条件对全屏 rows×cols 做 HashMap 插入
+    /// （pi/opencode 这类隐藏光标的 TUI = 主力路径，纯属白做）。三条约定：
+    /// 1) show_cursor 应用（cmd/nvim）查询返回 None 且**不建表**；
+    /// 2) 隐藏光标应用首次查询才建表，之后同一表复用（不重复构建）；
+    /// 3) 命中/未命中语义与全量表一致。
+    #[test]
+    fn cell_lookup_is_lazy() {
+        let cells: Vec<(Point, Cell)> = (0..2)
+            .flat_map(|r| {
+                (0..3).map(move |c| {
+                    let mut cell = Cell::default();
+                    cell.c = char::from(b'a' + c);
+                    (Point::new(Line(r), Column(c as usize)), cell)
+                })
+            })
+            .collect();
+
+        // 1) show_cursor：返回 None 且表始终不构建（静态帧的常态）。
+        let mut map: Option<HashMap<(i32, usize), &Cell>> = None;
+        assert!(lookup_cell(&mut map, &cells, true, 0, 1).is_none());
+        assert!(map.is_none(), "show_cursor 应用不得构建查找表");
+
+        // 2) 隐藏光标：首次查询才建表，第二次复用同一张表。
+        assert_eq!(lookup_cell(&mut map, &cells, false, 0, 1).unwrap().c, 'b');
+        assert!(map.is_some());
+        assert_eq!(lookup_cell(&mut map, &cells, false, 1, 2).unwrap().c, 'c');
+
+        // 3) 越界行/列返回 None（不 panic）。
+        assert!(lookup_cell(&mut map, &cells, false, 9, 9).is_none());
     }
 
     #[test]
