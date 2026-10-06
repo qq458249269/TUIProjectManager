@@ -8,7 +8,7 @@ use std::os::windows::ffi::OsStrExt;
 
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::{Selection as TermSelection, SelectionRange};
 use alacritty_terminal::term::cell::Cell;
@@ -76,10 +76,14 @@ pub fn build_snapshot(t: &Term<SessionListener>, snap_gen: u64) -> TermSnapshot 
         let cell = &t.grid()[cpoint];
         (cell.c, cell.flags)
     };
-let mut cells = Vec::new();
+// 预分配：display_iter 恰好吐 screen_lines×columns 个格。原先两个 Vec 从
+    // 零长起，每次重建要 log2(2400)≈11 次 doubling（重分配 + 全量拷贝）——
+    // 滚动时每帧一次，是白付的。
+    let cap = t.grid().screen_lines() * t.grid().columns();
+    let mut cells = Vec::with_capacity(cap);
     // 行指纹：cells 按 vline 升序（display_iter 自下而上，vline = line+offset），
     // 遇行号变化就封口上一行。种子带 vline，滚动换位也算内容变化。
-    let mut row_hashes: Vec<u64> = Vec::new();
+    let mut row_hashes: Vec<u64> = Vec::with_capacity(t.grid().screen_lines());
     let mut cur_line = i32::MIN;
     let mut rh = 0u64;
     for indexed in content.display_iter {

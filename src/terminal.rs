@@ -1739,7 +1739,11 @@ let default_fg = color_for(dark, Color32::WHITE, Color32::BLACK);
         skip_render_loop = true;
     }
 if !skip_render_loop {
-        let mut bg_shapes: Vec<egui::Shape> = Vec::new();
+        // 容量提示用上一帧的形状数（静止帧缓存里就是上一帧的真值）：命中时
+        // 一次分配到位，不命中时回落到 rows×8 的粗估。原先两个 Vec 零长起，
+        // extend_from_slice 拼满屏要经历一串 doubling 重分配 + 拷贝。
+        let shape_cap = sess.cached_render_shapes.as_ref().map_or(rows * 8, |v| v.len());
+        let mut bg_shapes: Vec<egui::Shape> = Vec::with_capacity(shape_cap);
             let mut fg_shapes: Vec<egui::Shape> = Vec::new();
 // 本帧图集访问权：共享图集帧级加锁一次（单 UI 线程零竞争），页签私有
         // 缓冲借用到 end_frame，循环内逐格零锁。gpu 为 None（字体链为空）时无帧，
