@@ -1503,7 +1503,7 @@ pub fn show_terminal(
     if sess.cells_stale.load(Ordering::Relaxed) {
         crate::session::refresh_snapshot(sess);
     }
-    let snap_arc = { let g = sess.snapshot.lock().unwrap(); g.clone() };
+    let snap_arc = { let g = sess.snapshot.lock().unwrap_or_else(|e| e.into_inner()); g.clone() };
     let snap: &TermSnapshot = &snap_arc;
     let offset = snap.offset;
     let cursor_point = snap.cursor_point;

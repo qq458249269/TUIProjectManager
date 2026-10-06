@@ -133,6 +133,52 @@ rm version.txt
 - **互斥**：同一时间只允许一个构建运行，新触发自动取消在跑的旧构建
 - **产物**：`tui-project-manager-win-x64-<版本号>` artifact + 同名 Release
 
+## 故障排查
+
+### 画面卡死（内容不动、进程还在、CPU 占用正常）
+
+先看**可执行文件同级目录**的 `crash.log`（`main.rs` 全局 panic 钩子写的）。
+
+本项目已发生过的两类根因：
+
+1. **reader 线程被 VT 解析 panic 带走**（历史高频）
+   症状：画面停在最后一帧，子进程还活着但不响应，进程不退出。
+   原因：`parser.advance()` 解析 PTY 输出时 panic（`alacritty_terminal` 内部），
+   reader 线程直接死 → PTY 再无人读 → 子进程写满管道后阻塞 →
+   快照停更 → 画面永远冻结。
+   现状：`session.rs` 的读循环用 `guarded()`（`catch_unwind`）包住解析，
+   panic 时打日志 + 置 `exited` + break（退出会话而不是静默冻屏）；
+   锁中毒一律 `into_inner()` 照旧取用（`wlock` / `rlock`）。
+
+2. **kitty 键盘模式 push 无界堆积**（2026-10-06 实测复现）
+   症状：跑 1~2 分钟后必冻屏；`crash.log` 报
+   `alacritty_terminal-0.26.0/src/term/mod.rs:1296:44:
+   removal index (is 0) should be < len (is 0)`。
+   原因：`Term::push_keyboard_mode`（处理 `ESC [ > flags u`）栈满 4096 时
+   **误对 `title_stack` 做 `remove(0)`** —— 上游把变量写错了，空栈即 panic。
+   触发：应用反复重新初始化终端（实测 pi 重启 43 次/秒，每次一个 push），
+   95 秒必堆到 4096。
+   现状：`strip_orphan_csi_u_bytes_into(.., &mut kitty_push_budget)` 给每会话
+   64 条 push 预算，超出直接丢弃（本工具本就不支持 kitty 协议，
+   应答 `ESC[?u` = flags 0，栈内容不影响对端）。
+   回归测试：`session::tests::kitty_push_budget_prevents_terminal_panic`
+   （喂 5000 条 push 不 panic）+ `kitty_push_within_budget_is_preserved`
+   （预算内不误伤）+ `kitty_push_drops_after_budget`。
+
+复现/取证开关（排障用，默认全关）：
+
+- `TUIPM_LOG_WRITES=1`：把写入 PTY 的每个字节打到 stderr（查杂散输入）
+- `PI_TUI_WRITE_LOG=<文件>`：让 pi 自己落盘 stdout（配合上面的日志对时序）
+- 复现后先核对 `crash.log` 的行号：行号变了 = 换了解析路径，别只看现象
+
+### TUI 输入框出现杂字（如 pi 输入框的 "CCCC"）
+
+我们**不**代答主 DA（`ESC[c`）：ConPTY 输入引擎处理 DA 时会把应答里的
+`c` 字符回显/泄漏成键盘文本，表现为输入框多出 `C`。
+查询应答只做被 ConPTY 干净消费的：DSR、DECRQM、kitty(`ESC[?u` → flags 0)、
+XTWINOPS 14、OSC 10/11/4 颜色。改动应答列表前先看
+`session.rs::reply_to_queries` 顶部注释。
+
 ## 技术栈
 
 - UI: [egui / eframe](https://github.com/emilk/egui)（OpenGL/Glow 渲染）

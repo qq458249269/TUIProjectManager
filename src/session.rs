@@ -328,6 +328,48 @@ pub cached_render_shapes: Option<Vec<egui::Shape>>,
     pub cells_stale: Arc<AtomicBool>,
 }
 
+/// 把字节转义成可打印日志片段（保留 ESC/CSI 原形，其余不可打印字节转义）。
+fn escape_for_log(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len().min(600) * 2);
+    for &b in bytes.iter().take(300) {
+        match b {
+            0x1b => s.push_str("\\e"),
+            0x07 => s.push_str("\\a"),
+            0x0d => s.push_str("\\r"),
+            0x0a => s.push_str("\\n"),
+            0x09 => s.push_str("\\t"),
+            0x20..=0x7e => s.push(b as char),
+            _ => s.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    s
+}
+
+/// 跑一次可能 panic 的闭包（reader 线程唯一的存活保证）。
+/// Err(()) = panic 已被拦下，调用方负责收尾：置 exited + 跳出读循环。
+/// 原始 panic 仍会先经 main.rs 全局钩子写进 crash.log（先 hook 后 unwind）。
+fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
+}
+
+/// 取写锁；已中毒时照旧拿（`into_inner`）。
+/// 解析 panic 被 `guarded` 拦下后锁即中毒：若此后各处走 `unwrap()` /
+/// `if let Ok(..)` 的失败分支，快照也永远刷新不了 = 画面继续冻结在最后一帧。
+fn wlock<'a, T>(r: std::sync::LockResult<std::sync::RwLockWriteGuard<'a, T>>) -> std::sync::RwLockWriteGuard<'a, T> {
+    match r {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+/// 取读锁；已中毒时照旧拿（见 `wlock`）。
+fn rlock<'a, T>(r: std::sync::LockResult<std::sync::RwLockReadGuard<'a, T>>) -> std::sync::RwLockReadGuard<'a, T> {
+    match r {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
 /// 终端事件监听器：把终端要求的写回 PTY、处理 OSC 52 剪贴板，并通知界面重绘。
 #[derive(Clone)]
 pub struct SessionListener {
@@ -503,7 +545,9 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
 /// 替换规则与 `strip_ansi` 的孤儿逻辑一致：每个连续残片段替换为
 /// 单个空格（残片后已有空白则吞掉多余空白）。
 /// 结果追加到调用方缓冲（reader 每块复用同一份，避免每块新分配）。
-fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8]) {
+/// `kitty_push_budget`：本会话还允许穿过多少条 kitty 键盘模式 push
+/// （ESC [ > flags u）。见调用处说明；传 `u32::MAX` 即不限。
+fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8], kitty_push_budget: &mut u32) {
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
@@ -517,11 +561,30 @@ fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8]) {
                 i += 1;
                 if next == b'[' {
                     // CSI：跳过参数字节 (0x30..=0x3F) + 中间字节 (0x20..=0x2F) + 终止字节
+                    let params_start = out.len();
                     while i < bytes.len() && ((0x20..=0x2f).contains(&bytes[i]) || (0x30..=0x3f).contains(&bytes[i])) {
                         out.push(bytes[i]);
                         i += 1;
                     }
                     if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
+                        // kitty 键盘模式 push（ESC [ > flags u）：alacritty 0.26
+                        // 栈满 4096 时误对空的 title_stack 做 remove(0) → panic，
+                        // reader 线程死 → PTY 无人读 → 画面永久冻结
+                        // （crash.log：alacritty_terminal-0.26.0/src/term/mod.rs:1296）。
+                        // 应用反复重初始化会无界 push（实测 pi 43 次/秒），
+                        // 超预算的整段丢弃：本工具本就不支持 kitty 协议
+                        // （回 ESC[?u 即 flags 0），栈内容不影响对端行为。
+                        let is_kitty_push = bytes[i] == b'u'
+                            && out.get(params_start) == Some(&b'>');
+                        if is_kitty_push {
+                            if *kitty_push_budget > 0 {
+                                *kitty_push_budget -= 1;
+                            } else {
+                                out.truncate(params_start.saturating_sub(2));
+                                i += 1;
+                                continue;
+                            }
+                        }
                         out.push(bytes[i]);
                         i += 1;
                     }
@@ -599,7 +662,8 @@ fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    strip_orphan_csi_u_bytes_into(&mut out, bytes);
+    let mut budget = u32::MAX;
+    strip_orphan_csi_u_bytes_into(&mut out, bytes, &mut budget);
     out
 }
 
@@ -942,23 +1006,49 @@ let mut last_chunk_ms: u64 = 0;
             // rows×cols 级别的小对象循环里反复 malloc 是后台多页签下的主要开销。
             let mut merged: Vec<u8> = Vec::with_capacity(0x10_000);
             let mut stripped: Vec<u8> = Vec::with_capacity(0x10_000);
+            // kitty 键盘模式 push（ESC [ > flags u）转发上限：alacritty 0.26
+            // 的 push_keyboard_mode 在栈满 4096 时误对 title_stack 做 remove(0)
+            // → panic（removal index 0 / len 0）→ reader 线程死 → PTY 无人读
+            // → 快照停更 → 画面永久冻结。应用反复重初始化（实测 pi 重启
+            // 43 次/秒，每次一个 push）95 秒必触。超预算的 push 直接丢弃：
+            // 本工具本就不支持 kitty 协议（应答 ESC[?u = flags 0），
+            // 栈内容不影响对端行为。
+            let mut kitty_push_budget: u32 = 64;
             let mut now_chars: Vec<char> = Vec::new();
             // 是否至少发布过一次整屏格子：后台页签在首次发布前也必须先给一份，
             // 否则 tab 切回来既无格子也无重建触发点（renderable_content 迭代需 term）。
             let mut published_once = false;
-            loop {
+            // VT 解析守护：alacritty 内部 panic（用户实况 crash.log：
+            // term/mod.rs:1296 `removal index (is 0) should be < len (is 0)`）
+            // 会带走整条 reader 线程 → PTY 无人读（子进程写满管道后自己阻塞）
+            // + 快照永不更新（UI 每帧走静止帧重放）＝画面永久冻结、程序看着还活着。
+            // 这里把 panic 收敛成「会话异常结束」：置 exited 让页签显示可重开的
+            // 结束态，break 后 drop reader 关管道，不静默冻屏。原始 panic 仍由
+            // main.rs 全局钩子记进 crash.log。
+            'read: loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
                         // 跨块残留一并刷入。
                         if !query_leftover.is_empty() {
                             parse_gen.fetch_add(1, Ordering::Relaxed);
-                            let mut t = term.write().unwrap();
-                            parser.advance(&mut *t, &query_leftover);
-                            let r = reply_to_queries(&t, &query_leftover, theme_dark.load(Ordering::Relaxed));
+                            let mut t = term.write().unwrap_or_else(|e| e.into_inner());
+                            let r = guarded(|| {
+                                parser.advance(&mut *t, &query_leftover);
+                                reply_to_queries(&t, &query_leftover, theme_dark.load(Ordering::Relaxed))
+                            });
                             drop(t);
-                            if let Some((reply, osc_color)) = r {
-                                if osc_color { osc_theme_aware.store(true, Ordering::Relaxed); }
-                                let _ = reply_tx.try_send(reply);
+                            match r {
+                                Ok(Some((reply, osc_color))) => {
+                                    if osc_color { osc_theme_aware.store(true, Ordering::Relaxed); }
+                                    let _ = reply_tx.try_send(reply);
+                                }
+                                Ok(None) => {}
+                                Err(()) => {
+                                    eprintln!("[reader] VT 解析 panic（残留块），会话中断；尾部字节: {}", escape_for_log(&query_leftover));
+                                    reader_exited.store(true, Ordering::Release);
+                                    reader_ctx.request_repaint();
+                                    break 'read;
+                                }
                             }
                             query_leftover.clear();
                         }
@@ -970,7 +1060,7 @@ let mut last_chunk_ms: u64 = 0;
                         std::thread::sleep(std::time::Duration::from_millis(50));
                         if reader_exited.load(Ordering::Acquire) {
                             reader_ctx.request_repaint();
-                            break;
+                            break 'read;
                         }
                         continue;
                     },
@@ -1105,7 +1195,7 @@ let mut last_chunk_ms: u64 = 0;
                         // `[57442;1:3u` 等无 ESC 前缀的残片会被 VT parser 当字面文本
                         // 渲染成可见乱码。在喂给 parser 前整段清理。
                         let merged: &[u8] = {
-                            strip_orphan_csi_u_bytes_into(&mut stripped, &merged);
+    strip_orphan_csi_u_bytes_into(&mut stripped, &merged, &mut kitty_push_budget);
                             &stripped
                         };
                         // ── 分块处理：每次最多 CHUNK_SIZE 字节后释放 term 锁，
@@ -1123,14 +1213,25 @@ let mut last_chunk_ms: u64 = 0;
                                 let end = (offset + CHUNK_SIZE).min(merged.len());
                                 let chunk = &merged[offset..end];
                                 let reply = {
-                                    let mut t = term.write().unwrap();
-                                    parser.advance(&mut *t, chunk);
-                                    reply_to_queries(
-                                        &t,
-                                        chunk,
-                                        theme_dark.load(Ordering::Relaxed),
-                                    )
-                                }; // ← term 锁在此释放
+                                    let mut t = term.write().unwrap_or_else(|e| e.into_inner());
+                                let r = guarded(|| {
+                                parser.advance(&mut *t, chunk);
+                                reply_to_queries(
+                                    &t,
+                                    chunk,
+                                    theme_dark.load(Ordering::Relaxed),
+                                )
+                            });
+                                    match r {
+                                        Ok(v) => v,
+                                        Err(()) => {
+                                            eprintln!("[reader] VT 解析 panic，会话中断；触发字节: {}", escape_for_log(chunk));
+                                            reader_exited.store(true, Ordering::Release);
+                                            reader_ctx.request_repaint();
+                                            break 'read;
+                                        }
+                                    }
+}; // ← term 锁在此释放
                                 if let Some((reply, osc_color)) = reply {
                                     if osc_color {
                                         osc_theme_aware.store(true, Ordering::Relaxed);
@@ -1143,13 +1244,23 @@ let mut last_chunk_ms: u64 = 0;
                             // 后台会话：一次加锁解析整块数据（不可见，
                             // 无需频繁释放锁给 UI，降低锁竞争频率）。
                             let reply = {
-                                let mut t = term.write().unwrap();
-                                parser.advance(&mut *t, merged);
-                                reply_to_queries(
-                                    &t,
-                                    merged,
-                                    theme_dark.load(Ordering::Relaxed),
-                                )
+                                let mut t = term.write().unwrap_or_else(|e| e.into_inner());
+                                let r = guarded(|| {
+                                    parser.advance(&mut *t, merged);
+                                    reply_to_queries(
+                                        &t,
+                                        merged,
+                                        theme_dark.load(Ordering::Relaxed),
+                                    )
+                                });
+                                match r {
+                                    Ok(v) => v,
+                                    Err(()) => {
+                                        eprintln!("[reader] VT 解析 panic（后台页签），会话中断；触发字节: {}", escape_for_log(merged));
+                                        reader_exited.store(true, Ordering::Release);
+                                        break 'read;
+                                    }
+                                }
                             }; // ← term 锁在此释放
                             if let Some((reply, osc_color)) = reply {
                                 if osc_color {
@@ -1160,15 +1271,14 @@ let mut last_chunk_ms: u64 = 0;
                         }
                         // ── 处理 UI 命令（滚动/调整大小/选区）──
                         while let Ok(cmd) = reader_cmd_rx.try_recv() {
-                            if let Ok(mut t) = term.write() {
-                                match cmd {
-                                    TermCommand::Scroll(s) => t.scroll_display(s),
-                                    TermCommand::Resize { cols, rows } => {
-                                        t.resize(TermSize::new(cols, rows));
-                                    }
-                                    TermCommand::UpdateSelection(sel) => {
-                                        t.selection = sel;
-                                    }
+                            let mut t = wlock(term.write());
+                            match cmd {
+                                TermCommand::Scroll(s) => t.scroll_display(s),
+                                TermCommand::Resize { cols, rows } => {
+                                    t.resize(TermSize::new(cols, rows));
+                                }
+                                TermCommand::UpdateSelection(sel) => {
+                                    t.selection = sel;
                                 }
                             }
                         }
@@ -1176,7 +1286,8 @@ let mut last_chunk_ms: u64 = 0;
                         //    然后通过 Arc 原子交换给 UI 线程。UI 线程
                         //    load() 时零锁竞争，彻底消除渲染卡顿。
                         {
-                            if let Ok(t) = term.read() {
+                            let t = rlock(term.read());
+                            {
                                 // 后台页签不重建整屏格子（每块 rows×cols 次Cell 克隆
                                 // + 分配，画面根本不可见）：只刷元数据/时间戳并标
                                 // cells_stale，UI 切回该页签那帧就地重建。
@@ -1219,7 +1330,7 @@ let mut last_chunk_ms: u64 = 0;
                                     }
                                     published_once = true;
                                     reader_cells_stale.store(false, Ordering::Relaxed);
-                                    *reader_snapshot.lock().unwrap() = Arc::new(snap);
+                                    *reader_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(snap);
                                 } else {
                                     let content = t.renderable_content();
                                     let offset_val = content.display_offset;
@@ -1390,13 +1501,14 @@ pub fn refresh_snapshot(sess: &mut Session) {
     // - gen 变化：新 PTY 输出改变了内容
     // - offset 变化：滚动改变了可见区域
     // - cells_stale：后台页签期间 reader 跳过了整屏克隆，切回前台就地补一帧
-    if let Ok(t) = term.read() {
+    {
+        let t = rlock(term.read());
         // 单份数据进 Arc 快照：UI 渲染期持 Arc，零额外副本（旧 AtomicPtr 方案
         // 这里同时持有 snapshot_scratch + snapshot.cells 两份全屏格）。
         let snap = build_snapshot(&t, cur_gen);
         let offset_val = snap.offset;
-        *snapshot.lock().unwrap() = Arc::new(snap);
-sess.cells_stale.store(false, Ordering::Relaxed);
+        *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(snap);
+        sess.cells_stale.store(false, Ordering::Relaxed);
         // 快照自带它真实的 parse_gen：用 ambient cur_gen 会在
         // 「gen 已推进、reader 尚未发布」的瞬间把旧快照标成最新，
         // 下一帧 terminal.rs 的静止帧快路径就永久钉住旧画面。
@@ -1411,7 +1523,41 @@ mod tests {
 use super::*;
 use alacritty_terminal::term::cell::Flags;
 
-    /// 行级增量渲染的前置假设：快照 cells 必须按 vline（point.line.0 + offset）
+    /// 卡死回归（出现过多次）：VT 解析 panic 会带走整条 reader 线程 →
+    /// PTY 无人读 + 快照永不更新 → 画面永久冻结、进程还活着。
+    /// 三条约定：`guarded` 拦下 panic；`wlock/rlock` 中毒后照旧可用
+    /// （否则快照同样停更 = 冻屏换个姿势复现）。
+    #[test]
+    fn parse_panic_is_contained_and_term_stays_usable() {
+        let listener = SessionListener {
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let term = std::sync::Arc::new(std::sync::RwLock::new(Term::new(
+            Config::default(),
+            &TermSize::new(8, 3),
+            listener,
+        )));
+
+        // 1) panic 被收敛成 Err（调用方据此置 exited、退出读循环）
+        let r: Result<(), ()> = guarded(|| {
+            let _t = wlock(term.write());
+            panic!("模拟 alacritty 解析 panic");
+        });
+        assert!(r.is_err(), "guarded 必须拦下 panic");
+
+        // 2) 锁已中毒但仍可取用：快照照常刷新，不会二次冻屏
+        {
+            let mut t = wlock(term.write());
+            let mut p: Processor = Default::default();
+            p.advance(&mut *t, b"hi");
+        }
+        let snap = build_snapshot(&rlock(term.read()), 1);
+        assert!(snap.cells.iter().any(|(_, c)| c.c == 'i'));
+    }
+
+/// 行级增量渲染的前置假设：快照 cells 必须按 vline（point.line.0 + offset）
     /// 升序排列，且 vline 0 就是首行。terminal.rs 按行切分区间的 while 循环
     /// 只靠这个序，序乱 = 整屏错位。
     #[test]
@@ -1612,6 +1758,57 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         // 冒号分隔但无 u 结尾且后接其它字符 → 保留。
         assert_eq!(strip_orphan_csi_u_bytes(b"a[1:2b"), b"a[1:2b");
     }
+
+    /// 冻屏回归：alacritty 0.26 的 push_keyboard_mode 在栈满 4096 时误对
+    /// title_stack 做 remove(0) → panic → reader 线程死 → PTY 无人读 →
+    /// 画面永久冻结（crash.log: alacritty_terminal-0.26.0/src/term/mod.rs:1296）。
+    /// 应用反复重初始化（实测 pi 43 次/秒）95 秒必触。这里验证：
+    /// 预算内 push 正常转发，预算耗尽后 push 被丢弃，Term 不再崩溃。
+    #[test]
+    fn kitty_push_budget_prevents_terminal_panic() {
+        let listener = SessionListener {
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let term_config = Config { kitty_keyboard: true, ..Default::default() };
+        let mut term = Term::new(term_config, &TermSize::new(80, 24), listener);
+        let mut parser: Processor = Default::default();
+
+        let mut budget: u32 = 64;
+        let mut feed = Vec::new();
+        for _ in 0..5000 {
+            feed.clear();
+            strip_orphan_csi_u_bytes_into(&mut feed, b"\x1b[>7u", &mut budget);
+            parser.advance(&mut term, &feed);
+        }
+        // 预算耗尽后 push 不再进入 VT 解析器：Term 存活、栈不再增长。
+        assert!(feed.is_empty(), "预算耗尽后 push 应被丢弃，实际={:?}", feed);
+    }
+
+    /// 预算内 push 必须原样透传（不能误伤正常 kitty 协商）。
+    #[test]
+    fn kitty_push_drops_after_budget() {
+        let mut budget: u32 = 2;
+        let mut out = Vec::new();
+        strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
+        assert_eq!(out, b"[>7u", "1st");
+        strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
+        assert_eq!(out, b"[>7u[>7u", "2nd");
+        out.clear();
+        strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
+        assert!(out.is_empty(), "3rd should be dropped, got {:?}", out);
+    }
+
+    #[test]
+    fn kitty_push_within_budget_is_preserved() {
+        let mut budget: u32 = 2;
+        let mut out = Vec::new();
+        strip_orphan_csi_u_bytes_into(&mut out, b"\x1b[>7u\x1b[>15u\x1b[?1;2u", &mut budget);
+        assert_eq!(out, b"\x1b[>7u\x1b[>15u\x1b[?1;2u");
+        assert_eq!(budget, 0);
+    }
 }
+
 
 
