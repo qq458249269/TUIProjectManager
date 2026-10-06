@@ -597,13 +597,7 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
 /// 单个空格（残片后已有空白则吞掉多余空白）。
 /// 结果覆盖写入调用方缓冲（reader 每块复用同一份，避免每块新分配；不清空就会
 /// 逐块累积，历史字节被反复重解析/重应答 → 子进程收到无穷多条重复应答）。
-/// `kitty_push_budget`：本会话还允许穿过多少条 kitty 键盘模式 push
-/// （ESC [ > flags u）。见调用处说明；传 `u32::MAX` 即不限。
-/// kitty 键盘模式栈转发预算（见 spawn 会话里的注释）。栈深恒 ≤ 本值，
-/// 远低于 alacritty 0.26 触顶 panic 的 4096。
-const KITTY_PUSH_BUDGET: u32 = 64;
-
-fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8], kitty_push_budget: &mut u32) {
+fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8]) {
     out.clear();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -618,35 +612,13 @@ fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8], kitty_push_bud
                 i += 1;
                 if next == b'[' {
                     // CSI：跳过参数字节 (0x30..=0x3F) + 中间字节 (0x20..=0x2F) + 终止字节
-                    let params_start = out.len();
-                    while i < bytes.len() && ((0x20..=0x2f).contains(&bytes[i]) || (0x30..=0x3f).contains(&bytes[i])) {
+                    while i < bytes.len()
+                        && ((0x20..=0x2f).contains(&bytes[i]) || (0x30..=0x3f).contains(&bytes[i]))
+                    {
                         out.push(bytes[i]);
                         i += 1;
                     }
-if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
-                        // kitty 键盘模式 push（ESC [ > flags u）：超预算整段丢弃，
-                        // 见 KITTY_PUSH_BUDGET。pop（ESC [ < n u）按 n 退还预算：
-                        // 不退的话，一会话内第 64 次之后的 push 永久失效，
-                        // kitty flags 跟踪随会话寿命衰减（Enter 键行为退变）。
-                        let is_kitty_push = bytes[i] == b'u'
-                            && out.get(params_start) == Some(&b'>');
-                        if is_kitty_push {
-                            if *kitty_push_budget > 0 {
-                                *kitty_push_budget -= 1;
-                            } else {
-                                out.truncate(params_start.saturating_sub(2));
-                                i += 1;
-                                continue;
-                            }
-                        } else if bytes[i] == b'u' && out.get(params_start) == Some(&b'<') {
-                            let n: u32 = out[params_start + 1..]
-                                .iter()
-                                .take_while(|b| b.is_ascii_digit())
-                                .fold(0u32, |acc, d| {
-                                    (acc * 10 + u32::from(d - b'0')).min(KITTY_PUSH_BUDGET)
-                                });
-*kitty_push_budget = (*kitty_push_budget).saturating_add(n).min(KITTY_PUSH_BUDGET);
-                        }
+                    if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
                         out.push(bytes[i]);
                         i += 1;
                     }
@@ -724,8 +696,7 @@ if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
 #[cfg(test)]
 fn strip_orphan_csi_u_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut budget = u32::MAX;
-    strip_orphan_csi_u_bytes_into(&mut out, bytes, &mut budget);
+    strip_orphan_csi_u_bytes_into(&mut out, bytes);
     out
 }
 
@@ -1080,19 +1051,8 @@ let mut last_chunk_ms: u64 = 0;
             // rows×cols 级别的小对象循环里反复 malloc 是后台多页签下的主要开销。
             let mut merged: Vec<u8> = Vec::with_capacity(0x10_000);
             let mut stripped: Vec<u8> = Vec::with_capacity(0x10_000);
-// kitty 键盘模式 push（ESC [ > flags u）转发上限：alacritty 0.26
-            // 的 push_keyboard_mode 在栈满 4096 时误对 title_stack 做 remove(0)
-            // → panic（removal index 0 / len 0）→ reader 线程死 → PTY 无人读
-            // → 快照停更 → 画面永久冻结 → 子进程写管道报错（os error 232）
-            // → 「终端被异常终止」。应用反复重初始化（实测 pi 重启 43 次/秒，
-            // 每次一个 push）95 秒必触。超预算的 push 直接丢弃，pop（ESC [ < n u）
-            // 按 n 退还：栈深恒 ≤ KITTY_PUSH_BUDGET（4096 触不到），而正常
-            // push/pop 配平的会话不受影响（本工具只读栈顶 flags，见 terminal.rs
-            // 的 DISAMBIGUATE 判定，栈内容不影响对端行为）。
-            // ponytail: 根治要改上游 term/mod.rs:1296 的 title_stack 笔误
-            // （vendor 一份 0.26 打补丁）；预算丢弃对本场景等价。
-            let mut kitty_push_budget: u32 = KITTY_PUSH_BUDGET;
             let mut now_chars: Vec<char> = Vec::new();
+
             // 连续 EOF 计数：子进程已退出时管道立刻 EOF，不重试就是每50ms 空转
             // 一条线程到进程结束（每个死页签漏一条）。真 EOF 连着来几次即认定
             // 管道已关，退出读循环；读错（Err）仍按原样退避重试（瞬时读错曾被
@@ -1297,7 +1257,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（残留块），会�
                         // `[57442;1:3u` 等无 ESC 前缀的残片会被 VT parser 当字面文本
                         // 渲染成可见乱码。在喂给 parser 前整段清理。
                         let merged: &[u8] = {
-    strip_orphan_csi_u_bytes_into(&mut stripped, &merged, &mut kitty_push_budget);
+strip_orphan_csi_u_bytes_into(&mut stripped, &merged);
                             &stripped
                         };
                         // ── 分块处理：每次最多 CHUNK_SIZE 字节后释放 term 锁，
@@ -1940,60 +1900,12 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         assert_eq!(strip_orphan_csi_u_bytes(b"a[1:2b"), b"a[1:2b");
     }
 
-    /// 冻屏回归：alacritty 0.26 的 push_keyboard_mode 在栈满 4096 时误对
-    /// title_stack 做 remove(0) → panic → reader 线程死 → PTY 无人读 →
-    /// 画面永久冻结（crash.log: alacritty_terminal-0.26.0/src/term/mod.rs:1296）。
-    /// 应用反复重初始化（实测 pi 43 次/秒）95 秒必触。这里验证：
-    /// 预算内 push 正常转发，预算耗尽后 push 被丢弃，Term 不再崩溃。
+    /// 上游 bug（已在 vendor 版修复）回归：不经 strip 的 push 洪水在第 4096 次
+    /// push 曾触发 alacritty panic（title_stack 为空 → remove(0) 越界），即
+    /// crash.log 里那串 panic 引发的一连串「终端被异常终止」。vendor 修完后
+    /// 同样的洪水不能再 panic。
     #[test]
-    fn kitty_push_budget_prevents_terminal_panic() {
-        let listener = SessionListener {
-            redraw: std::sync::mpsc::sync_channel(1).0,
-            ctx: eframe::egui::Context::default(),
-            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        let term_config = Config { kitty_keyboard: true, ..Default::default() };
-        let mut term = Term::new(term_config, &TermSize::new(80, 24), listener);
-        let mut parser: Processor = Default::default();
-
-let mut budget: u32 = KITTY_PUSH_BUDGET;
-        let mut feed = Vec::new();
-        for _ in 0..5000 {
-            feed.clear();
-            strip_orphan_csi_u_bytes_into(&mut feed, b"\x1b[>7u", &mut budget);
-            parser.advance(&mut term, &feed);
-        }
-        // 预算耗尽后 push 不再进入 VT 解析器：Term 存活、栈不再增长。
-        assert!(feed.is_empty(), "预算耗尽后 push 应被丢弃，实际={:?}", feed);
-    }
-
-    /// 预算内 push 必须原样透传（不能误伤正常 kitty 协商）。
-    #[test]
-    fn kitty_push_drops_after_budget() {
-        let mut budget: u32 = 2;
-        let mut out = Vec::new();
-        strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
-        assert_eq!(out, b"[>7u", "1st");
-        strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
-        assert_eq!(out, b"[>7u", "2nd（复用缓冲必须覆盖，不得追加）");
-        strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
-        assert!(out.is_empty(), "3rd should be dropped, got {:?}", out);
-    }
-
-#[test]
-    fn kitty_push_within_budget_is_preserved() {
-        let mut budget: u32 = 2;
-        let mut out = Vec::new();
-        strip_orphan_csi_u_bytes_into(&mut out, b"\x1b[>7u\x1b[>15u\x1b[?1;2u", &mut budget);
-        assert_eq!(out, b"\x1b[>7u\x1b[>15u\x1b[?1;2u");
-        assert_eq!(budget, 0);
-    }
-
-    /// 上游 bug 仍在（别以为 0.26 被谁修好了）：不经 strip 的 push 洪水在第
-    /// 4096 次 push 触发 alacritty panic（title_stack 为空 → remove(0) 越界）。
-    /// 这就是 crash.log 里那串 panic、以及它引发的一连串「终端被异常终止」。
-    #[test]
-    fn unfiltered_kitty_push_flood_still_panics_upstream() {
+    fn unfiltered_kitty_push_flood_no_longer_panics() {
         let old = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // 测试内不要污染 crash.log
         let listener = SessionListener {
@@ -2014,30 +1926,8 @@ let mut budget: u32 = KITTY_PUSH_BUDGET;
         }))
         .is_err();
         std::panic::set_hook(old);
-        assert!(panicked, "上游 0.26 的 push 洪水仍应 panic（若不再 panic，说明可去掉 strip 预算）");
+        assert!(!panicked, "vendor 已修复 push 洪水 panic；若再次 panic 说明 vendor patch 被破坏");
         assert!(fed <= 5000 * push.len());
     }
 
-    /// push/pop 配平的会话（应用反复重初始化）不能因预算单向递减而永久失效：
-    /// pop（ESC [ < n u）按 n 退还预算。
-    #[test]
-    fn kitty_pop_refunds_push_budget() {
-        let mut budget: u32 = KITTY_PUSH_BUDGET;
-        let mut out = Vec::new();
-        let mut flood = Vec::new();
-        for _ in 0..KITTY_PUSH_BUDGET + 1 {
-            flood.extend_from_slice(b"\x1b[>7u");
-        }
-        strip_orphan_csi_u_bytes_into(&mut out, &flood, &mut budget);
-assert_eq!(out.windows(4).filter(|w| *w == b"[>7u").count(), KITTY_PUSH_BUDGET as usize);
-
-        // 一次 pop(2) 退 2 → 紧随其后的两个 push 重新透传。
-        strip_orphan_csi_u_bytes_into(&mut out, b"\x1b[<2u\x1b[>7u\x1b[>7u\x1b[>7u", &mut budget);
-        assert_eq!(out, b"\x1b[<2u\x1b[>7u\x1b[>7u");
-assert_eq!(budget, 0, "1 个超额 push 被丢弃后预算应耗尽");
-
-        // pop 数量大於预算也不越界（退到上限为止）。
-        strip_orphan_csi_u_bytes_into(&mut out, b"\x1b[<99u", &mut budget);
-        assert_eq!(budget, KITTY_PUSH_BUDGET);
-    }
 }

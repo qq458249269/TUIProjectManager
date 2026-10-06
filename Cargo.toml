@@ -46,5 +46,8 @@ strip = true
 
 [patch.crates-io]
 getrandom = { path = "vendor/getrandom-0.4.3" }
+# 上游 0.26.0 bug：push_keyboard_mode 超深时误删 title_stack（空栈 remove(0) 直接 panic），
+# 触发场景：全屏 TUI 反复 push kitty 键盘模式 > TITLE_STACK_MAX_DEPTH。本地修正为删 keyboard_mode_stack。
+alacritty_terminal = { path = "vendor/alacritty_terminal-0.26.0" }
 
 [dev-dependencies]
