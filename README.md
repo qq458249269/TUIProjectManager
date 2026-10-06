@@ -171,22 +171,78 @@ rm version.txt
 - `PI_TUI_WRITE_LOG=<文件>`：让 pi 自己落盘 stdout（配合上面的日志对时序）
 - 复现后先核对 `crash.log` 的行号：行号变了 = 换了解析路径，别只看现象
 
-### TUI 输入框出现杂字（如 pi 输入框的 "CCCC"）
+### 终端整体失灵（无横幅、无提示符、按键/拖选/Ctrl+C·V·Tab 全无反应）
 
-**已修（2026-10-06）**：根因是**我们重复应答了 DSR**。
+**已修（2026-10-06，两处根因，同一次事故）**
 
-- 子进程发 `\x1b[6n`（光标位置查询）时，**ConPTY 自己就应答**（实测：
-  子进程输出流里能看到 ConPTY 注入的 `\x1b[6n`/`\x1b[c`，无需宿主参与）。
-- 宿主又回一份 `\x1b[row;colR` = 重复应答。ConPTY 把多余那份当成
-  **无主输入**直接塞回子进程 stdin，pi 把它当键序列插进输入框
-  → 输入框凭空多出 3~4 个 `C`。
-- 二分实测（`PI_TUI_WRITE_LOG` 数 `CCCC`）：应答 DSR = 3 次；不应答 = 0 次。
-- 现在 DA（`\x1b[c`）和 DSR（`\x1b[6n`）**都不应答**；
-  回归测试 `session::tests::reply_to_queries_ignores_dsr_cpr_query`。
+1. **reader 复用缓冲只追加不清空** —— 这才是「杂字 / 输入全废」的真正元凶。
+   `strip_orphan_csi_u_bytes_into(out, ..)` 的 `out` 是 reader 每块复用的同一个
+   `Vec`，但函数**从不 `clear()`**：每次 `read()` 都把「全部历史字节 + 新块」
+   重新丢给 VT parser 和 `reply_to_queries`。后果是每读一块就重复应答一遍
+   历史里所有 DSR/DA，子进程 stdin 收到无穷多条重复应答（实测 4 秒回显 80 KB
+   垃圾），画面被吃满、输入全废。
+   **规则：任何 `*_into(out, ..)` 复用的缓冲，函数入口必须 `out.clear()`。**
+   回归测试：`session::tests::strip_orphan_into_overwrites_reused_buffer`
+   （同一缓冲连喂两次，结果只含第二次）+ `kitty_push_drops_after_budget`
+   （它的旧断言曾把「追加」写成期望值，等于给 bug 背书，改动时勿再写反）。
 
-规律：**ConPTY 会应答的查询（DA/DSR/CPR），宿主一律不应答**；ConPTY 不管的
-（kitty `ESC[?u`、DECRQM、XTWINOPS、OSC 颜色）才由我们应答。
-改动 `reply_to_queries` 的应答列表前先对一下这条。
+2. **DSR / 主 DA 被误停答** —— cmd.exe 发出 `\x1b[6n` + `\x1b[c` 后
+   **ConPTY 不会替它应答**（本机实测：捆绑 conpty 1.25 与系统内置一致，
+   子进程就停在初始化等应答，既不打横幅也不出提示符）。
+   现在 `reply_to_queries` 应答：DSR（`\x1b[6n` / `\x1b[?6n`）、
+   主 DA（`\x1b[c` → `\x1b[?62;1;2;6;9;15;22c`）、DECRQM、kitty `ESC[?u`、
+   主键增强 `ESC[?2;1;0S`、XTWINOPS、OSC 10/11/4；XTVERSION 仍不答
+   （没有对端消费它，泄漏为键盘输入纯是噪声）。
+   回归测试：`session::tests::reply_to_queries_answers_dsr_and_da`。
+
+> **不要再引用旧结论「ConPTY 会替子进程应答 DA/DSR，宿主一律不应答」——
+> 该结论已实测证伪，害得整个终端不启动。**
+> 「TUI 输入框出现 CCCC」从来不是 DSR 本身的问题，而是上面第 1 条的重复应答
+> （`CCCC` ×N = N 条重复应答）。怀疑任何「ConPTY 会自动应答 X」的说法时，
+> 先裸 ConPTY + cmd.exe 实测，不要靠推断。
+
+### 终端被异常终止（子进程自己崩掉：writer_died.log / os error 232）
+
+**已修（2026-10-06）**：不是子进程的问题，是**我们的 reader 线程被上游 panic 带走**，
+子进程只是随后写管道失败被误记成“终端异常终止”。
+
+完整链条（crash.log + writer_died.log 实况）：
+
+```
+pi/opencode 重初始化狂发 kitty push（CSI > flags u，实测 43 次/秒）
+→ alacritty_terminal 0.26 上游笔误 term/mod.rs:1296：
+  push_keyboard_mode 栈满 4096 时误对**空的 title_stack** 做 remove(0)
+→ panic: removal index (is 0) should be < len (is 0)
+→ reader 线程死 → PTY 无人读 + 快照停更（画面永久冻结、进程还活着）
+→ 子进程写 stdout 管道报 os error 232 → writer_died.log
+```
+
+三处加固：
+
+1. **kitty push 预算 64 封顶**（`KITTY_PUSH_BUDGET`，在
+   `strip_orphan_csi_u_bytes_into` 里丢）：栈深恒 < 4096，panic 不可达。
+   pop（`ESC[<n u`）按 n **退还预算**——单向递减会让会话活过 64 次 push 后
+   kitty 协商永久失效（Enter 键行为退变）。
+2. **读循环整体 `catch_unwind`**：解析以外的 panic（快照/命令/尺寸）也不再静默
+   带走线程，一律收敛成「会话异常结束」+ 记日志 + 页签变可重开态。
+3. **写入侧管道断 → 立即结束会话**：不再“看着活着、敲字没反应”。
+
+回归测试：`unfiltered_kitty_push_flood_still_panics_upstream`（证明上游 bug
+仍在、预算封顶是唯一防线，**别删**）、`kitty_push_budget_prevents_terminal_panic`、
+`kitty_pop_refunds_push_budget`。
+
+> ponytail：根治要 vendor 一份 alacritty 0.26 打上游笔误补丁（46MB）。
+> 预算丢弃对本场景等价（只读栈顶 flags），等哪天必须保住 4096 级真实栈深再加。
+
+### 全局异常日志
+
+`main.rs::log_crash` 是**唯一落盘点**：`exe 同级 crash.log`（带 kind / 线程名 /
+pid / 出错位置 / 回溯，4MB 滚动为 crash.log.1）。panic hook、reader 解析 panic、
+writer-died 全部经它写入。
+
+> GUI 子系统**没有控制台**（`#![windows_subsystem]`），`eprintln!` 谁也看不见——
+> 排查任何异常都必须写文件，别再只打 stderr。也别往 CWD 写日志
+> （旧的 `writer_died.log` 就是这么丢的）。
 
 ## 技术栈
 

@@ -166,31 +166,64 @@ pub fn flash_taskbar(hwnd: isize) {
     unsafe { FlashWindowEx(&mut info) };
 }
 
+/// 全进程异常日志唯一落盘点：exe 同级 crash.log。
+/// GUI 子系统无控制台（eprintln 谁也看不见），日志散在 CWD 更是找不着 ——
+/// panic / reader 解析 panic / PTY 写入线程死，一律经 [`log_crash`] 写这里。
+pub fn crash_log_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("crash.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("crash.log"))
+}
+
+/// crash.log 超过此大小先滚一份 crash.log.1（异常风暴不把磁盘写满）。
+const CRASH_LOG_MAX: u64 = 4 << 20;
+
+/// 记一条异常。多线程可并发调用（含 panic 钩子）：自旋锁防日志交错，
+/// 中毒锁照旧写（`into_inner`）——写日志的锁被毒过就静默丢日志 = 最坏情况。
+/// 绝不 panic：调用方常在 panic 展开路径上。
+pub fn log_crash(kind: &str, msg: &str) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = crash_log_path();
+    if let Ok(md) = std::fs::metadata(&path)
+        && md.len() > CRASH_LOG_MAX
+    {
+        let _ = std::fs::remove_file(path.with_extension("log.1"));
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[{:?}] [{kind}] {msg} (thread={:?} pid={})",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            std::thread::current().name(),
+            std::process::id()
+        );
+        let _ = f.flush();
+    }
+}
+
 fn main() -> eframe::Result {
     // 全进程 panic 钩子：任何线程 panic（页签 reader/渲染/解析线程）都记到崩溃日志，
-    // 不静默吞掉。日志写在 exe 同级 crash.log，供事后定位到底哪个页签/线程崩了。
+    // 不静默吞掉。附线程名 + 出错位置 + 回溯：release 开了 strip，回溯多半只剩
+    // 帧号，但「是否 unwind 回 main / 崩在谁那里」一眼可辨。
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let msg = info.to_string();
-        eprintln!("[PANIC] {msg} (thread {:?})", std::thread::current().name());
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(dir.join("crash.log"))
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        writeln!(f, "[{:?}] {msg} (thread {:?})",
-                            std::time::SystemTime::now(),
-                            std::thread::current().name())
-                    });
-        }
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<?>".into());
+        log_crash("panic", &format!("{info}\n    at {loc}\n{}", std::backtrace::Backtrace::force_capture()));
         default_hook(info);
     }));
     unlock_exe();
     ensure_toast_registered();
+log_crash(
+        "start",
+        &format!("v{} renderer={:?}", app_version(), if prefer_glow() { "glow" } else { "wgpu" }),
+    );
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])

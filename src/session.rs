@@ -446,23 +446,27 @@ impl EventListener for SessionListener {
 /// 响应终端能力探测序列（TUI 启动时常用），返回要写回 PTY 的应答字节。
 /// 返回值（字节, 是否应答过 OSC 10/11/4 颜色查询）：后者供主题广播判断
 /// 该会话是否 OS 色，避免向 cmd 等不响 OSC 的 shell 推颜色序列。
-/// 实测（examples/conpty_probe，conpty.dll 1.25）：宿主写回的应答会被
-/// ConPTY 输入引擎消费、从不转发给子进程；DSR 应答总能被干净识别，而
-/// 主 DA/XTVERSION 应答在时序错位时会被当键盘文本打进子进程（cmd 提示符
-/// 后出现 ^[[?1;2c）。所以只答 DSR/DECRQM/kitty/像素尺寸这类被干净消费的：
-/// - DSR 光标位置（ESC[6n → ESC[r;cR）
+/// 应答项：
+/// - DSR 光标位置（ESC[6n / ESC[?6n → ESC[r;cR）
+/// - 主 DA（ESC[c / ESC[0c → ESC[?62;c，VT220）
 /// - DECRQM 模式查询（ESC[?...$p → ESC[?...;m$y）
 /// - kitty 键盘协议查询（ESC[?u → 回同样 ESC[?u 表示不支持）
+/// - 主键增强查询（ESC[?2;1;0S → ESC[?0u）
 /// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
 /// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
 ///
-/// 主 DA/XTVERSION 不应答（ConPTY 时序错位时泄漏为键盘输入杂字）；
-/// OMP 通过 TERM_PROGRAM 环境变量跳过 DA 查询。
+/// XTVERSION（ESC[>0q）不答：没有对端消费它，泄漏为键盘输入纯是噪声。
+///
+/// DSR/DA 必须答：本机实测（裸 ConPTY + cmd.exe，捆绑 1.25 与系统内置
+/// 行为一致）ConPTY **不会**替子进程应答这两条，cmd.exe 发出
+/// `ESC[6n ESC[c` 后就停在初始化等应答，既不打横幅也不出提示符——按键、
+/// 拖选、Ctrl+C/V 全都像失灵。92d9235 曾以「多回一份 CPR 会变成 4 个 C」
+/// 为由停答，那是本末倒置：不答直接换来「终端永不启动」。
 /// 返回 (应答字节, 是否应答了 OSC 颜色查询)。
 /// 查询序列可能跨块被截断：OMP 等程序的查询序列可能被 read() 切分到
 /// 相邻块中，扫描单块可能漏掉。调用方在外层已做跨块拼接（leftover 缓冲），
 /// 因此此函数只需处理完整/不完整序列即可。
-fn reply_to_queries(_term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
+fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> Option<(Vec<u8>, bool)> {
     // 高吞吐输出（AI 回答流）的绝大多数块根本没有转义序列：
     // 先做一次快速扫描，无 ESC 字节直接返回，省掉逐字节状态扫描。
     if !bytes.contains(&0x1b) {
@@ -540,15 +544,22 @@ fn reply_to_queries(_term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> 
         let fin = bytes[j];
         i = j + 1;
         if (params.is_empty() || params == b"0") && fin == b'c' {
-            // Primary Device Attributes (DA)：不应答。ConPTY 会应答子进程的
-            // DA 查询；我们再回一份属于重复应答，ConPTY 会把多余那份当作
-            // 无主输入转发给子进程。
-            //
-            // DSR（\x1b[6n）同理不应答：ConPTY 自己就应答光标位置查询。
-            // 我们多回的那份 CPR 会被当成无主输入塞进子进程 stdin，pi 会把它
-            // 当键序列插入输入框 —— 表现为输入框凭空多出 4 个 "C"
-            // （二分实测：应答 DSR = 3 次 CCCC，不应答 = 0 次）。
-            // 回归测试：reply_to_queries_ignores_dsr_cpr_query。
+            // Primary Device Attributes (DA)：报 VT220 + 常见能力位。
+            // 不答的话 cmd/pwsh/node 系会卡在启动探测上（见函数文档实测）。
+            out.extend_from_slice(b"\x1b[?62;1;2;6;9;15;22c");
+} else if (params.is_empty() || params == b"6") && fin == b'n' {
+            // DSR 光标位置（CPR）：回当前可见光标的 1-based 行;列。
+            // 滚动缓冲偏移要减掉——子进程问的是「屏幕上哪」，不是「历史上哪」。
+            let content = term.renderable_content();
+            let row = (content.cursor.point.line.0 - content.display_offset as i32 + 1).max(1);
+            let col = (content.cursor.point.column.0 + 1).max(1);
+            out.extend_from_slice(format!("\x1b[{row};{col}R").as_bytes());
+        } else if params == b"?6" && fin == b'n' {
+            // ESC[?6n（DECXCPR）同 CPR，按私有形态再答一份。
+            let content = term.renderable_content();
+            let row = (content.cursor.point.line.0 - content.display_offset as i32 + 1).max(1);
+            let col = (content.cursor.point.column.0 + 1).max(1);
+            out.extend_from_slice(format!("\x1b[?{row};{col};1R").as_bytes());
         } else if params.starts_with(b"?") && fin == b'u' {
             // kitty 键盘协议不支持：按协议回同样的 CSI ? u。
             out.extend_from_slice(b"\x1b[?u");
@@ -584,10 +595,16 @@ fn reply_to_queries(_term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> 
 /// 不影响真正的 ESC 转义序列；只处理无 ESC 前缀的 `[数字;数字u` 残片。
 /// 替换规则与 `strip_ansi` 的孤儿逻辑一致：每个连续残片段替换为
 /// 单个空格（残片后已有空白则吞掉多余空白）。
-/// 结果追加到调用方缓冲（reader 每块复用同一份，避免每块新分配）。
+/// 结果覆盖写入调用方缓冲（reader 每块复用同一份，避免每块新分配；不清空就会
+/// 逐块累积，历史字节被反复重解析/重应答 → 子进程收到无穷多条重复应答）。
 /// `kitty_push_budget`：本会话还允许穿过多少条 kitty 键盘模式 push
 /// （ESC [ > flags u）。见调用处说明；传 `u32::MAX` 即不限。
+/// kitty 键盘模式栈转发预算（见 spawn 会话里的注释）。栈深恒 ≤ 本值，
+/// 远低于 alacritty 0.26 触顶 panic 的 4096。
+const KITTY_PUSH_BUDGET: u32 = 64;
+
 fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8], kitty_push_budget: &mut u32) {
+    out.clear();
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
@@ -606,14 +623,11 @@ fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8], kitty_push_bud
                         out.push(bytes[i]);
                         i += 1;
                     }
-                    if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
-                        // kitty 键盘模式 push（ESC [ > flags u）：alacritty 0.26
-                        // 栈满 4096 时误对空的 title_stack 做 remove(0) → panic，
-                        // reader 线程死 → PTY 无人读 → 画面永久冻结
-                        // （crash.log：alacritty_terminal-0.26.0/src/term/mod.rs:1296）。
-                        // 应用反复重初始化会无界 push（实测 pi 43 次/秒），
-                        // 超预算的整段丢弃：本工具本就不支持 kitty 协议
-                        // （回 ESC[?u 即 flags 0），栈内容不影响对端行为。
+if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
+                        // kitty 键盘模式 push（ESC [ > flags u）：超预算整段丢弃，
+                        // 见 KITTY_PUSH_BUDGET。pop（ESC [ < n u）按 n 退还预算：
+                        // 不退的话，一会话内第 64 次之后的 push 永久失效，
+                        // kitty flags 跟踪随会话寿命衰减（Enter 键行为退变）。
                         let is_kitty_push = bytes[i] == b'u'
                             && out.get(params_start) == Some(&b'>');
                         if is_kitty_push {
@@ -624,6 +638,14 @@ fn strip_orphan_csi_u_bytes_into(out: &mut Vec<u8>, bytes: &[u8], kitty_push_bud
                                 i += 1;
                                 continue;
                             }
+                        } else if bytes[i] == b'u' && out.get(params_start) == Some(&b'<') {
+                            let n: u32 = out[params_start + 1..]
+                                .iter()
+                                .take_while(|b| b.is_ascii_digit())
+                                .fold(0u32, |acc, d| {
+                                    (acc * 10 + u32::from(d - b'0')).min(KITTY_PUSH_BUDGET)
+                                });
+*kitty_push_budget = (*kitty_push_budget).saturating_add(n).min(KITTY_PUSH_BUDGET);
                         }
                         out.push(bytes[i]);
                         i += 1;
@@ -886,14 +908,19 @@ pub fn spawn(
                     let _ = writer.flush();
                     write_count += 1;
                 }
-                Err(e) => {
+Err(e) => {
                     // ── writer 线程死亡诊断 ──
-                    // write_all 失败 = PTY 写入管道断裂（子进程退出或管道异常），
-                    // 此后所有 try_send 仍成功但数据永远不会到达 PTY。
+                    // write_all 失败 = PTY 写入管道断裂（子进程退出、读侧被丢，
+                    // 或 reader 线程 panic 后 drop 掉了管道）。此后所有 try_send
+                    // 仍成功但数据永远不会到达 PTY —— 必须记进 crash.log：
+                    // GUI 无控制台，丢在这里就只剩「终端莫名其妙不动了」。
                     writer_alive_clone.store(false, Ordering::Relaxed);
-                    let _ = std::fs::write("writer_died.log",
-                        format!("[WRITER-DIED] write_all failed: {e} (after {write_count} writes, {} bytes)\nlast_bytes: {:?}\n",
-                            bytes.len(), String::from_utf8_lossy(&bytes)));
+                    crate::log_crash(
+                        "writer-died",
+                        &format!("write_all failed: {e} (after {write_count} writes, {} bytes)\n    last_bytes: {}",
+                            bytes.len(),
+                            escape_for_log(&bytes)),
+                    );
                     break;
                 }
             }
@@ -908,7 +935,7 @@ pub fn spawn(
     // 退出时唤醒 UI：reader 线程设 exited 后立即 request_repaint（线程安全），
     // 停帧空闲时 `update_exited()` 才能在本帧发现退出（页签✔/状态栏/通知）。
     // 仅退出这一次，无常耗——后台输出/空闲不唤醒。
-    let reader_ctx = ctx.clone();
+let reader_ctx = ctx.clone();
     // 前台标记：UI 线程每帧同步 self.current；后台会话输出不唤醒 UI。
     let foreground = Arc::new(AtomicBool::new(false));
     let listener_fg = foreground.clone();
@@ -1027,7 +1054,14 @@ sel_range: None,
             .master
             .try_clone_reader()
             .map_err(|e| format!("获取 PTY 读取句柄失败: {e}"))?;
+// 读循环整体包一层 catch_unwind：除解析外的 panic（快照/命令处理/维度计算）
+        // 同样会静默带走 reader 线程 → PTY 无人读 + 快照停更 = 画面永久冻结，
+        // 子进程随后写管道报错（os error 232）＝“终端被异常终止”。一律收敛成
+        // 「会话异常结束」：记 crash.log + 置 exited，页签变可重开态。
+        let guard_exited = exited.clone();
+        let guard_ctx = reader_ctx.clone();
         std::thread::spawn(move || {
+        let reader_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut parser: Processor = Processor::default();
             let mut buf = [0u8; 0x10_000];
             let mut last_counted_ms: u64 = 0;
@@ -1046,14 +1080,18 @@ let mut last_chunk_ms: u64 = 0;
             // rows×cols 级别的小对象循环里反复 malloc 是后台多页签下的主要开销。
             let mut merged: Vec<u8> = Vec::with_capacity(0x10_000);
             let mut stripped: Vec<u8> = Vec::with_capacity(0x10_000);
-            // kitty 键盘模式 push（ESC [ > flags u）转发上限：alacritty 0.26
+// kitty 键盘模式 push（ESC [ > flags u）转发上限：alacritty 0.26
             // 的 push_keyboard_mode 在栈满 4096 时误对 title_stack 做 remove(0)
             // → panic（removal index 0 / len 0）→ reader 线程死 → PTY 无人读
-            // → 快照停更 → 画面永久冻结。应用反复重初始化（实测 pi 重启
-            // 43 次/秒，每次一个 push）95 秒必触。超预算的 push 直接丢弃：
-            // 本工具本就不支持 kitty 协议（应答 ESC[?u = flags 0），
-            // 栈内容不影响对端行为。
-let mut kitty_push_budget: u32 = 64;
+            // → 快照停更 → 画面永久冻结 → 子进程写管道报错（os error 232）
+            // → 「终端被异常终止」。应用反复重初始化（实测 pi 重启 43 次/秒，
+            // 每次一个 push）95 秒必触。超预算的 push 直接丢弃，pop（ESC [ < n u）
+            // 按 n 退还：栈深恒 ≤ KITTY_PUSH_BUDGET（4096 触不到），而正常
+            // push/pop 配平的会话不受影响（本工具只读栈顶 flags，见 terminal.rs
+            // 的 DISAMBIGUATE 判定，栈内容不影响对端行为）。
+            // ponytail: 根治要改上游 term/mod.rs:1296 的 title_stack 笔误
+            // （vendor 一份 0.26 打补丁）；预算丢弃对本场景等价。
+            let mut kitty_push_budget: u32 = KITTY_PUSH_BUDGET;
             let mut now_chars: Vec<char> = Vec::new();
             // 连续 EOF 计数：子进程已退出时管道立刻 EOF，不重试就是每50ms 空转
             // 一条线程到进程结束（每个死页签漏一条）。真 EOF 连着来几次即认定
@@ -1071,7 +1109,16 @@ let mut eof_streak: u32 = 0;
             // 这里把 panic 收敛成「会话异常结束」：置 exited 让页签显示可重开的
             // 结束态，break 后 drop reader 关管道，不静默冻屏。原始 panic 仍由
             // main.rs 全局钩子记进 crash.log。
+let reader_writer_alive = writer_alive.clone();
 'read: loop {
+        // 写入侧已死（管道断）→ 本会话输入永远到不了子进程，等同会话终止：
+        // 置 exited 让页签显示可重开的结束态，而不是“看着活着、敲字没反应”。
+        if !reader_writer_alive.load(Ordering::Relaxed) {
+            crate::log_crash("reader", "PTY 写入管道已断，结束会话读循环");
+            reader_exited.store(true, Ordering::Release);
+            reader_ctx.request_repaint();
+            break 'read;
+        }
 let read_res = reader.read(&mut buf);
                 // EOF 累计：连续三次读到 0 = 读侧已关（子进程退出），退出读循环，
                 // 不留一条每 50ms 醒一次、永远读到 EOF 的空转线程。读到数据或
@@ -1099,7 +1146,7 @@ let read_res = reader.read(&mut buf);
                                 }
                                 Ok(None) => {}
                                 Err(()) => {
-                                    eprintln!("[reader] VT 解析 panic（残留块），会话中断；尾部字节: {}", escape_for_log(&query_leftover));
+crate::log_crash("reader-panic", &format!("VT 解析 panic（残留块），会话中断；尾部字节: {}", escape_for_log(&query_leftover)));
                                     reader_exited.store(true, Ordering::Release);
                                     reader_ctx.request_repaint();
                                     break 'read;
@@ -1280,7 +1327,7 @@ let read_res = reader.read(&mut buf);
                                     match r {
                                         Ok(v) => v,
                                         Err(()) => {
-                                            eprintln!("[reader] VT 解析 panic，会话中断；触发字节: {}", escape_for_log(chunk));
+crate::log_crash("reader-panic", &format!("VT 解析 panic，前台页签会话中断；触发字节: {}", escape_for_log(chunk)));
                                             reader_exited.store(true, Ordering::Release);
                                             reader_ctx.request_repaint();
                                             break 'read;
@@ -1311,7 +1358,7 @@ let read_res = reader.read(&mut buf);
                                 match r {
                                     Ok(v) => v,
                                     Err(()) => {
-                                        eprintln!("[reader] VT 解析 panic（后台页签），会话中断；触发字节: {}", escape_for_log(merged));
+crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），会话中断；触发字节: {}", escape_for_log(merged)));
                                         reader_exited.store(true, Ordering::Release);
                                         break 'read;
                                     }
@@ -1437,10 +1484,16 @@ let read_res = reader.read(&mut buf);
                             //    这里不再额外 batch——后台输出量通常较小，
                             //    分块本身就足够轻量。）
                         }
-                    }
+}
                 }
             }
-        });
+        }));
+        if reader_result.is_err() {
+            crate::log_crash("reader-panic", "读循环 panic（解析/快照/命令），会话已标记异常结束");
+            guard_exited.store(true, Ordering::Release);
+guard_ctx.request_repaint();
+        }
+    });
     }
 
     let session = Session {
@@ -1735,25 +1788,29 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         assert_eq!(s.row_hashes[2], a.row_hashes[2], "未变行不应被牵连");
     }
 
-    /// 终端能力应答器：标准 VT 序列的应答都要对（opencode/OMP 等 TUI 靠它判定
-    /// 终端是否交互）。
+    /// DSR/DA 必须应答：本机实测（裸 ConPTY + cmd.exe，捆绑 conpty 1.25 与系统
+    /// 内置行为一致）ConPTY 不替子进程应答这两条，cmd 发出 `ESC[6n ESC[c` 后
+    /// 停在初始化等应答——不打横幅、不出提示符、按键无回显、拖选/Ctrl+C/V 全废。
     #[test]
-/// DSR（\x1b[6n）**不应答**：ConPTY 自己应答光标位置查询。我们多回的
-    /// 那份 CPR 被当成无主输入塞回子进程 stdin，pi 会把它当键序列插进输入框
-    /// （实测：应答 = 输入框凭空多出 3~4 个 "CCCC"，不应答 = 0）。
-    #[test]
-    #[test]
-    fn reply_to_queries_ignores_dsr_cpr_query() {
+    fn reply_to_queries_answers_dsr_and_da() {
         let listener = SessionListener {
             redraw: std::sync::mpsc::sync_channel(1).0,
             ctx: eframe::egui::Context::default(),
             foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
-        assert!(reply_to_queries(&term, b"\x1b[6n", true).is_none(), "DSR 不应应答");
-        assert!(reply_to_queries(&term, b"\x1b[6n\x1b[c", true).is_none(), "DSR/DA 都不应答");
+        assert!(reply_to_queries(&term, b"\x1b[6n", true).is_some(), "DSR 必须应答");
+        let r = reply_to_queries(&term, b"\x1b[6n\x1b[c", true).expect("DSR+DA 必须应答").0;
+        let s = String::from_utf8_lossy(&r);
+        assert!(s.contains("\x1b[1;1R"), "CPR 回 1;1: {s:?}");
+        assert!(s.contains("\x1b[?62;"), "DA 回 VT220: {s:?}");
+        // DECXCPR 私有形态同样应答。
+        let r2 = reply_to_queries(&term, b"\x1b[?6n", true).unwrap().0;
+        let s2 = String::from_utf8_lossy(&r2);
+        assert!(s2.starts_with("\x1b[?1;1;"), "DECXCPR: {s2:?}");
     }
 
+    #[test]
     fn reply_to_queries_standard() {
         let listener = SessionListener {
             redraw: std::sync::mpsc::sync_channel(1).0,
@@ -1765,15 +1822,13 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
         let r = reply_to_queries(&term, bytes, true).unwrap().0;
         let s = String::from_utf8_lossy(&r);
-        assert!(!s.contains("R\x1b"), "DSR 不应答（ConPTY 自己应答）: {s}");
+        assert!(s.contains("\x1b[1;1R"), "DSR CPR: {s}");
         assert!(s.contains("\x1b[?2026;1$y"), "DECRQM 2026: {s}");
         assert!(s.contains("\x1b[?1000;1$y"), "DECRQM 1000: {s}");
         assert!(s.contains("\x1b[?u"), "kitty 键盘: {s}");
         assert!(s.contains("\x1b[4;0;0t"), "XTWINOPS: {s}");
         assert!(s.contains("\x1b]11;rgb:16161a/16161a/16161a"), "OSC11 深色底: {s}");
-        // DA 与 XTVERSION 不应答（泄漏为键盘输入）。
-        assert!(reply_to_queries(&term, b"\x1b[c", true).is_none(), "主 DA 不应答");
-        assert!(reply_to_queries(&term, b"\x1b[0c", true).is_none(), "DA 0c 不应答");
+        // XTVERSION 不应答（无对端消费的查询）。
         assert!(reply_to_queries(&term, b"\x1b[>0q", true).is_none(), "XTVERSION 不应答");
         // 浅色主题下 OSC 11 回白底。
         let r3 = reply_to_queries(&term, b"\x1b]11;?\x1b\\", false).unwrap();
@@ -1901,7 +1956,7 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         let mut term = Term::new(term_config, &TermSize::new(80, 24), listener);
         let mut parser: Processor = Default::default();
 
-        let mut budget: u32 = 64;
+let mut budget: u32 = KITTY_PUSH_BUDGET;
         let mut feed = Vec::new();
         for _ in 0..5000 {
             feed.clear();
@@ -1920,13 +1975,12 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
         assert_eq!(out, b"[>7u", "1st");
         strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
-        assert_eq!(out, b"[>7u[>7u", "2nd");
-        out.clear();
+        assert_eq!(out, b"[>7u", "2nd（复用缓冲必须覆盖，不得追加）");
         strip_orphan_csi_u_bytes_into(&mut out, b"[>7u", &mut budget);
         assert!(out.is_empty(), "3rd should be dropped, got {:?}", out);
     }
 
-    #[test]
+#[test]
     fn kitty_push_within_budget_is_preserved() {
         let mut budget: u32 = 2;
         let mut out = Vec::new();
@@ -1934,7 +1988,56 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         assert_eq!(out, b"\x1b[>7u\x1b[>15u\x1b[?1;2u");
         assert_eq!(budget, 0);
     }
+
+    /// 上游 bug 仍在（别以为 0.26 被谁修好了）：不经 strip 的 push 洪水在第
+    /// 4096 次 push 触发 alacritty panic（title_stack 为空 → remove(0) 越界）。
+    /// 这就是 crash.log 里那串 panic、以及它引发的一连串「终端被异常终止」。
+    #[test]
+    fn unfiltered_kitty_push_flood_still_panics_upstream() {
+        let old = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 测试内不要污染 crash.log
+        let listener = SessionListener {
+            redraw: std::sync::mpsc::sync_channel(1).0,
+            ctx: eframe::egui::Context::default(),
+            foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let cfg = Config { kitty_keyboard: true, ..Default::default() };
+        let mut term = Term::new(cfg, &TermSize::new(80, 24), listener);
+        let mut parser: Processor = Default::default();
+        let push = b"\x1b[>1u";
+        let mut fed = 0;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..5000 {
+                fed += push.len();
+                parser.advance(&mut term, push);
+            }
+        }))
+        .is_err();
+        std::panic::set_hook(old);
+        assert!(panicked, "上游 0.26 的 push 洪水仍应 panic（若不再 panic，说明可去掉 strip 预算）");
+        assert!(fed <= 5000 * push.len());
+    }
+
+    /// push/pop 配平的会话（应用反复重初始化）不能因预算单向递减而永久失效：
+    /// pop（ESC [ < n u）按 n 退还预算。
+    #[test]
+    fn kitty_pop_refunds_push_budget() {
+        let mut budget: u32 = KITTY_PUSH_BUDGET;
+        let mut out = Vec::new();
+        let mut flood = Vec::new();
+        for _ in 0..KITTY_PUSH_BUDGET + 1 {
+            flood.extend_from_slice(b"\x1b[>7u");
+        }
+        strip_orphan_csi_u_bytes_into(&mut out, &flood, &mut budget);
+assert_eq!(out.windows(4).filter(|w| *w == b"[>7u").count(), KITTY_PUSH_BUDGET as usize);
+
+        // 一次 pop(2) 退 2 → 紧随其后的两个 push 重新透传。
+        strip_orphan_csi_u_bytes_into(&mut out, b"\x1b[<2u\x1b[>7u\x1b[>7u\x1b[>7u", &mut budget);
+        assert_eq!(out, b"\x1b[<2u\x1b[>7u\x1b[>7u");
+assert_eq!(budget, 0, "1 个超额 push 被丢弃后预算应耗尽");
+
+        // pop 数量大於预算也不越界（退到上限为止）。
+        strip_orphan_csi_u_bytes_into(&mut out, b"\x1b[<99u", &mut budget);
+        assert_eq!(budget, KITTY_PUSH_BUDGET);
+    }
 }
-
-
-
