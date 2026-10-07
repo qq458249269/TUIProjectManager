@@ -132,6 +132,13 @@ pub struct Settings {
     /// 目录下的 pi / opencode 路径，用户可在设置页增删（换机器就改这里）。
     #[serde(default)]
     pub tool_paths: Vec<String>,
+    /// 终端里 Ctrl+Shift+Z 发送给子进程的字节序列。
+    /// 本机 ConPTY 无法把 Ctrl+Shift+Z 作为按键传给子进程（实测 kitty
+    /// CSI-u / modifyOtherKeys 输入均不解析），只能翻译成子进程认识的键：
+    /// 默认 ^Y（PSReadLine / VS 的 redo 约定；pi 的 Ctrl+Y 是 yank，改这里
+    /// 不影响它）。写法：^X = Ctrl+X、\xNN = 十六进制、普通字符原样；留空 = 不发送。
+    #[serde(default = "default_ctrl_shift_z")]
+    pub ctrl_shift_z: String,
     /// 上面都找不到时，是否再扫 PATH。默认 true。
     #[serde(default = "default_true")]
     pub tool_search_path: bool,
@@ -145,10 +152,60 @@ impl Default for Settings {
             dark_mode: true,
             follow_system: false,
             history_lines: default_history_lines(),
+            ctrl_shift_z: default_ctrl_shift_z(),
             tool_paths: Vec::new(),
             tool_search_path: true,
         }
     }
+}
+
+fn default_ctrl_shift_z() -> String {
+    "^Y".to_string()
+}
+
+/// 把设置里可读的按键写法解析为字节序列：`^X` = Ctrl+X（X = @ A-Z [ \\ ] ^ _ ?）、
+/// `\xNN` 十六进制、`\n`/`\r`/`\t`/`\e`/`\\`、其余 ASCII 原样。失败（非 ASCII /
+/// 无效转义）返 None。
+pub fn parse_key_sequence(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '^' => {
+                let n = it.next()?;
+                out.push(match n {
+                    '@' => 0x00,
+                    'A'..='Z' => n as u8 - b'A' + 1,
+                    '[' => 0x1b,
+                    '\\' => 0x1c,
+                    ']' => 0x1d,
+                    '^' => 0x1e,
+                    '_' => 0x1f,
+                    '?' => 0x7f,
+                    _ => return None,
+                });
+            }
+            '\\' => match it.next()? {
+                'n' => out.push(b'\n'),
+                'r' => out.push(b'\r'),
+                't' => out.push(b'\t'),
+                'e' => out.push(0x1b),
+                '\\' => out.push(b'\\'),
+                'x' => {
+                    let mut v = 0u8;
+                    for _ in 0..2 {
+                        let h = it.next()?.to_digit(16)?;
+                        v = v * 16 + h as u8;
+                    }
+                    out.push(v);
+                }
+                _ => return None,
+            },
+            c if c.is_ascii() => out.push(c as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// 应用配置，保存到与程序同级目录下的 config/config.json。
@@ -665,6 +722,27 @@ pub fn save_omp_models(cfg: &ModelsConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_key_sequence_forms() {
+        assert_eq!(parse_key_sequence("^Y"), Some(vec![0x19]));
+        assert_eq!(parse_key_sequence("^Z"), Some(vec![0x1a]));
+        assert_eq!(parse_key_sequence("^@"), Some(vec![0x00]));
+        assert_eq!(parse_key_sequence("^["), Some(vec![0x1b]));
+        assert_eq!(parse_key_sequence("^?"), Some(vec![0x7f]));
+        assert_eq!(parse_key_sequence("\\x1b[1;6Z"), Some(b"\x1b[1;6Z".to_vec()));
+        assert_eq!(parse_key_sequence("ab\\n"), Some(b"ab\n".to_vec()));
+        assert_eq!(parse_key_sequence(""), Some(Vec::new()));
+        // 非法：非 ASCII、坏转义、裸 ^ 后无字符。
+        assert_eq!(parse_key_sequence("中"), None);
+        assert_eq!(parse_key_sequence("\\q"), None);
+        assert_eq!(parse_key_sequence("^"), None);
+        assert_eq!(parse_key_sequence("\\x1"), None);
+        // 默认配置、旧文件兼容：无字段时按默认 ^Y。
+        let s: Settings =
+            serde_json::from_str(r#"{"tui_commands":["nvim"],"tui_command":"nvim"}"#).unwrap();
+        assert_eq!(s.ctrl_shift_z, "^Y");
+    }
 
     #[test]
     fn models_json_roundtrip() {

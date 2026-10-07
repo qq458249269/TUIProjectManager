@@ -888,7 +888,8 @@ pub fn show_terminal(
     dark: bool,
     status: &mut Option<String>,
     term_focused: &mut bool,
-wheel: &Wheel,
+    wheel: &Wheel,
+    ctrl_shift_z: &[u8],
 ) {
     let perf = perf_on();
     let perf_t0 = std::time::Instant::now();
@@ -1523,7 +1524,17 @@ scroll_now(&sess.term, &sess.cmd_tx, if *key == egui::Key::PageUp {
                                     m.intersects(TermMode::DISAMBIGUATE_ESC_CODES)
                                 });
                             bytes_out.push(encode_modified_enter(shift, alt, ctrl, full));
-                        } else if let Some(bytes) = encode_key(*key, ctrl, alt, shift, false) {
+                        } else if ctrl && shift && !alt && *key == egui::Key::Z
+                            && !ctrl_shift_z.is_empty()
+                        {
+                            // Ctrl+Shift+Z → 设置里配置的字节序列（默认 ^Y = Ctrl+Y）。
+                            // 本机 ConPTY 字节流无法表达 Ctrl+Shift+Z 键，只能发子进程
+                            // 认识的另一种键；留空 = 不发（pi 的 Ctrl+Y 是 yank，想禁用
+                            // 就在设置里清空）。其余 Ctrl+X 照旧发 \x18。
+                            bytes_out.push(ctrl_shift_z.to_vec());
+                        } else if let Some(bytes) =
+                            encode_key(*key, ctrl, alt, shift, false)
+                        {
                             bytes_out.push(bytes);
                         }
                     }
