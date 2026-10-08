@@ -1668,7 +1668,9 @@ use alacritty_terminal::term::cell::Flags;
             let m2 = Arc::new(RwLock::new(1u32));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
                 let g = m2.write().unwrap();
-                move || panic!("毒化")
+                // 必须持有写锁到 panic 发生的这一刻：unwind 时 guard 的 Drop
+                // 才会把锁标成中毒，下面 try_wlock 断言才不是空转。
+                move || panic!("在持有写锁时毒化 {:?}", *g)
             }));
             m2
         };
