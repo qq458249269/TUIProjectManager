@@ -422,6 +422,15 @@ fn csi_mod(mod_param: Option<u8>, letter: u8) -> Vec<u8> {
     }
 }
 
+/// CSI n~ 类键（PageUp/PageDown/Insert/Delete）带修饰编码：
+/// 无修饰 = `ESC [ n ~`；有修饰 = `ESC [ n ; m ~`（xterm 标准）。
+fn csi_tilde(n: u8, mod_param: Option<u8>) -> Vec<u8> {
+    match mod_param {
+        Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
+        None => format!("\x1b[{n}~").into_bytes(),
+    }
+}
+
 /// F1..F12 编码。
 fn fkey(key: egui::Key, mod_param: Option<u8>) -> Vec<u8> {
     let n = key as u8 - egui::Key::F1 as u8 + 1;
@@ -575,12 +584,16 @@ fn encode_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool, _repeat: bool)
         egui::Key::Backspace => Some(vec![0x7f]),
         egui::Key::Escape => Some(vec![0x1b]),
         egui::Key::Tab => Some(if shift { b"\x1b[Z".to_vec() } else { vec![b'\t'] }),
-        egui::Key::Home => Some(vec![0x1b, b'[', b'H']),
-        egui::Key::End => Some(vec![0x1b, b'[', b'F']),
-        egui::Key::PageUp => Some(b"\x1b[5~".to_vec()),
-        egui::Key::PageDown => Some(b"\x1b[6~".to_vec()),
-        egui::Key::Insert => Some(b"\x1b[2~".to_vec()),
-        egui::Key::Delete => Some(b"\x1b[3~".to_vec()),
+        // Home/End/PageUp/PageDown/Insert/Delete 透传修饰符（原样发送）：
+        // ConPTY 输入引擎实测解析 \x1b[F→End、\x1b[1;5F→Ctrl+End、
+        // \x1b[5;5~→Ctrl+PageUp，无修饰时字节与旧版逐字节相同，不回归。
+        // 仅 Ctrl+C/V/Z 保留固定功能绑定（见调用点）。
+        egui::Key::Home => Some(csi_mod(mod_param, b'H')),
+        egui::Key::End => Some(csi_mod(mod_param, b'F')),
+        egui::Key::PageUp => Some(csi_tilde(5, mod_param)),
+        egui::Key::PageDown => Some(csi_tilde(6, mod_param)),
+        egui::Key::Insert => Some(csi_tilde(2, mod_param)),
+        egui::Key::Delete => Some(csi_tilde(3, mod_param)),
         egui::Key::ArrowUp => Some(csi_mod(mod_param, b'A')),
         egui::Key::ArrowDown => Some(csi_mod(mod_param, b'B')),
         egui::Key::ArrowRight => Some(csi_mod(mod_param, b'C')),
@@ -2660,6 +2673,15 @@ let term = Arc::new(RwLock::new(Term::new(
         assert_eq!(key_bytes(egui::Key::Tab, false, false, false), Some(vec![b'\t']));
         assert_eq!(key_bytes(egui::Key::Tab, false, false, true), Some(b"\x1b[Z".to_vec()));
         assert_eq!(key_bytes(egui::Key::Home, false, false, false), Some(b"\x1b[H".to_vec()));
+        assert_eq!(key_bytes(egui::Key::End, false, false, false), Some(b"\x1b[F".to_vec()));
+        // Ctrl+End/Ctrl+Home：透传修饰符（用户报告 ctrl+end 失效的根因——
+        // 旧版丢掉 mod_param，与无修饰字节相同）。
+        assert_eq!(key_bytes(egui::Key::End, true, false, false), Some(b"\x1b[1;5F".to_vec()));
+        assert_eq!(key_bytes(egui::Key::Home, true, false, false), Some(b"\x1b[1;5H".to_vec()));
+        assert_eq!(key_bytes(egui::Key::PageUp, true, false, false), Some(b"\x1b[5;5~".to_vec()));
+        assert_eq!(key_bytes(egui::Key::PageDown, true, false, false), Some(b"\x1b[6;5~".to_vec()));
+        assert_eq!(key_bytes(egui::Key::Delete, true, false, false), Some(b"\x1b[3;5~".to_vec()));
+        assert_eq!(key_bytes(egui::Key::Insert, false, false, true), Some(b"\x1b[2;2~".to_vec()));
         assert_eq!(key_bytes(egui::Key::PageUp, false, false, false), Some(b"\x1b[5~".to_vec()));
         assert_eq!(key_bytes(egui::Key::F1, false, false, false), Some(b"\x1bOP".to_vec()));
         assert_eq!(key_bytes(egui::Key::F5, false, false, false), Some(b"\x1b[15~".to_vec()));
