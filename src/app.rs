@@ -3258,8 +3258,6 @@ pub struct ClientApp {
     /// 编辑命令时的索引和缓冲区（Some(i) = 内联编辑第 i 行）。
     pub settings_edit_idx: Option<usize>,
     pub settings_edit_buffer: String,
-    /// 设置页「Ctrl+Shift+Z 发送」输入框的缓冲区。
-    pub settings_csz_buffer: String,
     /// 设置页里编辑的「工具更新目录」列表（工作副本，改动写回 config）。
     pub settings_tool_dirs: Vec<String>,
     /// 新增工具目录的输入框。
@@ -3912,7 +3910,6 @@ impl ClientApp {
         let settings_command = config.settings.tui_command.clone();
         let settings_commands = config.settings.tui_commands.clone();
         let settings_tool_dirs = config.settings.tool_paths.clone();
-        let settings_csz_buffer = config.settings.ctrl_shift_z.clone();
         // opencode 配置：读失败（如 jsonc 带注释）时只记错、设置页不提供写回。
         let (opencode_models, opencode_load_err) = match config::load_opencode_providers() {
             Ok(c) => (c, None),
@@ -3939,7 +3936,6 @@ impl ClientApp {
             settings_new_command: String::new(),
             settings_edit_idx: None,
             settings_edit_buffer: String::new(),
-            settings_csz_buffer,
             settings_tool_dirs,
             settings_new_tool_dir: String::new(),
             status: Some("在左侧选择项目并点击「启动」启动内嵌终端页签。".to_string()),
@@ -6417,7 +6413,6 @@ let s = TAB_GAP;
         self.tool_dirs_section_ui(ui);
         self.providers_section_ui(ui);
         ui.add_space(12.0);
-        self.keys_section_ui(ui);
         self.notify_section_ui(ui);
         ui.separator();
         ui.add_space(6.0);
@@ -6428,46 +6423,6 @@ let s = TAB_GAP;
         ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入即消失；失焦/回焦不算「看过」，窗口没回到屏幕前就不会被抹掉；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才弹系统通知并闪烁任务栏。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
 ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
-    }
-
-    /// 设置页的「终端 Ctrl+Shift+Z」：发什么字节给子进程（默认 ^Y）。
-    fn keys_section_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("终端 Ctrl+Shift+Z 发送").strong());
-        ui.label(
-            RichText::new(
-                "本机 Windows 的 ConPTY 字节流无法把 Ctrl+Shift+Z 作为按键传给子进程\n\
-                 （实测 kitty CSI-u / modifyOtherKeys 输入均不解析），只能翻译成子进程认识的字节序列。\n\
-                 默认 ^Y = Ctrl+Y（PowerShell PSReadLine / Visual Studio 的 redo 约定）。\n\
-                 pi 的 Ctrl+Y 是 yank（粘贴），不需要时可留空 = 按下无动作。\n\
-                 写法：^X = Ctrl+X，\\xNN = 十六进制（如 \\x1b[1;6Z），普通字符原样。",
-            )
-            .weak()
-            .small(),
-        );
-        ui.horizontal(|ui| {
-            ui.label("发送：");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.settings_csz_buffer).desired_width(140.0),
-            );
-            if resp.changed() {
-                let new = self.settings_csz_buffer.trim().to_string();
-                if config::parse_key_sequence(&new).is_some() {
-                    if self.config.settings.ctrl_shift_z != new {
-                        self.config.settings.ctrl_shift_z = new;
-                        self.persist_config();
-                    }
-                } else {
-                    self.status = Some(format!("按键写法无效，已还原: {new}"));
-                    self.settings_csz_buffer = self.config.settings.ctrl_shift_z.clone();
-                }
-            }
-        });
-        let hint = match config::parse_key_sequence(&self.config.settings.ctrl_shift_z) {
-            None => "（当前配置无效，按下将不发送）".to_string(),
-            Some(b) if b.is_empty() => "（空 = 按下无动作）".to_string(),
-            Some(b) => format!("每次 Ctrl+Shift+Z 发送: {:02X?}", b),
-        };
-        ui.label(RichText::new(hint).weak().small());
     }
 
     /// 设置页的「通知」区：说明「运行结束」与「任务完成」通知的规则。
@@ -7279,9 +7234,6 @@ ui.add_space(12.0);
             && self.settings_commands.iter().any(|c| c == &tui_command)
         {
             self.settings_command = tui_command;
-        }
-        if self.settings_csz_buffer != self.config.settings.ctrl_shift_z {
-            self.settings_csz_buffer = self.config.settings.ctrl_shift_z.clone();
         }
     }
 
@@ -8778,9 +8730,6 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                         &mut self.term_focused,
                     );
                     let wheel = &self.wheel;
-                    let ctrl_shift_z =
-                        config::parse_key_sequence(&self.config.settings.ctrl_shift_z)
-                            .unwrap_or_default();
                     let sess = match self.tabs.get_mut(self.current) {
                         Some(Tab::Session(s)) => s,
                         _ => unreachable!(),
@@ -8794,7 +8743,6 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                                 status,
                                 term_focused,
                                 wheel,
-                                &ctrl_shift_z,
                             );
                         }),
                     ) {

@@ -577,13 +577,9 @@ fn encode_char_key(key: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option
             return Some(vec![0]);
         }
         let lc = b.to_ascii_lowercase();
-        // Ctrl+Shift+Z → ^Y(0x19)：PSReadLine 的 Redo（Ctrl+Z = Undo 的反功能，
-        // Windows 默认绑定实测 Ctrl+z Undo / Ctrl+y Redo）。终端字节流无法
-        // 表达 shift+ctrl 字母，子进程只认 ^Y；Ctrl+Z 照旧发 ^Z（0x1a）。
-        // ponytail: bash/readline 无默认 redo，^Y 在那里是 yank（无害）。
-        if shift && lc == b'z' {
-            return Some(vec![0x19]);
-        }
+        // Ctrl 组合一律发控制码原样转发（Ctrl+Z = 0x1a），不再把 Ctrl+Shift+Z
+        // 特判成 ^Y：终端字节流表达不出 shift，子进程那边按键本身就没绑定，
+        // 翻译过去只会打到别的功能上（pi 的 Ctrl+Y 是 yank）。
         if lc.is_ascii_lowercase() {
             return Some(vec![lc - b'a' + 1]);
         }
@@ -972,7 +968,6 @@ pub fn show_terminal(
     status: &mut Option<String>,
     term_focused: &mut bool,
     wheel: &Wheel,
-    ctrl_shift_z: &[u8],
 ) {
     let perf = perf_on();
     let perf_t0 = std::time::Instant::now();
@@ -1615,14 +1610,6 @@ scroll_now(&sess.term, &sess.cmd_tx, if *key == egui::Key::PageUp {
                                     m.intersects(TermMode::DISAMBIGUATE_ESC_CODES)
                                 });
                             bytes_out.push(encode_modified_enter(shift, alt, ctrl, full));
-                        } else if ctrl && shift && !alt && *key == egui::Key::Z
-                            && !ctrl_shift_z.is_empty()
-                        {
-                            // Ctrl+Shift+Z → 设置里配置的字节序列（默认 ^Y = Ctrl+Y）。
-                            // 本机 ConPTY 字节流无法表达 Ctrl+Shift+Z 键，只能发子进程
-                            // 认识的另一种键；留空 = 不发（pi 的 Ctrl+Y 是 yank，想禁用
-                            // 就在设置里清空）。其余 Ctrl+X 照旧发 \x18。
-                            bytes_out.push(ctrl_shift_z.to_vec());
                         } else if let Some(bytes) =
                             encode_key(*key, ctrl, alt, shift, false)
                         {
@@ -2781,8 +2768,8 @@ let term = Arc::new(RwLock::new(Term::new(
         assert_eq!(key_bytes(egui::Key::A, true, false, false), Some(vec![0x01]));
         assert_eq!(key_bytes(egui::Key::C, true, false, false), Some(vec![0x03]));
         assert_eq!(key_bytes(egui::Key::Z, true, false, false), Some(vec![0x1a]));
-        // Ctrl+Shift+Z → ^Y（Redo = Ctrl+Z Undo 的反功能，PSReadLine 绑定）。
-        assert_eq!(key_bytes(egui::Key::Z, true, false, true), Some(vec![0x19]));
+        // Ctrl+Shift+Z 原样转发成 ^Z（字节流表达不出 shift，不再翻译成 ^Y）。
+        assert_eq!(key_bytes(egui::Key::Z, true, false, true), Some(vec![0x1a]));
         assert_eq!(key_bytes(egui::Key::Space, true, false, false), Some(vec![0x00]));
         // ctrl+shift+M -> \r
         assert_eq!(key_bytes(egui::Key::M, true, false, true), Some(vec![0x0d]));
