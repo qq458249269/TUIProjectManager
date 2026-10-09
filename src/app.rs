@@ -69,12 +69,25 @@ fn frame_delay_ms(interacting: bool, scrolling: bool, busy: bool) -> u64 {
 }
 
 /// 页签状态判定：只看**屏幕可见格的变化**（reader 逐块比对快照，见
-/// session.rs MIN_CONTENT_CELLS）。最近 3 秒内有成规模内容变化 → 运行中；
-/// 3 秒无内容 → 视为「输出结束/完成」。整屏重画同样的字（转义重绘）不算变化，
-/// 1~3 格的秒表/时钟也不算内容——两者曾让静止画面永远「有内容」，于是 🔄 常驻、
-/// ✅ 亮不出来。不做进程树 CPU 采样，不按 agent 分家。
-/// 代价即本方案：静默思考 / 网络等待（>3s 屏幕不动）会被判为完成。
+/// session.rs MIN_CONTENT_CELLS）。最近 [`OUTPUT_END_MS`] 内有成规模内容变化 →
+/// 运行中；**整段静默 ≥ [`DONE_QUIET_MS`]** 才视为「输出结束/完成」。整屏重画
+/// 同样的字（转义重绘）不算变化，1~3 格的秒表/时钟也不算内容——两者曾让静止
+/// 画面永远「有内容」，于是 🔄 常驻、✅ 亮不出来。不做进程树 CPU 采样，不按
+/// agent 分家。
+/// 代价即本方案：静默思考 / 网络等待（长时间屏幕不动）仍会被判为完成，只是把
+/// 窗口从 3s 拉到 8s（见 [`DONE_QUIET_MS`]）。
 const OUTPUT_END_MS: u64 = 3_000;
+/// 「判完成」的静默门槛，**宽于 🔄 的内容窗口**（[`OUTPUT_END_MS`]）：两者故意
+/// 不等，否则「刚停下来 3~8s」这段窗口里没有 🔄 也没有 ✅，页签图标直接空掉。
+///
+/// 为什么从「同一条 3s」拆成两档（用户反馈「状态被误判完成，实际还在执行中」）：
+/// agent 回合里的静默极常见——按下回车到首个 token 到达（模型排队/网络）、跑一条
+/// 不出字的命令（编译、等网络）、工具执行期间 TUI 只在有变化时重绘。这些静默与
+/// 「回合真的跑完了」在屏幕上**不可区分**，所以只能整体后延：✅ 推迟 5s 亮起，
+/// 换来这 5s 内继续亮 🔄。代价是真跑完的页签晚 5s 变 ✅（页签在跑态多挂 5s，
+/// 远好过谎报完成 + 误弹「任务完成」）。系统通知另有更严的 [`TOAST_QUIET_MS`]
+/// （10s），不受此值影响。
+const DONE_QUIET_MS: u64 = 8_000;
 /// 用户驱动回显例外（✂ 不吞任务真实输出）：键盘/IME/粘贴、点击/中键转发都写
 /// last_input_ms（terminal.rs 统一走 stamp_user_input 记账）→ 直接引发的回显
 /// 是用户驱动、不是任务在跑，其窗口内跳过 🔄 判定；滚动转发的 TUI 重绘回显记
@@ -3409,9 +3422,11 @@ fn watched(is_current: bool, app_fg: bool) -> bool {
 /// ❌ 进程已退出 / 🔄 启动加载中 → 压过一切。
 /// 🔄 画面 ≤ANIM_BUSY_MS 就变过（spinner/时钟/进度条/流式打字都落这里）
 ///   或画面在 ≤MOTION_HOLD_MS 内**连续**动过（跨得过一个采样间隔）
-///   或 最近 3s 内有成规模内容变化 → 运行中。
+///   或 最近 3s 内有成规模内容变化
+///   或 内容才停了不到 DONE_QUIET_MS（不确定窗口，宁可先报在跑）→ 运行中。
 ///   · 最近 1.5s 打字、500ms 滚轮回显不算「在跑」（用户自己弄出来的）。
-/// ✅ 有内容、**未查看**、成规模内容已 ≥3s 未变、画面也不在高频动 → 完成/待查看。
+/// ✅ 有内容、**未查看**、成规模内容已 ≥DONE_QUIET_MS 未变、画面也不在高频动
+///   → 完成/待查看。
 /// 其余（已查看 / 从无内容）→ 空。激活页签跑完同样先亮 ✅（不看是不是当前页签），
 /// 但真实交互（点/切页签、终端内操作，记账在 `has_been_viewed`）一到就熄。
 #[allow(clippy::too_many_arguments)]
@@ -3448,11 +3463,21 @@ fn tab_icon(
     let motion = last_motion != 0 && now_ms.saturating_sub(last_motion) < MOTION_HOLD_MS;
     // 成规模内容最近 ≤3s → 运行中。秒表/时钟这类 1~3 格的小刷新不算内容。
     let fresh_content = last_content != 0 && now_ms.saturating_sub(last_content) <= OUTPUT_END_MS;
-    if !typing && !scroll_echo && (fresh_content || screen_busy || motion) {
+    // 静默是否已越过判完成的门槛（见 DONE_QUIET_MS）。last_content=0（从未变化过）
+    // 时恒为 true——零内容会话不参与完成判定，见下面的 count > 0。
+    let quiet_enough = now_ms.saturating_sub(last_content) > DONE_QUIET_MS;
+    // 🔄 = 「还在动」三条通道任一成立，**或**内容才停了不到 DONE_QUIET_MS：
+    // 后半句管的是「3s 之后、8s 之前」那段不确定窗口（agent 回合中途的静默、
+    // 长命令的无声期）——这时判完成太早（用户反馈「实际还在执行，状态却说完成」），
+    // 判空图标又像丢了状态，所以继续报在跑。1Hz 秒表/时钟的 last_content 早就是
+    // 陈旧的（它不算内容），照样落回 ✅。
+    // 用户驱动的输入/滚轮回显窗口内不报 🔄（回显是用户自己弄出来的）。
+    let user_own_echo = typing || scroll_echo;
+    if !user_own_echo && (fresh_content || screen_busy || motion || !quiet_enough) {
         return Some("🔄");
     }
-    // 无内容 ≥3s → 完成；有内容（count>0）且用户未查看才亮 ✅。
-    if count > 0 && !viewed && now_ms.saturating_sub(last_content) > OUTPUT_END_MS {
+    // 完成：静默已过门槛、有内容、**未查看**。其余（已查看 / 从无内容）→ 空。
+    if count > 0 && !viewed && quiet_enough {
         return Some("✅");
     }
     // 空：无内容可看 / 已查看过。
@@ -4939,17 +4964,17 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
     // ---- 渲染 ----
 
     /// 页签块底色：选中 → 实底高亮，悬停 → 半透明浅染，否则透明。
-    /// 深色模式下使用深灰底色 + 微弱蓝色点缀，与面板背景区分但不刺眼；
-    /// 浅色模式沿用 egui 选中蓝。
+    /// 深色模式下用**深蓝**实底（浅色模式的选中色是 `from_gray(176)`，那是浅灰块，
+    /// 搬到深色面板上刺眼）：原选的 `rgb(42,44,52)` 与面板底色（egui Dark 的
+    /// `panel_fill` ≈ rgb(32,32,32)）只差十级灰，用户反馈「深色状态下激活页签
+    /// 颜色不明显」。改成蓝调深底（明度/色相都拉开了）+ 下边线（见 tab_accent），
+    /// 两个信号叠加才算真正「一眼看出当前在哪个页签」。
     fn tab_bg(sel_fill: Color32, selected: bool, hovered: bool, dark: bool) -> Color32 {
         if dark {
-            // 深色模式：深灰底色（比面板背景 #1e1e22 稍亮），带微弱蓝色调
-            let accent = Color32::from_rgb(42, 44, 52);   // 深灰偏冷
-            let hover = Color32::from_rgb(52, 54, 64);    // 悬停稍亮
             if selected {
-                accent
+                Color32::from_rgb(41, 66, 104)    // 选中：深蓝实底
             } else if hovered {
-                hover
+                Color32::from_rgb(58, 60, 70)    // 悬停：中性浅一档
             } else {
                 Color32::TRANSPARENT
             }
@@ -4962,6 +4987,29 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
                 Color32::TRANSPARENT
             }
         }
+    }
+
+    /// 选中页签的强调下边线颜色（`block` 是 `tab_bg` 那块色块的矩形）。
+    ///
+    /// 只在深色模式画：深色下底色再深，选中与否的差异仍偏「色相」而非「明度」，
+    /// 再压一条 2px 高亮边（VS Code / 浏览器那种 active tab 底线），选中态在任何
+    /// 缩放与背景色下都认得出来。浅色模式的选中块本来就是浅灰满块（明度差极大），
+    /// 再加底线只是噪声，不画。选不中时返回 None（调用方跳过）。
+    fn tab_accent(dark: bool, selected: bool, block: egui::Rect) -> Option<egui::Shape> {
+        if !dark || !selected {
+            return None;
+        }
+        const H: f32 = 2.0;
+        // 两端各留 8px：极窄页签（将来做图标页签）也不让 rect 反转。
+        let inset = 8.0f32.min(block.width() / 3.0);
+        Some(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(block.left() + inset, block.bottom() - H),
+                egui::pos2(block.right() - inset, block.bottom()),
+            ),
+            1.0,
+            Color32::from_rgb(116, 170, 255),
+        ))
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -5029,8 +5077,12 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
                 }
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
+                let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
+                let block = rect.expand2(egui::vec2(5.0, 2.0));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(block, 0.0, bg));
+                if let Some(accent) = Self::tab_accent(dark, selected, block) {
+                    ui.painter().add(accent);
+                }
             }
 
             // ── 固定区：设置页签（恒在首页之后，与首页完全同款）──
@@ -5067,8 +5119,12 @@ let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
                 }
                 let hovering = !selected
                     && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-                let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
+                    let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
+                let block = rect.expand2(egui::vec2(5.0, 2.0));
+                ui.painter().set(bg_idx, egui::Shape::rect_filled(block, 0.0, bg));
+                if let Some(accent) = Self::tab_accent(dark, selected, block) {
+                    ui.painter().add(accent);
+                }
                 // 不进 tab_rects：拖动落位不许把会话插到设置页签前面/后面去。
             }
 
@@ -5395,7 +5451,11 @@ let s = TAB_GAP;
                         && drag_index.is_none()
                         && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
                     let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
-                    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(5.0, 2.0)), 0.0, bg));
+                    let block = rect.expand2(egui::vec2(5.0, 2.0));
+                    ui.painter().set(bg_idx, egui::Shape::rect_filled(block, 0.0, bg));
+                    if let Some(accent) = Self::tab_accent(dark, selected, block) {
+                        ui.painter().add(accent);
+                    }
                     tab_rects.push((i, rect));
 } else if let Tab::Placeholder { title } = tab {
                     // ── 重启/切换命令占位页签：保持位置与标题可见，不可拖动/关闭。
@@ -8256,7 +8316,7 @@ let mut busy = self.downloading
 // 交互活跃：最近有键盘/IME/粘贴输入，或 500ms 内有滚轮。优先级高于
         // busy（输出在途时也先保证回显跟手）。
         let now_ms = crate::now_ms();
-let (interacting, scrolling) = self.tabs.get(self.current).map_or((false, false), |t| {
+        let (mut interacting, scrolling) = self.tabs.get(self.current).map_or((false, false), |t| {
             let Tab::Session(s) = t else { return (false, false) };
             let li = s.last_input_ms.load(Ordering::Relaxed);
             let ls = s.last_scroll_ms.load(Ordering::Relaxed);
@@ -8265,6 +8325,14 @@ let (interacting, scrolling) = self.tabs.get(self.current).map_or((false, false)
                 ls != 0 && now_ms.saturating_sub(ls) < SCROLL_ECHO_MS,
             )
         });
+        // Ctrl/⌘ 按住期间强制 60 FPS：终端里靠**物理 V 键状态**认 Ctrl+V 手势
+        // （文件剪贴板时 egui 一个事件都不给，见 terminal.rs v_key_down），
+        // 全靠帧采样。IDLE 500ms 心跳会跳过 ~100ms 的一次轻点，Ctrl+V 偶发
+        // 粘不上；按住 Ctrl 本来就是「人正在按键」，也算交互。
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        if ctrl_held && matches!(self.tabs.get(self.current), Some(Tab::Session(_))) {
+            interacting = true;
+        }
         if let Some(Tab::Session(s)) = self.tabs.get(self.current) {
             // 仅前台页签消费合并信号：解析线程有新输出待画时按配置帧率刷新。
             if s.redraw_rx.try_recv().is_ok() {
@@ -8789,8 +8857,8 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
-        state_due, tab_icon, toast_quiet_enough, ANIM_BUSY_MS, ICON_BUSY, ICON_EMPTY,
-        OUTPUT_END_MS, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS, icon_code,
+        state_due, tab_icon, toast_quiet_enough, ANIM_BUSY_MS, DONE_QUIET_MS, ICON_BUSY,
+        ICON_EMPTY, OUTPUT_END_MS, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS, icon_code,
     };
     use std::sync::atomic::Ordering;
 
@@ -8819,14 +8887,36 @@ tab_icon(
         assert_eq!(icon(0, false, 2_000), Some("🔄"));
     }
 
-    // 边界：恰好 3s 内仍有内容 → 🔄；超过 3s → 完成。
+    // 边界：恰好 3s 内仍有内容 → 🔄；刚过 3s 仍是 🔄（**不确定窗口**，见
+    // DONE_QUIET_MS：agent 回合中途的静默就落在这段，报完成太早）。
     #[test]
     fn three_sec_boundary() {
         assert_eq!(icon(10, false, 3_000), Some("🔄"));
-        assert_eq!(icon(10, false, 3_001), Some("✅"));
+        assert_eq!(icon(10, false, 3_001), Some("🔄"));
+        // 静默满 DONE_QUIET_MS 才判完成。
+        assert_eq!(icon(10, false, DONE_QUIET_MS), Some("🔄"));
+        assert_eq!(icon(10, false, DONE_QUIET_MS + 1), Some("✅"));
     }
 
-// 3s 无内容 + 有内容 + 未查看 → ✅（完成/待查看）。
+    // 回归（用户反馈「状态被误判完成，实际还在执行中」）：agent 回合中途的静默
+    // ——按下回车到首个 token 到达、跑一条不出字的命令、工具执行期 TUI 只在有
+    // 变化时重绘——最长可达好几秒。旧判据 3s 就亮 ✅，等于谎报完成；现在
+    // 3~DONE_QUIET_MS 这段继续报 🔄（而不是掉成空图标，那更像丢了状态）。
+    #[test]
+    fn mid_turn_silence_keeps_running_until_done_quiet() {
+        for silent in [3_001u64, 4_000, 6_000, DONE_QUIET_MS - 1] {
+            assert_eq!(
+                icon(10, false, silent),
+                Some("🔄"),
+                "回合中途静默 {silent}ms 内不许判完成"
+            );
+        }
+        // 已查看的页签同样走 🔄（不看 viewed），过门槛后才落空。
+        assert_eq!(icon(10, true, 5_000), Some("🔄"));
+        assert_eq!(icon(10, true, DONE_QUIET_MS + 1), None);
+        // 反向代价钉住：真跑完后 ✅ 确实晚 DONE_QUIET_MS 才亮。
+        assert_eq!(icon(10, false, DONE_QUIET_MS + 1), Some("✅"));
+    }
     #[test]
     fn content_stopped_3s_shows_done() {
         assert_eq!(icon(10, false, 10_000), Some("✅"));
@@ -8929,12 +9019,12 @@ tab_icon(
     }
 
     /// 整屏重画同样的字 = 屏幕零变化：两个时间戳都不该被刷新，于是安静下来
-    /// 3s 后就是 ✅（旧判据只看到「字节一直在来」→ 永远 🔄）。
+    /// 过 DONE_QUIET_MS 后就是 ✅（旧判据只看到「字节一直在来」→ 永远 🔄）。
     #[test]
     fn identical_repaint_is_not_progress() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 5_000, now - 5_000, 0, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now, 0, 0),
             Some("✅")
         );
     }
@@ -9002,11 +9092,14 @@ fn scrolling_does_not_count_as_update() {
     #[test]
     fn toast_needs_more_silence_than_the_icon() {
         let now = 100_000u64;
-        assert_eq!(icon(10, false, 5_000), Some("✅"));
-        assert!(!toast_quiet_enough(now - 5_000, now));
+        assert_eq!(icon(10, false, 10_000), Some("✅"));
+        assert!(!toast_quiet_enough(now - 10_000, now));
         assert!(!toast_quiet_enough(now - TOAST_QUIET_MS, now));
         assert!(toast_quiet_enough(now - TOAST_QUIET_MS - 1, now));
-        assert!(TOAST_QUIET_MS > OUTPUT_END_MS);
+        assert!(
+            TOAST_QUIET_MS > OUTPUT_END_MS && TOAST_QUIET_MS > DONE_QUIET_MS,
+            "通知门槛要宽于页签图标的两档门槛（🔄 的内容窗口 / 判完成的静默门槛）"
+        );
     }
 
 /// 从未有内容（时间戳仍是初始 0）不得走完成通知：0 距 now 恒「远超门槛」。
@@ -9151,6 +9244,60 @@ mod frame_delay_tests {
                 && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS,
             "帧率档必须单调"
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_look_tests {
+use super::{ClientApp, Color32};
+    use eframe::egui::{Rect, Shape, Vec2, pos2};
+
+    /// 相对亮度（sRGB 通道均值够用：只看「亮不亮」这一个维度）。
+    fn lum(c: Color32) -> f32 {
+        (c.r() as f32 + c.g() as f32 + c.b() as f32) / 3.0
+    }
+
+    /// 深色模式的选中页签必须一眼可见（用户反馈「深色状态下激活页签颜色不明显」）。
+    /// 旧底色 rgb(42,44,52) 与面板底色 rgb(32,32,32) 只差十级灰，肉眼分不出。
+    /// 现在钉三件事：选中比悬停亮、比面板底色亮得多（≥16 级）、且带蓝色调。
+    #[test]
+    fn dark_selected_tab_is_obvious() {
+        let panel = Color32::from_rgb(32, 32, 32); // egui Dark 的 panel_fill
+        let sel = ClientApp::tab_bg(Color32::from_gray(176), true, false, true);
+        let hov = ClientApp::tab_bg(Color32::from_gray(176), false, true, true);
+        let idle = ClientApp::tab_bg(Color32::from_gray(176), false, false, true);
+        assert_eq!(idle, Color32::TRANSPARENT, "未选中页签不占地色");
+        assert!(lum(sel) - lum(panel) >= 16.0, "选中底色要明显亮过面板底色");
+        assert!(lum(sel) > lum(hov), "选中要比悬停更突出");
+        assert!(
+            sel.b() > sel.r() + 30,
+            "选中底色带蓝调（{:?}），与面板的中性灰不同族",
+            sel
+        );
+    }
+
+    /// 浅色模式语义不变：选中 = egui 选中色（from_gray(176)），不画下边线。
+    #[test]
+    fn light_selected_tab_keeps_egui_selection_color() {
+        let sel_fill = Color32::from_gray(176);
+        assert_eq!(ClientApp::tab_bg(sel_fill, true, false, false), sel_fill);
+        let r = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(80.0, 20.0));
+        assert!(ClientApp::tab_accent(false, true, r).is_none());
+    }
+
+    /// 强调下边线只在「深色 + 选中」时画，且落在色块底边内（不盖住页签文字）。
+    #[test]
+    fn accent_bar_only_for_dark_selected_tab() {
+        let r = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(80.0, 20.0));
+        let bar = ClientApp::tab_accent(true, true, r).expect("深色选中页签要有下边线");
+        let Shape::Rect(sh) = bar else {
+            panic!("下边线应是矩形")
+        };
+        assert!(sh.rect.top() >= r.top() && sh.rect.bottom() <= r.bottom() + 0.01);
+        assert!(sh.rect.height() >= 2.0, "至少 2px 高，否则细到看不见");
+        assert_eq!(sh.rect.width(), r.width() - 16.0, "两端留白，不顶到页签角");
+        assert!(ClientApp::tab_accent(true, false, r).is_none(), "未选中不画");
+        assert!(ClientApp::tab_accent(false, true, r).is_none(), "浅色模式不画");
     }
 }
 

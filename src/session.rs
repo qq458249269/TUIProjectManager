@@ -243,8 +243,9 @@ pub struct Session {
     /// 稳定停留 DONE_STABLE_MS 才提醒，过滤 top/watch/编译间歇输出等周期性
     /// 进程在 🔄↔✅ 间横跳造成的重复误报。
     pub done_since_ms: Arc<AtomicU64>,
-    /// 上次认领的剪贴板序列号（复制文件后 Ctrl+V 的兜底识别，见 show_terminal）。
-    pub last_clipboard_seq: Option<std::num::NonZeroU32>,
+    /// 本次「物理 V 键按住」是否已经认领过一次文件粘贴（终端.rs 的 Ctrl+V
+    /// 兜底）。按住不放（含系统自动重复）只注入一次，V 松开才复位。
+    pub file_paste_held: bool,
     /// 最近一次有输出的绝对时间戳（毫秒），供 UI 精确判定连续输出是否已停。
     /// 含转义/动画块：页签 🔄 图标用——动画重绘也算在跑（spinner/状态栏
     /// 刷新保持旋转）。
@@ -1586,7 +1587,7 @@ guard_ctx.request_repaint();
         last_toast_ms: Arc::new(AtomicU64::new(0)),
         last_reap_ms: Arc::new(AtomicU64::new(0)),
         done_since_ms: Arc::new(AtomicU64::new(0)),
-        last_clipboard_seq: None,
+        file_paste_held: false,
         output_count,
         out_bytes,
         last_output_ms,

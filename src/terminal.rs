@@ -19,7 +19,7 @@ use crate::session::TermSnapshot;
 use crate::session::RowCache;
 use crate::term_gl::{hash_mix, CellQuad, GlyphAtlas, TermGpu};
 // 读 Windows 剪贴板 CF_HDROP（资源管理器复制/剪切的文件列表）。
-use clipboard_win::{formats::FileList, get_clipboard, raw as clip_raw, set_clipboard_string};
+use clipboard_win::{formats::FileList, get_clipboard, set_clipboard_string};
 
 /// 终端内嵌页面使用的等宽字号。
 pub const TERM_FONT_SIZE: f32 = 14.0;
@@ -362,6 +362,35 @@ fn clipboard_files() -> Vec<String> {
     get_clipboard(FileList).unwrap_or_default()
 }
 
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetAsyncKeyState(vkey: i32) -> i16;
+}
+
+/// 物理 V 键当前是否按住（VK_V = 0x56，高位 0x8000 = 按下中）。
+///
+/// 为什么必须绕到物理键：**egui 事件流里根本看不到 Ctrl+V**。egui-winit 在
+/// `on_keyboard_input` 里对粘贴组合键 `return` 得极早（egui-winit 0.36
+/// src/lib.rs：`is_paste_command` 分支），只有剪贴板**有文本**时才补一个
+/// `Event::Paste`；剪贴板里只有文件时这次按键既不产生 `Event::Paste` 也不产生
+/// `Event::Key`。于是「从事件里认粘贴手势」这条路是死的——任何「Ctrl 按住 +
+/// 别的事件没来」的判据都会把 Ctrl+Tab / Ctrl+Shift+A 之类一并吞掉（旧实现
+/// 正是栽在这：凡 Ctrl 按住且剪贴板序列号变过就注入路径，切页签时凭空往
+/// 输入行插一串文件路径）。GetAsyncKeyState 是全局物理状态，egui 吞不干净。
+///
+/// 采样可靠性：logic() 把「Ctrl/⌘ 按住」计入 interacting（16ms 一帧，见
+/// frame_delay_ms），所以按下 V 后的 ~100ms 必被采到，不会被 IDLE 500ms
+/// 心跳跳过去。
+#[cfg(windows)]
+fn v_key_down() -> bool {
+    unsafe { GetAsyncKeyState(0x56) as u16 & 0x8000 != 0 }
+}
+#[cfg(not(windows))]
+fn v_key_down() -> bool {
+    false
+}
+
 /// 把绝对路径转成相对会话启动目录的路径（Windows 路径不区分大小写）：
 /// 在目录内 → 相对路径；目录外 → 保留绝对路径。前缀必须落在分隔符上，
 /// 避免 `D:\code` 误把 `D:\code2\a.txt` 裁成 `2\a.txt`。
@@ -390,6 +419,47 @@ fn path_for_input(p: &str) -> String {
     } else {
         p.to_string()
     }
+}
+
+/// 「这一帧的物理 V 键按住所代表的粘贴手势」该不该注入文件路径（纯函数）。
+///
+/// 为什么要物理键：文件剪贴板时 egui-winit 对 Ctrl+V 直接吞掉，事件流里既没有
+/// `Event::Paste` 也没有 `Event::Key`（见 [`v_key_down`]）。而旧判据「Ctrl 按住 +
+/// 剪贴板序列号变过」根本不是粘贴手势，是「剪贴板变过之后的第一次任意 Ctrl 按键」
+/// —— Ctrl+Tab 切页签、Ctrl+Shift+A 等都会命中，于是输入行凭空多出一串文件路径、
+/// 状态栏弹「已粘贴文件相对路径」（用户报告）。现在**只有 V 键按住**才算手势。
+///
+/// 逐条判据：
+/// · `v_down`：物理 V 键按住（egui 看不见的那一次按键）；
+/// · `already_held`：本次按住已经注入过 → 不重复（连按/系统自动重复只粘一次）；
+/// · `ctrl`：Ctrl/⌘ 按住才可能是粘贴；`alt` 是 AltGr（部分布局下 Ctrl+Alt+字母
+///   是可打印字符），排除；
+/// · `app_focused`：窗口不在前台时物理键状态是别的程序在用，不能认领；
+/// · `!saw_paste_event`：剪贴板文本与文件都有时 egui 已给 `Event::Paste`，下面
+///   的 Paste 分支按「文件优先」处理过了，再注入就是同一次手势粘两遍；
+/// · `has_sel`/`over_term`：有文本选区（复制优先）或指针不在终端上，都不是
+///   「往这个终端粘路径」。`has_sel` 是闭包：读选区要抢 term 锁（与 reader 的
+///   写锁竞争），而手势本身极罕见——`&&` 短路保证前面任一条不成立时闭包根本
+///   不被调用，这一帧完全不碰锁。
+#[allow(clippy::too_many_arguments)]
+fn paste_files_intent(
+    v_down: bool,
+    already_held: bool,
+    ctrl: bool,
+    alt: bool,
+    app_focused: bool,
+    saw_paste_event: bool,
+    has_sel: impl FnOnce() -> bool,
+    over_term: bool,
+) -> bool {
+    v_down
+        && !already_held
+        && ctrl
+        && !alt
+        && app_focused
+        && !saw_paste_event
+        && !has_sel()
+        && over_term
 }
 
 /// 把剪贴板/拖放的文件列表转成相对路径并写入终端输入行。
@@ -1435,26 +1505,34 @@ if paste_file_paths(sess, &files, status) {
         }
     }
 
+    // 物理 V 键状态每帧维护（与焦点无关）：粘文件手势靠它认领/清零，见下方兜底。
+    let v_down = v_key_down();
+    if !v_down {
+        sess.file_paste_held = false;
+    }
+
     if *term_focused {
-        // 剪贴板里只有文件（资源管理器复制）时，egui 的 Ctrl+V 不产生任何事件
-        // （它只读文本剪贴板，没文本就直接吞掉按键）。用剪贴板序列号兜底：
-        // 序列变化 + Ctrl 按下 + 指针在终端上 + 无文本选区，视为一次“粘贴文件”
-        // 手势。数字签变化只认领一次，避免每次按住 Ctrl 都重复注入。
-        if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
-            let seq = clip_raw::seq_num();
-            if sess.last_clipboard_seq != seq {
-                sess.last_clipboard_seq = seq;
-                let has_sel = sess
-                    .term
-                    .read()
-                    .map(|t| t.selection.is_some())
-                    .unwrap_or(false);
-                let over_term = ui
-                    .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
-                if !has_sel && over_term {
-                    paste_file_paths(sess, &clipboard_files(), status);
-                }
-            }
+        // ── Ctrl+V 粘贴文件路径兜底 ──
+        // 剪贴板里只有文件（资源管理器复制）时 egui 完全不产事件（见 v_key_down
+        // 的注释），只能靠「物理 V 键按住 + Ctrl/⌘ 按住」认手势（纯函数
+        // paste_files_intent，逐项判据有单测钉住）。
+        let mods = ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.alt));
+        let app_focused = ui.input(|i| i.focused);
+        let saw_paste_event = ui
+            .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+        let over_term = ui.input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
+        if paste_files_intent(
+            v_down,
+            sess.file_paste_held,
+            mods.0,
+            mods.1,
+            app_focused,
+            saw_paste_event,
+            || sess.term.read().map(|t| t.selection.is_some()).unwrap_or(false),
+            over_term,
+        ) {
+            sess.file_paste_held = true;
+            paste_file_paths(sess, &clipboard_files(), status);
         }
 
         // 事件在单次 input 闭包内就地处理：原实现先 clone 整个事件列表再遍历，
@@ -2795,6 +2873,60 @@ let term = Arc::new(RwLock::new(Term::new(
             encode_modified_enter(true, false, true, true),
             b"\x1b[13;6u".to_vec()
         );
+    }
+
+/// 回归（用户报告「按 Ctrl+Tab 切换页签，状态栏提示已粘贴文件相对路径、
+    /// 输入框里多出文件路径」）：粘文件手势**只认物理 V 键**。旧判据是「Ctrl 按住 +
+    /// 剪贴板序列号变过」，等价于「剪贴板变过之后的第一次任意 Ctrl 按键」——
+    /// 切页签的 Ctrl+Tab 正中靶心。
+    #[test]
+    fn only_ctrl_v_pastes_files_not_ctrl_tab() {
+    // 基准手势：V 按住 + Ctrl + 窗口前台 + 指针在终端上 + 无选区 + 无 Paste 事件。
+        let ok = |v_down, held, ctrl, alt, focused, paste_ev, sel, over| {
+            paste_files_intent(v_down, held, ctrl, alt, focused, paste_ev, || sel, over)
+        };
+        assert!(ok(true, false, true, false, true, false, false, true));
+        // Ctrl+Tab / Ctrl+Shift+A：V 没按 → 不是粘贴手势。
+        assert!(!ok(false, false, true, false, true, false, false, true));
+        // 只有 V、没有 Ctrl（例如用户自己打字打出一个 v）→ 也不认。
+        assert!(!ok(true, false, false, false, true, false, false, true));
+        // 选区闭包不被调用（手势不成立时不能为读选区去抢 term 锁）。
+        let mut asked = false;
+        assert!(!paste_files_intent(
+            false, false, true, false, true, false, || {
+                asked = true;
+                false
+            },
+            true
+        ));
+        assert!(!asked, "手势不成立时不应读 term 锁");
+    }
+
+    /// 同一次按住只注入一次（系统自动重复也不能连着粘）；松手后认下一次。
+    #[test]
+    fn holding_v_pastes_once() {
+        assert!(paste_files_intent(
+            true, false, true, false, true, false, || false,
+            true
+        ));
+        assert!(!paste_files_intent(
+            true, true, true, false, true, false, || false,
+            true
+        ));
+    }
+
+    /// 其余门槛：AltGr、窗口失焦、指针不在终端、有文本选区（复制优先）、
+    /// 本帧已有 Event::Paste（文本+文件剪贴板，别粘两遍）。
+    #[test]
+    fn paste_intent_extra_guards() {
+        let base = |alt, focused, paste_ev, sel, over| {
+            paste_files_intent(true, false, true, alt, focused, paste_ev, || sel, over)
+        };
+        assert!(!base(true, true, false, false, true), "AltGr 不是粘贴");
+        assert!(!base(false, false, false, false, true), "窗口失焦不认领");
+        assert!(!base(false, true, true, false, true), "本帧已有 Paste 事件");
+        assert!(!base(false, true, false, true, true), "有文本选区 = 复制优先");
+        assert!(!base(false, true, false, false, false), "指针不在终端上");
     }
 
     /// 相对路径转换：大小写不敏感、目录边界必须落分隔符、目录外保留绝对。
