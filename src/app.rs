@@ -95,8 +95,9 @@ const DONE_STABLE_MS: u64 = 2_000;
 /// 页签图标与「任务完成」通知都读同一份每秒快照（Session.state_icon /
 /// state_done），好处三条：① 检测频率封顶（帧率再高也不重算时间判据）；
 /// ② 图标不会亚秒抖动；③ 图标与通知不会各判各的、互相打脸。
-/// 三个**事件驱动**的例外不排队，立即重算：首次判定、退出/加载态翻转（❌ 与
-/// 启动 🔄 必须即时）、出现新的实质内容（命令刚跑起来 🔄 要立刻亮）。
+/// 四个**事件驱动**的例外不排队，立即重算：首次判定、退出/加载态翻转（❌ 与
+/// 启动 🔄 必须即时）、出现新的实质内容（命令刚跑起来 🔄 要立刻亮）、
+/// **画面在连续动**（见 [`MOTION_HOLD_MS`]）。
 const STATE_CHECK_MS: u64 = 1_000;
 /// 动画活性阈值：最近 ANIM_BUSY_MS 内**屏幕可见格发生过变化** ⇒ 画面还在动
 /// （spinner/时钟/进度条/流式打字，帧间隔 ~80-150ms）⇒ **还在思考/还在跑命令**，
@@ -107,6 +108,16 @@ const STATE_CHECK_MS: u64 = 1_000;
 /// 这是纯屏幕启发式的固有边界：全程无输出也无动画的长命令（静默编译）3s 后仍会
 /// 判完成；空闲时仍高频刷动画的全屏 TUI 会常亮 🔄——宁可少亮一次 ✅，也不谎报。
 const ANIM_BUSY_MS: u64 = 250;
+/// 「画面在**连续快速动**」的保持窗口（reader 按 [`MOTION_GAP_MS`] 节奏记
+/// `Session::last_motion_ms`，这里管它能撑多久）。
+///
+/// 为什么 [`ANIM_BUSY_MS`] 不够：它判的是「**刚刚**变了」，而图标读的是**采样**
+/// 结果（STATE_CHECK_MS=1s 才重算一次）。两者错位 ⇒ 动画周期只要不是 1s 的
+/// 整数倍，采样点大多数落在 250ms 窗口外：实测进度条 800ms 一跳时 75% 的时间
+/// 显示空图标（用户反馈「后台页签明明在跑，状态却经常变空」），时钟 2s 一跳时
+/// 50%。窗口取 1s ⇒ 跨得过一个采样间隔；且只在**连续**变化时才有值（1Hz 的
+/// 秒表/时钟进不了 reader 侧的 MOTION_GAP_MS，仍按 ANIM_BUSY_MS 判完成）。
+const MOTION_HOLD_MS: u64 = 1_000;
 /// 同一页签两条系统通知的最小间隔：完成提醒每轮 ✅ 都可再弹（done_notified
 /// 随 ✅ 离开复位），靠 10s 节流防周期输出/退出-完成连发轰炸（用户拍板）。
 const TOAST_MIN_INTERVAL_MS: u64 = 10_000;
@@ -3397,6 +3408,7 @@ fn watched(is_current: bool, app_fg: bool) -> bool {
 /// 判定链（自上而下，先到先得）：
 /// ❌ 进程已退出 / 🔄 启动加载中 → 压过一切。
 /// 🔄 画面 ≤ANIM_BUSY_MS 就变过（spinner/时钟/进度条/流式打字都落这里）
+///   或画面在 ≤MOTION_HOLD_MS 内**连续**动过（跨得过一个采样间隔）
 ///   或 最近 3s 内有成规模内容变化 → 运行中。
 ///   · 最近 1.5s 打字、500ms 滚轮回显不算「在跑」（用户自己弄出来的）。
 /// ✅ 有内容、**未查看**、成规模内容已 ≥3s 未变、画面也不在高频动 → 完成/待查看。
@@ -3410,6 +3422,7 @@ fn tab_icon(
     viewed: bool,
     last_content: u64,
     last_screen: u64,
+    last_motion: u64,
     now_ms: u64,
     last_input: u64,
     last_scroll: u64,
@@ -3427,9 +3440,15 @@ fn tab_icon(
     // 画面在高频动 ⇒ 界面在动（spinner/时钟/进度条/流式打字）→ 不是结束态。
     // 一次采样定生死：spinner 每 ~100ms 一帧，1s 门限下采样恒落在窗口内。
     let screen_busy = last_screen != 0 && now_ms.saturating_sub(last_screen) < ANIM_BUSY_MS;
+    // 画面在**连续**快速动（进度条/流式打字这类间隔 >ANIM_BUSY_MS 但
+    // ≤MOTION_GAP_MS 的变化）：瞬时信号跨不过 1s 的采样间隔，靠它兜住——否则
+    // 采样点大多数落在上面那个窗口外，🔄 掉成空（已查看页签）或误亮 ✅。
+    // 1Hz 秒表/时钟进不了 reader 侧的 MOTION_GAP_MS，这里恒为 0，仍按
+    // ANIM_BUSY_MS 判完成。
+    let motion = last_motion != 0 && now_ms.saturating_sub(last_motion) < MOTION_HOLD_MS;
     // 成规模内容最近 ≤3s → 运行中。秒表/时钟这类 1~3 格的小刷新不算内容。
     let fresh_content = last_content != 0 && now_ms.saturating_sub(last_content) <= OUTPUT_END_MS;
-    if !typing && !scroll_echo && (fresh_content || screen_busy) {
+    if !typing && !scroll_echo && (fresh_content || screen_busy || motion) {
         return Some("🔄");
     }
     // 无内容 ≥3s → 完成；有内容（count>0）且用户未查看才亮 ✅。
@@ -3476,17 +3495,22 @@ fn icon_from_code(code: u8) -> Option<&'static str> {
 
 /// 「现在该不该重算状态快照」（纯函数，把频率语义钉在测试里）。
 ///
-/// 默认走 [`STATE_CHECK_MS`] 门限（最快 1s 一次）；三条**事件驱动**的例外立即
+/// 默认走 [`STATE_CHECK_MS`] 门限（最快 1s 一次）；四条**事件驱动**的例外立即
 /// 放行，否则会迟钝到能看出来：
 /// ① 首次（`last_check == 0`）；
 /// ② 退出/加载态与快照里的位不一致（❌ 与启动 🔄 不能等下一秒）；
-/// ③ 出现了新的**实质**内容（命令刚跑起来，🔄 必须立刻亮；动画不算，否则
-/// spinner 会把门限彻底顶掉，等于没降频）。
+/// ③ 出现了新的**实质**内容（命令刚跑起来，🔄 必须立刻亮；纯动画不算）；
+/// ④ 画面在**连续动**（`motion_ms`）——这条是「只有动画活性」的页签唯一的
+/// 活路。不放行就只能等 1s 采样，而采样点与动画周期不同步时大多数落在
+/// ANIM_BUSY_MS 窗口外 → 页签在跑却显示空（实测 800ms 进度条 75% 时间显示空）。
+/// 放行量可控：reader 侧按 SCREEN_EVENT_MERGE_MS=250ms 合并同一次重绘的相邻块，
+/// 最多 ~4 次/s，每次只是重跑一遍几个原子量比较。
 #[allow(clippy::too_many_arguments)]
 fn state_due(
     last_check_ms: u64,
     now_ms: u64,
     real_out_ms: u64,
+    motion_ms: u64,
     snap: u8,
     exited: bool,
     loading: bool,
@@ -3497,7 +3521,7 @@ fn state_due(
     if (snap & SNAP_EXITED != 0) != exited || (snap & SNAP_LOADING != 0) != loading {
         return true;
     }
-    real_out_ms > last_check_ms
+    real_out_ms > last_check_ms || motion_ms > last_check_ms
 }
 
 /// App 侧的快照刷新：把图标 + 完成态**一起**算进 Session 的原子里。
@@ -3510,17 +3534,26 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
     let exited = s.exited.load(Ordering::Acquire);
     let loading = s.loading_active(now_ms);
     let real_out = s.last_content_ms.load(Ordering::Relaxed);
-    if !state_due(last_check, now_ms, real_out, snap, exited, loading) {
+    if !state_due(
+        last_check,
+        now_ms,
+        real_out,
+        s.last_motion_ms.load(Ordering::Relaxed),
+        snap,
+        exited,
+        loading,
+    ) {
         return;
     }
     s.state_check_ms.store(now_ms, Ordering::Relaxed);
-let code = icon_code(tab_icon(
+    let code = icon_code(tab_icon(
         exited,
         loading,
         s.output_count.load(Ordering::Relaxed),
         s.has_been_viewed.load(Ordering::Relaxed),
         real_out,
         s.last_screen_change_ms.load(Ordering::Relaxed),
+        s.last_motion_ms.load(Ordering::Relaxed),
         now_ms,
         s.last_input_ms.load(Ordering::Relaxed),
         s.last_scroll_ms.load(Ordering::Relaxed),
@@ -8756,9 +8789,10 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
-        state_due, tab_icon, toast_quiet_enough, ANIM_BUSY_MS, ICON_EMPTY, OUTPUT_END_MS,
-        SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
+        state_due, tab_icon, toast_quiet_enough, ANIM_BUSY_MS, ICON_BUSY, ICON_EMPTY,
+        OUTPUT_END_MS, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS, icon_code,
     };
+    use std::sync::atomic::Ordering;
 
     /// 只喂「内容静默时长」与「是否已查看」：画面时间戳与内容同步（普通命令输出场景）。
     fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
@@ -8770,6 +8804,7 @@ tab_icon(
             viewed,
             now.saturating_sub(silent_ms),
             now.saturating_sub(silent_ms),
+            0,
             now,
             0,
             0,
@@ -8814,15 +8849,15 @@ tab_icon(
     #[test]
     fn never_output_never_flashes_running() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, 0, false, 0, 0, now, 0, 0), None);
+        assert_eq!(tab_icon(false, false, 0, false, 0, 0, 0, now, 0, 0), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, 0, 0, now, 0, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, 0, 0, now, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, 10, false, 0, 0, 0, now, 0, 0), Some("❌"));
+        assert_eq!(tab_icon(false, true, 10, false, 0, 0, 0, now, 0, 0), Some("🔄"));
     }
 
     // 输入驱动例外：最近 1.5s 内用户输过键，输入回显不判运行中；窗口过期后
@@ -8831,7 +8866,7 @@ tab_icon(
     fn typing_echo_not_running() {
         let now = 100_000u64;
         let f = |last_input| {
-            tab_icon(false, false, 10, false, now - 1_000, now - 1_000, now, last_input, 0)
+            tab_icon(false, false, 10, false, now - 1_000, now - 1_000, 0, now, last_input, 0)
         };
         assert_eq!(f(now - 1_000), None);
         assert_eq!(f(now - 1_501), Some("🔄")); // 窗口过期
@@ -8844,11 +8879,11 @@ tab_icon(
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, now, now - 500, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now, now - 500, 0),
             Some("✅")
         );
         assert_eq!(
-            tab_icon(false, false, 10, true, now - 10_000, now - 10_000, now, now - 500, 0),
+            tab_icon(false, false, 10, true, now - 10_000, now - 10_000, 0, now, now - 500, 0),
             None,
             "真实交互（打字）置位 viewed → ✅ 清空"
         );
@@ -8862,19 +8897,19 @@ tab_icon(
         // 内容早已静默 10s，但画面 100ms 前还在变（spinner 在动）→ 🔄。
         for ago in [0u64, 40, 99, 150] {
             assert_eq!(
-                tab_icon(false, false, 10, false, now - 10_000, now - ago, now, 0, 0),
+                tab_icon(false, false, 10, false, now - 10_000, now - ago, 0, now, 0, 0),
                 Some("🔄"),
                 "画面还在高频动 = 还在思考/跑命令（ago={ago}）"
             );
         }
         // 变化停 300ms（> ANIM_BUSY_MS）→ 照常亮 ✅（回合真跑完了）。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 300, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 300, 0, now, 0, 0),
             Some("✅")
         );
 // 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」（用 < 而非 <=）。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - ANIM_BUSY_MS, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - ANIM_BUSY_MS, 0, now, 0, 0),
             Some("✅")
         );
     }
@@ -8887,7 +8922,7 @@ tab_icon(
         let now = 100_000u64;
         // 每秒一跳：上一次跳在 1s 前（>250ms，不算「在动」），内容已停 10s → ✅。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 1_000, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 1_000, 0, now, 0, 0),
             Some("✅"),
             "1Hz 秒表/时钟只改几个格，不该永远钉在 🔄"
         );
@@ -8899,7 +8934,7 @@ tab_icon(
     fn identical_repaint_is_not_progress() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 5_000, now - 5_000, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 5_000, now - 5_000, 0, now, 0, 0),
             Some("✅")
         );
     }
@@ -8909,15 +8944,15 @@ tab_icon(
     fn screen_animation_does_not_override_running() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 500, now - 100, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 500, now - 100, 0, now, 0, 0),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(false, true, 10, false, now - 10_000, now - 100, now, 0, 0),
+            tab_icon(false, true, 10, false, now - 10_000, now - 100, 0, now, 0, 0),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(true, false, 10, false, now - 10_000, now - 100, now, 0, 0),
+            tab_icon(true, false, 10, false, now - 10_000, now - 100, 0, now, 0, 0),
             Some("❌")
         );
     }
@@ -8928,15 +8963,15 @@ tab_icon(
     fn state_snapshot_rechecks_at_most_once_a_second() {
         let now = 100_000u64;
         let idle = ICON_EMPTY;
-        assert!(state_due(0, now, 0, idle, false, false));
-        assert!(!state_due(now - 200, now, now - 10_000, idle, false, false));
-        assert!(!state_due(now - STATE_CHECK_MS + 1, now, now - 10_000, idle, false, false));
-        assert!(state_due(now - STATE_CHECK_MS, now, now - 10_000, idle, false, false));
-        assert!(state_due(now - 200, now, now - 100, idle, false, false));
-        assert!(state_due(now - 200, now, now - 10_000, idle, true, false));
-        assert!(state_due(now - 200, now, now - 10_000, idle, false, true));
+        assert!(state_due(0, now, 0, 0, idle, false, false));
+        assert!(!state_due(now - 200, now, now - 10_000, 0, idle, false, false));
+        assert!(!state_due(now - STATE_CHECK_MS + 1, now, now - 10_000, 0, idle, false, false));
+        assert!(state_due(now - STATE_CHECK_MS, now, now - 10_000, 0, idle, false, false));
+        assert!(state_due(now - 200, now, now - 100, 0, idle, false, false));
+        assert!(state_due(now - 200, now, now - 10_000, 0, idle, true, false));
+        assert!(state_due(now - 200, now, now - 10_000, 0, idle, false, true));
         let snap_exit = idle | SNAP_EXITED;
-        assert!(!state_due(now - 200, now, now - 10_000, snap_exit, true, false));
+        assert!(!state_due(now - 200, now, now - 10_000, 0, snap_exit, true, false));
     }
 
     // 滚动/翻页只改视口、不产生 PTY 输出 → 不计更新状态：滚动后仍按内容判 ✅/空。
@@ -8951,14 +8986,14 @@ fn scrolling_does_not_count_as_update() {
     fn scroll_echo_window_only_swallows_prompt_redraw() {
         let now = 100_000u64;
         let f = |last_scroll, last_screen| {
-            tab_icon(false, false, 10, false, now - 100, last_screen, now, 0, last_scroll)
+            tab_icon(false, false, 10, false, now - 100, last_screen, 0, now, 0, last_scroll)
         };
         assert_eq!(f(now - 100, now - 100), None); // 例外生效
         assert_eq!(f(now - 501, now - 100), Some("🔄")); // 窗口过期
         assert_eq!(f(0, now - 100), Some("🔄")); // 无滚动记录
         // 例外不吞 ✅：内容早停、未查看 → 仍判完成。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, now, 0, now - 100),
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now, 0, now - 100),
             Some("✅")
         );
     }
@@ -8974,10 +9009,122 @@ fn scrolling_does_not_count_as_update() {
         assert!(TOAST_QUIET_MS > OUTPUT_END_MS);
     }
 
-    /// 从未有内容（时间戳仍是初始 0）不得走完成通知：0 距 now 恒「远超门槛」。
+/// 从未有内容（时间戳仍是初始 0）不得走完成通知：0 距 now 恒「远超门槛」。
     #[test]
     fn never_output_session_never_toasts() {
         assert!(!toast_quiet_enough(0, 100_000));
+    }
+
+/// 回归（用户反馈「后台页签实际在执行，状态却经常变为空」）：
+    /// 🔄 的两条通道都是**瞬时**信号，而图标读的是 STATE_CHECK_MS=1s 才重算
+    /// 一份的**采样快照**。纯函数逐项看都对，串起来才炸：画面变化每 `tick` 一跳、
+    /// 内容早已静默时，重算时刻与动画相位不同步 ⇒ 大多数采样点落在
+    /// ANIM_BUSY_MS=250ms 窗口外 ⇒ 🔄 掉成空（已查看页签）或误亮 ✅。
+    /// 旧实现实测（200s 模拟，已查看页签）：800ms 一跳 → 75% 时间显示空，
+    /// 2s 一跳 → 50%，1s 一跳 → 0%（相位恰好整除，纯属走运）。
+    ///
+/// 这里用 reader 侧的真实节奏（stamp_screen_activity：变化事件间隔
+    /// <MOTION_GAP_MS=700ms 刷 motion，间隔 <250ms 的同一次重绘块折叠）重放同一条
+    /// 时间线；慢动画的变化点故意放在两个重算点正中间（最坏相位）。
+    fn replay(tick: u64, motion: bool, viewed: bool) -> (u32, u32, u32) {
+        use crate::session::stamp_screen_activity;
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        let screen = AtomicU64::new(0);
+        let content = AtomicU64::new(60_000);
+        let last_motion = AtomicU64::new(0);
+        let count = AtomicU32::new(1);
+        let mut last_event = 0u64;
+        let mut now = 100_000u64;
+        let mut last_check = 0u64;
+        let mut snap = ICON_EMPTY;
+        let (mut empty, mut busy, mut done) = (0u32, 0u32, 0u32);
+        for _ in 0..20_000 {
+            now += 10;
+            // 相位取「最坏」：慢动画（≥500ms/帧）的变化落在两个采样点正中间，
+            // 瞬时信号 ANIM_BUSY_MS=250ms 一定采样不到（真实里相位随机，这正是
+            // 「经常变空」的成因）。快动画（<500ms）本来就该被瞬时信号抓到。
+            let age_at_sample = if tick >= 500 { tick / 2 + 10 } else { 0 };
+            if (now + age_at_sample).is_multiple_of(tick) {
+                // 1~3 格的小刷新（进度条/秒表），motion 开关模拟「是否接了
+                // stamp_screen_activity」：false = 旧实现（只刷 last_screen_change）。
+                if motion {
+                    stamp_screen_activity(
+                        2,
+                        now,
+                        &mut last_event,
+                        &screen,
+                        &content,
+                        &last_motion,
+                        &count,
+                    );
+                } else {
+                    screen.store(now, Ordering::Relaxed);
+                }
+            }
+            if state_due(
+                last_check,
+                now,
+                content.load(Ordering::Relaxed),
+                last_motion.load(Ordering::Relaxed),
+                snap,
+                false,
+                false,
+            ) {
+                last_check = now;
+                snap = icon_code(tab_icon(
+                    false,
+                    false,
+                    1,
+                    viewed,
+                    content.load(Ordering::Relaxed),
+                    screen.load(Ordering::Relaxed),
+                    last_motion.load(Ordering::Relaxed),
+                    now,
+                    0,
+                    0,
+                ));
+            }
+            // 前 1.5s 是「动画刚起步」的过渡期：确认「连续在动」需要两次变化
+            // 事件（≤MOTION_GAP_MS 一跳），这段不计入统计。
+            if now < 101_500 {
+                continue;
+            }
+            match snap {
+                ICON_EMPTY => empty += 1,
+                ICON_BUSY => busy += 1,
+                _ => done += 1,
+            }
+        }
+        (empty, busy, done)
+    }
+
+    #[test]
+    fn motion_channel_keeps_running_tab_from_going_blank() {
+        for tick in [100u64, 150, 200, 250, 300, 400, 500, 600] {
+            let (empty, busy, _) = replay(tick, true, true);
+            assert_eq!(
+                empty, 0,
+                "tick={tick}ms：画面在连续动就必须一直 🔄，不能掉成空（空={empty} 🔄={busy}）"
+            );
+        }
+        // 对照：旧实现（无 motion 通道）在同样节奏下大面积变空 —— 这就是用户
+        // 看到的「后台页签在跑，状态却经常变空」。
+        let (empty, busy, _) = replay(500, false, true);
+        assert!(
+            empty > 10_000,
+            "旧路径本就该出现大量空图标（实测 {empty} 帧），否则这条回归测不到东西"
+        );
+        assert_eq!(busy, 19_851 - empty);
+    }
+
+    /// 反向：1Hz 秒表/时钟**孤立**跳一格，进不了 motion 通道，仍按 ANIM_BUSY_MS
+    /// 判完成 —— 不能因为修「在跑却发空」就把 🔄 钉死在所有带时钟的 TUI 上。
+    #[test]
+    fn isolated_clock_ticks_still_finish() {
+        let (empty, busy, done) = replay(1000, true, false);
+        assert_eq!(done, 19_851, "1Hz 秒表不该被判成「连续在动」");
+        assert_eq!(busy, 0);
+        assert_eq!(empty, 0);
     }
 }
 #[cfg(test)]
