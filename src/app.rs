@@ -2234,6 +2234,28 @@ fn tool_entry_visible(
         )
 }
 
+/// 工具 exe 路径并进「启动命令」列表的**判定**（纯函数，便于单测）。
+#[derive(Debug, PartialEq, Eq)]
+enum MergeHow {
+    /// 已有等价的**可用**命令（`nvim` / `D:\x\nvim.exe` 同义），原样不动。
+    Kept,
+    /// 已有等价但**跑不起来**的命令（死路径，或本机没装的裸名 `pi`），已就地
+    /// 换成新路径——不在列表里堆死条目。
+    Replaced,
+    /// 列表里没有，追加。
+    Added,
+}
+
+impl std::fmt::Display for MergeHow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MergeHow::Kept => "启动命令里已有",
+            MergeHow::Replaced => "已替换失效的旧命令",
+            MergeHow::Added => "已加入启动命令",
+        })
+    }
+}
+
 /// 把缺失的同级默认路径补进配置（已存在的不动，用户改过的不会被覆写）。
 /// 返回 true = 配置有变化，需要落盘。
 fn fill_default_tool_paths(config: &mut config::Config) -> bool {
@@ -6815,11 +6837,24 @@ ui.add_space(12.0);
                     .small(),
             );
         }
-        ui.label(
+ui.label(
             RichText::new("示例: nvim / lazygit / htop / cmd / bash")
                 .weak()
                 .small(),
         );
+        ui.horizontal(|ui| {
+            if ui
+                .button("↺ 自动补齐")
+                .on_hover_text("按「工具更新路径」的查找顺序（本软件目录 → 配的路径 → PATH）扫 pi / opencode，找到的 exe 自动加进上面的启动命令列表；已有的可用命令不动，失效的旧路径就地替换")
+                .clicked()
+            {
+                match self.auto_fill_tool_commands() {
+                    Ok(msg) => self.status = Some(msg),
+                    Err(e) => self.status = Some(format!("自动补齐失败: {e}")),
+                }
+            }
+            ui.label(RichText::new("把工具更新路径里扫到的 pi / opencode 加进来").weak().small());
+        });
         if dirty {
             self.config.settings.tui_command = self.settings_command.trim().to_string();
             self.config.settings.tui_commands = self.settings_commands.clone();
@@ -7273,6 +7308,30 @@ ui.add_space(12.0);
             .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()))
     }
 
+/// 工具 exe 路径并进「启动命令」列表（幂等 + 自愈）。
+    ///
+    /// `cmd` 为空 / 等价键为空（写不出可比对的名字）时一律不动列表，只回报
+    /// Kept——空路径塞进配置只会得到一条永远起不来的死命令。
+fn merge_tui_command(list: &mut Vec<String>, cmd: &str, usable: fn(&str) -> bool) -> MergeHow {
+        let cmd = cmd.trim();
+        let key = config::tui_command_key(cmd);
+        if key.is_empty() {
+            return MergeHow::Kept;
+        }
+        let same = list.iter().position(|c| config::tui_command_key(c) == key);
+        match same {
+            Some(i) if usable(&list[i]) => MergeHow::Kept,
+            Some(i) if Self::replaceable_command_idx(list, &key) == Some(i) => {
+                list[i] = cmd.to_string();
+                MergeHow::Replaced
+            }
+            _ => {
+                list.push(cmd.to_string());
+                MergeHow::Added
+            }
+        }
+    }
+
     /// 工具刚自动装好后把它写进「启动命令」列表：点完「⬇ 安装」就能直接用它
     /// 启动页签，不必再去设置页手敲一遍路径。幂等 + 自愈：已有等价的**可用**
     /// 命令（`nvim` / `D:\x\nvim.exe` 同义）就不动；已有等价但**跑不起来**的
@@ -7285,26 +7344,79 @@ ui.add_space(12.0);
         if cmd.is_empty() {
             return Err("安装路径为空".to_string());
         }
-        let key = config::tui_command_key(cmd);
         let mut list = self.settings_commands.clone();
-        let same = list.iter().position(|c| config::tui_command_key(c) == key);
-        let how = match same {
-            Some(i) if Self::tui_command_usable(&list[i]) => "启动命令里已有",
-            Some(i) if Self::replaceable_command_idx(&list, &key) == Some(i) => {
-                list[i] = cmd.to_string();
-                "已替换失效的旧命令"
+        let how = Self::merge_tui_command(&mut list, cmd, Self::tui_command_usable);
+        self.commit_tui_commands(list);
+        Ok(how.to_string())
+    }
+
+    /// 设置页「↺ 自动补齐」：按「工具更新路径」那套查找顺序（本软件目录 → 配置
+    /// 路径 → PATH）扫一遍 pi / opencode，把找到的 exe 补进「启动命令」列表——
+    /// 已装好的工具直接变成可选项，不用手敲绝对路径。与安装完成后的自动写入
+    /// 共用同一套合并规则（幂等：已有的可用命令不动，失效的就地替换）。
+    ///
+    /// 不动用户选中的 `tui_command`（除非它指的就是被替换掉的那条，见
+    /// [`Self::commit_tui_commands`]）。找不到任何工具时也不落盘（列表没变）。
+    /// 返回给状态栏的一句话；Err = 落盘失败。
+    fn auto_fill_tool_commands(&mut self) -> Result<String, String> {
+        let dirs = self.tool_search_dirs();
+        let use_path = self.config.settings.tool_search_path;
+        let mut list = self.settings_commands.clone();
+        let mut added: Vec<String> = Vec::new();
+        let mut kept: Vec<String> = Vec::new();
+        for spec in TOOL_SPECS {
+            let Some(exe) = find_tool_exe(spec, &dirs, use_path) else {
+                continue;
+            };
+            let cmd = exe.to_string_lossy().into_owned();
+            match Self::merge_tui_command(&mut list, &cmd, Self::tui_command_usable) {
+                MergeHow::Kept => kept.push(spec.label.to_string()),
+                MergeHow::Replaced => added.push(format!("{}（已替换失效旧命令）", spec.label)),
+                MergeHow::Added => added.push(spec.label.to_string()),
             }
-            _ => {
-                list.push(cmd.to_string());
-                "已加入启动命令"
-            }
-        };
+        }
+        if list != self.settings_commands {
+            self.commit_tui_commands(list);
+        }
+        Ok(match (added.is_empty(), kept.is_empty()) {
+            // 一个都没扫到：多半是工具路径配错或压根没装，如实说，别谎报成功。
+            (true, true) => format!(
+                "在工具更新路径{}里没找到 pi / opencode，未补齐",
+                if use_path { " 与 PATH" } else { "" }
+            ),
+            (true, false) => format!("启动命令里已有：{}", kept.join("、")),
+            (false, false) => format!(
+                "已补齐启动命令：{}（{} 已在列表）",
+                added.join("、"),
+                kept.join("、")
+            ),
+            (false, true) => format!("已补齐启动命令：{}", added.join("、")),
+        })
+    }
+
+    /// 把合并后的启动命令列表写回快照与配置并落盘（自动补齐 / 自动安装共用）。
+    ///
+    /// 被替换的条目若正是当前选中的那条，选中项按等价键跟到列表里的新写法——
+    /// 否则列表里再没有一条与 `settings_command` 相等，UI 上会变成“未选”，
+    /// 而用户选的其实是同一个工具。键对不上（跨工具）才不动，那是改他的默认。
+    fn commit_tui_commands(&mut self, list: Vec<String>) {
+        let key = config::tui_command_key(&self.settings_command);
+        if !key.is_empty()
+            && !list.iter().any(|c| c == &self.settings_command)
+            && let Some(cur) = list.iter().find(|c| config::tui_command_key(c) == key).cloned()
+        {
+            self.settings_command = cur.clone();
+            self.config.settings.tui_command = cur;
+        }
         self.settings_commands = list.clone();
         self.config.settings.tui_commands = list;
-        config::save(&self.config).map_err(|e| e.to_string())?;
+        if let Err(e) = config::save(&self.config) {
+            self.config_save_failed = true;
+            self.status = Some(format!("保存配置失败: {e}"));
+            return;
+        }
         self.config_save_failed = false;
         self.last_config_save = std::time::Instant::now();
-        Ok(how.to_string())
     }
 
     /// 设置页里的「工具更新路径」区：配置「检查更新」到哪里找 pi / opencode。
@@ -10212,6 +10324,41 @@ mod update_tests {
         // 带空格的路径整条就是路径，也能整体替换
         assert_eq!(f(&list(&[r"C:\Program Files\pi\pi.exe"]), "pi"), Some(0));
         assert_eq!(f(&list(&[r"C:\Program Files\pi\pi.exe"]), "opencode"), None);
+    }
+
+/// 「↺ 自动补齐」与安装完成后的自动写入共用同一套合并规则：幂等（已有可用
+    /// 命令不动）、自愈（失效的旧路径就地换成扫到的真路径）、空输入不污染列表。
+    #[test]
+    fn merge_tui_command_is_idempotent_and_self_healing() {
+        use super::MergeHow;
+        let f = ClientApp::merge_tui_command;
+        let mut list = vec!["nvim".to_string()];
+        // 已有的可用命令不动（`NVIM` 与 `nvim` 同义）
+        assert_eq!(f(&mut list, r"D:\x\NVIM.exe", |_| true), MergeHow::Kept);
+        assert_eq!(list, vec!["nvim".to_string()]);
+        // 没有 → 追加
+        assert_eq!(f(&mut list, r"D:\Agent\pi\pi.exe", |_| true), MergeHow::Added);
+        // 已有等价但**跑不起来**（旧机器路径已不存在）→ 就地换成扫到的真路径
+        let mut stale = vec![r"D:\old\pi-windows-x64\pi.exe".to_string()];
+        assert_eq!(f(&mut stale, r"D:\Agent\pi\pi.exe", |_| false), MergeHow::Replaced);
+        assert_eq!(stale, vec![r"D:\Agent\pi\pi.exe".to_string()]);
+        // 扫到的就是死命令自身 → 也不堆重复项
+        assert_eq!(f(&mut stale, r"D:\Agent\pi\pi.exe", |_| false), MergeHow::Replaced);
+        assert_eq!(stale.len(), 1);
+        // 已有的可用裸名 `pi` 不动
+        assert_eq!(f(&mut list, "pi", |_| true), MergeHow::Kept);
+        assert_eq!(list, vec!["nvim".to_string(), r"D:\Agent\pi\pi.exe".to_string()]);
+        // 再补一次同一路径 → 幂等
+        assert_eq!(f(&mut list, r"D:\Agent\pi\pi.exe", |_| true), MergeHow::Kept);
+        assert_eq!(list.len(), 2);
+        // 带参数的旧命令替换不得（会丢参数）：改不动就追加一条
+        let mut args = vec!["pi --foo".to_string()];
+        assert_eq!(f(&mut args, r"D:\Agent\pi\pi.exe", |_| false), MergeHow::Added);
+        assert_eq!(args.len(), 2);
+        // 空输入不污染列表
+        let mut list2 = vec!["nvim".to_string()];
+        assert_eq!(f(&mut list2, "   ", |_| false), MergeHow::Kept);
+        assert_eq!(list2, vec!["nvim".to_string()]);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 - **项目列表**：左侧选择项目 → 点击「启动」在内嵌终端页签中运行配置的 TUI 命令。
 - **添加项目**：支持名称 + 路径（原生文件夹选择窗口「浏览…」），名称留空时自动用路径最后一段。
 - **项目管理**：重命名 / 改路径 / 删除，配置自动保存到 exe 同级的 `config/config.json`。
-- **多 TUI 命令**：在「设置」中可配置多个命令（nvim / lazygit / cmd …），点选其中一个作为启动命令；pi / opencode 自动安装装好后也会自动加进这个列表。
+- **多 TUI 命令**：在「设置」中可配置多个命令（nvim / lazygit / cmd …），点选其中一个作为启动命令；pi / opencode 自动安装装好后也会自动加进这个列表，设置页里还有「↺ 自动补齐」把「工具更新路径」扫到的 pi / opencode 一并加进来。
 - **内嵌终端**：多页签并排，退出时记录打开中的页签目录，下次启动自动恢复。
 - **深浅主题**：右下角一键切换，暗色 TUI 输出自动映射为浅色主题可读配色；原生标题栏固定黑色（DWM），不随深浅切换。
 - **复制粘贴**：右键弹菜单（复制 / 粘贴 / 清空输入），不再右键直接粘贴以免误触；Ctrl+C 只做复制选区（`0x03` 永不写进 PTY，所以无选区时也不会发 SIGINT）；多行粘贴支持括号粘贴（应用按字面插入）或转 `\r`（shell 逐行执行）。
@@ -97,7 +97,7 @@
 
 `settings.tui_commands`：启动命令列表。**添加 / 改名 / 加载时都先按等价键判重**（去首尾空白与引号 → 取命令本身 → 取路径末段文件名 → 去 `.exe` → 小写），所以 `nvim`、`NVIM`、`nvim.exe`、`D:\Tools\nvim.EXE` 视为同一条，不会重复入列；输入框边输边标黄提示「已存在」，点添加时只在状态栏提示、不入列。配置里已有的重复项在加载时自动去重（保留首条），选中的 `tui_command` 归一到列表里真实存在的那条。
 
-`settings.tool_paths` / `settings.tool_search_path`：「检查更新」里 pi / opencode 的查找位置（本机路径，不跨机器共用）与是否回退扫 PATH。启动时自动补齐「本软件同级目录下的 pi / opencode」两项（路径由 `current_exe()` 推得，不硬编码），设置页可增删。
+`settings.tool_paths` / `settings.tool_search_path`：「检查更新」里 pi / opencode 的查找位置（本机路径，不跨机器共用）与是否回退扫 PATH。启动时自动补齐「本软件同级目录下的 pi / opencode」两项（路径由 `current_exe()` 推得，不硬编码），设置页可增删。这份查找顺序（本软件目录 → 配的路径 → PATH）也被启动命令区的「↺ 自动补齐」复用：扫到的 pi / opencode 绝对路径按等价键幂并进 `tui_commands`，已有可用命令不动、失效旧路径就地替换、列表没变则不落盘；它只动列表，不改用户选中的 `tui_command`。
 
 **opencode 供应商配置**：设置页第三个页签，写 `~/.config/opencode/opencode.json`（有 `opencode.jsonc` 时优先那个）。只 patch `provider` 子树里本程序管理的字段（`name` / `npm` / `options.baseURL` / `options.apiKey` / `models.<id>.name`），`$schema`、顶层 `model`、`disabled_providers`、模型项的 `limit` 等一律原样保留。文件带注释（JSONC）导致解析失败时**停用编辑并报错**，绝不覆写原文件。`baseURL` 用的是 opencode 自己的键名，与 pi 页签的 `baseUrl` 不同。
 
